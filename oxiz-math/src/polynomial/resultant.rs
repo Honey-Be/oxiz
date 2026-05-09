@@ -515,7 +515,8 @@ mod tests {
     /// non-zero constant.
     #[test]
     fn test_resultant_sylvester_linear() {
-        let cfg = ResultantConfig { method: ResultantMethod::Sylvester, ..Default::default() };
+        let mut cfg = ResultantConfig::default();
+        cfg.method = ResultantMethod::Sylvester;
         let mut computer = ResultantComputer::new(cfg);
 
         let var: Var = 0;
@@ -548,7 +549,8 @@ mod tests {
     /// `Res(x² - 5, x² - 2)` should equal 9 (confirmed by SymPy).
     #[test]
     fn test_resultant_sylvester_quadratics() {
-        let cfg = ResultantConfig { method: ResultantMethod::Sylvester, ..Default::default() };
+        let mut cfg = ResultantConfig::default();
+        cfg.method = ResultantMethod::Sylvester;
         let mut computer = ResultantComputer::new(cfg);
 
         let var: Var = 0;
