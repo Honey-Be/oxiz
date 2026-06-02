@@ -7,6 +7,9 @@ incremental = true
 # Target for WASM builds
 [target.wasm32-unknown-unknown]
 rustflags = [
+  # Tell getrandom 0.3.x (via ahash/hashbrown transitive dep) to use the JS backend.
+  # Without this, getrandom 0.3.4 refuses to compile for wasm32-unknown-unknown.
+  "--cfg", "getrandom_backend=\"wasm_js\"",
   # Optimize for size in WASM
   "-C", "opt-level=z",
   # Enable link-time optimization
