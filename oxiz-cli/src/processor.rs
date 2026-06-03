@@ -654,20 +654,101 @@ fn process_single_file(
     }
 }
 
-/// Process input from stdin
+/// Process input from stdin.
+///
+/// Subprocess consumers (Verus's `SmtProcess`, Lean4's `smt_abduce`)
+/// keep `stdin` open across an entire session and rely on
+/// `(echo "<<DONE>>")` sentinels to delimit response batches.
+/// Reading until EOF and only then handing the script to
+/// `execute_and_format` deadlocks both sides — oxiz waits on EOF,
+/// the consumer waits on the verdict line.
+///
+/// To keep that protocol working while preserving the file-mode
+/// timing/stats shape, we dispatch every top-level S-expression as
+/// soon as its parens balance and flush `stdout` after each
+/// dispatch.  Per-chunk results are still routed through
+/// `execute_and_format` so any of its non-SMT modes (validate /
+/// format / analyze / classify / dependency / diagnostic) keep
+/// working when the script is piped in; the aggregated stats
+/// shape that follows the loop is unchanged.
 pub(crate) fn run_stdin(ctx: &mut Context, args: &Args, verbosity: Verbosity) {
+    use std::io::Write;
     if verbosity >= Verbosity::Verbose {
-        eprintln_colored(args, "Reading from stdin...");
+        eprintln_colored(args, "Reading from stdin (streaming)...");
     }
 
     let stdin = io::stdin();
-    let mut script = String::new();
+    let mut reader = stdin.lock();
+    let mut accumulator = String::new();
+    let mut line = String::new();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut in_comment = false;
+    let mut error_count: usize = 0;
+    let mut success_count: usize = 0;
+    let mut combined_result = String::new();
 
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(l) => {
-                script.push_str(&l);
-                script.push('\n');
+    let track_memory = args.memory;
+    let start = Instant::now();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                for ch in line.chars() {
+                    if in_comment {
+                        if ch == '\n' {
+                            in_comment = false;
+                        }
+                        continue;
+                    }
+                    if in_string {
+                        if escape_next {
+                            escape_next = false;
+                        } else if ch == '\\' {
+                            escape_next = true;
+                        } else if ch == '"' {
+                            in_string = false;
+                        }
+                        continue;
+                    }
+                    match ch {
+                        ';' => in_comment = true,
+                        '"' => in_string = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth < 0 {
+                                eprintln_colored(
+                                    args,
+                                    "Error reading stdin: unbalanced ')'",
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                accumulator.push_str(&line);
+                if depth == 0 && !accumulator.trim().is_empty() {
+                    let chunk = std::mem::take(&mut accumulator);
+                    let chunk_result = execute_and_format(ctx, &chunk, args);
+                    if !chunk_result.is_empty() {
+                        println!("{}", chunk_result);
+                        let _ = io::stdout().flush();
+                    }
+                    if chunk_result.starts_with("(error") {
+                        error_count = error_count.saturating_add(1);
+                    } else {
+                        success_count = success_count.saturating_add(1);
+                    }
+                    if !combined_result.is_empty() {
+                        combined_result.push('\n');
+                    }
+                    combined_result.push_str(&chunk_result);
+                }
             }
             Err(e) => {
                 eprintln_colored(args, &format!("Error reading stdin: {}", e));
@@ -676,10 +757,17 @@ pub(crate) fn run_stdin(ctx: &mut Context, args: &Args, verbosity: Verbosity) {
         }
     }
 
-    let track_memory = args.memory;
+    // Anything left in the accumulator at EOF was a trailing
+    // unfinished expression — surface it as a parse error so the
+    // consumer doesn't silently lose data.
+    if !accumulator.trim().is_empty() {
+        eprintln_colored(
+            args,
+            "Error reading stdin: unterminated top-level expression at EOF",
+        );
+        std::process::exit(1);
+    }
 
-    let start = Instant::now();
-    let result = execute_and_format(ctx, &script, args);
     let time_ms = start.elapsed().as_millis();
 
     // Collect process-scope RSS after solving – current + OS-level peak (VmHWM on Linux).
@@ -689,10 +777,18 @@ pub(crate) fn run_stdin(ctx: &mut Context, args: &Args, verbosity: Verbosity) {
         (0, 0)
     };
 
+    // Per-chunk results were already routed through `println!` /
+    // `stdout().flush()` above so the consumer saw them as soon as
+    // each top-level expression was dispatched.  We keep the
+    // aggregated payload around for `output_results`' file-mode
+    // shape (it expects the full session-level reply), but we
+    // suppress its second emit when stats/format flags aren't
+    // active so streaming consumers don't see every chunk twice.
+    let result = combined_result;
     let solver_result = SolverResult {
         file: None,
         result: result.clone(),
-        error: if result.starts_with("(error") {
+        error: if error_count > 0 {
             Some(result)
         } else {
             None
@@ -708,8 +804,8 @@ pub(crate) fn run_stdin(ctx: &mut Context, args: &Args, verbosity: Verbosity) {
         files_processed: 1,
         memory_bytes,
         peak_memory_bytes: peak_memory,
-        success_count: if solver_result.error.is_none() { 1 } else { 0 },
-        error_count: if solver_result.error.is_some() { 1 } else { 0 },
+        success_count,
+        error_count,
         profiling_data: if args.profile {
             Some(vec![ProfilingData {
                 operation: "stdin".to_string(),
@@ -728,7 +824,24 @@ pub(crate) fn run_stdin(ctx: &mut Context, args: &Args, verbosity: Verbosity) {
         restarts: sat_stats.restarts,
     };
 
-    output_results(&[solver_result], args, &stats);
+    // Only re-emit the aggregated payload when an output-shape flag
+    // demands it (JSON / file export / etc.); the per-chunk
+    // `println!` loop above already streamed every visible verdict
+    // to subprocess consumers, and printing them again here would
+    // confuse line-based parsers like Verus's `SmtProcess`.
+    if args.smtcomp
+        || args.format_smtlib
+        || args.validate_only
+        || args.analyze
+        || args.classify
+        || args.dependencies
+        || args.dependencies_detailed
+        || args.diagnostic
+        || args.dependencies_export.is_some()
+        || args.diagnostic_export.is_some()
+    {
+        output_results(&[solver_result], args, &stats);
+    }
 
     if (args.time || args.memory || args.stats) && !args.smtcomp {
         print_statistics(&stats, args);
