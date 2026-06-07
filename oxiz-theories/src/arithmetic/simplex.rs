@@ -894,9 +894,13 @@ impl Simplex {
     #[inline]
     fn can_increase(&self, var: VarId) -> bool {
         let idx = var as usize;
-        match &self.upper[idx] {
-            Some(hi) => self.assignment[idx] < hi.value,
-            None => true,
+        // adsmt-patch (rc.30): a variable whose bound vectors were
+        // not yet extended (idx past `upper.len()`) has no upper
+        // bound — treat it as unbounded rather than panicking on
+        // an out-of-range index.
+        match self.upper.get(idx) {
+            Some(Some(hi)) => self.assignment.get(idx).is_none_or(|a| *a < hi.value),
+            _ => true,
         }
     }
 
@@ -904,9 +908,11 @@ impl Simplex {
     #[inline]
     fn can_decrease(&self, var: VarId) -> bool {
         let idx = var as usize;
-        match &self.lower[idx] {
-            Some(lo) => self.assignment[idx] > lo.value,
-            None => true,
+        // adsmt-patch (rc.30): see `can_increase` — an unallocated
+        // bound slot means no lower bound.
+        match self.lower.get(idx) {
+            Some(Some(lo)) => self.assignment.get(idx).is_none_or(|a| *a > lo.value),
+            _ => true,
         }
     }
 
