@@ -443,15 +443,19 @@ impl<'a> Parser<'a> {
             datatype_names.push(dt_name);
         }
 
-        // Parse constructors list
-        self.expect_lparen()?;
+        // Parse the constructor-groups list — one group per declared
+        // datatype.  adsmt-patch (rc.30): the previous code parsed
+        // only the FIRST group then expected the command-closing `)`,
+        // so a multi-datatype `(declare-datatypes ((R 0)(L 0)) (g1 g2))`
+        // failed with "expected ')', found LParen" at the second
+        // group.  Loop over every group and register each datatype's
+        // sort + constructors so later terms resolve.
+        self.expect_lparen()?; // outer constructor-groups list
 
-        let mut constructors = Vec::new();
-
-        // Opening paren for the first datatype's constructors
-        self.expect_lparen()?;
-
+        let mut constructors: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        let mut group_idx = 0usize;
         loop {
+            // End of the outer constructor-groups list?
             if let Some(t) = self.lexer.peek()
                 && matches!(t.kind, TokenKind::RParen)
             {
@@ -459,10 +463,9 @@ impl<'a> Parser<'a> {
                 break;
             }
 
+            // This datatype's constructor group.
             self.expect_lparen()?;
-            let ctor_name = self.expect_symbol()?;
-
-            let mut selectors = Vec::new();
+            let mut group_ctors: Vec<(String, Vec<(String, String)>)> = Vec::new();
             loop {
                 if let Some(t) = self.lexer.peek()
                     && matches!(t.kind, TokenKind::RParen)
@@ -472,28 +475,47 @@ impl<'a> Parser<'a> {
                 }
 
                 self.expect_lparen()?;
-                let selector_name = self.expect_symbol()?;
-                let selector_sort = self.expect_symbol()?;
-                self.expect_rparen()?;
-                selectors.push((selector_name, selector_sort));
+                let ctor_name = self.expect_symbol()?;
+
+                let mut selectors = Vec::new();
+                loop {
+                    if let Some(t) = self.lexer.peek()
+                        && matches!(t.kind, TokenKind::RParen)
+                    {
+                        self.lexer.next_token();
+                        break;
+                    }
+
+                    self.expect_lparen()?;
+                    let selector_name = self.expect_symbol()?;
+                    let selector_sort = self.expect_symbol()?;
+                    self.expect_rparen()?;
+                    selectors.push((selector_name, selector_sort));
+                }
+
+                group_ctors.push((ctor_name, selectors));
             }
 
-            constructors.push((ctor_name, selectors));
+            // Register this datatype's sort + constructors.
+            let dt_name = datatype_names
+                .get(group_idx)
+                .cloned()
+                .unwrap_or_else(|| "UnknownDatatype".to_string());
+            let dt_sort = self.manager.sorts.mk_datatype_sort(&dt_name);
+            for (ctor_name, _selectors) in &group_ctors {
+                self.dt_constructors.insert(ctor_name.clone(), dt_sort);
+            }
+            constructors.extend(group_ctors);
+            group_idx += 1;
         }
 
-        // Close outer constructor list and outer command list
-        self.expect_rparen()?;
+        // Close the outer command list.
         self.expect_rparen()?;
 
         let name = datatype_names
             .first()
             .cloned()
             .unwrap_or_else(|| "UnknownDatatype".to_string());
-
-        let dt_sort = self.manager.sorts.mk_datatype_sort(&name);
-        for (ctor_name, _selectors) in &constructors {
-            self.dt_constructors.insert(ctor_name.clone(), dt_sort);
-        }
 
         Ok(Command::DeclareDatatype { name, constructors })
     }
