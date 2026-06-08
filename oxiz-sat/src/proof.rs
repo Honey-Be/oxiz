@@ -13,28 +13,28 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// DRAT proof logger, parameterized over the underlying writer.
+/// DRAT proof emitter, parameterized over the underlying writer `W`.
 ///
 /// Defaults to `BufWriter<File>` so existing callers using the bare
-/// `DratProof` type and the `enable(&path)` API see exactly the same
+/// `DratWriter` type and the `enable(&path)` API see exactly the same
 /// behavior as before; in-memory capture via `enable_writer` chooses
 /// a different `W` (e.g. `Cursor<Vec<u8>>`).
 ///
-/// `Debug` is derived so its output for `DratProof<BufWriter<File>>`
+/// `Debug` is derived so its output for `DratWriter<BufWriter<File>>`
 /// — the upstream form — is byte-identical to pre-fork.
 #[derive(Debug)]
-pub struct DratProof<W: Write + Send = BufWriter<File>> {
+pub struct DratWriter<W: Write + Send = BufWriter<File>> {
     writer: Option<W>,
     /// Whether proof logging is enabled
     enabled: bool,
 }
 
-impl DratProof<BufWriter<File>> {
+impl DratWriter<BufWriter<File>> {
     /// Create a new DRAT proof logger (disabled). Defaults to the
     /// `BufWriter<File>` writer type so existing call sites
-    /// `DratProof::new()` (no annotation) compile and infer
+    /// `DratWriter::new()` (no annotation) compile and infer
     /// identically to upstream. To capture the proof in memory,
-    /// build a typed instance via [`DratProof::<W>::with_writer`].
+    /// build a typed instance via [`DratWriter::<W>::with_writer`].
     pub fn new() -> Self {
         Self {
             writer: None,
@@ -54,9 +54,9 @@ impl DratProof<BufWriter<File>> {
     }
 }
 
-impl<W: Write + Send> DratProof<W> {
+impl<W: Write + Send> DratWriter<W> {
     /// Construct a proof logger pre-configured with `w` as the
-    /// writer sink. Equivalent to `let mut p = DratProof::new();
+    /// writer sink. Equivalent to `let mut p = DratWriter::new();
     /// p.enable_writer(w);` but works for arbitrary `W` without
     /// requiring the default `BufWriter<File>` first.
     pub fn with_writer(w: W) -> Self {
@@ -68,7 +68,7 @@ impl<W: Write + Send> DratProof<W> {
 
     /// Enable proof logging to an arbitrary writer sink.
     ///
-    /// Mirrors [`enable`] but writes to the provided sink instead of
+    /// Mirrors [`DratWriter::enable`] but writes to the provided sink instead of
     /// opening a file. For any equivalent sequence of clauses the
     /// byte stream is identical; pass `Cursor<Vec<u8>>` to capture
     /// the DRAT proof in memory.
@@ -139,29 +139,29 @@ impl<W: Write + Send> DratProof<W> {
 }
 
 /// Default specialized on the file-backed form so source-compat is
-/// preserved for callers that rely on `DratProof::default()`. Other
-/// `W` use [`DratProof::with_writer`] instead.
-impl Default for DratProof<BufWriter<File>> {
+/// preserved for callers that rely on `DratWriter::default()`. Other
+/// `W` use [`DratWriter::with_writer`] instead.
+impl Default for DratWriter<BufWriter<File>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<W: Write + Send> Drop for DratProof<W> {
+impl<W: Write + Send> Drop for DratWriter<W> {
     fn drop(&mut self) {
         let _ = self.flush();
     }
 }
 
-/// LRAT proof logger, parameterized over the underlying writer.
+/// LRAT proof emitter, parameterized over the underlying writer `W`.
 ///
-/// Mirrors [`DratProof`] — defaults to `BufWriter<File>` so existing
+/// Mirrors [`DratWriter`] — defaults to `BufWriter<File>` so existing
 /// callers see no change; pass a different `W` to capture in memory.
 ///
-/// `Debug` is derived so its output for `LratProof<BufWriter<File>>`
+/// `Debug` is derived so its output for `LratWriter<BufWriter<File>>`
 /// — the upstream form — is byte-identical to pre-fork.
 #[derive(Debug)]
-pub struct LratProof<W: Write + Send = BufWriter<File>> {
+pub struct LratWriter<W: Write + Send = BufWriter<File>> {
     writer: Option<W>,
     /// Whether proof logging is enabled
     enabled: bool,
@@ -169,9 +169,9 @@ pub struct LratProof<W: Write + Send = BufWriter<File>> {
     next_id: u64,
 }
 
-impl LratProof<BufWriter<File>> {
+impl LratWriter<BufWriter<File>> {
     /// Create a new LRAT proof logger (disabled). Default-typed for
-    /// source compatibility — see [`DratProof::new`].
+    /// source compatibility — see [`DratWriter::new`].
     pub fn new() -> Self {
         Self {
             writer: None,
@@ -192,7 +192,7 @@ impl LratProof<BufWriter<File>> {
     }
 }
 
-impl<W: Write + Send> LratProof<W> {
+impl<W: Write + Send> LratWriter<W> {
     /// Construct an LRAT logger pre-configured with `w`.
     pub fn with_writer(w: W) -> Self {
         Self {
@@ -203,7 +203,7 @@ impl<W: Write + Send> LratProof<W> {
     }
 
     /// Enable proof logging to an arbitrary writer sink. See
-    /// [`DratProof::enable_writer`] for the in-memory capture
+    /// [`DratWriter::enable_writer`] for the in-memory capture
     /// pattern.
     pub fn enable_writer(&mut self, w: W) -> std::io::Result<()> {
         self.writer = Some(w);
@@ -311,14 +311,14 @@ impl<W: Write + Send> LratProof<W> {
     }
 }
 
-/// Default specialized on the file-backed form (see [`DratProof::default`]).
-impl Default for LratProof<BufWriter<File>> {
+/// Default specialized on the file-backed form (see [`DratWriter::default`]).
+impl Default for LratWriter<BufWriter<File>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<W: Write + Send> Drop for LratProof<W> {
+impl<W: Write + Send> Drop for LratWriter<W> {
     fn drop(&mut self) {
         let _ = self.flush();
     }
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn test_drat_proof() {
         let path = std::env::temp_dir().join("test_drat.proof");
-        let mut proof = DratProof::new();
+        let mut proof = DratWriter::new();
 
         assert!(!proof.is_enabled());
 
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_disabled_proof() {
-        let mut proof = DratProof::new();
+        let mut proof = DratWriter::new();
 
         // Should not error even though not enabled
         let v0 = Var(0);
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn test_lrat_proof() {
         let path = std::env::temp_dir().join("test_lrat.proof");
-        let mut proof = LratProof::new();
+        let mut proof = LratWriter::new();
 
         assert!(!proof.is_enabled());
 
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn test_lrat_empty_clause() {
         let path = std::env::temp_dir().join("test_lrat_empty.proof");
-        let mut proof = LratProof::new();
+        let mut proof = LratWriter::new();
 
         proof.enable(&path).expect("test operation should succeed");
 
@@ -602,7 +602,7 @@ mod tests {
     fn test_drat_enable_writer_captures_to_cursor() {
         use std::io::Cursor;
         let buffer = Cursor::new(Vec::<u8>::new());
-        let mut proof = DratProof::<Cursor<Vec<u8>>>::with_writer(buffer);
+        let mut proof = DratWriter::<Cursor<Vec<u8>>>::with_writer(buffer);
 
         let v0 = Var::new(0);
         let v1 = Var::new(1);
@@ -622,9 +622,9 @@ mod tests {
         // `#[derive(Debug)]` did pre-fork. We can't import the
         // pre-fork output but we can pin the current derive output
         // and assert it contains the expected field names and values.
-        let proof = DratProof::new();
+        let proof = DratWriter::new();
         let s = format!("{:?}", proof);
-        assert!(s.starts_with("DratProof {"));
+        assert!(s.starts_with("DratWriter {"));
         assert!(s.contains("writer: None"));
         assert!(s.contains("enabled: false"));
     }
@@ -641,7 +641,7 @@ mod tests {
 
         // Path variant
         {
-            let mut proof = DratProof::new();
+            let mut proof = DratWriter::new();
             proof.enable(&path).expect("enable path");
             proof.add_clause(&[Lit::pos(v0), Lit::pos(v1)]).expect("test operation should succeed");
             proof.add_clause(&[Lit::neg(v0)]).expect("test operation should succeed");
@@ -658,7 +658,7 @@ mod tests {
         let (captured, sink) = shared_sink();
 
         {
-            let mut proof = DratProof::<BufWriter<SharedSink>>::with_writer(sink);
+            let mut proof = DratWriter::<BufWriter<SharedSink>>::with_writer(sink);
             proof.add_clause(&[Lit::pos(v0), Lit::pos(v1)]).expect("test operation should succeed");
             proof.add_clause(&[Lit::neg(v0)]).expect("test operation should succeed");
             proof.delete_clause(&[Lit::pos(v0), Lit::pos(v1)]).expect("test operation should succeed");
@@ -679,7 +679,7 @@ mod tests {
     fn test_lrat_enable_writer_captures_to_cursor() {
         use std::io::Cursor;
         let buffer = Cursor::new(Vec::<u8>::new());
-        let mut proof = LratProof::<Cursor<Vec<u8>>>::with_writer(buffer);
+        let mut proof = LratWriter::<Cursor<Vec<u8>>>::with_writer(buffer);
 
         let v0 = Var::new(0);
         let v1 = Var::new(1);
@@ -709,7 +709,7 @@ mod tests {
 
         // Path variant
         {
-            let mut proof = LratProof::new();
+            let mut proof = LratWriter::new();
             proof.enable(&path).expect("enable path");
             let id1 = proof
                 .add_clause(&[Lit::pos(v0), Lit::pos(v1)], &[])
@@ -733,7 +733,7 @@ mod tests {
         let (captured, sink) = shared_sink();
 
         {
-            let mut proof = LratProof::<BufWriter<SharedSink>>::with_writer(sink);
+            let mut proof = LratWriter::<BufWriter<SharedSink>>::with_writer(sink);
             let id1 = proof
                 .add_clause(&[Lit::pos(v0), Lit::pos(v1)], &[])
                 .expect("test operation should succeed");
@@ -762,7 +762,7 @@ mod tests {
         let v0 = Var::new(0);
         let v1 = Var::new(1);
 
-        let mut proof = DratProof::<BufWriter<SharedSink>>::with_writer(sink_a);
+        let mut proof = DratWriter::<BufWriter<SharedSink>>::with_writer(sink_a);
         // Reassign the sink before writing anything.
         proof.enable_writer(sink_b).expect("test operation should succeed");
         proof
@@ -786,7 +786,7 @@ mod tests {
         let v0 = Var::new(0);
         let v1 = Var::new(1);
 
-        let mut proof = LratProof::<BufWriter<SharedSink>>::with_writer(sink_a);
+        let mut proof = LratWriter::<BufWriter<SharedSink>>::with_writer(sink_a);
         // Reassign the sink before writing anything.
         proof.enable_writer(sink_b).expect("test operation should succeed");
         proof

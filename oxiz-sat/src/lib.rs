@@ -269,6 +269,6 @@ pub use profiling::{
     ProfilingCategory, ProfilingCategorySnapshot, ProfilingSnapshot, ProfilingStats, ScopedTimer,
 };
 #[cfg(feature = "std")]
-pub use proof::{DratProof, LratProof, ProofTrimmer};
+pub use proof::{DratWriter, LratWriter, ProofTrimmer};
 #[cfg(feature = "std")]
 pub use stats_dashboard::{StatsAggregator, StatsDashboard};

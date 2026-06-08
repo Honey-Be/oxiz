@@ -15,7 +15,7 @@ use crate::clause::{ClauseDatabase, ClauseId};
 use crate::literal::{Lit, Var};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::proof::DratProof;
+use crate::proof::DratWriter;
 
 /// Statistics for DRAT-based inprocessing
 #[derive(Debug, Default, Clone)]
@@ -118,7 +118,7 @@ impl DratInprocessor {
     pub fn inprocess(
         &mut self,
         db: &mut ClauseDatabase,
-        proof: &mut DratProof,
+        proof: &mut DratWriter,
     ) -> std::io::Result<usize> {
         self.stats.rounds += 1;
         let mut simplifications = 0;
@@ -145,7 +145,7 @@ impl DratInprocessor {
     fn eliminate_subsumed(
         &mut self,
         db: &mut ClauseDatabase,
-        proof: &mut DratProof,
+        proof: &mut DratWriter,
     ) -> std::io::Result<usize> {
         let mut eliminated = 0;
 
@@ -215,7 +215,7 @@ impl DratInprocessor {
     fn eliminate_blocked_clauses(
         &mut self,
         db: &mut ClauseDatabase,
-        proof: &mut DratProof,
+        proof: &mut DratWriter,
     ) -> std::io::Result<usize> {
         let mut eliminated = 0;
 
@@ -319,7 +319,7 @@ impl DratInprocessor {
     fn eliminate_variables(
         &mut self,
         db: &mut ClauseDatabase,
-        proof: &mut DratProof,
+        proof: &mut DratWriter,
     ) -> std::io::Result<usize> {
         let mut eliminated = 0;
 
@@ -435,7 +435,7 @@ impl DratInprocessor {
     fn eliminate_variable(
         &mut self,
         db: &mut ClauseDatabase,
-        proof: &mut DratProof,
+        proof: &mut DratWriter,
         var: Var,
     ) -> std::io::Result<usize> {
         let (pos_clauses, neg_clauses) = self.collect_clauses_with_var(db, var);
