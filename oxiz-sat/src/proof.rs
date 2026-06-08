@@ -80,9 +80,6 @@ impl<W: Write + Send> DratProof<W> {
         self.enabled = true;
         Ok(())
     }
-}
-
-impl<W: Write + Send> DratProof<W> {
 
     /// Disable proof logging
     pub fn disable(&mut self) {
@@ -213,9 +210,6 @@ impl<W: Write + Send> LratProof<W> {
         self.enabled = true;
         Ok(())
     }
-}
-
-impl<W: Write + Send> LratProof<W> {
 
     /// Disable proof logging
     pub fn disable(&mut self) {
@@ -439,6 +433,34 @@ mod tests {
     use crate::literal::Var;
     use std::fs;
     use std::io::Read;
+    use std::sync::{Arc, Mutex};
+
+    /// In-memory writer sink whose accumulated bytes remain inspectable
+    /// after the owning proof logger is dropped, via a shared
+    /// `Arc<Mutex<Vec<u8>>>`. Wrap in `BufWriter` to match
+    /// `enable(&path)`'s buffering exactly.
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("test operation should succeed")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Create a fresh shared byte buffer paired with a `BufWriter`-wrapped
+    /// [`SharedSink`] writing into it.
+    fn shared_sink() -> (Arc<Mutex<Vec<u8>>>, BufWriter<SharedSink>) {
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = BufWriter::new(SharedSink(captured.clone()));
+        (captured, sink)
+    }
 
     #[test]
     fn test_drat_proof() {
@@ -631,19 +653,9 @@ mod tests {
         File::open(&path).expect("test operation should succeed").read_to_end(&mut file_contents).expect("test operation should succeed");
         fs::remove_file(&path).ok();
 
-        // Writer variant — wrap a Vec<u8> in a Cursor wrapped in a
+        // Writer variant — a Vec<u8> behind a shared Mutex wrapped in a
         // BufWriter so the buffering matches `enable(&path)` exactly.
-        let captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        struct SharedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl Write for SharedSink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("test operation should succeed").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
-        let sink = BufWriter::new(SharedSink(captured.clone()));
+        let (captured, sink) = shared_sink();
 
         {
             let mut proof = DratProof::<BufWriter<SharedSink>>::with_writer(sink);
@@ -659,5 +671,134 @@ mod tests {
             file_contents, writer_contents,
             "enable_writer must produce byte-identical output to enable(&path)"
         );
+    }
+
+    // === LRAT in-memory capture (mirrors the DRAT tests above) ===
+
+    #[test]
+    fn test_lrat_enable_writer_captures_to_cursor() {
+        use std::io::Cursor;
+        let buffer = Cursor::new(Vec::<u8>::new());
+        let mut proof = LratProof::<Cursor<Vec<u8>>>::with_writer(buffer);
+
+        let v0 = Var::new(0);
+        let v1 = Var::new(1);
+
+        // Original clause: x0 ∨ x1 (id 1).
+        let id1 = proof
+            .add_clause(&[Lit::pos(v0), Lit::pos(v1)], &[])
+            .expect("test operation should succeed");
+        // Derived clause: ~x0 with a resolution hint on clause 1 (id 2).
+        let _id2 = proof
+            .add_clause(&[Lit::neg(v0)], &[id1])
+            .expect("test operation should succeed");
+        proof.delete_clause(id1).expect("test operation should succeed");
+        proof.flush().expect("test operation should succeed");
+        // The byte-identity guarantee is asserted by the parallel
+        // file-vs-writer test; this test confirms the API surface
+        // and that no panic / error occurs.
+    }
+
+    #[test]
+    fn test_lrat_writer_output_matches_file_path() {
+        // Run the same LRAT sequence twice: once via enable(&path), once
+        // via a BufWriter<SharedSink>. The byte streams must be identical.
+        let path = std::env::temp_dir().join("oxiz_lrat_strict_superset.proof");
+        let v0 = Var::new(0);
+        let v1 = Var::new(1);
+
+        // Path variant
+        {
+            let mut proof = LratProof::new();
+            proof.enable(&path).expect("enable path");
+            let id1 = proof
+                .add_clause(&[Lit::pos(v0), Lit::pos(v1)], &[])
+                .expect("test operation should succeed");
+            proof
+                .add_clause(&[Lit::neg(v0)], &[id1])
+                .expect("test operation should succeed");
+            proof.delete_clause(id1).expect("test operation should succeed");
+            proof.flush().expect("test operation should succeed");
+            proof.disable();
+        }
+        let mut file_contents = Vec::new();
+        File::open(&path)
+            .expect("test operation should succeed")
+            .read_to_end(&mut file_contents)
+            .expect("test operation should succeed");
+        fs::remove_file(&path).ok();
+
+        // Writer variant — shared Mutex<Vec<u8>> behind a BufWriter so the
+        // buffering matches `enable(&path)` exactly.
+        let (captured, sink) = shared_sink();
+
+        {
+            let mut proof = LratProof::<BufWriter<SharedSink>>::with_writer(sink);
+            let id1 = proof
+                .add_clause(&[Lit::pos(v0), Lit::pos(v1)], &[])
+                .expect("test operation should succeed");
+            proof
+                .add_clause(&[Lit::neg(v0)], &[id1])
+                .expect("test operation should succeed");
+            proof.delete_clause(id1).expect("test operation should succeed");
+            proof.flush().expect("test operation should succeed");
+            proof.disable();
+        }
+        let writer_contents = captured.lock().expect("test operation should succeed").clone();
+
+        assert_eq!(
+            file_contents, writer_contents,
+            "enable_writer must produce byte-identical output to enable(&path)"
+        );
+    }
+
+    // === enable_writer reassignment: bytes land in the new sink ===
+
+    #[test]
+    fn test_drat_enable_writer_reassigns_sink() {
+        let (sink_a_buf, sink_a) = shared_sink();
+        let (sink_b_buf, sink_b) = shared_sink();
+
+        let v0 = Var::new(0);
+        let v1 = Var::new(1);
+
+        let mut proof = DratProof::<BufWriter<SharedSink>>::with_writer(sink_a);
+        // Reassign the sink before writing anything.
+        proof.enable_writer(sink_b).expect("test operation should succeed");
+        proof
+            .add_clause(&[Lit::pos(v0), Lit::pos(v1)])
+            .expect("test operation should succeed");
+        proof.flush().expect("test operation should succeed");
+
+        let a_bytes = sink_a_buf.lock().expect("test operation should succeed").clone();
+        let b_bytes = sink_b_buf.lock().expect("test operation should succeed").clone();
+
+        assert!(a_bytes.is_empty(), "original sink must stay empty after reassignment");
+        assert!(!b_bytes.is_empty(), "reassigned sink must receive the clause bytes");
+        assert_eq!(b_bytes, b"1 2 0\n");
+    }
+
+    #[test]
+    fn test_lrat_enable_writer_reassigns_sink() {
+        let (sink_a_buf, sink_a) = shared_sink();
+        let (sink_b_buf, sink_b) = shared_sink();
+
+        let v0 = Var::new(0);
+        let v1 = Var::new(1);
+
+        let mut proof = LratProof::<BufWriter<SharedSink>>::with_writer(sink_a);
+        // Reassign the sink before writing anything.
+        proof.enable_writer(sink_b).expect("test operation should succeed");
+        proof
+            .add_clause(&[Lit::pos(v0), Lit::pos(v1)], &[])
+            .expect("test operation should succeed");
+        proof.flush().expect("test operation should succeed");
+
+        let a_bytes = sink_a_buf.lock().expect("test operation should succeed").clone();
+        let b_bytes = sink_b_buf.lock().expect("test operation should succeed").clone();
+
+        assert!(a_bytes.is_empty(), "original sink must stay empty after reassignment");
+        assert!(!b_bytes.is_empty(), "reassigned sink must receive the clause bytes");
+        assert_eq!(b_bytes, b"1 1 2 0\n");
     }
 }
