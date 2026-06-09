@@ -254,53 +254,40 @@ impl Solver {
 
     /// Get a SAT variable for a term, then check satisfiability
     pub fn check(&mut self, manager: &mut TermManager) -> SolverResult {
-        eprintln!(
-            "[Solver::check] starting, assertions={}",
-            self.assertions.len()
-        );
         // Check for trivial unsat (false assertion)
         if self.has_false_assertion {
             self.build_unsat_core_trivial_false();
-            eprintln!("[Solver::check] trivial unsat");
             return SolverResult::Unsat;
         }
 
         if self.assertions.is_empty() {
-            eprintln!("[Solver::check] empty assertions → Sat");
             return SolverResult::Sat;
         }
 
         // Check string constraints for early conflict detection
-        eprintln!("[Solver::check] check_string");
         if self.check_string_constraints(manager) {
             return SolverResult::Unsat;
         }
 
         // Check floating-point constraints for early conflict detection
-        eprintln!("[Solver::check] check_fp");
         if self.check_fp_constraints(manager) {
             return SolverResult::Unsat;
         }
 
         // Check datatype constraints for early conflict detection
-        eprintln!("[Solver::check] check_dt");
         if self.check_dt_constraints(manager) {
             return SolverResult::Unsat;
         }
 
         // Check array constraints for early conflict detection
-        eprintln!("[Solver::check] check_array");
         if self.check_array_constraints(manager) {
             return SolverResult::Unsat;
         }
-        eprintln!("[Solver::check] check_array done");
 
         // Check bitvector constraints for early conflict detection
-        eprintln!("[Solver::check] check_bv");
         if self.check_bv_constraints(manager) {
             return SolverResult::Unsat;
         }
-        eprintln!("[Solver::check] check_bv done");
 
         // For NIA/NRA logics: dispatch all assertions to the full polynomial
         // solver first (NiaSolver or NlsatSolver). This gives a definitive

@@ -1186,8 +1186,9 @@ impl<'a> TheoryManager<'a> {
                             // non-empty conflict clause if the SAT sub-solver returns UNSAT.
                             let constraint_term = self.term_for_var(var);
                             self.bv.record_constraint_term(constraint_term);
+                            let bv_check_result = self.bv.check();
                             if let Ok(TheoryCheckResultEnum::Unsat(conflict_terms)) =
-                                self.bv.check()
+                                bv_check_result
                             {
                                 let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
                                 return TheoryCheckResult::Conflict(conflict_lits);
@@ -1489,7 +1490,6 @@ impl TheoryCallback for TheoryManager<'_> {
     }
 
     fn final_check(&mut self) -> TheoryCheckResult {
-        eprintln!("[final_check] entering, theory_mode={:?}", self.theory_mode);
         // In lazy mode, process all pending assignments now
         if self.theory_mode == TheoryMode::Lazy {
             for &(lit, is_positive) in &self.pending_assignments.clone() {
@@ -1518,7 +1518,6 @@ impl TheoryCallback for TheoryManager<'_> {
             self.pending_assignments.clear();
         }
 
-        eprintln!("[final_check] checking EUF");
         // Check EUF for conflicts
         if let Some(conflict_terms) = self.euf.check_conflicts() {
             // Convert TermIds to Lits for the conflict clause
@@ -1534,7 +1533,6 @@ impl TheoryCallback for TheoryManager<'_> {
             return TheoryCheckResult::Conflict(conflict_lits);
         }
 
-        eprintln!("[final_check] propagating EUF equalities to arith");
         // Propagate EUF-derived equalities into the arithmetic solver.
         // When EUF fires congruence closure and derives f(x) = f(y) because
         // x = y was asserted, the arithmetic solver is unaware of this equality.
@@ -1546,7 +1544,6 @@ impl TheoryCallback for TheoryManager<'_> {
             return eq_result;
         }
 
-        eprintln!("[final_check] checking arith");
         // Check arithmetic
         match self.arith.check() {
             Ok(result) => {
