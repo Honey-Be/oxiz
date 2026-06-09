@@ -948,8 +948,19 @@ impl Solver {
         // We only send NEW assignments (not previously processed ones) to avoid
         // duplicate theory constraints that would cause spurious UNSAT.
         let mut theory_processed: usize = 0;
+        let mut loop_iter: u64 = 0;
 
         loop {
+            loop_iter += 1;
+            if loop_iter <= 5 || loop_iter % 1000 == 0 {
+                eprintln!(
+                    "[solve_with_theory] iter={} vars={} dl={} assignments={}",
+                    loop_iter,
+                    self.num_vars,
+                    self.trail.decision_level(),
+                    self.trail.assignments().len()
+                );
+            }
             // Boolean propagation
             if let Some(conflict) = self.propagate() {
                 self.stats.conflicts += 1;

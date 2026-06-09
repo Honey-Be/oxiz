@@ -46,7 +46,7 @@ OxiZ has achieved **100% correctness parity with Z3** across all 88 benchmark te
 
 ---
 
-## Current Statistics (v0.2.3 - 2026-06-09)
+## Current Statistics (v0.2.4 - Unreleased)
 
 - **Rust Lines of Code (code)**: 337,523 code lines across 1,017 files
 - **Total Rust Lines (with docs/tests)**: 423,377
@@ -712,7 +712,7 @@ oxiz-core (foundation)
 ---
 
 **Status**: Production Ready
-**Current Version**: v0.2.3 (2026-06-09)
+**Current Version**: v0.2.4 (Unreleased)
 **Tests**: 6,826 passing | **LoC**: 337,523 code (423,377 total) | **Files**: 1,017 | **Clippy**: 0 warnings
 **Next Milestone**: v0.3.0 - Performance Parity + SMT-COMP (Target: Q3 2026)
 **Long-term Goal**: v1.0.0 - Industry-Ready SMT Solver (Target: Q4 2026)

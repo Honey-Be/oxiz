@@ -1,12 +1,12 @@
 # oxiz-solver TODO
 
-Last Updated: 2026-06-09 (v0.2.3)
+Last Updated: 2026-06-09 (v0.2.4)
 
 Reference: Z3's `smt/` directory at `../z3/src/smt/`
 
-## Current Status (v0.2.3)
+## Current Status (v0.2.4)
 
-- **Version**: 0.2.3
+- **Version**: 0.2.4
 - **Status**: Stable
 - **Tests**: 505+ passing
 - **Zero** `todo!`/`unimplemented!` calls

@@ -12,7 +12,7 @@ OxiZ is a high-performance Satisfiability Modulo Theories (SMT) solver written e
 
 **Pure Rust is a fundamental requirement** - no C/C++ dependencies, no FFI bindings, just clean, safe Rust code.
 
-### Implementation Status (v0.2.3)
+### Implementation Status (v0.2.4)
 
 OxiZ is under active development with core theories at production quality:
 
@@ -21,7 +21,7 @@ OxiZ is under active development with core theories at production quality:
 - **Z3 Parity**: 100.0% accuracy across 88 benchmarks (8/8 logics at 100%) ✅
 - **Production Ready**: All core theory solvers validated against Z3
 
-## What's New in 0.2.3 (2026-06-09)
+## What's New in 0.2.4 (Unreleased)
 
 ### Generic Proof Writers (oxiz-sat)
 - `DratWriter<W>` and `LratWriter<W>` are now generic over any `W: Write + Send`, replacing the previous `DratProof` / `LratProof` types that were hard-coded to `BufWriter<File>`.
@@ -165,7 +165,7 @@ Starting from 64.8% (57/88), we systematically fixed:
 
 This milestone validates OxiZ as a production-ready SMT solver implementation in Pure Rust.
 
-## Project Statistics (v0.2.3)
+## Project Statistics (v0.2.4)
 
 | Metric | Value |
 |--------|-------|
@@ -231,21 +231,21 @@ For optimal performance, we recommend:
 ```toml
 # Add to your Cargo.toml
 [dependencies]
-oxiz = "0.2.3"  # Default includes solver
+oxiz = "0.2.4"  # Default includes solver
 ```
 
 Or with specific features:
 
 ```toml
 [dependencies]
-oxiz = { version = "0.2.3", features = ["nlsat", "optimization"] }
+oxiz = { version = "0.2.4", features = ["nlsat", "optimization"] }
 ```
 
 For all features:
 
 ```toml
 [dependencies]
-oxiz = { version = "0.2.3", features = ["full"] }
+oxiz = { version = "0.2.4", features = ["full"] }
 ```
 
 ### Building from Source

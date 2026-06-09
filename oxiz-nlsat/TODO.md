@@ -1,6 +1,6 @@
 # oxiz-nlsat TODO
 
-Last Updated: 2026-06-09 (v0.2.3)
+Last Updated: 2026-06-09 (v0.2.4)
 
 Reference: Z3's `nlsat/` directory at `../z3/src/nlsat/`
 

@@ -207,6 +207,20 @@ fn encode_bv_term_recursive(
         if encoded.contains(&tid) {
             continue;
         }
+        // If the BV solver already has a circuit for this term (encoded in a
+        // previous call to encode_bv_term_recursive), skip both the child-push
+        // and the encoding phases.  This makes the function globally idempotent:
+        // calling it a second time for the same sub-tree is a no-op, which
+        // prevents the adder/multiplier circuits from being duplicated across
+        // CDCL restarts (each duplicate brings ~33 fresh carry SAT variables and
+        // hundreds of new clauses, causing the embedded BV SAT to blow up).
+        // Leaves (Var, BitVecConst) are already idempotent via `new_bv`'s
+        // `or_insert_with`, so this guard is only strictly necessary for
+        // compound operations, but checking unconditionally is correct and safe.
+        if bv.get_bv(tid).is_some() {
+            encoded.insert(tid);
+            continue;
+        }
 
         let term = match mgr.get(tid) {
             Some(t) => t,
@@ -1475,6 +1489,7 @@ impl TheoryCallback for TheoryManager<'_> {
     }
 
     fn final_check(&mut self) -> TheoryCheckResult {
+        eprintln!("[final_check] entering, theory_mode={:?}", self.theory_mode);
         // In lazy mode, process all pending assignments now
         if self.theory_mode == TheoryMode::Lazy {
             for &(lit, is_positive) in &self.pending_assignments.clone() {
@@ -1503,6 +1518,7 @@ impl TheoryCallback for TheoryManager<'_> {
             self.pending_assignments.clear();
         }
 
+        eprintln!("[final_check] checking EUF");
         // Check EUF for conflicts
         if let Some(conflict_terms) = self.euf.check_conflicts() {
             // Convert TermIds to Lits for the conflict clause
@@ -1518,6 +1534,7 @@ impl TheoryCallback for TheoryManager<'_> {
             return TheoryCheckResult::Conflict(conflict_lits);
         }
 
+        eprintln!("[final_check] propagating EUF equalities to arith");
         // Propagate EUF-derived equalities into the arithmetic solver.
         // When EUF fires congruence closure and derives f(x) = f(y) because
         // x = y was asserted, the arithmetic solver is unaware of this equality.
@@ -1529,6 +1546,7 @@ impl TheoryCallback for TheoryManager<'_> {
             return eq_result;
         }
 
+        eprintln!("[final_check] checking arith");
         // Check arithmetic
         match self.arith.check() {
             Ok(result) => {
