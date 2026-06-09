@@ -716,6 +716,64 @@ mod tests {
         }
     }
 
+    /// Regression (adsmt 2026-06-09): a bound asserted *after a push*
+    /// (a SAT decision level) that conflicts with a level-0 bound must
+    /// still be detected by `check()`. The SMT-level symptom was
+    /// `(or (< x 0) (> x 0)) ∧ (>= x 0) ∧ (<= x 0)` returning a spurious
+    /// `sat`: x≥0,x≤0 at level 0, then the decided `x<0` (⇒ x≤-1) at
+    /// level 1 should conflict, but didn't.
+    #[test]
+    fn test_bound_conflict_after_push_is_detected() {
+        let mut solver = ArithSolver::lia();
+        let x = TermId::new(1);
+        let reason = TermId::new(100);
+        // level 0:  x >= 0  ∧  x <= 0   (⇒ x = 0)
+        solver.assert_ge(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        solver.assert_le(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        assert!(
+            matches!(solver.check(), Ok(TheoryResult::Sat)),
+            "x=0 should be SAT before the decision"
+        );
+        // decision level 1:  x < 0  (⇒ x <= -1)
+        solver.push();
+        solver.assert_lt(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        let r = solver.check();
+        assert!(
+            matches!(r, Ok(TheoryResult::Unsat(_))),
+            "x>=0 ∧ x<=-1 must be UNSAT after the push, got {r:?}"
+        );
+    }
+
+    /// Regression (adsmt 2026-06-09): the push → assert → pop → push →
+    /// assert cycle a backtracking SAT solver drives (`(or (< x 0) (> x
+    /// 0)) ∧ (>= x 0) ∧ (<= x 0)`: try `< 0`, conflict, pop, try `> 0`)
+    /// must restore the level-0 bounds on `pop`, so the *second*
+    /// conflicting bound is still detected. The SMT symptom was a
+    /// spurious `sat` because the second `check()` returned `Sat`.
+    #[test]
+    fn test_level0_bounds_restored_after_pop_then_repush() {
+        let mut solver = ArithSolver::lia();
+        let x = TermId::new(1);
+        let reason = TermId::new(100);
+        // level 0:  x >= 0  ∧  x <= 0
+        solver.assert_ge(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        solver.assert_le(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        // decision 1:  x < 0  (⇒ x <= -1)  → conflict
+        solver.push();
+        solver.assert_lt(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        assert!(matches!(solver.check(), Ok(TheoryResult::Unsat(_))), "first branch must be UNSAT");
+        // backtrack the decision, then try the other disjunct
+        solver.pop();
+        // decision 1':  x > 0  (⇒ x >= 1)  → must ALSO conflict with x<=0
+        solver.push();
+        solver.assert_gt(&[(x, Rational64::one())], Rational64::from_integer(0), reason);
+        let r = solver.check();
+        assert!(
+            matches!(r, Ok(TheoryResult::Unsat(_))),
+            "x<=0 ∧ x>=1 must be UNSAT after pop+repush (level-0 bounds restored), got {r:?}"
+        );
+    }
+
     #[test]
     fn test_gcd_computation() {
         assert_eq!(gcd_i64(12, 8), 4);

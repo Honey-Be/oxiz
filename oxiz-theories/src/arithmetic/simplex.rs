@@ -209,6 +209,22 @@ pub struct Simplex {
     /// Cached assignments for warm-starting (basis caching)
     /// Saves assignment state at each decision level for faster incremental solving
     cached_assignments: Vec<Vec<DeltaRational>>,
+    /// Cached tableau + basis snapshots, one per `push`.
+    ///
+    /// Soundness fix (2026-06-09): `check()` detects most infeasibility by
+    /// *pivoting* in `make_feasible`, which mutates the tableau rows and the
+    /// `basic` flags — including rows established at *lower* decision levels.
+    /// The undo `trail` only restores bounds and variable/slack counts, not
+    /// the pivoted tableau, so after `push → assert → check(pivots) → pop`
+    /// the lower-level rows stayed in their pivoted form and a subsequent
+    /// conflicting bound went undetected (the SMT symptom was a spurious
+    /// `sat` for `(or (< x 0) (> x 0)) ∧ (= x 0)`: the second disjunct's
+    /// conflict was lost after backtracking the first). Snapshot the tableau
+    /// and `basic` on `push`; restore them on `pop` so every backtrack
+    /// returns the simplex to the exact structural state of the target level.
+    cached_tableaus: Vec<FxHashMap<VarId, LinExpr>>,
+    /// `basic` flags snapshotted alongside [`Self::cached_tableaus`].
+    cached_basic: Vec<Vec<bool>>,
     /// Pivoting rule to use
     pivoting_rule: PivotingRule,
     /// Maximum number of pivot operations before giving up
@@ -244,6 +260,8 @@ impl Simplex {
             trail: Vec::new(),
             trail_limits: vec![0],
             cached_assignments: Vec::new(),
+            cached_tableaus: Vec::new(),
+            cached_basic: Vec::new(),
             pivoting_rule: config.pivoting_rule,
             max_pivots: config.max_pivots,
         }
@@ -1315,6 +1333,9 @@ impl Simplex {
         self.trail.clear();
         self.trail_limits.clear();
         self.trail_limits.push(0);
+        self.cached_assignments.clear();
+        self.cached_tableaus.clear();
+        self.cached_basic.clear();
     }
 
     /// Push a new decision level
@@ -1322,6 +1343,12 @@ impl Simplex {
         self.trail_limits.push(self.trail.len());
         // Cache current assignment for warm-starting on pop (basis caching)
         self.cached_assignments.push(self.assignment.clone());
+        // Snapshot the structural state (tableau rows + basis) so a `pop`
+        // can undo the pivots `check()` performs at this level — the trail
+        // alone restores only bounds and counts (soundness fix 2026-06-09;
+        // see `cached_tableaus`).
+        self.cached_tableaus.push(self.tableau.clone());
+        self.cached_basic.push(self.basic.clone());
     }
 
     /// Pop to previous decision level
@@ -1378,31 +1405,22 @@ impl Simplex {
                 }
             }
 
-            // Clean up stale tableau entries (can happen due to pivoting before pop)
-            // Remove entries whose variable indices are out of bounds
-            let num_vars = self.assignment.len();
-            self.tableau.retain(|&var, expr| {
-                // Check if the basic variable is valid
-                if (var as usize) >= num_vars {
-                    return false;
-                }
-                // Check if all terms reference valid variables
-                for (v, _) in &expr.terms {
-                    if (*v as usize) >= num_vars {
-                        return false;
-                    }
-                }
-                true
-            });
-
-            // Also reset the basic flags for variables that might have been incorrectly
-            // marked as basic due to pivoting
-            for i in 0..num_vars {
-                let var_id = i as VarId;
-                if self.basic[i] && !self.tableau.contains_key(&var_id) {
-                    // Variable marked as basic but has no tableau entry - mark as non-basic
-                    self.basic[i] = false;
-                }
+            // Restore the structural snapshot taken at the matching `push`:
+            // the exact pre-push tableau rows and basis. `check()` detects
+            // most infeasibility by pivoting in `make_feasible`, which
+            // rewrites tableau rows and `basic` flags — including rows from
+            // *lower* decision levels. The undo `trail` restores only bounds
+            // and variable/slack counts, so without re-installing the
+            // snapshot those pivoted lower-level rows would survive the pop
+            // and a later conflicting bound could go undetected — the
+            // spurious-`sat` soundness bug fixed 2026-06-09. The snapshot is
+            // authoritative, so it supersedes the previous best-effort
+            // "remove out-of-range rows / fix dangling basic flags" cleanup.
+            if let Some(tableau) = self.cached_tableaus.pop() {
+                self.tableau = tableau;
+            }
+            if let Some(basic) = self.cached_basic.pop() {
+                self.basic = basic;
             }
 
             self.infeasible = None;
