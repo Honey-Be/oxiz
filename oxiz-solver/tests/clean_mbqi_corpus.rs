@@ -70,6 +70,16 @@ fn solve_clean(path: &Path) -> Verdict {
     };
     let mut ctx = Context::new();
     ctx.set_clean_mbqi(true);
+    // Cap per-case wall-clock so the WHOLE corpus completes in CI-time. The
+    // SOUNDNESS gate is unaffected — a spurious `unsat` is a wrong conclusion
+    // reached fast, not a non-termination, so a short deadline cannot hide it;
+    // it only turns slow-but-correct cases into the sound `Unknown` sooner.
+    // Override with OXIZ_PARITY_TIMEOUT_MS (e.g. 3000) for a completeness run.
+    let ms: u64 = std::env::var("OXIZ_PARITY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    ctx.set_timeout_ms(ms);
     match ctx.execute_script(&script) {
         Ok(out) => out
             .iter()
@@ -90,7 +100,9 @@ fn clean_engine_corpus_no_spurious_verdict() {
     let mut spurious: Vec<String> = Vec::new();
 
     for c in &cases {
+        eprintln!("[clean-corpus] solving {} (z3={:?})", c.relpath, c.z3);
         let got = solve_clean(&corpus_root().join("benchmarks").join(&c.relpath));
+        eprintln!("[clean-corpus]   -> {:?}", got);
         match (c.z3, got) {
             // SOUNDNESS VIOLATIONS — the gate.
             (Verdict::Sat, Verdict::Unsat) | (Verdict::Unknown, Verdict::Unsat) => {

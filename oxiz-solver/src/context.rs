@@ -842,6 +842,15 @@ impl Context {
         self.solver.set_config(cfg);
     }
 
+    /// Set the solver wall-clock budget in milliseconds (0 = the default
+    /// non-termination guard). Doubles as the MBQI/quantifier loop deadline:
+    /// on expiry the verdict is the sound `Unknown`, never a guess.
+    pub fn set_timeout_ms(&mut self, ms: u64) {
+        let mut cfg = self.solver.config().clone();
+        cfg.timeout_ms = ms;
+        self.solver.set_config(cfg);
+    }
+
     /// Check satisfiability under temporary assumptions (crate-internal use only).
     pub(crate) fn check_with_assumptions_raw(
         &mut self,
