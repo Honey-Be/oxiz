@@ -827,6 +827,21 @@ impl Context {
         self.solver.set_config(config);
     }
 
+    /// Enable or disable the clean-room quantifier engine (`oxiz-mbqi`) for the
+    /// model-based instantiation phase.
+    ///
+    /// The clean engine is sound by construction (it never fabricates a
+    /// universe witness; the spurious-`unsat` bug class is structurally
+    /// impossible) but currently less complete than the legacy `mbqi/` path on
+    /// non-LIA+UF problems, so it is off by default and opted into by the
+    /// verifier-backend path (e.g. the adsmt in-process OxiZ delegation that
+    /// feeds the verus prelude). See `solver/mod.rs` and `clean_mbqi.rs`.
+    pub fn set_clean_mbqi(&mut self, on: bool) {
+        let mut cfg = self.solver.config().clone();
+        cfg.clean_mbqi = on;
+        self.solver.set_config(cfg);
+    }
+
     /// Check satisfiability under temporary assumptions (crate-internal use only).
     pub(crate) fn check_with_assumptions_raw(
         &mut self,
