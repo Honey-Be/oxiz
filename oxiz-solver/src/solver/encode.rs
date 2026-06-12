@@ -1195,6 +1195,17 @@ impl Solver {
                 let body_id = *body;
                 let _vars_clone = vars.clone();
                 let patterns_clone = patterns.clone();
+                // Only quantifiers with EXPLICIT `:pattern` triggers are driven
+                // by Phase-1 e-matching.  A trigger-free `forall` (e.g.
+                // reflexivity `∀x. po(x,x)`, or a strict-order biconditional)
+                // has only AUTO-generated triggers, which fire against
+                // model-completion witnesses and can manufacture an unsound
+                // instantiation — so it must be left to the model-based MBQI
+                // (Phase 2) instead.  Registering only explicitly-triggered
+                // quantifiers with the e-matching engine keeps the two phases
+                // disjoint and matches the z3/cvc5 discipline (explicit pattern
+                // ⇒ e-match; no pattern ⇒ MBQI).
+                let has_explicit_patterns = !patterns.is_empty();
                 let body_is_exists = manager
                     .get(body_id)
                     .map(|t| matches!(t.kind, TermKind::Exists { .. }))
@@ -1210,8 +1221,10 @@ impl Solver {
                         if let Ok(skolemized) = sk_ctx.skolemize(manager, term) {
                             // Register the Skolemized version with MBQI
                             self.mbqi.add_quantifier(skolemized, manager);
-                            // Register with E-matching engine
-                            let _ = self.ematch_engine.register_quantifier(skolemized, manager);
+                            // Register with E-matching engine (explicit triggers only).
+                            if has_explicit_patterns {
+                                let _ = self.ematch_engine.register_quantifier(skolemized, manager);
+                            }
 
                             // Also collect Skolem function application terms from the
                             // Skolemized body as MBQI candidates.  These terms (e.g.
@@ -1221,18 +1234,24 @@ impl Solver {
                         } else {
                             // Skolemization failed — fall back to original
                             self.mbqi.add_quantifier(term, manager);
-                            let _ = self.ematch_engine.register_quantifier(term, manager);
+                            if has_explicit_patterns {
+                                let _ = self.ematch_engine.register_quantifier(term, manager);
+                            }
                         }
                     }
                     #[cfg(not(feature = "std"))]
                     {
                         self.mbqi.add_quantifier(term, manager);
-                        let _ = self.ematch_engine.register_quantifier(term, manager);
+                        if has_explicit_patterns {
+                            let _ = self.ematch_engine.register_quantifier(term, manager);
+                        }
                     }
                 } else {
                     self.mbqi.add_quantifier(term, manager);
                     // Register with E-matching engine for trigger-based instantiation
-                    let _ = self.ematch_engine.register_quantifier(term, manager);
+                    if has_explicit_patterns {
+                        let _ = self.ematch_engine.register_quantifier(term, manager);
+                    }
                 }
 
                 // Collect ground terms from patterns as candidates

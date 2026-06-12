@@ -219,3 +219,75 @@ fn cdqi_no_false_conflict_when_existing_terms_are_consistent() {
     ]);
     assert_eq!(r, SolverResult::Sat);
 }
+
+// --- Uninterpreted sort cardinality (verus-fork P0 "Bug A") ---------------
+
+#[test]
+fn distinct_over_an_uninterpreted_sort_is_sat() {
+    // (declare-sort S 0) has an UNBOUNDED domain, so `(distinct c1 … cN)` over
+    // fresh constants is satisfiable for every N. Pre-fix `Context::parse_sort_name`
+    // defaulted every unknown sort to `Bool` (a 2-element domain), so 3+ distinct
+    // constants were unsat by pigeonhole — a soundness bug that made every Verus
+    // prelude sort (FuelId, Height, Poly, …) finite. (z3: sat.)
+    let mut cmds: Vec<String> = vec!["(declare-sort S 0)".into()];
+    for i in 1..=60 {
+        cmds.push(format!("(declare-const c{i} S)"));
+    }
+    let mut distinct = String::from("(assert (distinct");
+    for i in 1..=60 {
+        distinct.push_str(&format!(" c{i}"));
+    }
+    distinct.push_str("))");
+    cmds.push(distinct);
+    cmds.push("(check-sat)".into());
+    let refs: Vec<&str> = cmds.iter().map(String::as_str).collect();
+    assert_eq!(
+        solve_streamed(&refs),
+        SolverResult::Sat,
+        "60 distinct constants of an uninterpreted sort are satisfiable"
+    );
+}
+
+#[test]
+fn uninterpreted_function_into_an_uninterpreted_sort_is_unbounded() {
+    // `height : Poly -> Height` with three Poly arguments mapped to distinct
+    // Height values — satisfiable (the Height domain is unbounded). Exercises
+    // a declared sort used as a function RANGE, fed command-by-command.
+    let r = solve_streamed(&[
+        "(declare-sort Poly 0)",
+        "(declare-sort Height 0)",
+        "(declare-fun height (Poly) Height)",
+        "(declare-const p1 Poly)",
+        "(declare-const p2 Poly)",
+        "(declare-const p3 Poly)",
+        "(assert (distinct (height p1) (height p2) (height p3)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat);
+}
+
+#[test]
+fn trigger_free_partial_order_axioms_are_sat() {
+    // verus-fork P0 "Bug C": reflexivity of a partial order plus the standard
+    // strict-order biconditional, over an UNINTERPRETED sort, with NO
+    // `:pattern`. Trivially satisfiable (z3: sat). A regression introduced
+    // when pattern-guided e-matching (Phase 1) ran EAGERLY for trigger-free
+    // quantifiers too: its auto-generated triggers fired against
+    // model-completion witnesses and manufactured an unsound `unsat`. Phase-1
+    // e-matching is now gated to EXPLICITLY-triggered quantifiers; trigger-free
+    // ones are left to the model-based MBQI (Phase 2).
+    let r = solve_streamed(&[
+        "(declare-sort Height 0)",
+        "(declare-fun height_lt (Height Height) Bool)",
+        "(declare-fun partial-order (Height Height) Bool)",
+        "(assert (forall ((x Height)) (partial-order x x)))",
+        "(assert (forall ((x Height) (y Height)) \
+            (= (height_lt x y) (and (partial-order x y) (not (= x y))))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "reflexivity + strict-order def over an uninterpreted sort is satisfiable"
+    );
+}

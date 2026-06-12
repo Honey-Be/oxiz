@@ -8,7 +8,7 @@ use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::error::Result;
 #[cfg(feature = "std")]
 use oxiz_core::smtlib::{Command, ParserEnv, parse_script_with_env};
-use oxiz_core::sort::SortId;
+use oxiz_core::sort::{SortId, SortKind};
 #[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
 
@@ -844,21 +844,28 @@ impl Context {
 
     /// Parse a sort name and return its SortId
     fn parse_sort_name(&mut self, name: &str) -> SortId {
-        match name {
-            "Bool" => self.terms.sorts.bool_sort,
-            "Int" => self.terms.sorts.int_sort,
-            "Real" => self.terms.sorts.real_sort,
-            _ => {
-                // Check for BitVec
-                if let Some(width_str) = name.strip_prefix("BitVec")
-                    && let Ok(width) = width_str.trim().parse::<u32>()
-                {
-                    return self.terms.sorts.bitvec(width);
-                }
-                // Default to Bool for unknown sorts
-                self.terms.sorts.bool_sort
-            }
+        // Built-in scalar sorts and user-defined `define-sort` aliases.
+        if let Some(sort_id) = self.terms.sorts.resolve_by_name(name) {
+            return sort_id;
         }
+        // `(_ BitVec N)`.
+        if let Some(width_str) = name.strip_prefix("BitVec")
+            && let Ok(width) = width_str.trim().parse::<u32>()
+        {
+            return self.terms.sorts.bitvec(width);
+        }
+        // Any other name is an UNINTERPRETED sort — a `(declare-sort S 0)`, or
+        // a sort referenced before its declaration was processed (commands are
+        // fed to `execute_script` one at a time).  It must have an UNBOUNDED
+        // domain, NOT `Bool`: defaulting to `Bool` modelled every uninterpreted
+        // sort with exactly two elements, so `(distinct c1 c2 c3 …)` over fresh
+        // constants of the sort was unsatisfiable by pigeonhole — a soundness
+        // bug for any UF problem (every Verus prelude sort: FuelId, Height,
+        // Poly, Type, …).  `intern` dedups by name, so the same sort name maps
+        // to the same `SortId` on every command, and the persistent
+        // `TermManager` keeps it across calls.
+        let key = self.terms.sorts.intern_str(name);
+        self.terms.sorts.intern(SortKind::Uninterpreted(key))
     }
 
     /// Execute an SMT-LIB2 script
@@ -1005,8 +1012,20 @@ impl Context {
                         output.push(format!("(error \"Unsupported info keyword: {}\")", keyword));
                     }
                 }
+                Command::DeclareSort(name, arity) => {
+                    // Register the uninterpreted sort so references resolve to a
+                    // proper unbounded sort (not the `Bool` fallback).  Arity-0
+                    // is the common case (Verus's FuelId / Height / Poly / …);
+                    // `parse_sort_name` also creates it on first use, but
+                    // registering here covers a declared-but-unused sort and
+                    // records the parametric arity.
+                    if arity == 0 {
+                        let _ = self.parse_sort_name(&name);
+                    } else {
+                        self.terms.sorts.declare_parametric_sort(&name, arity as usize);
+                    }
+                }
                 Command::SetInfo(_, _)
-                | Command::DeclareSort(_, _)
                 | Command::DefineSort(_, _, _)
                 | Command::DefineFun(_, _, _, _)
                 | Command::DeclareDatatype { .. } => {
