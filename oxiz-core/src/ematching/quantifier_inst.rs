@@ -168,6 +168,10 @@ impl EmatchEngine {
                 }
             };
 
+            // Names of THIS quantifier's bound variables — used to reject the
+            // identity self-match (see the groundness guard below).
+            let bound_names: FxHashSet<Spur> = vars.iter().map(|(name, _)| *name).collect();
+
             for trigger in &quant_info.triggers {
                 if results.len() >= max_this_round || self.stats.total_instantiations >= max_total {
                     break;
@@ -186,6 +190,31 @@ impl EmatchEngine {
                         || self.stats.total_instantiations >= max_total
                     {
                         break;
+                    }
+
+                    // Soundness: an instantiation must not reintroduce THIS
+                    // quantifier's own bound variables.  The term pool
+                    // (`all_term_ids`) also holds the quantifier's OWN body
+                    // subterms, so a trigger like `(charClip i)` matches the
+                    // in-body `(charClip i)` and yields the identity substitution
+                    // `{i ↦ i}`.  Applying it returns the body with `i` still
+                    // free — and because distinct quantifiers hash-cons a reused
+                    // bound-var name (`i`) to ONE `Var` term, those free vars then
+                    // capture across axioms and manufacture a spurious UNSAT (it
+                    // also makes the verdict depend on assertion grouping:
+                    // per-command streaming vs one-shot batch).  Reject any match
+                    // whose substitution range still mentions a bound variable.
+                    // (Declared constants are `Var` terms too, so a plain
+                    // `is_ground` check would wrongly drop legitimate matches like
+                    // `{a ↦ x}` — we test against the bound-name set instead.)
+                    let captures_bound_var = subst.iter().any(|(_, &t)| {
+                        manager.free_vars(t).iter().any(|&v| {
+                            matches!(manager.get(v).map(|x| &x.kind),
+                                Some(TermKind::Var(n)) if bound_names.contains(n))
+                        })
+                    });
+                    if captures_bound_var {
+                        continue;
                     }
 
                     self.stats.successful_matches += 1;

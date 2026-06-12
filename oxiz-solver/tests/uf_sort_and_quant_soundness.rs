@@ -291,3 +291,77 @@ fn trigger_free_partial_order_axioms_are_sat() {
         "reflexivity + strict-order def over an uninterpreted sort is satisfiable"
     );
 }
+
+#[test]
+fn patterned_quantifier_does_not_self_match_its_own_body() {
+    // verus-fork P0 "Bug B": the full `charClip`/`charInv`/`bitshr` Unicode-clamp
+    // prelude fragment was spuriously `unsat` when fed ONE command at a time
+    // (the in-process OxiZ delegation, and the streaming-stdin CLI), while the
+    // one-shot batch parse was correctly `sat`.
+    //
+    // Root cause (engine, grouping-independent): e-matching scanned the WHOLE
+    // term pool for trigger candidates — including the quantifier's OWN body
+    // subterms. A trigger `(charClip i)` matched the in-body `(charClip i)`,
+    // yielding the IDENTITY substitution `{i ↦ i}`; applying it returned the
+    // body with `i` still free. Because two `:pattern` quantifiers that reuse
+    // the bound-var name `i` hash-cons it to ONE `Var` term, those free vars
+    // captured across the two axioms and manufactured a false `unsat`. The
+    // verdict's dependence on assertion grouping was a downstream symptom.
+    //
+    // Fixed by rejecting any e-matching substitution whose range reintroduces a
+    // bound variable of the quantifier being instantiated. (z3: does not
+    // terminate in 60s — the only sound verdicts are sat/unknown, never unsat.)
+    let r = solve_streamed(&[
+        "(declare-sort Poly 0)",
+        "(declare-fun %I (Poly) Int)",
+        "(declare-fun iHi (Int) Int)",
+        "(declare-fun charClip (Int) Int)",
+        "(declare-fun charInv (Int) Bool)",
+        "(declare-fun uClip (Int Int) Int)",
+        "(declare-fun uInv (Int Int) Bool)",
+        "(declare-fun bitshr (Poly Poly) Int)",
+        "(declare-const c1 Int)",
+        "(assert (= (iHi 128) 170141183460469231731687303715884105728))",
+        "(assert (forall ((i Int)) (! (and \
+            (or (and (<= 0 (charClip i)) (<= (charClip i) 55295)) \
+                (and (<= 57344 (charClip i)) (<= (charClip i) 1114111))) \
+            (=> (or (and (<= 0 i) (<= i 55295)) (and (<= 57344 i) (<= i 1114111))) \
+                (= i (charClip i)))) :pattern ((charClip i)))))",
+        "(assert (forall ((i Int)) (! (= (charInv i) \
+            (or (and (<= 0 i) (<= i 55295)) (and (<= 57344 i) (<= i 1114111)))) \
+            :pattern ((charInv i)))))",
+        "(assert (forall ((x Poly) (y Poly) (bits Int)) (! \
+            (=> (and (uInv bits (%I x)) (<= 0 (%I y))) (uInv bits (bitshr x y))) \
+            :pattern ((uClip bits (bitshr x y))))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(
+        r,
+        SolverResult::Unsat,
+        "the Unicode-clamp prelude fragment is satisfiable (z3 agrees it is not unsat)"
+    );
+}
+
+#[test]
+fn patterned_quantifier_still_instantiates_at_real_ground_terms() {
+    // Companion to the self-match guard: it must NOT block legitimate ground
+    // matches. A `:pattern`-guided `Add` axiom plus a GROUND application
+    // `(Add x y)` (over declared constants — internally `Var` terms!) must still
+    // e-match and entail the contradiction. Guards against an over-strict
+    // `is_ground`-style fix that would drop `{a ↦ x, b ↦ y}`. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(declare-fun Add (Int Int) Int)",
+        "(declare-const x Int)",
+        "(declare-const y Int)",
+        "(assert (forall ((a Int) (b Int)) \
+            (! (= (Add a b) (+ a b)) :pattern ((Add a b)))))",
+        "(assert (= (Add x y) 7))",
+        "(assert (= (+ x y) 9))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "Add(x,y)=7 with the axiom Add(a,b)=a+b and x+y=9 is unsat"
+    );
+}
