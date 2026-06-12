@@ -708,7 +708,15 @@ impl Solver {
             TermKind::False => {
                 let var = self.get_or_create_var(manager.mk_false());
                 self.sat.add_clause([Lit::neg(var)]);
-                Lit::neg(var)
+                // The literal REPRESENTING `false` must be the one that is
+                // *false* in the model — i.e. `var` itself (pinned false above),
+                // NOT `¬var` (which evaluates TRUE). The old `Lit::neg(var)`
+                // made `false`-as-a-subterm read as TRUE: e.g. `(distinct 5 3)`
+                // encodes `¬(5=3)` = `¬false`; with the inverted literal the
+                // disequality became unsatisfiable and the assertion spuriously
+                // `unsat`. (Top-level `(assert false)` is short-circuited via
+                // `has_false_assertion`, which masked this for years.)
+                Lit::pos(var)
             }
             TermKind::Var(_) => {
                 let var = self.get_or_create_var(term);
