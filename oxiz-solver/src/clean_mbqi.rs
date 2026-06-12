@@ -16,7 +16,7 @@
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_core::sort::SortId;
-use oxiz_mbqi::{Binding, TermLang, TermView};
+use oxiz_mbqi::{Binding, ModelEval, TermLang, TermView};
 use rustc_hash::FxHashMap;
 
 // Reserved syms for structured connectives/operators. A `Spur` is a
@@ -171,4 +171,123 @@ impl<'a> TermLang for OxizHost<'a> {
     fn mk_implies(&mut self, a: TermId, b: TermId) -> TermId {
         self.tm.mk_implies(a, b)
     }
+}
+
+/// The model oracle the engine consults for CDQI (`eval_bool`), relevance
+/// gating (`is_active`), and model-based verification (`eval_forall`).
+///
+/// Built per round from the solver's current model. Holds a CLONE of the
+/// model's `term → value` assignments (so it does not alias the manager the
+/// host borrows mutably) plus the True/False term ids. Every method is
+/// CONSERVATIVE: a wrong `eval_bool`/`is_active` can only cost completeness
+/// (a missed CDQI conflict, an extra instantiation), never soundness — the
+/// engine emits sound lemmas regardless, and verdicts are the host core's.
+pub struct SolverModel {
+    /// `term → value` assignments from the current model (cloned).
+    assign: FxHashMap<TermId, TermId>,
+    true_id: TermId,
+    false_id: TermId,
+}
+
+impl SolverModel {
+    pub fn new(assign: FxHashMap<TermId, TermId>, true_id: TermId, false_id: TermId) -> Self {
+        SolverModel {
+            assign,
+            true_id,
+            false_id,
+        }
+    }
+
+    /// The model value of `t` (the assignment, else `t` itself if it is its
+    /// own value — a constant).
+    #[inline]
+    fn value(&self, t: TermId) -> TermId {
+        self.assign.get(&t).copied().unwrap_or(t)
+    }
+}
+
+impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
+    fn eval_bool(&self, lang: &OxizHost<'a>, t: TermId) -> Option<bool> {
+        // Direct true/false constant or assignment.
+        if t == self.true_id {
+            return Some(true);
+        }
+        if t == self.false_id {
+            return Some(false);
+        }
+        if let Some(&v) = self.assign.get(&t) {
+            if v == self.true_id {
+                return Some(true);
+            }
+            if v == self.false_id {
+                return Some(false);
+            }
+        }
+        // Structural fallback over the connectives (conservative: `None` when
+        // any operand is undetermined).
+        match lang.view(t) {
+            TermView::App { sym } => {
+                let args = lang.children(t);
+                match sym {
+                    OP_NOT => self.eval_bool(lang, args[0]).map(|b| !b),
+                    OP_AND => {
+                        let mut all_true = true;
+                        for &a in &args {
+                            match self.eval_bool(lang, a) {
+                                Some(false) => return Some(false),
+                                Some(true) => {}
+                                None => all_true = false,
+                            }
+                        }
+                        all_true.then_some(true).or(None)
+                    }
+                    OP_OR => {
+                        let mut all_false = true;
+                        for &a in &args {
+                            match self.eval_bool(lang, a) {
+                                Some(true) => return Some(true),
+                                Some(false) => {}
+                                None => all_false = false,
+                            }
+                        }
+                        all_false.then_some(false).or(None)
+                    }
+                    OP_IMPLIES => {
+                        let a = self.eval_bool(lang, args[0]);
+                        let b = self.eval_bool(lang, args[1]);
+                        match (a, b) {
+                            (Some(false), _) | (_, Some(true)) => Some(true),
+                            (Some(true), Some(false)) => Some(false),
+                            _ => None,
+                        }
+                    }
+                    OP_EQ => {
+                        let (va, vb) = (self.value(args[0]), self.value(args[1]));
+                        if va == vb {
+                            Some(true)
+                        } else {
+                            None // distinct values may still be model-equal; stay safe
+                        }
+                    }
+                    // An uninterpreted boolean atom not in the assignment, or
+                    // any operator we do not fold: undetermined.
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn is_active(&self, _lang: &OxizHost<'a>, quant: TermId) -> bool {
+        // Active unless the quantifier's literal is explicitly false in the
+        // model (then its guard is off → skip). Unassigned ⇒ active
+        // (conservative: never skip something that might constrain).
+        self.assign.get(&quant) != Some(&self.false_id)
+    }
+
+    // eval_forall: v1 leaves trigger-free quantifiers unverified (`None` ⇒ the
+    // engine reports `Inconclusive` ⇒ host `Unknown`). Sound (matches native
+    // lu-smt / z3-times-out); a model-completion verifier that returns
+    // `Some(true)` for satisfiable definitional axioms (to reach `Sat`) is a
+    // follow-up. The default `None` is inherited.
 }
