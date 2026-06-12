@@ -5,35 +5,39 @@
 //! valid instances, grouped by sort. There is no path that adds a fabricated
 //! witness or a bound variable to this index, so any substitution drawn from
 //! it has a ground, in-problem range by construction.
+//!
+//! The index is keyed by the lifetime-free [`Sig`], so it lives on the engine
+//! across rounds; its term-walking methods take the borrowing host `&L` per
+//! call (`L: TermLang<Sig = S>`).
 
-use crate::term::{TermLang, TermView};
+use crate::term::{Sig, TermLang, TermView};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Ground terms seen so far, indexed for candidate lookup.
-pub struct GroundIndex<L: TermLang> {
+pub struct GroundIndex<S: Sig> {
     /// All ground terms, deduplicated.
-    all: FxHashSet<L::Term>,
+    all: FxHashSet<S::Term>,
     /// Ground terms grouped by sort (candidate domains for instantiation).
-    by_sort: FxHashMap<L::Sort, Vec<L::Term>>,
+    by_sort: FxHashMap<S::Sort, Vec<S::Term>>,
     /// Ground applications grouped by head symbol (candidates for e-matching
     /// a trigger whose top symbol is `sym`).
-    by_head: FxHashMap<L::Sym, Vec<L::Term>>,
+    by_head: FxHashMap<S::Sym, Vec<S::Term>>,
     /// Monotonic insertion index per term — the frontier watermark. A
     /// quantifier remembers how many terms existed when it last scanned; new
     /// candidates are those with `idx >= watermark`. Purely an efficiency
     /// device (the `seen` dedup already guarantees correctness); it turns
     /// per-round matching from "all ground terms" into "the delta".
-    idx: FxHashMap<L::Term, u32>,
+    idx: FxHashMap<S::Term, u32>,
     next_idx: u32,
 }
 
-impl<L: TermLang> Default for GroundIndex<L> {
+impl<S: Sig> Default for GroundIndex<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<L: TermLang> GroundIndex<L> {
+impl<S: Sig> GroundIndex<S> {
     pub fn new() -> Self {
         GroundIndex {
             all: FxHashSet::default(),
@@ -50,21 +54,21 @@ impl<L: TermLang> GroundIndex<L> {
     }
 
     /// The insertion index of a term (0 if somehow absent).
-    pub fn idx_of(&self, t: L::Term) -> u32 {
+    pub fn idx_of(&self, t: S::Term) -> u32 {
         self.idx.get(&t).copied().unwrap_or(0)
     }
 
     /// Candidate terms of a given sort.
-    pub fn of_sort(&self, sort: L::Sort) -> &[L::Term] {
+    pub fn of_sort(&self, sort: S::Sort) -> &[S::Term] {
         self.by_sort.get(&sort).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Ground applications whose head is `sym` (e-matching candidates).
-    pub fn with_head(&self, sym: L::Sym) -> &[L::Term] {
+    pub fn with_head(&self, sym: S::Sym) -> &[S::Term] {
         self.by_head.get(&sym).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    pub fn contains(&self, t: L::Term) -> bool {
+    pub fn contains(&self, t: S::Term) -> bool {
         self.all.contains(&t)
     }
 
@@ -73,13 +77,13 @@ impl<L: TermLang> GroundIndex<L> {
     /// descended into — its bound variables are not ground, so it never
     /// becomes a candidate. This is the structural guarantee behind
     /// invariant #1: the index can only hold variable-free, in-problem terms.
-    pub fn add_term(&mut self, lang: &L, t: L::Term) {
+    pub fn add_term<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
         self.add_rec(lang, t);
     }
 
     /// Returns `true` if `t` is ground (contains no variables) — and as a
     /// side effect registers its ground subterms.
-    fn add_rec(&mut self, lang: &L, t: L::Term) -> bool {
+    fn add_rec<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) -> bool {
         match lang.view(t) {
             TermView::Var { .. } => {
                 // A `Var` REACHED by the index is a free / declared constant,
@@ -120,7 +124,7 @@ impl<L: TermLang> GroundIndex<L> {
         }
     }
 
-    fn register(&mut self, lang: &L, t: L::Term) {
+    fn register<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
         if self.all.insert(t) {
             self.by_sort.entry(lang.sort_of(t)).or_default().push(t);
             self.idx.insert(t, self.next_idx);

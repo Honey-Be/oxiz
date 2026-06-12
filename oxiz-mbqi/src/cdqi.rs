@@ -17,21 +17,26 @@
 use crate::ground::GroundIndex;
 use crate::instantiate::{InstResult, Quant, instantiate};
 use crate::model::ModelEval;
-use crate::term::TermLang;
+use crate::term::{Sig, TermLang};
 
 /// Search for one conflicting instance of `quant`. On success returns the
 /// conflicting binding `x̄↦t̄`; the engine emits it through the same sound
 /// `emit` path as every other strategy (so dedup/guard/indexing are uniform).
 /// Bounded by `max_tuples` evaluations.
-pub fn find_conflict<L: TermLang, M: ModelEval<L>>(
+pub fn find_conflict<S, L, M>(
     lang: &mut L,
-    ground: &GroundIndex<L>,
+    ground: &GroundIndex<S>,
     model: &M,
-    quant: &Quant<L>,
+    quant: &Quant<S>,
     max_tuples: usize,
-) -> Option<Vec<(L::VarName, L::Term)>> {
-    let sorts: Vec<L::Sort> = quant.vars.iter().map(|(_, s)| *s).collect();
-    let domains: Vec<Vec<L::Term>> = sorts.iter().map(|s| ground.of_sort(*s).to_vec()).collect();
+) -> Option<Vec<(S::VarName, S::Term)>>
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+    M: ModelEval<L>,
+{
+    let sorts: Vec<S::Sort> = quant.vars.iter().map(|(_, s)| *s).collect();
+    let domains: Vec<Vec<S::Term>> = sorts.iter().map(|s| ground.of_sort(*s).to_vec()).collect();
     if domains.iter().any(|d| d.is_empty()) {
         return None; // no real candidates → no conflict to find
     }
@@ -43,8 +48,8 @@ pub fn find_conflict<L: TermLang, M: ModelEval<L>>(
             return None;
         }
         tried += 1;
-        let tuple: Vec<L::Term> = (0..k).map(|i| domains[i][idx[i]]).collect();
-        let binding: Vec<(L::VarName, L::Term)> = quant
+        let tuple: Vec<S::Term> = (0..k).map(|i| domains[i][idx[i]]).collect();
+        let binding: Vec<(S::VarName, S::Term)> = quant
             .vars
             .iter()
             .map(|(n, _)| *n)
@@ -54,7 +59,7 @@ pub fn find_conflict<L: TermLang, M: ModelEval<L>>(
         // ask the model whether the bare instantiated body is false.
         if let InstResult::Lemma(_) = instantiate(lang, ground, quant, &binding) {
             let bare = {
-                let b = crate::term::Binding::<L>::new(&binding);
+                let b = crate::term::Binding::<S>::new(&binding);
                 lang.substitute(quant.body, &b)
             };
             if model.eval_bool(lang, bare) == Some(false) {

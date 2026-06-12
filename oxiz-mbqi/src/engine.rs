@@ -10,12 +10,16 @@
 //! enumeration** (the cvc5 order). All three funnel through the single sound
 //! `emit` path (dedup + guard + index), so soundness is enforced in one
 //! place regardless of which strategy proposed the tuple.
+//!
+//! The engine is keyed by the lifetime-free [`Sig`] (`Engine<S>`), so it lives
+//! on the solver across `check()` rounds; each round passes a freshly-borrowed
+//! host `&mut L` (`L: TermLang<Sig = S>`).
 
 use crate::cdqi;
 use crate::ground::GroundIndex;
 use crate::instantiate::{InstResult, Quant, instantiate};
 use crate::model::{ModelEval, NoModel};
-use crate::term::{TermLang, TermView};
+use crate::term::{Sig, TermLang, TermView};
 use crate::trigger;
 use rustc_hash::FxHashSet;
 
@@ -51,10 +55,10 @@ impl Default for Config {
     }
 }
 
-pub struct Engine<L: TermLang> {
-    quants: Vec<Quant<L>>,
-    ground: GroundIndex<L>,
-    seen: FxHashSet<(usize, Vec<L::Term>)>,
+pub struct Engine<S: Sig> {
+    quants: Vec<Quant<S>>,
+    ground: GroundIndex<S>,
+    seen: FxHashSet<(usize, Vec<S::Term>)>,
     /// Per-quantifier frontier watermark: ground-index insertion indices below
     /// this were already scanned for this quantifier (mod-time e-matching).
     scanned: Vec<u32>,
@@ -63,7 +67,7 @@ pub struct Engine<L: TermLang> {
     cfg: Config,
 }
 
-impl<L: TermLang> Engine<L> {
+impl<S: Sig> Engine<S> {
     pub fn new(cfg: Config) -> Self {
         Engine {
             quants: Vec::new(),
@@ -82,12 +86,12 @@ impl<L: TermLang> Engine<L> {
 
     /// Register an asserted top-level term: index its ground subterms and
     /// register any quantifiers it (top-level) contains.
-    pub fn assert(&mut self, lang: &L, t: L::Term) {
+    pub fn assert<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
         self.ground.add_term(lang, t);
         self.collect_quants(lang, t);
     }
 
-    fn collect_quants(&mut self, lang: &L, t: L::Term) {
+    fn collect_quants<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
         match lang.view(t) {
             TermView::Quant { forall, vars, body } => {
                 let vars = vars.to_vec();
@@ -100,7 +104,6 @@ impl<L: TermLang> Engine<L> {
                     universal: forall,
                 });
                 self.scanned.push(0); // new quantifier: scan the whole index once
-
             }
             TermView::App { .. } => {
                 for a in lang.children(t) {
@@ -112,14 +115,18 @@ impl<L: TermLang> Engine<L> {
     }
 
     /// One round with no model (pure syntactic: e-match + enumerate).
-    pub fn round(&mut self, lang: &mut L) -> Verdict<L::Term> {
+    pub fn round<L: TermLang<Sig = S>>(&mut self, lang: &mut L) -> Verdict<S::Term> {
         self.round_with(lang, &NoModel)
     }
 
     /// One round with a model oracle. Per quantifier (relevance-gated to
     /// those whose `Q` is true in the model): CDQI → e-matching (frontier) →
     /// enumeration. Watermarks advance so the next round only scans the delta.
-    pub fn round_with<M: ModelEval<L>>(&mut self, lang: &mut L, model: &M) -> Verdict<L::Term> {
+    pub fn round_with<L, M>(&mut self, lang: &mut L, model: &M) -> Verdict<S::Term>
+    where
+        L: TermLang<Sig = S>,
+        M: ModelEval<L>,
+    {
         let mut lemmas = Vec::new();
         let round_start = self.ground.frontier();
         let n = self.quants.len();
@@ -196,7 +203,11 @@ impl<L: TermLang> Engine<L> {
         Verdict::Saturated
     }
 
-    fn ematch_all(&self, lang: &L, qi: usize) -> Vec<Vec<(L::VarName, L::Term)>> {
+    fn ematch_all<L: TermLang<Sig = S>>(
+        &self,
+        lang: &L,
+        qi: usize,
+    ) -> Vec<Vec<(S::VarName, S::Term)>> {
         let q = &self.quants[qi];
         let watermark = self.scanned[qi];
         let mut out = Vec::new();
@@ -210,7 +221,7 @@ impl<L: TermLang> Engine<L> {
                     TermView::App { sym, .. } => sym,
                     _ => continue,
                 };
-                let cands: Vec<L::Term> = self
+                let cands: Vec<S::Term> = self
                     .ground
                     .with_head(head)
                     .iter()
@@ -226,9 +237,14 @@ impl<L: TermLang> Engine<L> {
         out
     }
 
-    fn enumerate(&mut self, lang: &mut L, qi: usize, out: &mut Vec<L::Term>) {
-        let sorts: Vec<L::Sort> = self.quants[qi].vars.iter().map(|(_, s)| *s).collect();
-        let domains: Vec<Vec<L::Term>> =
+    fn enumerate<L: TermLang<Sig = S>>(
+        &mut self,
+        lang: &mut L,
+        qi: usize,
+        out: &mut Vec<S::Term>,
+    ) {
+        let sorts: Vec<S::Sort> = self.quants[qi].vars.iter().map(|(_, s)| *s).collect();
+        let domains: Vec<Vec<S::Term>> =
             sorts.iter().map(|s| self.ground.of_sort(*s).to_vec()).collect();
         if domains.iter().any(|d| d.is_empty()) {
             return; // no real candidate of some sort → emit nothing (no fabrication)
@@ -241,7 +257,7 @@ impl<L: TermLang> Engine<L> {
                 break;
             }
             tuples += 1;
-            let binding: Vec<(L::VarName, L::Term)> = self.quants[qi]
+            let binding: Vec<(S::VarName, S::Term)> = self.quants[qi]
                 .vars
                 .iter()
                 .map(|(n, _)| *n)
@@ -268,14 +284,14 @@ impl<L: TermLang> Engine<L> {
     /// The single sound emit path used by every strategy: dedup by
     /// (quantifier, tuple), run the central invariant-enforcing `instantiate`,
     /// index the new ground subterms, and collect the guarded lemma.
-    fn emit(
+    fn emit<L: TermLang<Sig = S>>(
         &mut self,
         lang: &mut L,
         qi: usize,
-        binding: &[(L::VarName, L::Term)],
-        out: &mut Vec<L::Term>,
+        binding: &[(S::VarName, S::Term)],
+        out: &mut Vec<S::Term>,
     ) {
-        let tuple: Vec<L::Term> = binding.iter().map(|(_, t)| *t).collect();
+        let tuple: Vec<S::Term> = binding.iter().map(|(_, t)| *t).collect();
         if !self.seen.insert((qi, tuple)) {
             return; // already emitted
         }

@@ -16,7 +16,7 @@
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_core::sort::SortId;
-use oxiz_mbqi::{Binding, ModelEval, TermLang, TermView};
+use oxiz_mbqi::{Binding, ModelEval, Sig, TermLang, TermView};
 use rustc_hash::FxHashMap;
 
 // Reserved syms for structured connectives/operators. A `Spur` is a
@@ -49,6 +49,21 @@ fn spur_sym(s: Spur) -> u64 {
     s.into_inner().get() as u64
 }
 
+/// The lifetime-free identity signature for OxiZ terms. The clean engine's
+/// persistent state is keyed on this (`Engine<OxizSig>`, `GroundIndex<OxizSig>`,
+/// …), so it carries no borrow and can live on `Solver` across `check()`
+/// rounds. The borrowing behavior lives on [`OxizHost`], which impls
+/// [`TermLang`] with `type Sig = OxizSig` and is re-created (borrowing the
+/// `TermManager`) once per round.
+pub struct OxizSig;
+
+impl Sig for OxizSig {
+    type Term = TermId;
+    type Sort = SortId;
+    type VarName = Spur;
+    type Sym = u64;
+}
+
 /// A short-lived wrapper around the persistent `TermManager`, created per
 /// engine round. Holds `&mut` so the engine can intern instance terms.
 pub struct OxizHost<'a> {
@@ -56,6 +71,7 @@ pub struct OxizHost<'a> {
 }
 
 impl<'a> OxizHost<'a> {
+    /// Wrap a mutable borrow of the term manager for one engine round.
     pub fn new(tm: &'a mut TermManager) -> Self {
         OxizHost { tm }
     }
@@ -66,12 +82,9 @@ impl<'a> OxizHost<'a> {
 }
 
 impl<'a> TermLang for OxizHost<'a> {
-    type Term = TermId;
-    type Sort = SortId;
-    type VarName = Spur;
-    type Sym = u64;
+    type Sig = OxizSig;
 
-    fn view(&self, t: TermId) -> TermView<'_, Self> {
+    fn view(&self, t: TermId) -> TermView<'_, OxizSig> {
         let Some(term) = self.m().get(t) else {
             return TermView::Opaque;
         };
@@ -153,7 +166,7 @@ impl<'a> TermLang for OxizHost<'a> {
         self.m().get(t).map(|x| x.sort).unwrap_or(self.m().sorts.bool_sort)
     }
 
-    fn substitute(&mut self, body: TermId, binding: &Binding<Self>) -> TermId {
+    fn substitute(&mut self, body: TermId, binding: &Binding<OxizSig>) -> TermId {
         // Map the binding's bound-var NAMES to the actual `Var` TermIds in the
         // body, then delegate to the manager's (capture-free) substitute.
         let fvs = self.m().free_vars(body);
@@ -190,6 +203,8 @@ pub struct SolverModel {
 }
 
 impl SolverModel {
+    /// Build the oracle from a snapshot of the solver's `term → value`
+    /// assignments plus the interned `true`/`false` term ids.
     pub fn new(assign: FxHashMap<TermId, TermId>, true_id: TermId, false_id: TermId) -> Self {
         SolverModel {
             assign,

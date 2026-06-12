@@ -1,7 +1,7 @@
 //! M3 tests: model-based verification of trigger-free quantifiers, with the
 //! D-bug firewall (synthetic witnesses never become lemmas).
 
-use oxiz_mbqi::toy::{Tid, Toy};
+use oxiz_mbqi::toy::{Tid, Toy, ToySig};
 use oxiz_mbqi::{Config, Engine, ModelEval, Verdict};
 
 const BOOL: u32 = 0;
@@ -38,7 +38,7 @@ fn partial_order_def(t: &mut Toy) -> Tid {
     t.forall(&[(400, HEIGHT), (401, HEIGHT)], &[], body, BOOL)
 }
 
-fn run(e: &mut Engine<Toy>, t: &mut Toy, model: &impl ModelEval<Toy>) -> (&'static str, usize) {
+fn run(e: &mut Engine<ToySig>, t: &mut Toy, model: &impl ModelEval<Toy>) -> (&'static str, usize) {
     let mut emitted = 0;
     loop {
         match e.round_with(t, model) {

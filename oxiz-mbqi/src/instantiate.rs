@@ -14,18 +14,19 @@
 //!  3. capture-freedom is the host `substitute`'s contract.
 
 use crate::ground::GroundIndex;
-use crate::term::{Binding, TermLang};
+use crate::term::{Binding, Sig, TermLang};
 
-/// A registered quantifier the engine instantiates.
-pub struct Quant<L: TermLang> {
+/// A registered quantifier the engine instantiates. Keyed by the lifetime-free
+/// [`Sig`] so it lives on the engine across rounds.
+pub struct Quant<S: Sig> {
     /// The quantifier term itself (used as the guard literal `Q`).
-    pub term: L::Term,
+    pub term: S::Term,
     /// Bound variables and their sorts.
-    pub vars: Vec<(L::VarName, L::Sort)>,
+    pub vars: Vec<(S::VarName, S::Sort)>,
     /// `:pattern` trigger groups (flattened); empty ⇒ trigger-free.
-    pub triggers: Vec<Vec<L::Term>>,
+    pub triggers: Vec<Vec<S::Term>>,
     /// The matrix.
-    pub body: L::Term,
+    pub body: S::Term,
     /// Universal? (Existentials are skolemized by the host before reaching us.)
     pub universal: bool,
 }
@@ -42,12 +43,16 @@ pub enum InstResult<T> {
 
 /// Build the guarded instance lemma for `quant` under `binding`, enforcing
 /// the soundness conditions. `binding` maps each bound var to a candidate.
-pub fn instantiate<L: TermLang>(
+pub fn instantiate<S, L>(
     lang: &mut L,
-    ground: &GroundIndex<L>,
-    quant: &Quant<L>,
-    binding: &[(L::VarName, L::Term)],
-) -> InstResult<L::Term> {
+    ground: &GroundIndex<S>,
+    quant: &Quant<S>,
+    binding: &[(S::VarName, S::Term)],
+) -> InstResult<S::Term>
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+{
     // (1) every bound variable assigned exactly once.
     if binding.len() != quant.vars.len() {
         return InstResult::Rejected;
@@ -67,7 +72,7 @@ pub fn instantiate<L: TermLang>(
         }
     }
     // (3) capture-free substitution (host contract).
-    let b = Binding::<L>::new(binding);
+    let b = Binding::<S>::new(binding);
     let instance = lang.substitute(quant.body, &b);
     // Guard with the quantifier literal so the instance inherits the
     // quantifier's polarity context (e.g. a `∀` under `(=> g …)` only fires

@@ -3,10 +3,13 @@
 
 use oxiz_core::ast::TermManager;
 use oxiz_mbqi::{Config, Engine, Verdict};
-use oxiz_solver::clean_mbqi::{OxizHost, SolverModel};
+use oxiz_solver::clean_mbqi::{OxizHost, OxizSig, SolverModel};
 use rustc_hash::FxHashMap;
 
-fn drain<'a>(e: &mut Engine<OxizHost<'a>>, host: &mut OxizHost<'a>) -> usize {
+// `Engine<OxizSig>` is lifetime-free (keyed on the `Sig` marker, not the
+// borrowing `OxizHost<'a>`), so it no longer ties the engine to the host's
+// borrow — the M4e unblock. The host is re-borrowed per round.
+fn drain(e: &mut Engine<OxizSig>, host: &mut OxizHost<'_>) -> usize {
     let mut emitted = 0;
     loop {
         match e.round(&mut *host) {

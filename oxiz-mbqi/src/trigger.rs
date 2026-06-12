@@ -13,26 +13,30 @@
 //! are themselves ground. The B/E bug class is unrepresentable here.
 
 use crate::ground::GroundIndex;
-use crate::term::{TermLang, TermView};
+use crate::term::{Sig, TermLang, TermView};
 use rustc_hash::FxHashMap;
 
 /// A substitution under construction: bound-var name → ground term.
-type Subst<L> = FxHashMap<<L as TermLang>::VarName, <L as TermLang>::Term>;
+type Subst<S> = FxHashMap<<S as Sig>::VarName, <S as Sig>::Term>;
 
 /// Match a single trigger `pattern` (whose holes are `bound`) against the
 /// given `candidates` (ground terms sharing the pattern's top symbol — the
 /// caller frontier-filters them), returning all consistent substitutions.
 /// Each returned substitution binds **every** bound variable (partial matches
 /// are dropped — an instance must be fully ground).
-pub fn match_single<L: TermLang>(
+pub fn match_single<S, L>(
     lang: &L,
-    candidates: &[L::Term],
-    pattern: L::Term,
-    bound: &[(L::VarName, L::Sort)],
-) -> Vec<Vec<(L::VarName, L::Term)>> {
+    candidates: &[S::Term],
+    pattern: S::Term,
+    bound: &[(S::VarName, S::Sort)],
+) -> Vec<Vec<(S::VarName, S::Term)>>
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+{
     let mut out = Vec::new();
     for &cand in candidates {
-        let mut subst: Subst<L> = FxHashMap::default();
+        let mut subst: Subst<S> = FxHashMap::default();
         if match_term(lang, pattern, cand, bound, &mut subst)
             && bound.iter().all(|(n, _)| subst.contains_key(n))
         {
@@ -44,12 +48,16 @@ pub fn match_single<L: TermLang>(
 
 /// Match several trigger patterns simultaneously with one consistent
 /// substitution (a multi-pattern `:pattern (p1 p2 …)`). All must match.
-pub fn match_multi<L: TermLang>(
+pub fn match_multi<S, L>(
     lang: &L,
-    ground: &GroundIndex<L>,
-    patterns: &[L::Term],
-    bound: &[(L::VarName, L::Sort)],
-) -> Vec<Vec<(L::VarName, L::Term)>> {
+    ground: &GroundIndex<S>,
+    patterns: &[S::Term],
+    bound: &[(S::VarName, S::Sort)],
+) -> Vec<Vec<(S::VarName, S::Term)>>
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+{
     if patterns.is_empty() {
         return Vec::new();
     }
@@ -58,7 +66,7 @@ pub fn match_multi<L: TermLang>(
         _ => return Vec::new(),
     };
     // Seed with the first pattern's matches, then filter-extend by the rest.
-    let mut partial: Vec<Subst<L>> = match_single(lang, ground.with_head(head0), patterns[0], bound)
+    let mut partial: Vec<Subst<S>> = match_single(lang, ground.with_head(head0), patterns[0], bound)
         .into_iter()
         .map(|b| b.into_iter().collect())
         .collect();
@@ -87,13 +95,17 @@ pub fn match_multi<L: TermLang>(
 
 /// Unify `pattern` (holes = `bound`) against ground term `g`, extending
 /// `subst`. Returns false on structural mismatch or inconsistent binding.
-fn match_term<L: TermLang>(
+fn match_term<S, L>(
     lang: &L,
-    pattern: L::Term,
-    g: L::Term,
-    bound: &[(L::VarName, L::Sort)],
-    subst: &mut Subst<L>,
-) -> bool {
+    pattern: S::Term,
+    g: S::Term,
+    bound: &[(S::VarName, S::Sort)],
+    subst: &mut Subst<S>,
+) -> bool
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+{
     match lang.view(pattern) {
         TermView::Var { name } if bound.iter().any(|(n, _)| *n == name) => {
             // A hole. Bind it to `g` (which is ground), or check consistency.

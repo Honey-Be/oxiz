@@ -19,4 +19,4 @@ pub mod trigger;
 pub use engine::{Config, Engine, Verdict};
 pub use instantiate::Quant;
 pub use model::{ModelEval, NoModel};
-pub use term::{Binding, TermLang, TermView};
+pub use term::{Binding, Sig, TermLang, TermView};

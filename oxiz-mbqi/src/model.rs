@@ -6,13 +6,17 @@
 //! never builds a model itself. `None` means "the model does not determine
 //! it" (a symbolic residual) — the engine treats that conservatively (it is
 //! never grounds for a refutation).
+//!
+//! The oracle is parameterized by the borrowing host `L: TermLang` (it needs
+//! `view`/`children` to fold connectives), and references the host's term type
+//! through the lifetime-free signature as `<L::Sig as Sig>::Term`.
 
-use crate::term::TermLang;
+use crate::term::{Sig, TermLang};
 
 pub trait ModelEval<L: TermLang> {
     /// Evaluate a GROUND boolean term under the current model.
     /// `Some(true/false)` if determined, `None` if symbolic/unknown.
-    fn eval_bool(&self, lang: &L, t: L::Term) -> Option<bool>;
+    fn eval_bool(&self, lang: &L, t: <L::Sig as Sig>::Term) -> Option<bool>;
 
     /// **M3 model-based verification.** Does the model satisfy this
     /// universally-quantified term? `Some(true)` = the host checked it over
@@ -29,7 +33,7 @@ pub trait ModelEval<L: TermLang> {
     ///
     /// Default `None` (engine then reports the quantifier unverified →
     /// `Unknown`, never a guess).
-    fn eval_forall(&self, _lang: &L, _quant: L::Term) -> Option<bool> {
+    fn eval_forall(&self, _lang: &L, _quant: <L::Sig as Sig>::Term) -> Option<bool> {
         None
     }
 
@@ -47,7 +51,7 @@ pub trait ModelEval<L: TermLang> {
     ///
     /// Default `true` (conservative: if the host can't say, treat as active —
     /// never skip something that might constrain).
-    fn is_active(&self, _lang: &L, _quant: L::Term) -> bool {
+    fn is_active(&self, _lang: &L, _quant: <L::Sig as Sig>::Term) -> bool {
         true
     }
 }
@@ -58,7 +62,7 @@ pub trait ModelEval<L: TermLang> {
 pub struct NoModel;
 
 impl<L: TermLang> ModelEval<L> for NoModel {
-    fn eval_bool(&self, _lang: &L, _t: L::Term) -> Option<bool> {
+    fn eval_bool(&self, _lang: &L, _t: <L::Sig as Sig>::Term) -> Option<bool> {
         None
     }
 }

@@ -4,13 +4,26 @@
 //! plain recursive replace — capture-free because the substitution range is
 //! always ground (no variables to capture).
 
-use crate::term::{Binding, TermLang, TermView};
+use crate::term::{Binding, Sig, TermLang, TermView};
 use rustc_hash::FxHashMap;
 
 pub type Tid = u32;
 pub type Name = u32;
 pub type Sym = u32;
 pub type Sort = u32;
+
+/// The lifetime-free signature marker for the toy host. `Engine<ToySig>`,
+/// `GroundIndex<ToySig>`, etc. are keyed on this (not on `Toy`), so they carry
+/// no borrow — mirroring how `Engine<OxizSig>` is keyed on `OxizSig`, not
+/// `OxizHost<'a>`.
+pub struct ToySig;
+
+impl Sig for ToySig {
+    type Term = Tid;
+    type Sort = Sort;
+    type VarName = Name;
+    type Sym = Sym;
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Node {
@@ -93,12 +106,9 @@ impl Toy {
 }
 
 impl TermLang for Toy {
-    type Term = Tid;
-    type Sort = Sort;
-    type VarName = Name;
-    type Sym = Sym;
+    type Sig = ToySig;
 
-    fn view(&self, t: Tid) -> TermView<'_, Self> {
+    fn view(&self, t: Tid) -> TermView<'_, ToySig> {
         match &self.nodes[t as usize] {
             Node::Var(n) => TermView::Var { name: *n },
             Node::App(s, _) => TermView::App { sym: *s },
@@ -132,7 +142,7 @@ impl TermLang for Toy {
         self.sort[t as usize]
     }
 
-    fn substitute(&mut self, body: Tid, binding: &Binding<Self>) -> Tid {
+    fn substitute(&mut self, body: Tid, binding: &Binding<ToySig>) -> Tid {
         self.subst_rec(body, binding)
     }
 
@@ -144,7 +154,7 @@ impl TermLang for Toy {
 }
 
 impl Toy {
-    fn subst_rec(&mut self, t: Tid, binding: &Binding<Toy>) -> Tid {
+    fn subst_rec(&mut self, t: Tid, binding: &Binding<ToySig>) -> Tid {
         match self.nodes[t as usize].clone() {
             Node::Var(n) => binding.get(n).unwrap_or(t),
             Node::App(s, args) => {

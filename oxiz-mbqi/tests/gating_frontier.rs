@@ -3,7 +3,7 @@
 //! "fuel" trigger — a quantifier under a false guard must not be
 //! instantiated at all.
 
-use oxiz_mbqi::toy::{Tid, Toy};
+use oxiz_mbqi::toy::{Tid, Toy, ToySig};
 use oxiz_mbqi::{Config, Engine, ModelEval, Verdict};
 
 const BOOL: u32 = 0;
@@ -44,7 +44,7 @@ fn fuel_quant(t: &mut Toy) -> (Tid, Tid) {
     (q, fbd_c)
 }
 
-fn run(e: &mut Engine<Toy>, t: &mut Toy, m: &impl ModelEval<Toy>) -> (&'static str, usize) {
+fn run(e: &mut Engine<ToySig>, t: &mut Toy, m: &impl ModelEval<Toy>) -> (&'static str, usize) {
     let mut emitted = 0;
     loop {
         match e.round_with(t, m) {

@@ -7,7 +7,7 @@
 //! would then report `sat`, matching z3/native, instead of the old spurious
 //! `unsat`).
 
-use oxiz_mbqi::toy::Toy;
+use oxiz_mbqi::toy::{Toy, ToySig};
 use oxiz_mbqi::{Config, Engine, Verdict};
 
 const BOOL: u32 = 0;
@@ -22,7 +22,7 @@ const AND: u32 = 13;
 const NOT: u32 = 14;
 const F: u32 = 20;
 
-fn drain(engine: &mut Engine<Toy>, toy: &mut Toy) -> (usize, usize) {
+fn drain(engine: &mut Engine<ToySig>, toy: &mut Toy) -> (usize, usize) {
     // run rounds to saturation/budget; return (total lemmas, rejected)
     let mut total = 0;
     loop {

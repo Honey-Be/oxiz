@@ -5,7 +5,7 @@
 //! are not in the index — so a `:pattern` with no real ground match emits
 //! ZERO lemmas (not the spurious identity `{i↦i}`).
 
-use oxiz_mbqi::toy::{Tid, Toy};
+use oxiz_mbqi::toy::{Tid, Toy, ToySig};
 use oxiz_mbqi::{Config, Engine, ModelEval, Verdict};
 use rustc_hash::FxHashSet;
 
@@ -16,7 +16,7 @@ const G: u32 = 21;
 const P: u32 = 22;
 const EQ: u32 = 12;
 
-fn drain_syntactic(e: &mut Engine<Toy>, t: &mut Toy) -> usize {
+fn drain_syntactic(e: &mut Engine<ToySig>, t: &mut Toy) -> usize {
     let mut total = 0;
     loop {
         match e.round(t) {
