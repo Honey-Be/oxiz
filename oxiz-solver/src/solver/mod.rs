@@ -312,6 +312,59 @@ impl Solver {
         SolverModel::new(assign, manager.mk_true(), manager.mk_false())
     }
 
+    /// Confirm a clean-engine `unsat` with a SINGLE-SHOT ground solve.
+    ///
+    /// OxiZ's INCREMENTAL CDCL(T) can report a spurious `unsat` after the clean
+    /// engine adds instance lemmas across MBQI rounds (the same clause set
+    /// solved fresh is sound). The engine's instances are sound GROUND
+    /// consequences of the asserted quantifiers, so we re-solve
+    /// `{non-quantifier assertions} ∪ {ground instances}` in a FRESH solver
+    /// that instantiates nothing (clean off, no quantifiers asserted): a
+    /// confirmed `unsat` is real (it follows from sound consequences); anything
+    /// else means the incremental `unsat` was spurious, and the sound verdict
+    /// is `Unknown` (never a fabricated `unsat`).
+    ///
+    /// SCOPE: this only catches an INCREMENTAL/single-shot DIVERGENCE — it
+    /// trusts the single-shot ground solve. If OxiZ's *ground* EUF/arith solver
+    /// is itself unsound on a particular instance set (a separate, deeper bug
+    /// the clean engine can also expose), this verification confirms the
+    /// spurious `unsat`. A fully sound clean engine requires a sound host
+    /// ground core; closing the remaining ground-solver soundness gaps is a
+    /// follow-up.
+    fn verify_clean_unsat(
+        &mut self,
+        instances: &[TermId],
+        manager: &mut TermManager,
+    ) -> SolverResult {
+        let mut config = self.config.clone();
+        config.clean_mbqi = false;
+        let mut verifier = Solver::with_config(config);
+        let assertions = self.assertions.clone();
+        for a in assertions {
+            // Skip quantifiers — their ground instances stand in for them, so
+            // the verifier never instantiates (and so cannot itself fabricate).
+            if matches!(
+                manager.get(a).map(|t| &t.kind),
+                Some(TermKind::Forall { .. } | TermKind::Exists { .. })
+            ) {
+                continue;
+            }
+            verifier.assert(a, manager);
+        }
+        for &inst in instances {
+            verifier.assert(inst, manager);
+        }
+        match verifier.check(manager) {
+            SolverResult::Unsat => {
+                self.build_unsat_core();
+                SolverResult::Unsat
+            }
+            // Not confirmed by a sound ground solve ⇒ the incremental `unsat`
+            // was spurious; report the sound `Unknown`.
+            _ => SolverResult::Unknown,
+        }
+    }
+
     /// Get a SAT variable for a term, then check satisfiability
     pub fn check(&mut self, manager: &mut TermManager) -> SolverResult {
         // Check for trivial unsat (false assertion)
@@ -422,6 +475,13 @@ impl Solver {
         // it outlives any single `&mut TermManager` borrow). Only used when
         // `config.clean_mbqi` is set; otherwise the legacy `mbqi/` path runs.
         let mut clean_engine: Option<CleanEngine<OxizSig>> = None;
+        // The GROUND bodies of the clean engine's instances (each a sound
+        // consequence of the asserted quantifiers). Used to VERIFY an
+        // incremental `unsat` with a single-shot ground solve — OxiZ's
+        // incremental CDCL(T) can report a spurious `unsat` after lemmas are
+        // added across MBQI rounds, whereas the same clause set solved fresh is
+        // sound. See `verify_clean_unsat`.
+        let mut clean_instances: Vec<TermId> = Vec::new();
 
         loop {
             #[cfg(feature = "std")]
@@ -432,6 +492,15 @@ impl Solver {
             let sat_result = self.sat.solve_with_theory(&mut theory_manager);
             match sat_result {
                 SatResult::Unsat => {
+                    // The clean engine never *concludes* `unsat` — that is the
+                    // host ground core's job, and is sound only for a sound
+                    // core. OxiZ's INCREMENTAL re-solve (after lemmas are added
+                    // across rounds) can be unsound here, so when the clean
+                    // engine has contributed lemmas, confirm the `unsat` with a
+                    // single-shot ground solve before trusting it.
+                    if self.config.clean_mbqi && !clean_instances.is_empty() {
+                        return self.verify_clean_unsat(&clean_instances, manager);
+                    }
                     self.build_unsat_core();
                     return SolverResult::Unsat;
                 }
@@ -708,6 +777,10 @@ impl Solver {
                                             if !manager.free_vars(phi).is_empty() {
                                                 continue;
                                             }
+                                            // Record the GROUND instance body (a
+                                            // sound consequence of `Q`) for the
+                                            // single-shot unsat verification.
+                                            clean_instances.push(phi);
                                             // Reuse the quantifier's EXISTING literal — do NOT
                                             // `encode(q)`, which re-runs the `Forall` arm and
                                             // re-registers the quantifier with mbqi/ematch on

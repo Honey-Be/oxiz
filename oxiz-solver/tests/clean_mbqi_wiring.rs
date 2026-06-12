@@ -126,3 +126,45 @@ fn genuine_conflict_is_unsat() {
         "∀x.P(x) instantiated at c contradicts ¬P(c)"
     );
 }
+
+#[test]
+fn injective_no_bounds_is_not_unsat() {
+    // ∀x y:Int. f(x)=f(y) ⇒ x=y   (injectivity) ∧ f(1)=10 ∧ f(2)=20.
+    // SATISFIABLE (an injective f with those values exists). The clean engine's
+    // instantiation over ground terms drives OxiZ's INCREMENTAL CDCL(T) into a
+    // spurious `unsat` (the same clause set solved single-shot is sound). The
+    // unsat-verification backstop re-solves {facts ∪ ground instances} fresh,
+    // finds it satisfiable, and returns the SOUND `Unknown` — never the
+    // spurious `unsat`. Regression for the incremental-divergence class.
+    let mut s = clean_solver();
+    let mut m = TermManager::new();
+    let int = m.sorts.int_sort;
+
+    let x = m.mk_var("x", int);
+    let y = m.mk_var("y", int);
+    let fx = m.mk_apply("f", [x], int);
+    let fy = m.mk_apply("f", [y], int);
+    let feq = m.mk_eq(fx, fy);
+    let xeqy = m.mk_eq(x, y);
+    let body = m.mk_implies(feq, xeqy);
+    let q = m.mk_forall([("x", int), ("y", int)], body);
+    s.assert(q, &mut m);
+
+    let one = m.mk_int(1);
+    let f1 = m.mk_apply("f", [one], int);
+    let ten = m.mk_int(10);
+    let e1 = m.mk_eq(f1, ten);
+    s.assert(e1, &mut m);
+    let two = m.mk_int(2);
+    let f2 = m.mk_apply("f", [two], int);
+    let twenty = m.mk_int(20);
+    let e2 = m.mk_eq(f2, twenty);
+    s.assert(e2, &mut m);
+
+    let r = s.check(&mut m);
+    assert_ne!(
+        r,
+        SolverResult::Unsat,
+        "injective f with f(1)=10, f(2)=20 is satisfiable — must not be unsat"
+    );
+}
