@@ -365,3 +365,44 @@ fn patterned_quantifier_still_instantiates_at_real_ground_terms() {
         "Add(x,y)=7 with the axiom Add(a,b)=a+b and x+y=9 is unsat"
     );
 }
+
+#[test]
+fn trigger_free_quant_over_uninterpreted_sort_is_not_enumerated_into_unsat() {
+    // verus-fork P0 "trigger D": a trigger-free definitional axiom over an
+    // UNINTERPRETED sort — `∀x y:Height. height_lt(x,y) = (po(x,y) ∧ x≠y)` —
+    // combined with two semantically-independent axioms over OTHER sorts (a
+    // ground `fuel_bool_default` implication over `FuelId`, and `∀n:Int.
+    // ens%false(n)=false`). All satisfiable (z3 does not terminate goal-free,
+    // native: unknown — so the only sound verdicts are sat/unknown, never
+    // unsat).
+    //
+    // Pre-fix: `unsat`.  Root cause: MBQI's enumerative instantiator built the
+    // candidate domain for the `Height` variables from the model's FABRICATED
+    // universe witnesses (`u!0`..`u!7`, minted by model completion), then
+    // emitted the whole 8×8 grid of `body[x/u!i, y/u!j]` as hard SAT lemmas.
+    // Though each is a sound universal instance, the fabricated grid accumulates
+    // (non-monotonically in the count of unrelated ground facts) into a spurious
+    // `unsat`.  Fixed by not enumerating over fabricated witnesses for
+    // uninterpreted sorts — a genuine refutation still surfaces via the
+    // counterexample generator.
+    let r = solve_streamed(&[
+        "(declare-sort Height 0)",
+        "(declare-sort FuelId 0)",
+        "(declare-fun height_lt (Height Height) Bool)",
+        "(declare-fun partial-order (Height Height) Bool)",
+        "(declare-fun fuel_bool_default (FuelId) Bool)",
+        "(declare-const f0 FuelId) (declare-const f1 FuelId) (declare-const f2 FuelId)",
+        "(declare-fun ens (Int) Bool)",
+        "(assert (forall ((x Height) (y Height)) \
+            (= (height_lt x y) (and (partial-order x y) (not (= x y))))))",
+        "(assert (=> (fuel_bool_default f0) (and (fuel_bool_default f1) (fuel_bool_default f2))))",
+        "(assert (forall ((n Int)) (! (= (ens n) false) :pattern ((ens n)))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(
+        r,
+        SolverResult::Unsat,
+        "a trigger-free order definition over an uninterpreted sort must not be \
+         enumerated over fabricated witnesses into a spurious unsat"
+    );
+}

@@ -931,9 +931,27 @@ impl EnumerativeInstantiator {
         for &(_name, sort) in bound_vars {
             let mut domain = Vec::new();
 
-            // Use universe if available
-            if let Some(universe) = model.universe(sort) {
-                domain.extend_from_slice(universe);
+            // Use the model universe ONLY for interpreted (theory) sorts.  For
+            // an UNINTERPRETED sort the universe is a set of fabricated witnesses
+            // (`u!0`, `u!1`, …, minted by model completion) — model-CHECKING
+            // placeholders, not real ground terms of the problem.  Enumerating
+            // the quantifier body over them turns `body[x/u!i]` into hard SAT
+            // lemmas; though each is a sound universal instance, accumulating a
+            // whole fabricated `n×n` grid (e.g. a trigger-free `Height`
+            // strict-order definition over 8 witnesses) drives a spurious
+            // `unsat` (verus-fork P0 "trigger D"; z3/native: sat/unknown).  A
+            // genuine refutation over an uninterpreted sort still surfaces via
+            // the counterexample generator (which instantiates at the model's
+            // actual witness for a VIOLATED body), so this only drops the
+            // redundant enumeration when the model already satisfies the axiom.
+            let is_interpreted = sort == manager.sorts.int_sort
+                || sort == manager.sorts.real_sort
+                || sort == manager.sorts.bool_sort
+                || manager.sorts.get(sort).is_some_and(|s| s.is_bitvec());
+            if is_interpreted {
+                if let Some(universe) = model.universe(sort) {
+                    domain.extend_from_slice(universe);
+                }
             }
 
             // Add default integer candidates from -2 to 5
