@@ -150,6 +150,24 @@ impl EmatchEngine {
         // Clone quantifier info to avoid borrow conflict with self
         let quantifiers: Vec<QuantifierInfo> = self.quantifiers.clone();
 
+        // Names bound by ANY registered quantifier.  A trigger candidate (or a
+        // substitution image) that mentions one of these is NOT a ground term —
+        // it is a subterm lifted out of some quantifier's body — and matching
+        // against it produces an instance with a bound variable left free.
+        // Because bound variables are hash-consed by `(name, sort)`, that free
+        // var then captures across axioms into a spurious `unsat`.  We reject
+        // such matches below.  (Declared constants are `Var` terms too but their
+        // mangled names never appear here, so legitimate `{a ↦ const}` matches
+        // are kept — a plain `is_ground` filter would wrongly drop them.)
+        let mut all_bound_names: FxHashSet<Spur> = FxHashSet::default();
+        for qi in &quantifiers {
+            if let Some(t) = manager.get(qi.quant_id) {
+                if let TermKind::Forall { vars, .. } | TermKind::Exists { vars, .. } = &t.kind {
+                    all_bound_names.extend(vars.iter().map(|(name, _)| *name));
+                }
+            }
+        }
+
         for quant_info in &quantifiers {
             if results.len() >= max_this_round || self.stats.total_instantiations >= max_total {
                 break;
@@ -167,10 +185,6 @@ impl EmatchEngine {
                     _ => continue,
                 }
             };
-
-            // Names of THIS quantifier's bound variables — used to reject the
-            // identity self-match (see the groundness guard below).
-            let bound_names: FxHashSet<Spur> = vars.iter().map(|(name, _)| *name).collect();
 
             for trigger in &quant_info.triggers {
                 if results.len() >= max_this_round || self.stats.total_instantiations >= max_total {
@@ -192,25 +206,23 @@ impl EmatchEngine {
                         break;
                     }
 
-                    // Soundness: an instantiation must not reintroduce THIS
-                    // quantifier's own bound variables.  The term pool
-                    // (`all_term_ids`) also holds the quantifier's OWN body
-                    // subterms, so a trigger like `(charClip i)` matches the
-                    // in-body `(charClip i)` and yields the identity substitution
-                    // `{i ↦ i}`.  Applying it returns the body with `i` still
-                    // free — and because distinct quantifiers hash-cons a reused
-                    // bound-var name (`i`) to ONE `Var` term, those free vars then
-                    // capture across axioms and manufacture a spurious UNSAT (it
-                    // also makes the verdict depend on assertion grouping:
-                    // per-command streaming vs one-shot batch).  Reject any match
-                    // whose substitution range still mentions a bound variable.
-                    // (Declared constants are `Var` terms too, so a plain
-                    // `is_ground` check would wrongly drop legitimate matches like
-                    // `{a ↦ x}` — we test against the bound-name set instead.)
+                    // Soundness: an instantiation must not leave a bound variable
+                    // free.  The term pool (`all_term_ids`) holds every quantifier's
+                    // body subterms, so a trigger matches not only its OWN body —
+                    // yielding the identity `{i ↦ i}` — but ANOTHER quantifier's
+                    // body, e.g. trigger `(uInv bits i)` against `(uInv SZ x)` from
+                    // a sibling axiom, yielding `{bits ↦ SZ, i ↦ x}` whose image `x`
+                    // is the SIBLING's bound var.  Applying either returns the body
+                    // with a bound var still free; because bound vars are hash-consed
+                    // by `(name, sort)`, those free vars capture across axioms and
+                    // manufacture a spurious UNSAT (it also makes the verdict depend
+                    // on assertion grouping: per-command streaming vs batch).  Reject
+                    // any match whose substitution range mentions a name bound by
+                    // ANY registered quantifier.
                     let captures_bound_var = subst.iter().any(|(_, &t)| {
                         manager.free_vars(t).iter().any(|&v| {
                             matches!(manager.get(v).map(|x| &x.kind),
-                                Some(TermKind::Var(n)) if bound_names.contains(n))
+                                Some(TermKind::Var(n)) if all_bound_names.contains(n))
                         })
                     });
                     if captures_bound_var {
