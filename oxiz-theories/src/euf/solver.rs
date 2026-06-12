@@ -215,6 +215,19 @@ pub struct EufSolver {
     sig_trail: Vec<SigTrailEntry>,
     /// Scope checkpoints into sig_trail, parallel to uf.trail_limits.
     sig_trail_limits: Vec<usize>,
+    /// Undo trail for proof-forest edge insertions.  Each entry is the node
+    /// index whose `proof_forest[idx]` had an edge appended; `pop()` pops these
+    /// in LIFO order so that merge/congruence edges added inside a scope are
+    /// removed when the scope is popped.  Without this, an edge appended to a
+    /// node that SURVIVES the pop (index < `num_nodes`) would linger after its
+    /// union was backtracked, and `explain_equality`'s BFS could route through
+    /// the stale edge and return reasons for equalities that no longer hold —
+    /// yielding an INVALID learned conflict clause and a spurious UNSAT.
+    /// (`proof_forest.truncate(num_nodes)` only drops edges of the popped nodes
+    /// themselves, never those leaked onto survivors.)
+    proof_trail: Vec<u32>,
+    /// Scope checkpoints into `proof_trail`, parallel to `uf.trail_limits`.
+    proof_trail_limits: Vec<usize>,
     /// Reusable BFS queue for explain_equality — avoids per-call VecDeque allocation.
     explain_queue: crate::prelude::VecDeque<u32>,
     /// Reusable visited flags for explain_equality — resized to proof_forest.len() and cleared at entry.
@@ -262,6 +275,8 @@ impl EufSolver {
             propagation_buf: Vec::new(),
             sig_trail: Vec::new(),
             sig_trail_limits: Vec::new(),
+            proof_trail: Vec::new(),
+            proof_trail_limits: Vec::new(),
             explain_queue: crate::prelude::VecDeque::new(),
             explain_visited: Vec::new(),
             explain_parent: Vec::new(),
@@ -295,7 +310,8 @@ impl EufSolver {
         props: &FunctionProperties,
         args: &[u32],
     ) -> SmallVec<[u32; 4]> {
-        let mut canonical: SmallVec<[u32; 4]> = args.iter().map(|&a| self.uf.find(a)).collect();
+        let mut canonical: SmallVec<[u32; 4]> =
+            args.iter().map(|&a| self.uf.find_no_compress(a)).collect();
 
         // For commutative functions, sort arguments by their canonical representative
         if props.commutative {
@@ -318,7 +334,7 @@ impl EufSolver {
     ) {
         buf.clear();
         for &a in args {
-            buf.push(self.uf.find(a));
+            buf.push(self.uf.find_no_compress(a));
         }
         if props.commutative {
             buf.sort_unstable();
@@ -426,6 +442,17 @@ impl EufSolver {
         idx
     }
 
+    /// Append a proof-forest edge to `node`, recording it in `proof_trail` when
+    /// inside a push scope so `pop()` can undo it.  All proof-edge insertions go
+    /// through here to keep the undo trail complete.
+    #[inline]
+    fn push_proof_edge(&mut self, node: u32, edge: MergeEdge) {
+        self.proof_forest[node as usize].push(edge);
+        if !self.proof_trail_limits.is_empty() {
+            self.proof_trail.push(node);
+        }
+    }
+
     /// Merge two equivalence classes
     #[inline]
     pub fn merge(&mut self, a: u32, b: u32, reason: TermId) -> Result<()> {
@@ -446,26 +473,32 @@ impl EufSolver {
         propagation_buf.clear();
 
         while let Some((a, b, reason)) = self.pending.pop() {
-            let root_a = self.uf.find(a);
-            let root_b = self.uf.find(b);
+            let root_a = self.uf.find_no_compress(a);
+            let root_b = self.uf.find_no_compress(b);
 
             if root_a == root_b {
                 continue;
             }
 
             // Record the merge in the proof forest (for explanation generation)
-            self.proof_forest[a as usize].push(MergeEdge {
-                other: b,
-                reason: MergeReason::Assertion(reason),
-            });
-            self.proof_forest[b as usize].push(MergeEdge {
-                other: a,
-                reason: MergeReason::Assertion(reason),
-            });
+            self.push_proof_edge(
+                a,
+                MergeEdge {
+                    other: b,
+                    reason: MergeReason::Assertion(reason),
+                },
+            );
+            self.push_proof_edge(
+                b,
+                MergeEdge {
+                    other: a,
+                    reason: MergeReason::Assertion(reason),
+                },
+            );
 
             // Union the classes
             self.uf.union(root_a, root_b);
-            let new_root = self.uf.find(root_a);
+            let new_root = self.uf.find_no_compress(root_a);
 
             // Congruence closure: check for new merges
             let other_root = if new_root == root_a { root_b } else { root_a };
@@ -536,22 +569,28 @@ impl EufSolver {
                 // Check signature table for congruence match
                 let sig = (func, canon_buf.clone());
                 if let Some(&existing) = self.sig_table.get(&sig) {
-                    if !self.uf.same(user, existing) {
+                    if !self.uf.same_no_compress(user, existing) {
                         // Congruence detected: record proof edges
-                        self.proof_forest[user as usize].push(MergeEdge {
-                            other: existing,
-                            reason: MergeReason::Congruence {
-                                term1: user,
-                                term2: existing,
+                        self.push_proof_edge(
+                            user,
+                            MergeEdge {
+                                other: existing,
+                                reason: MergeReason::Congruence {
+                                    term1: user,
+                                    term2: existing,
+                                },
                             },
-                        });
-                        self.proof_forest[existing as usize].push(MergeEdge {
-                            other: user,
-                            reason: MergeReason::Congruence {
-                                term1: user,
-                                term2: existing,
+                        );
+                        self.push_proof_edge(
+                            existing,
+                            MergeEdge {
+                                other: user,
+                                reason: MergeReason::Congruence {
+                                    term1: user,
+                                    term2: existing,
+                                },
                             },
-                        });
+                        );
 
                         propagation_buf.push((user, existing, TermId::new(0)));
                     }
@@ -633,7 +672,7 @@ impl EufSolver {
         let conflict_idx = self
             .diseqs
             .iter()
-            .position(|d| self.uf.same(d.lhs, d.rhs))?;
+            .position(|d| self.uf.same_no_compress(d.lhs, d.rhs))?;
 
         let (lhs, rhs, reason) = {
             let d = &self.diseqs[conflict_idx];
@@ -763,26 +802,64 @@ impl EufSolver {
     }
 
     /// Check if two terms are equivalent
+    ///
+    /// Uses the non-compressing query so that backtracking (`uf.pop`) can fully
+    /// restore the parent array — path compression would write untracked parent
+    /// pointers that a later `truncate(num_nodes)` could leave dangling.
+    ///
+    /// Total over *any* `u32`: a node index that is no longer live (≥ the
+    /// current node count, e.g. a term interned in a scope that has since been
+    /// popped) is treated as its own singleton class.  This keeps stale-index
+    /// queries sound — two distinct stale indices are never equal, and a stale
+    /// index is never equal to a live one — instead of indexing past the
+    /// (now-truncated) union-find.
     #[inline]
     pub fn are_equal(&mut self, a: u32, b: u32) -> bool {
-        self.uf.same(a, b)
+        if a == b {
+            return true;
+        }
+        let live = self.nodes.len() as u32;
+        if a >= live || b >= live {
+            return false;
+        }
+        self.uf.same_no_compress(a, b)
     }
 
     /// Get the representative of a term
+    ///
+    /// Non-compressing for the same backtracking-safety reason as `are_equal`,
+    /// and total: a non-live index (≥ the current node count) represents itself.
     #[inline]
     pub fn find(&mut self, a: u32) -> u32 {
-        self.uf.find(a)
+        if (a as usize) >= self.nodes.len() {
+            return a;
+        }
+        self.uf.find_no_compress(a)
     }
 
     /// Get the representative of a term without path compression (immutable)
+    ///
+    /// Total: a non-live index (≥ the current node count) represents itself.
     #[inline]
     pub fn find_immutable(&self, a: u32) -> u32 {
+        if (a as usize) >= self.nodes.len() {
+            return a;
+        }
         self.uf.find_no_compress(a)
     }
 
     /// Check equivalence without mutation (immutable)
+    ///
+    /// Total over any `u32`; see `are_equal` for the stale-index contract.
     #[inline]
     pub fn are_equal_immutable(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return true;
+        }
+        let live = self.nodes.len() as u32;
+        if a >= live || b >= live {
+            return false;
+        }
         self.uf.same_no_compress(a, b)
     }
 
@@ -983,15 +1060,48 @@ impl Theory for EufSolver {
         self.uf.push();
         // Record sig_trail checkpoint, mirroring uf.trail_limits.push(...)
         self.sig_trail_limits.push(self.sig_trail.len());
+        // Record proof_trail checkpoint, likewise mirroring uf.trail_limits.
+        self.proof_trail_limits.push(self.proof_trail.len());
     }
 
     fn pop(&mut self) {
         if let Some(state) = self.context_stack.pop() {
             let num_nodes = state.num_nodes;
 
+            // Backtracking changes both the union state and the proof forest, so
+            // any cached explanation may now be stale.  Drop the cache (mirrors
+            // the clear in `merge`).
+            self.expl_cache.clear();
+
             self.nodes.truncate(num_nodes);
             self.diseqs.truncate(state.num_diseqs);
             self.uf.pop();
+            // The union-find allocates one slot per E-node (`intern`/`intern_app`
+            // call `uf.add()` alongside the `nodes.push`), but `uf.pop()` only
+            // reverts *unions* — it leaves the slots added since the matching
+            // push in place.  Truncate them away so `uf.len()` tracks
+            // `nodes.len()`; otherwise the next `intern` desyncs the node index
+            // from the uf slot and a later `find` returns a dangling root past
+            // the (now shorter) `use_list` (the historical use_list OOB panic).
+            // Sound because every in-scope union was just reverted and the
+            // backtracked find paths do not compress (see `find_no_compress`
+            // usage below), so no surviving node points past `num_nodes`.
+            self.uf.truncate(num_nodes);
+
+            // Undo proof-forest edges appended since the matching push, in LIFO
+            // order, BEFORE truncating `proof_forest` (the trail may reference
+            // popped node indices ≥ num_nodes that still exist until the
+            // truncate below).  This removes edges that leaked onto SURVIVING
+            // nodes during the scope — the ones `truncate(num_nodes)` cannot
+            // reach — so `explain_equality` never routes through a retracted
+            // merge.  Mirrors the sig_trail rewind.
+            if let Some(proof_limit) = self.proof_trail_limits.pop() {
+                while self.proof_trail.len() > proof_limit {
+                    if let Some(node) = self.proof_trail.pop() {
+                        self.proof_forest[node as usize].pop();
+                    }
+                }
+            }
 
             // Also truncate related structures
             self.use_list.truncate(num_nodes);
@@ -1042,6 +1152,9 @@ impl Theory for EufSolver {
         self.function_properties.clear();
         self.sig_trail.clear();
         self.sig_trail_limits.clear();
+        self.proof_trail.clear();
+        self.proof_trail_limits.clear();
+        self.expl_cache.clear();
     }
 }
 
@@ -1577,6 +1690,74 @@ mod tests {
             "a and b should not be equal after full pop"
         );
         let _ = (fab, fbc, c, d);
+    }
+
+    /// Regression for the ground-audit bug `b` (bounded-injectivity spurious
+    /// UNSAT): a merge made inside a push scope must not leave a proof-forest
+    /// edge behind after `pop`.  A leaked edge lets `explain_equality` route
+    /// through a retracted merge and cite a reason for an equality that no
+    /// longer holds — yielding an invalid conflict clause downstream.
+    #[test]
+    fn test_pop_removes_stale_proof_edges() {
+        use crate::theory::Theory;
+
+        let mut s = EufSolver::new();
+        let a = s.intern(TermId::new(1));
+        let b = s.intern(TermId::new(2));
+
+        // Merge a=b inside a scope with reason 100, then pop it away.
+        s.push();
+        s.merge(a, b, TermId::new(100)).expect("merge a=b");
+        assert!(s.are_equal(a, b));
+        s.pop();
+        assert!(!s.are_equal(a, b), "merge must be undone by pop");
+
+        // Re-merge with a DIFFERENT reason 200.
+        s.merge(a, b, TermId::new(200)).expect("re-merge a=b");
+        assert!(s.are_equal(a, b));
+
+        // The explanation must cite only the live reason (200), never the
+        // retracted reason (100) whose proof edge should have been removed.
+        let reasons = s.explain_equality(a, b);
+        assert!(
+            reasons.contains(&TermId::new(200)),
+            "explanation must cite the live merge reason 200, got {reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&TermId::new(100)),
+            "explanation must NOT cite the popped merge reason 100, got {reasons:?}"
+        );
+    }
+
+    /// A merge that survives across a pop (it was made at a shallower level than
+    /// the pop) must KEEP its proof edge.  Guards against the proof-trail undo
+    /// over-removing edges from outer scopes.
+    #[test]
+    fn test_pop_keeps_outer_scope_proof_edges() {
+        use crate::theory::Theory;
+
+        let mut s = EufSolver::new();
+        let a = s.intern(TermId::new(1));
+        let b = s.intern(TermId::new(2));
+        let c = s.intern(TermId::new(3));
+
+        // Outer merge a=b at level 1 (reason 10).
+        s.push();
+        s.merge(a, b, TermId::new(10)).expect("merge a=b");
+
+        // Inner merge b=c at level 2 (reason 20), then pop level 2 away.
+        s.push();
+        s.merge(b, c, TermId::new(20)).expect("merge b=c");
+        s.pop();
+
+        // a=b must survive; b=c must be gone.
+        assert!(s.are_equal(a, b), "outer-scope merge must survive the pop");
+        assert!(!s.are_equal(b, c), "inner-scope merge must be undone");
+        let reasons = s.explain_equality(a, b);
+        assert!(
+            reasons.contains(&TermId::new(10)),
+            "explanation must still cite the surviving reason 10, got {reasons:?}"
+        );
     }
 
     #[test]

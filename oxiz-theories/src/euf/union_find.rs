@@ -163,6 +163,30 @@ impl UnionFind {
         id
     }
 
+    /// Truncate the element space to `n` elements, dropping every element with
+    /// index ≥ `n`.
+    ///
+    /// This is the counterpart to `add` for a caller (the EUF E-graph) that
+    /// allocates union-find slots in lock-step with another array (`nodes`) and
+    /// shrinks *that* array on backtrack.  `pop()` only undoes *unions* (it has
+    /// no way to know the caller also wants to forget the most recently added
+    /// elements), so after a scoped `push`/intern/`pop` cycle the parent/rank
+    /// vectors would otherwise stay longer than the caller's node array and a
+    /// later `find` could return a now-dangling root.  Call `truncate(num_nodes)`
+    /// right after `pop()` to keep the two in sync.
+    ///
+    /// Safety contract: the caller must guarantee that, at the point of the
+    /// call, no surviving element (index < `n`) has a parent pointer ≥ `n`.
+    /// The EUF holds this because (a) all unions made since the matching `push`
+    /// were already reverted by `pop`, restoring every surviving parent to its
+    /// pre-scope (in-range) value, and (b) the find queries on the backtracked
+    /// path do not compress, so no untracked cross-boundary parent pointer is
+    /// ever written.  A no-op when `n >= len()`.
+    pub fn truncate(&mut self, n: usize) {
+        self.parent.truncate(n);
+        self.rank.truncate(n);
+    }
+
     /// Get the number of elements
     #[must_use]
     pub fn len(&self) -> usize {

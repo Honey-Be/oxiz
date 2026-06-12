@@ -105,6 +105,18 @@ pub(crate) struct TheoryManager<'a> {
     /// detects conflicts (e.g., f(a)=true, f(b)=false, but a=b).
     bool_true_node: Option<u32>,
     bool_false_node: Option<u32>,
+    /// Current SAT phase of each theory-atom variable (`true` = assigned
+    /// positively, `false` = assigned negatively).  Recorded on every
+    /// assignment so that `terms_to_conflict_clause` can emit each conflict
+    /// literal with the polarity that *falsifies* it under the current
+    /// assignment.  Without this a diseq reason that came from a
+    /// negatively-assigned equality atom (e.g. a `(= x y)` the SAT solver set
+    /// false, asserted into EUF as `x != y`) would be negated the wrong way,
+    /// yielding a learned clause that is satisfied rather than falsified — a
+    /// malformed conflict that drives spurious UNSAT once several accumulate.
+    /// Stale entries for backtracked vars are never queried: a popped EUF
+    /// merge/diseq no longer contributes its reason term to any live conflict.
+    assigned_phase: FxHashMap<Var, bool>,
 }
 
 /// Post-order, memoised BV term encoding.
@@ -488,6 +500,7 @@ impl<'a> TheoryManager<'a> {
             has_bv_arith_ops,
             interned_int_constants: FxHashMap::default(),
             interned_bv_constants: FxHashMap::default(),
+            assigned_phase: FxHashMap::default(),
             bool_true_node: None,
             bool_false_node: None,
         }
@@ -617,8 +630,18 @@ impl<'a> TheoryManager<'a> {
                 let t1 = shared_terms[i];
                 let t2 = shared_terms[j];
 
-                let t1_node = self.euf.intern(t1);
-                let t2_node = self.euf.intern(t2);
+                // Only compare terms ALREADY interned in EUF — never `intern`
+                // here. `intern` is the LEAF intern, so on an application term
+                // (e.g. `f(g(k))`) it would fabricate a spurious leaf node; and
+                // creating ANY node DURING a theory check (after a SAT push)
+                // grows the EUF node space while `pop` later truncates it,
+                // leaving stale union-find roots that index past `use_list`
+                // (an out-of-bounds panic / wrong `find`s).
+                let (Some(t1_node), Some(t2_node)) =
+                    (self.euf.term_to_node(t1), self.euf.term_to_node(t2))
+                else {
+                    continue;
+                };
 
                 if self.euf.are_equal(t1_node, t2_node) {
                     let t1_value = self.arith.value(t1);
@@ -903,7 +926,21 @@ impl<'a> TheoryManager<'a> {
         let mut conflict = SmallVec::new();
         for &term in terms {
             if let Some(&var) = self.term_to_var.get(&term) {
-                conflict.push(Lit::neg(var));
+                // Emit the literal in the polarity that FALSIFIES it under the
+                // current assignment: a positively-assigned atom contributes its
+                // negation, a negatively-assigned atom contributes itself.  A
+                // reason term whose atom was asserted positively (the common
+                // case: an equality the SAT solver set true, merged in EUF) maps
+                // to `Lit::neg`; a reason term from a negatively-assigned atom
+                // (an equality set false, asserted as a disequality) maps to
+                // `Lit::pos`.  Defaulting to `neg` when the phase is unknown
+                // preserves the historical behaviour for atoms we never saw
+                // assigned (e.g. internally-derived reasons).
+                let lit = match self.assigned_phase.get(&var) {
+                    Some(false) => Lit::pos(var),
+                    _ => Lit::neg(var),
+                };
+                conflict.push(lit);
             }
         }
         conflict
@@ -1487,6 +1524,10 @@ impl TheoryCallback for TheoryManager<'_> {
     fn on_assignment(&mut self, lit: Lit) -> TheoryCheckResult {
         let var = lit.var();
         let is_positive = !lit.is_neg();
+
+        // Remember the phase so conflict-clause generation can negate each
+        // literal in the direction that falsifies it (see `assigned_phase`).
+        self.assigned_phase.insert(var, is_positive);
 
         // Track propagation
         self.statistics.propagations += 1;

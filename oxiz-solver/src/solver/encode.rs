@@ -178,38 +178,27 @@ impl Solver {
             // In contrast, terms like `f(sk(x))` where `sk(x)` is a fresh Skolem
             // constant (NOT in arith_terms) are safe to add because there are no
             // contradictory EUF congruence facts to violate.
-            TermKind::Apply { args, .. } => {
+            TermKind::Apply { .. } => {
                 let is_int = term.sort == manager.sorts.int_sort;
                 let is_real = term.sort == manager.sorts.real_sort;
                 if is_int || is_real {
-                    // Check: is any argument a *non-Skolem* Apply term that is
-                    // already in arith?  When f(g(a)) is added to arith AND g(a)
-                    // has an arith model value v, EUF applies congruence to derive
-                    // f(g(a)) = f(v), conflicting with arith's independent
-                    // assignment to f(g(a)).  Skolem-generated Apply terms (whose
-                    // function names start with "sk!") are fresh constants created
-                    // during quantifier Skolemization; EUF has no equality facts
-                    // about them so no congruence conflict can arise.
-                    let has_conflicting_apply_arg = args.iter().any(|&arg| {
-                        manager.get(arg).is_some_and(|a| {
-                            if let TermKind::Apply {
-                                func,
-                                args: inner_args,
-                                ..
-                            } = &a.kind
-                            {
-                                if inner_args.is_empty() {
-                                    return false;
-                                }
-                                let fname = manager.resolve_str(*func);
-                                let is_skolem = fname.starts_with("sk!");
-                                !is_skolem && self.arith_terms.contains(&arg)
-                            } else {
-                                false
-                            }
-                        })
-                    });
-                    if !has_conflicting_apply_arg && !self.arith_terms.contains(&term_id) {
+                    // Track EVERY numeric application — including nested apps like
+                    // `f(g(a))` — as an arithmetic variable so its DIRECT numeric
+                    // constraints (e.g. `f(g(a)) = 20` ∧ `f(g(a)) <= 10`) reach
+                    // the arithmetic solver.  Dropping a nested app here loses
+                    // those constraints and is unsound (it can turn UNSAT into a
+                    // spurious SAT; ground audit bug `a`).
+                    //
+                    // The historical reason for skipping nested apps — that arith
+                    // would treat `f(g(a))` as independent from the congruent
+                    // `f(v)` once `g(a) = v`, causing a spurious combination
+                    // conflict — is handled the sound way instead, by
+                    // `propagate_euf_equalities_to_arith` asserting the EUF
+                    // congruence `f(g(a)) = f(v)` into arith.  (That propagation
+                    // became reliable once the EUF proof forest was correctly
+                    // backtracked; a leaked proof edge previously produced invalid
+                    // conflict explanations.)
+                    if !self.arith_terms.contains(&term_id) {
                         self.arith_terms.insert(term_id);
                         self.trail.push(TrailOp::ArithTermAdded { term: term_id });
                         self.arith.intern(term_id);
@@ -354,57 +343,21 @@ impl Solver {
             //   (b) the constraint `f(k) > 10` is handled consistently with any
             //       later instantiation that produces `f(k) <= 10`.
             //
-            // Restriction: only treat flat Apply terms (all args atomic) as
-            // arithmetic variables.  Nested applications like `f(f(k))` are
-            // handled by the EUF solver; including them in arith would require
-            // full Nelson-Oppen equality propagation to avoid spurious UNSAT.
-            TermKind::Apply { args, .. } => {
+            // Represent EVERY numeric Apply term — flat (`f(k)`) or nested
+            // (`f(g(k))`) — as an arithmetic variable so its direct linear
+            // constraints are seen by the arithmetic solver.  Dropping a nested
+            // app here loses its bounds and is unsound (`f(g(k)) = 20` ∧
+            // `f(g(k)) <= 10` would be missed → spurious SAT; ground audit bug
+            // `a`).  The EUF↔arith congruence that makes `f(g(k))` agree with the
+            // congruent `f(v)` once `g(k) = v` is supplied soundly by
+            // `propagate_euf_equalities_to_arith`, not by hiding the term from
+            // arith.  (See the matching note in `track_theory_vars`.)
+            TermKind::Apply { .. } => {
                 let sort = term.sort;
                 let is_numeric = sort == manager.sorts.int_sort || sort == manager.sorts.real_sort;
                 if is_numeric {
-                    // Skip if any argument is a *non-Skolem* Apply term that is
-                    // already in arith_terms.  This mirrors the restriction in
-                    // `track_theory_vars` and avoids EUF/arith congruence conflicts.
-                    // Skolem Apply terms (prefix "sk!") are safe because EUF has no
-                    // equality facts about fresh Skolem symbols.
-                    //
-                    // KNOWN INCOMPLETENESS (ground audit bug `a`): this drops a
-                    // nested app like `f(g(k))` from arith once `g(k)` becomes an
-                    // arith term, which loses the DIRECT bounds on `f(g(k))` →
-                    // spurious SAT for e.g. `f(g(k))≥20 ∧ f(g(k))≤10`. Keeping it
-                    // instead reintroduces spurious UNSAT (arith treats nested
-                    // apps as independent without complete congruence
-                    // propagation). The conservative choice here trades the
-                    // (completeness-only) spurious SAT to avoid the (soundness)
-                    // spurious UNSAT — the clean quantifier engine depends on the
-                    // latter never happening. A real fix needs complete
-                    // Nelson-Oppen equality propagation between EUF and arith.
-                    let has_conflicting_apply_arg = args.iter().any(|&arg| {
-                        manager.get(arg).is_some_and(|a| {
-                            if let TermKind::Apply {
-                                func,
-                                args: inner_args,
-                                ..
-                            } = &a.kind
-                            {
-                                if inner_args.is_empty() {
-                                    return false;
-                                }
-                                let fname = manager.resolve_str(*func);
-                                let is_skolem = fname.starts_with("sk!");
-                                !is_skolem && self.arith_terms.contains(&arg)
-                            } else {
-                                false
-                            }
-                        })
-                    });
-                    if !has_conflicting_apply_arg {
-                        terms.push((term_id, scale));
-                        Some(())
-                    } else {
-                        // Non-Skolem nested Apply in arith -- cannot safely represent.
-                        None
-                    }
+                    terms.push((term_id, scale));
+                    Some(())
                 } else {
                     // Non-numeric Apply (e.g. uninterpreted predicate) -- not linear.
                     None
