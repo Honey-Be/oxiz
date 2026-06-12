@@ -1,0 +1,61 @@
+//! M4 port smoke tests: drive the clean-room engine over REAL OxiZ terms via
+//! `OxizHost`, validating the `TermLang` mapping end-to-end.
+
+use oxiz_core::ast::TermManager;
+use oxiz_mbqi::{Config, Engine, Verdict};
+use oxiz_solver::clean_mbqi::OxizHost;
+
+fn drain<'a>(e: &mut Engine<OxizHost<'a>>, host: &mut OxizHost<'a>) -> usize {
+    let mut emitted = 0;
+    loop {
+        match e.round(&mut *host) {
+            Verdict::NewLemmas(ls) => emitted += ls.len(),
+            _ => break,
+        }
+    }
+    emitted
+}
+
+#[test]
+fn host_ematch_instantiates_at_a_real_ground_constant() {
+    // ∀x:Int. f(x)=g(x)  :pattern (f x).   Ground: f(c), c a declared
+    // constant (a `Var` in OxiZ). e-match binds x↦c → emits Q ⇒ f(c)=g(c).
+    let mut tm = TermManager::new();
+    let int = tm.sorts.int_sort;
+    let c = tm.mk_var("c", int); // declared constant — Var in OxiZ
+    let fc = tm.mk_apply("f", [c], int); // ground f(c)
+    let x = tm.mk_var("x", int);
+    let fx = tm.mk_apply("f", [x], int);
+    let gx = tm.mk_apply("g", [x], int);
+    let body = tm.mk_eq(fx, gx);
+    let q = tm.mk_forall_with_patterns([("x", int)], body, [[fx]]);
+
+    let mut host = OxizHost::new(&mut tm);
+    let mut e = Engine::new(Config::default());
+    e.assert(&host, fc);
+    e.assert(&host, q);
+    let emitted = drain(&mut e, &mut host);
+    assert!(emitted >= 1, "should e-match at the real ground f(c)");
+    assert_eq!(e.rejected(), 0, "every candidate came from the ground index");
+}
+
+#[test]
+fn host_patterned_quant_with_no_ground_match_fabricates_nothing() {
+    // ∀x:Int. f(x)=g(x)  :pattern (f x).   NO ground f(_) exists. The clean
+    // engine emits ZERO instances (the OxiZ B-bug self-match is impossible —
+    // the body's f(x) is under the quantifier, never in the ground index).
+    let mut tm = TermManager::new();
+    let int = tm.sorts.int_sort;
+    let x = tm.mk_var("x", int);
+    let fx = tm.mk_apply("f", [x], int);
+    let gx = tm.mk_apply("g", [x], int);
+    let body = tm.mk_eq(fx, gx);
+    let q = tm.mk_forall_with_patterns([("x", int)], body, [[fx]]);
+
+    let mut host = OxizHost::new(&mut tm);
+    let mut e = Engine::new(Config::default());
+    e.assert(&host, q);
+    let emitted = drain(&mut e, &mut host);
+    assert_eq!(emitted, 0, "no ground f(_) ⇒ no instance");
+    assert_eq!(e.rejected(), 0);
+}

@@ -8,6 +8,7 @@ members = [
     "oxiz-nlsat",
     "oxiz-theories",
     "oxiz-solver",
+    "oxiz-mbqi",
     "oxiz-opt",
     "oxiz-spacer",
     "oxiz-proof",
@@ -30,6 +31,7 @@ default-members = [
     "oxiz-nlsat",
     "oxiz-theories",
     "oxiz-solver",
+    "oxiz-mbqi",
     "oxiz-opt",
     "oxiz-spacer",
     "oxiz-proof",
@@ -66,6 +68,7 @@ oxiz = { version = "0.2.4", path = "oxiz" }
 
 # Core crates (default-features = false so downstream can control std)
 oxiz-core = { version = "0.2.4", path = "oxiz-core", default-features = false }
+oxiz-mbqi = { version = "0.2.4", path = "oxiz-mbqi" }
 oxiz-math = { version = "0.2.4", path = "oxiz-math", default-features = false }
 oxiz-sat = { version = "0.2.4", path = "oxiz-sat", default-features = false }
 oxiz-nlsat = { version = "0.2.4", path = "oxiz-nlsat" }

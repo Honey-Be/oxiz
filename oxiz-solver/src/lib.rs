@@ -129,6 +129,9 @@ pub mod shared_terms;
 // MBQI module (Model-Based Quantifier Instantiation)
 pub mod mbqi;
 
+// Clean-room quantifier engine host (M4 port of `oxiz-mbqi`).
+pub mod clean_mbqi;
+
 // Z3 API compatibility layer (std-only)
 #[cfg(feature = "std")]
 pub mod z3_compat;
