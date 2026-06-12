@@ -367,6 +367,18 @@ impl Solver {
                     // `track_theory_vars` and avoids EUF/arith congruence conflicts.
                     // Skolem Apply terms (prefix "sk!") are safe because EUF has no
                     // equality facts about fresh Skolem symbols.
+                    //
+                    // KNOWN INCOMPLETENESS (ground audit bug `a`): this drops a
+                    // nested app like `f(g(k))` from arith once `g(k)` becomes an
+                    // arith term, which loses the DIRECT bounds on `f(g(k))` →
+                    // spurious SAT for e.g. `f(g(k))≥20 ∧ f(g(k))≤10`. Keeping it
+                    // instead reintroduces spurious UNSAT (arith treats nested
+                    // apps as independent without complete congruence
+                    // propagation). The conservative choice here trades the
+                    // (completeness-only) spurious SAT to avoid the (soundness)
+                    // spurious UNSAT — the clean quantifier engine depends on the
+                    // latter never happening. A real fix needs complete
+                    // Nelson-Oppen equality propagation between EUF and arith.
                     let has_conflicting_apply_arg = args.iter().any(|&arg| {
                         manager.get(arg).is_some_and(|a| {
                             if let TermKind::Apply {
