@@ -20,9 +20,11 @@ pub use types::{
     Statistics, TheoryMode, UnsatCore,
 };
 
+use crate::clean_mbqi::{OxizHost, OxizSig, SolverModel};
 use crate::mbqi::{MBQIIntegration, MBQIResult};
 #[allow(unused_imports)]
 use crate::prelude::*;
+use oxiz_mbqi::{Config as CleanConfig, Engine as CleanEngine, Verdict as CleanVerdict};
 use crate::simplify::Simplifier;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::ematching::{EmatchingConfig, EmatchingEngine};
@@ -296,6 +298,20 @@ impl Solver {
         added == 0
     }
 
+    /// Snapshot the current model as the oracle the clean engine consults for
+    /// CDQI / relevance-gating. Holds a CLONE of the `term → value`
+    /// assignments (so it does not alias the manager the host borrows mutably)
+    /// plus the interned `true`/`false` ids. Conservative everywhere — a wrong
+    /// answer can only cost completeness, never soundness.
+    fn build_clean_model(&self, manager: &TermManager) -> SolverModel {
+        let assign = self
+            .model
+            .as_ref()
+            .map(|m| m.assignments().clone())
+            .unwrap_or_default();
+        SolverModel::new(assign, manager.mk_true(), manager.mk_false())
+    }
+
     /// Get a SAT variable for a term, then check satisfiability
     pub fn check(&mut self, manager: &mut TermManager) -> SolverResult {
         // Check for trivial unsat (false assertion)
@@ -399,6 +415,14 @@ impl Solver {
             Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
         };
 
+        // The clean-room quantifier engine (`oxiz-mbqi`), built lazily on the
+        // first SAT-with-quantifiers round and PERSISTED across MBQI iterations
+        // so its ground-term index, `seen` dedup, and frontier watermarks
+        // accumulate (the whole point of the lifetime-free `Engine<OxizSig>`:
+        // it outlives any single `&mut TermManager` borrow). Only used when
+        // `config.clean_mbqi` is set; otherwise the legacy `mbqi/` path runs.
+        let mut clean_engine: Option<CleanEngine<OxizSig>> = None;
+
         loop {
             #[cfg(feature = "std")]
             if self.has_quantifiers && mbqi_deadline.is_some_and(|d| std::time::Instant::now() >= d)
@@ -438,7 +462,14 @@ impl Solver {
                     // pattern-FREE quantifiers that have no trigger to bound
                     // them).  If it added clauses or closed the formula we fall
                     // through to the loop tail and re-solve.
-                    let ematch_saturated = self.ematch_fixpoint_step(manager);
+                    //
+                    // Legacy Phase-1 e-matching runs ONLY when the clean engine
+                    // is off — the clean engine (below) does its own sound
+                    // e-matching, so we must not also drive the legacy one. The
+                    // `&&` short-circuits, so `ematch_fixpoint_step` is not even
+                    // called when `clean_mbqi` is set.
+                    let ematch_saturated =
+                        !self.config.clean_mbqi && self.ematch_fixpoint_step(manager);
                     if ematch_saturated {
                         // Run MBQI to check quantified formulas
                         let model_assignments = self
@@ -621,6 +652,101 @@ impl Solver {
                             }
                         }
                     } // end `if ematch_saturated` (Phase 2)
+
+                    // ===== Clean-room model-based instantiation phase =====
+                    // Sound by construction: the engine only emits guarded
+                    // ground instances drawn from the real ground-term index, so
+                    // a spurious `unsat` (e-match self/sibling capture,
+                    // fabricated `u!N` witnesses, dropped fuel guards) is
+                    // structurally impossible. A trigger-free axiom it cannot
+                    // model-verify yields the sound `Unknown`, never a guess.
+                    if self.config.clean_mbqi {
+                        // Build + assert the formula once; persist across rounds.
+                        if clean_engine.is_none() {
+                            let mut eng = CleanEngine::new(CleanConfig::default());
+                            {
+                                let host = OxizHost::new(manager);
+                                for &a in &self.assertions {
+                                    eng.assert(&host, a);
+                                }
+                            }
+                            clean_engine = Some(eng);
+                        }
+                        // One instantiation round against the current model.
+                        let verdict = {
+                            let model = self.build_clean_model(manager);
+                            let eng = clean_engine.as_mut().expect("just built above");
+                            let mut host = OxizHost::new(manager);
+                            eng.round_with(&mut host, &model)
+                        };
+                        match verdict {
+                            CleanVerdict::NewLemmas(lemmas) => {
+                                // Assert each guarded instance `Q ⇒ φ[x̄↦t̄]` and
+                                // re-solve on the next loop iteration (fall
+                                // through to the tail below).
+                                //
+                                // The lemma is added as the DIRECT guarded clause
+                                // `[¬Q, φ]`, NOT as a unit on the `Implies` node's
+                                // Tseitin proxy. This is the standard SMT
+                                // instantiation-lemma form: when the quantifier
+                                // literal `Q` is asserted/derived true the instance
+                                // `φ` is forced (so a real conflict surfaces);
+                                // when `Q` is false the clause is vacuous (sound
+                                // for guarded / disjunctive quantifiers, where the
+                                // unconditional `φ` would be unsound).
+                                for l in lemmas {
+                                    match manager.get(l).map(|t| t.kind.clone()) {
+                                        Some(TermKind::Implies(q, phi)) => {
+                                            // Defensive groundness guard: the host
+                                            // `substitute` is total over FO/UF/LIA
+                                            // but not (yet) over BV/string/nested
+                                            // quantifiers, so an instance could
+                                            // retain a free variable. Adding such a
+                                            // clause would be unsound (a stray free
+                                            // var is implicitly closed); DROP it
+                                            // instead — costs only completeness.
+                                            if !manager.free_vars(phi).is_empty() {
+                                                continue;
+                                            }
+                                            let qlit = self.encode(q, manager);
+                                            if manager
+                                                .get(phi)
+                                                .is_some_and(|t| matches!(t.kind, TermKind::False))
+                                            {
+                                                // `Q ⇒ false` ≡ `¬Q`.
+                                                let _ = self.sat.add_clause([qlit.negate()]);
+                                            } else {
+                                                let philit = self.encode(phi, manager);
+                                                let _ =
+                                                    self.sat.add_clause([qlit.negate(), philit]);
+                                                self.collect_ground_candidates_from_term(
+                                                    phi, manager,
+                                                );
+                                            }
+                                        }
+                                        // The engine always guards with `Implies`;
+                                        // a bare lemma is only a defensive fallback.
+                                        _ => {
+                                            let lit = self.encode(l, manager);
+                                            let _ = self.sat.add_clause([lit]);
+                                            self.collect_ground_candidates_from_term(l, manager);
+                                        }
+                                    }
+                                }
+                            }
+                            CleanVerdict::Saturated => {
+                                // Every quantifier satisfied by the model.
+                                self.unsat_core = None;
+                                return SolverResult::Sat;
+                            }
+                            CleanVerdict::Inconclusive | CleanVerdict::BudgetExhausted => {
+                                // A trigger-free axiom could not be verified, or
+                                // the budget was hit: the SOUND verdict is
+                                // `Unknown` (never a fabricated `unsat`/`sat`).
+                                return SolverResult::Unknown;
+                            }
+                        }
+                    }
 
                     mbqi_iteration += 1;
                     if mbqi_iteration >= max_mbqi_iterations {

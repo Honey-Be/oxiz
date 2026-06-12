@@ -6,12 +6,27 @@
 //! developed and z3-cross-checked standalone, drives OxiZ terms with no
 //! engine change.
 //!
-//! Soundness note: `substitute` delegates to `TermManager::substitute` (always
-//! correct for every `TermKind`), so the instance bodies are exact. Only the
-//! `view`/`children` structural mapping is allowed to be partial — an
-//! unmapped `TermKind` becomes `Opaque` (a leaf atom), which can only cost
-//! COMPLETENESS (a ground subterm not indexed ⇒ a missed candidate ⇒ a missed
-//! instantiation), never soundness (no spurious instance, no spurious unsat).
+//! Substitution note: `substitute` delegates to `TermManager::substitute`,
+//! which recurses through the full FO/UF/LIA fragment (uninterpreted
+//! applications, the boolean connectives, linear arithmetic) — the fragment
+//! the verus prelude's quantifier bodies live in, and the only fragment the
+//! clean engine is wired for today. (A latent OxiZ bug had `substitute`
+//! silently no-op on `Apply`, so `(P x)[x↦c]` stayed `(P x)` — an instance
+//! over the BOUND variable, vacuous; fixed in
+//! `oxiz-core/.../query.rs::substitute_cached`.)
+//!
+//! LIMITATION (completeness, not soundness): a bound variable inside a
+//! BV/string node or a NESTED quantifier is still left unsubstituted by the
+//! host `substitute`, so the produced "instance" would retain a free variable.
+//! The wiring guards against this — `Solver::check` DROPS any instance whose
+//! body is not variable-free (`free_vars(phi)` non-empty) — so such a body
+//! simply yields no lemma (sound, just incomplete). Broadening
+//! `substitute_cached` to BV/string/nested-quantifier bodies (to RECOVER that
+//! completeness) is a follow-up.
+//!
+//! The `view`/`children` structural mapping may also be partial — an unmapped
+//! `TermKind` becomes `Opaque` (a leaf atom), a missed candidate at worst,
+//! never a spurious instance or spurious unsat.
 
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;

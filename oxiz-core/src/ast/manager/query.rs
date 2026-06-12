@@ -441,7 +441,76 @@ impl TermManager {
                     self.mk_store(new_arr, new_idx, new_val)
                 }
             }
-            // For complex terms, just return as-is for now
+            // Uninterpreted function/predicate application. Substituting into
+            // the arguments is essential for quantifier instantiation — without
+            // it, `(P x)[x↦c]` silently stays `(P x)`, so an instance lemma is
+            // produced over the BOUND variable instead of the ground term (a
+            // missed instantiation / vacuous guard). The sort is preserved by
+            // substitution, so the original term's sort is reused exactly.
+            Some(TermKind::Apply { func, args }) => {
+                let new_args: SmallVec<[TermId; 4]> = args
+                    .iter()
+                    .map(|&a| self.substitute_cached(a, subst, cache))
+                    .collect();
+                if new_args.iter().zip(args.iter()).all(|(a, b)| a == b) {
+                    id
+                } else {
+                    let sort = self.get(id).map(|t| t.sort).unwrap_or(self.sorts.bool_sort);
+                    self.intern(TermKind::Apply { func, args: new_args }, sort)
+                }
+            }
+            Some(TermKind::Distinct(args)) => {
+                let new_args: SmallVec<[TermId; 4]> = args
+                    .iter()
+                    .map(|&a| self.substitute_cached(a, subst, cache))
+                    .collect();
+                if new_args.iter().zip(args.iter()).all(|(a, b)| a == b) {
+                    id
+                } else {
+                    let sort = self.get(id).map(|t| t.sort).unwrap_or(self.sorts.bool_sort);
+                    self.intern(TermKind::Distinct(new_args), sort)
+                }
+            }
+            Some(TermKind::Neg(arg)) => {
+                let new_arg = self.substitute_cached(arg, subst, cache);
+                if new_arg == arg {
+                    id
+                } else {
+                    self.mk_neg(new_arg)
+                }
+            }
+            Some(TermKind::Xor(a, b)) => {
+                let na = self.substitute_cached(a, subst, cache);
+                let nb = self.substitute_cached(b, subst, cache);
+                if na == a && nb == b {
+                    id
+                } else {
+                    self.mk_xor(na, nb)
+                }
+            }
+            Some(TermKind::Div(a, b)) => {
+                let na = self.substitute_cached(a, subst, cache);
+                let nb = self.substitute_cached(b, subst, cache);
+                if na == a && nb == b {
+                    id
+                } else {
+                    self.mk_div(na, nb)
+                }
+            }
+            Some(TermKind::Mod(a, b)) => {
+                let na = self.substitute_cached(a, subst, cache);
+                let nb = self.substitute_cached(b, subst, cache);
+                if na == a && nb == b {
+                    id
+                } else {
+                    self.mk_mod(na, nb)
+                }
+            }
+            // For the remaining (BV/string/quantifier/…) kinds, return as-is.
+            // NOTE: this is still a substitution gap for those theories — the
+            // FO/UF/LIA fragment above is complete, which covers the clean
+            // quantifier engine's instantiation needs; broadening the rest is a
+            // follow-up.
             Some(_) => id,
         };
 

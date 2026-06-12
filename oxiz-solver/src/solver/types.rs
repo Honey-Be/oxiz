@@ -263,6 +263,19 @@ pub struct SolverConfig {
     pub enable_inprocessing: bool,
     /// Inprocessing interval (number of conflicts between inprocessing)
     pub inprocessing_interval: u64,
+    /// Use the clean-room quantifier engine (`oxiz-mbqi`) for the model-based
+    /// instantiation phase instead of the legacy `mbqi/` subsystem.
+    ///
+    /// The clean engine is **sound by construction** — it never fabricates a
+    /// universe witness and only emits guarded ground instances drawn from the
+    /// real ground-term index, so the spurious-`unsat` bug class (e-match
+    /// self/sibling capture, fabricated `u!N` MBQI witnesses, dropped fuel
+    /// guards) is structurally impossible. It is currently less *complete*
+    /// than the legacy path (a trigger-free axiom it cannot model-verify yields
+    /// the sound `Unknown` rather than a decisive — and sometimes unsound —
+    /// verdict), so it is **off by default** and opted into by the
+    /// verifier-backend path. See `clean_mbqi.rs` and `oxiz-mbqi`.
+    pub clean_mbqi: bool,
 }
 
 impl Default for SolverConfig {
@@ -295,6 +308,7 @@ impl SolverConfig {
             enable_symmetry_breaking: false,
             enable_inprocessing: false, // No inprocessing for speed
             inprocessing_interval: 0,
+            clean_mbqi: false,
         }
     }
 
@@ -321,6 +335,7 @@ impl SolverConfig {
             enable_symmetry_breaking: false, // Still expensive
             enable_inprocessing: true,
             inprocessing_interval: 10000,
+            clean_mbqi: false,
         }
     }
 
@@ -347,6 +362,7 @@ impl SolverConfig {
             enable_symmetry_breaking: true, // Enable for hard problems
             enable_inprocessing: true,
             inprocessing_interval: 5000, // More frequent inprocessing
+            clean_mbqi: false,
         }
     }
 
@@ -373,6 +389,7 @@ impl SolverConfig {
             enable_symmetry_breaking: false,
             enable_inprocessing: false,
             inprocessing_interval: 0,
+            clean_mbqi: false,
         }
     }
 
