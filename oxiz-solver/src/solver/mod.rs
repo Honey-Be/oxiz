@@ -708,7 +708,14 @@ impl Solver {
                                             if !manager.free_vars(phi).is_empty() {
                                                 continue;
                                             }
-                                            let qlit = self.encode(q, manager);
+                                            // Reuse the quantifier's EXISTING literal — do NOT
+                                            // `encode(q)`, which re-runs the `Forall` arm and
+                                            // re-registers the quantifier with mbqi/ematch on
+                                            // every instance (state pollution).
+                                            let qlit = match self.term_to_var.get(&q) {
+                                                Some(&v) => oxiz_sat::Lit::pos(v),
+                                                None => self.encode(q, manager),
+                                            };
                                             if manager
                                                 .get(phi)
                                                 .is_some_and(|t| matches!(t.kind, TermKind::False))
