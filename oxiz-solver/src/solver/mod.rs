@@ -41,6 +41,14 @@ use theory_manager::TheoryManager;
 use trail::{ContextState, TrailOp};
 use types::{Constraint, ParsedArithConstraint, Polarity};
 
+/// Default wall-clock budget (milliseconds) for the MBQI quantifier-
+/// instantiation loop when no explicit `timeout_ms` is configured.  A pure
+/// non-termination guard: quantifier reasoning over an infinite domain is
+/// semi-decidable, so without it a genuinely-SAT `forall`-with-trigger axiom
+/// can spin forever.  On expiry the loop returns the sound `Unknown`.
+#[cfg(feature = "std")]
+const MBQI_NONTERMINATION_GUARD_MS: u64 = 3_000;
+
 /// Main CDCL(T) SMT Solver
 #[derive(Debug)]
 pub struct Solver {
@@ -252,6 +260,42 @@ impl Solver {
         self.mbqi.register_declared_const(term, sort);
     }
 
+    /// One round of trigger-based e-matching, asserting each new instantiation
+    /// lemma as a unit clause.  Returns `true` when e-matching is **saturated**
+    /// — it produced no new clauses and found no conflict — which is the signal
+    /// that the model-based (Phase 2) check may run.  Returns `false` when it
+    /// added clauses or a lemma closed the formula (an empty/false clause), so
+    /// the caller should re-solve before any model-based reasoning.
+    ///
+    /// Saturation terminates for `:pattern`-annotated axioms: each lemma is the
+    /// body specialised at a ground term matching the trigger, the match cache
+    /// dedups already-seen `(quantifier, substitution)` pairs, and a lemma adds
+    /// fresh trigger terms only when the axiom is genuinely recursive (bounded
+    /// then by the MBQI iteration cap and the wall-clock guard).
+    fn ematch_fixpoint_step(&mut self, manager: &mut TermManager) -> bool {
+        let lemmas = self.ematch_engine.match_round(manager).unwrap_or_default();
+        let mut added = 0usize;
+        for lemma in lemmas {
+            // Seed sub-terms of the instance as candidates so chained triggers
+            // can fire on the next round.
+            self.collect_ground_candidates_from_term(lemma, manager);
+            let lit = self.encode(lemma, manager);
+            if self.sat.add_clause([lit]) {
+                added += 1;
+                // Give the theory solvers the arithmetic structure of the new
+                // ground lemma, mirroring the model-based instantiation path.
+                self.add_arith_diseq_split(lemma, manager);
+                self.add_arith_eq_trichotomy(lemma, manager);
+                self.add_int_domain_clauses(lemma, manager);
+            } else {
+                // The lemma is inconsistent with the current clause set — the
+                // next SAT solve will surface `Unsat`.
+                return false;
+            }
+        }
+        added == 0
+    }
+
     /// Get a SAT variable for a term, then check satisfiability
     pub fn check(&mut self, manager: &mut TermManager) -> SolverResult {
         // Check for trivial unsat (false assertion)
@@ -336,7 +380,31 @@ impl Solver {
         let max_mbqi_iterations = 100;
         let mut mbqi_iteration = 0;
 
+        // Wall-clock backstop for the MBQI loop.  Quantifier instantiation over
+        // an infinite domain is only semi-decidable: a `forall`-with-`:pattern`
+        // axiom whose model is genuinely SAT (e.g. `y>0 ∧ ¬(Add(x,y)>0)` with
+        // `Add(a,b)=a+b`) can make the counterexample/enumeration path generate
+        // fresh ground terms without converging, so the iteration cap alone does
+        // not bound wall-clock.  Honour the configured `timeout_ms` if set, else
+        // apply a default non-termination guard.  On expiry the verdict is the
+        // SOUND `Unknown` (never a guessed sat/unsat).  Quantifier-free problems
+        // run the body once and never reach this.
+        #[cfg(feature = "std")]
+        let mbqi_deadline: Option<std::time::Instant> = {
+            let ms = if self.config.timeout_ms > 0 {
+                self.config.timeout_ms
+            } else {
+                MBQI_NONTERMINATION_GUARD_MS
+            };
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
+        };
+
         loop {
+            #[cfg(feature = "std")]
+            if self.has_quantifiers && mbqi_deadline.is_some_and(|d| std::time::Instant::now() >= d)
+            {
+                return SolverResult::Unknown;
+            }
             let sat_result = self.sat.solve_with_theory(&mut theory_manager);
             match sat_result {
                 SatResult::Unsat => {
@@ -357,134 +425,83 @@ impl Solver {
                     // Build partial model for MBQI
                     self.build_model(manager);
 
-                    // Run MBQI to check quantified formulas
-                    let model_assignments = self
-                        .model
-                        .as_ref()
-                        .map(|m| m.assignments().clone())
-                        .unwrap_or_default();
+                    // Phase 1 — e-matching to a fixpoint (see
+                    // `ematch_fixpoint_step`).  Pattern-triggered (`:pattern`)
+                    // instantiation is the sound, TERMINATING discipline for
+                    // axioms that carry triggers; running it first (a) catches
+                    // pattern conflicts — the axiom's `Add(2,3)=2+3` against an
+                    // asserted `Add(2,3)=6` — and (b) lets a pattern-saturated
+                    // model be reported `sat` without the enumerative blow-up
+                    // that model-based instantiation suffers over an infinite
+                    // domain.  Only when e-matching adds nothing new do we run
+                    // the model-based Phase-2 check (for the remaining,
+                    // pattern-FREE quantifiers that have no trigger to bound
+                    // them).  If it added clauses or closed the formula we fall
+                    // through to the loop tail and re-solve.
+                    let ematch_saturated = self.ematch_fixpoint_step(manager);
+                    if ematch_saturated {
+                        // Run MBQI to check quantified formulas
+                        let model_assignments = self
+                            .model
+                            .as_ref()
+                            .map(|m| m.assignments().clone())
+                            .unwrap_or_default();
 
-                    let mbqi_result = self.mbqi.check_with_model(&model_assignments, manager);
-                    match mbqi_result {
-                        MBQIResult::NoQuantifiers => {
-                            self.unsat_core = None;
-                            return SolverResult::Sat;
-                        }
-                        MBQIResult::Satisfied => {
-                            // All quantifiers satisfied by the current model.
-                            self.unsat_core = None;
-                            return SolverResult::Sat;
-                        }
-                        MBQIResult::InstantiationLimit => {
-                            // Too many instantiations - return unknown
-                            return SolverResult::Unknown;
-                        }
-                        MBQIResult::Conflict {
-                            quantifier: _,
-                            reason,
-                        } => {
-                            // Add conflict clause
-                            let lits: Vec<Lit> = reason
-                                .iter()
-                                .filter_map(|&t| self.term_to_var.get(&t).map(|&v| Lit::neg(v)))
-                                .collect();
-                            if !lits.is_empty() {
-                                self.sat.add_clause(lits);
+                        let mbqi_result = self.mbqi.check_with_model(&model_assignments, manager);
+                        match mbqi_result {
+                            MBQIResult::NoQuantifiers => {
+                                self.unsat_core = None;
+                                return SolverResult::Sat;
                             }
-                            // Continue loop
-                        }
-                        MBQIResult::NewInstantiations(instantiations) => {
-                            // Collect ground sub-terms (especially Skolem
-                            // applications) from instantiation results so they
-                            // become MBQI candidates in subsequent rounds.
-                            for inst in &instantiations {
-                                self.collect_ground_candidates_from_term(inst.result, manager);
+                            MBQIResult::Satisfied => {
+                                // All quantifiers satisfied by the current model.
+                                self.unsat_core = None;
+                                return SolverResult::Sat;
                             }
-
-                            // Collect domain/disequality info for pigeonhole
-                            let mut ph_domains: FxHashMap<TermId, (i64, i64)> =
-                                FxHashMap::default();
-                            let mut ph_diseqs: Vec<(TermId, TermId)> = Vec::new();
-
-                            // Add instantiation lemmas
-                            for inst in instantiations {
-                                // If the instantiation result is definitively False
-                                // (e.g., a nested Exists with no valid witness), add an
-                                // empty clause to signal immediate UNSAT.
-                                let is_false_result = manager
-                                    .get(inst.result)
-                                    .is_some_and(|t| matches!(t.kind, TermKind::False));
-                                if is_false_result {
-                                    self.sat.add_clause([] as [Lit; 0]);
-                                    break;
+                            MBQIResult::InstantiationLimit => {
+                                // Too many instantiations - return unknown
+                                return SolverResult::Unknown;
+                            }
+                            MBQIResult::Conflict {
+                                quantifier: _,
+                                reason,
+                            } => {
+                                // Add conflict clause
+                                let lits: Vec<Lit> = reason
+                                    .iter()
+                                    .filter_map(|&t| self.term_to_var.get(&t).map(|&v| Lit::neg(v)))
+                                    .collect();
+                                if !lits.is_empty() {
+                                    self.sat.add_clause(lits);
                                 }
-                                // Scan for pigeonhole patterns (recurses into Implies)
-                                self.scan_for_pigeonhole(
-                                    inst.result,
-                                    manager,
-                                    &mut ph_domains,
-                                    &mut ph_diseqs,
-                                );
-                                let lit = self.encode(inst.result, manager);
-                                let ok = self.sat.add_clause([lit]);
-                                let _ = ok;
-                                self.add_arith_diseq_split(inst.result, manager);
-                                self.add_arith_eq_trichotomy(inst.result, manager);
-                                self.add_int_domain_clauses(inst.result, manager);
+                                // Continue loop
                             }
-                            // Add pigeonhole exclusion clauses
-                            if !ph_diseqs.is_empty() && !ph_domains.is_empty() {
-                                self.add_pigeonhole_exclusions_from(
-                                    &ph_domains,
-                                    &ph_diseqs,
-                                    manager,
-                                );
-                            }
-
-                            // E-matching phase: find additional instantiations via trigger patterns
-                            let ematch_lemmas =
-                                self.ematch_engine.match_round(manager).unwrap_or_default();
-                            let mut new_clauses_added = 0usize;
-                            let mut ematch_unsat = false;
-                            for lemma in ematch_lemmas {
-                                let lit = self.encode(lemma, manager);
-                                if self.sat.add_clause([lit]) {
-                                    new_clauses_added += 1;
-                                } else {
-                                    ematch_unsat = true;
-                                    break;
+                            MBQIResult::NewInstantiations(instantiations) => {
+                                // Collect ground sub-terms (especially Skolem
+                                // applications) from instantiation results so they
+                                // become MBQI candidates in subsequent rounds.
+                                for inst in &instantiations {
+                                    self.collect_ground_candidates_from_term(inst.result, manager);
                                 }
-                            }
-                            if ematch_unsat || new_clauses_added > 0 {
-                                // SAT solver will process newly added clauses on next iteration
-                            }
-                            // Continue loop
-                        }
-                        MBQIResult::Unknown => {
-                            // Some evaluations produced symbolic residuals.
-                            // Generate blind instantiations (simplified) once
-                            // to seed the solver with ground lemmas for array
-                            // theory reasoning (pigeonhole, bounds, etc.).
-                            if !self.mbqi.blind_tried() {
-                                self.mbqi.mark_blind_tried();
-                                // Clear dedup cache so that blind instantiations with
-                                // corrected substitution results are not filtered out
-                                // as duplicates of earlier (broken) engine results.
-                                self.mbqi.clear_dedup_cache();
-                                let blind = self.mbqi.generate_blind_instantiations(manager);
+
+                                // Collect domain/disequality info for pigeonhole
                                 let mut ph_domains: FxHashMap<TermId, (i64, i64)> =
                                     FxHashMap::default();
                                 let mut ph_diseqs: Vec<(TermId, TermId)> = Vec::new();
-                                for inst in blind {
-                                    let is_false = manager
+
+                                // Add instantiation lemmas
+                                for inst in instantiations {
+                                    // If the instantiation result is definitively False
+                                    // (e.g., a nested Exists with no valid witness), add an
+                                    // empty clause to signal immediate UNSAT.
+                                    let is_false_result = manager
                                         .get(inst.result)
                                         .is_some_and(|t| matches!(t.kind, TermKind::False));
-                                    if is_false {
+                                    if is_false_result {
                                         self.sat.add_clause([] as [Lit; 0]);
                                         break;
                                     }
-                                    // Track domains and disequalities for pigeonhole
-                                    let _ = manager.get(inst.result);
+                                    // Scan for pigeonhole patterns (recurses into Implies)
                                     self.scan_for_pigeonhole(
                                         inst.result,
                                         manager,
@@ -492,65 +509,118 @@ impl Solver {
                                         &mut ph_diseqs,
                                     );
                                     let lit = self.encode(inst.result, manager);
-                                    let _ = self.sat.add_clause([lit]);
+                                    let ok = self.sat.add_clause([lit]);
+                                    let _ = ok;
                                     self.add_arith_diseq_split(inst.result, manager);
                                     self.add_arith_eq_trichotomy(inst.result, manager);
                                     self.add_int_domain_clauses(inst.result, manager);
                                 }
-                                // Add pigeonhole exclusion clauses directly
-                                // from the collected domains and disequalities.
-                                self.add_pigeonhole_exclusions_from(
-                                    &ph_domains,
-                                    &ph_diseqs,
-                                    manager,
-                                );
+                                // Add pigeonhole exclusion clauses
+                                if !ph_diseqs.is_empty() && !ph_domains.is_empty() {
+                                    self.add_pigeonhole_exclusions_from(
+                                        &ph_domains,
+                                        &ph_diseqs,
+                                        manager,
+                                    );
+                                }
+                                // (Trigger-based e-matching runs as Phase 1, before
+                                // this model-based path — see `ematch_fixpoint_step`.)
+                                // Continue loop
                             }
-                            // After 2 Unknown rounds, try finite instantiation:
-                            // for quantifiers with bounded integer guards like
-                            // (i >= 0 && i <= 3), enumerate all values and add
-                            // ground instances directly.
-                            if mbqi_iteration == 2 {
-                                let finite_insts =
-                                    self.mbqi.generate_finite_domain_instantiations(manager);
-                                if !finite_insts.is_empty() {
-                                    let mut ph_d: FxHashMap<TermId, (i64, i64)> =
+                            MBQIResult::Unknown => {
+                                // Some evaluations produced symbolic residuals.
+                                // Generate blind instantiations (simplified) once
+                                // to seed the solver with ground lemmas for array
+                                // theory reasoning (pigeonhole, bounds, etc.).
+                                if !self.mbqi.blind_tried() {
+                                    self.mbqi.mark_blind_tried();
+                                    // Clear dedup cache so that blind instantiations with
+                                    // corrected substitution results are not filtered out
+                                    // as duplicates of earlier (broken) engine results.
+                                    self.mbqi.clear_dedup_cache();
+                                    let blind = self.mbqi.generate_blind_instantiations(manager);
+                                    let mut ph_domains: FxHashMap<TermId, (i64, i64)> =
                                         FxHashMap::default();
-                                    let mut ph_q: Vec<(TermId, TermId)> = Vec::new();
-                                    for inst in &finite_insts {
-                                        let simplified =
-                                            self.mbqi.deep_simplify(inst.result, manager);
-                                        // Skip tautologies
-                                        if manager
-                                            .get(simplified)
-                                            .is_some_and(|t| matches!(t.kind, TermKind::True))
-                                        {
-                                            continue;
+                                    let mut ph_diseqs: Vec<(TermId, TermId)> = Vec::new();
+                                    for inst in blind {
+                                        let is_false = manager
+                                            .get(inst.result)
+                                            .is_some_and(|t| matches!(t.kind, TermKind::False));
+                                        if is_false {
+                                            self.sat.add_clause([] as [Lit; 0]);
+                                            break;
                                         }
+                                        // Track domains and disequalities for pigeonhole
+                                        let _ = manager.get(inst.result);
                                         self.scan_for_pigeonhole(
-                                            simplified, manager, &mut ph_d, &mut ph_q,
+                                            inst.result,
+                                            manager,
+                                            &mut ph_domains,
+                                            &mut ph_diseqs,
                                         );
-                                        let lit = self.encode(simplified, manager);
+                                        let lit = self.encode(inst.result, manager);
                                         let _ = self.sat.add_clause([lit]);
-                                        self.add_arith_diseq_split(simplified, manager);
-                                        self.add_int_domain_clauses(simplified, manager);
+                                        self.add_arith_diseq_split(inst.result, manager);
+                                        self.add_arith_eq_trichotomy(inst.result, manager);
+                                        self.add_int_domain_clauses(inst.result, manager);
                                     }
-                                    if !ph_q.is_empty() && !ph_d.is_empty() {
-                                        self.add_pigeonhole_exclusions_from(&ph_d, &ph_q, manager);
+                                    // Add pigeonhole exclusion clauses directly
+                                    // from the collected domains and disequalities.
+                                    self.add_pigeonhole_exclusions_from(
+                                        &ph_domains,
+                                        &ph_diseqs,
+                                        manager,
+                                    );
+                                }
+                                // After 2 Unknown rounds, try finite instantiation:
+                                // for quantifiers with bounded integer guards like
+                                // (i >= 0 && i <= 3), enumerate all values and add
+                                // ground instances directly.
+                                if mbqi_iteration == 2 {
+                                    let finite_insts =
+                                        self.mbqi.generate_finite_domain_instantiations(manager);
+                                    if !finite_insts.is_empty() {
+                                        let mut ph_d: FxHashMap<TermId, (i64, i64)> =
+                                            FxHashMap::default();
+                                        let mut ph_q: Vec<(TermId, TermId)> = Vec::new();
+                                        for inst in &finite_insts {
+                                            let simplified =
+                                                self.mbqi.deep_simplify(inst.result, manager);
+                                            // Skip tautologies
+                                            if manager
+                                                .get(simplified)
+                                                .is_some_and(|t| matches!(t.kind, TermKind::True))
+                                            {
+                                                continue;
+                                            }
+                                            self.scan_for_pigeonhole(
+                                                simplified, manager, &mut ph_d, &mut ph_q,
+                                            );
+                                            let lit = self.encode(simplified, manager);
+                                            let _ = self.sat.add_clause([lit]);
+                                            self.add_arith_diseq_split(simplified, manager);
+                                            self.add_int_domain_clauses(simplified, manager);
+                                        }
+                                        if !ph_q.is_empty() && !ph_d.is_empty() {
+                                            self.add_pigeonhole_exclusions_from(
+                                                &ph_d, &ph_q, manager,
+                                            );
+                                        }
                                     }
                                 }
+                                if mbqi_iteration >= 10 {
+                                    // After exhausting blind and finite domain
+                                    // instantiation attempts, assume the model
+                                    // satisfies all quantifiers.  This is sound
+                                    // under the incomplete-but-practical MBQI
+                                    // heuristic used by Z3 and similar solvers.
+                                    self.unsat_core = None;
+                                    return SolverResult::Sat;
+                                }
+                                // Continue MBQI loop
                             }
-                            if mbqi_iteration >= 10 {
-                                // After exhausting blind and finite domain
-                                // instantiation attempts, assume the model
-                                // satisfies all quantifiers.  This is sound
-                                // under the incomplete-but-practical MBQI
-                                // heuristic used by Z3 and similar solvers.
-                                self.unsat_core = None;
-                                return SolverResult::Sat;
-                            }
-                            // Continue MBQI loop
                         }
-                    }
+                    } // end `if ematch_saturated` (Phase 2)
 
                     mbqi_iteration += 1;
                     if mbqi_iteration >= max_mbqi_iterations {

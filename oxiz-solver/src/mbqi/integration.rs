@@ -113,10 +113,21 @@ impl MBQIIntegration {
         };
 
         match &t.kind {
-            oxiz_core::ast::TermKind::Forall { vars, body, .. } => {
+            oxiz_core::ast::TermKind::Forall {
+                vars,
+                body,
+                patterns,
+            } => {
                 let bound_vars: SmallVec<[(Spur, SortId); 4]> = vars.iter().copied().collect();
-                self.quantifiers
-                    .push(QuantifiedFormula::new(term, bound_vars, *body, true));
+                let mut qf = QuantifiedFormula::new(term, bound_vars, *body, true);
+                // Capture the `:pattern` triggers so the model-based search can
+                // tell a trigger-guided axiom (handled by Phase-1 e-matching)
+                // from a trigger-free one (which it must enumerate).
+                qf.patterns = patterns
+                    .iter()
+                    .map(|p| p.iter().copied().collect())
+                    .collect();
+                self.quantifiers.push(qf);
                 self.stats.num_quantifiers += 1;
             }
             oxiz_core::ast::TermKind::Exists { vars, body, .. } => {
@@ -215,6 +226,21 @@ impl MBQIIntegration {
         let quantifiers: Vec<_> = self.quantifiers.to_vec();
         for quantifier in &quantifiers {
             if !quantifier.can_instantiate() {
+                continue;
+            }
+
+            // Trigger-guided axioms are instantiated by Phase-1 e-matching
+            // (`Solver::ematch_fixpoint_step`), which the caller drives to a
+            // fixpoint BEFORE this model-based pass runs.  Re-enumerating them
+            // here would (a) duplicate that work and (b) blow up: the
+            // counterexample generator builds `f(v1,v2)` for candidate domain
+            // values, each a fresh trigger term that re-fires e-matching, and
+            // over an infinite integer domain it never converges.  So skip
+            // them — once e-matching has saturated, a `:pattern` quantifier is
+            // satisfied at every relevant ground term (the standard trigger
+            // semantics z3/cvc5 use).  Trigger-FREE quantifiers have no such
+            // bound and MUST be enumerated, so they fall through.
+            if !quantifier.patterns.is_empty() {
                 continue;
             }
 

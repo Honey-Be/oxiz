@@ -120,7 +120,45 @@ impl<'a> Parser<'a> {
         }
 
         let var_refs: Vec<_> = vars.iter().map(|(n, s)| (n.as_str(), *s)).collect();
-        Ok(self.manager.mk_forall(var_refs, body))
+        // Thread the body's `:pattern` triggers (stored as annotations by the
+        // `!` form) into the quantifier.  Without this the `Forall` carries no
+        // patterns, so the model-based MBQI engine cannot tell a trigger-guided
+        // axiom (which e-matching handles, terminating) from a trigger-free one
+        // (which it must enumerate) — and enumerating a `:pattern` axiom over an
+        // infinite domain does not converge.
+        let patterns = self.collect_trigger_patterns(body);
+        if patterns.is_empty() {
+            Ok(self.manager.mk_forall(var_refs, body))
+        } else {
+            Ok(self.manager.mk_forall_with_patterns(var_refs, body, patterns))
+        }
+    }
+
+    /// Extract the `:pattern` trigger groups annotated on `body` (by the `!`
+    /// form).  Each `:pattern (t1 t2 …)` becomes one trigger group `[t1,t2,…]`.
+    pub(super) fn collect_trigger_patterns(&self, body: TermId) -> Vec<Vec<TermId>> {
+        use super::AttributeValue;
+        let Some(attrs) = self.annotations.get(&body) else {
+            return Vec::new();
+        };
+        attrs
+            .iter()
+            .filter(|a| a.key == "pattern")
+            .filter_map(|a| a.value.as_ref())
+            .map(|v| match v {
+                // `:pattern (t1 t2 …)` parses to an SExpr of the trigger terms.
+                AttributeValue::SExpr(items) => items
+                    .iter()
+                    .filter_map(|i| match i {
+                        AttributeValue::Term(t) => Some(*t),
+                        _ => None,
+                    })
+                    .collect(),
+                AttributeValue::Term(t) => vec![*t],
+                _ => Vec::new(),
+            })
+            .filter(|g: &Vec<TermId>| !g.is_empty())
+            .collect()
     }
 
     /// Parse an exists binder: (exists ((name sort) ...) body)

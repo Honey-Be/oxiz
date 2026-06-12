@@ -275,6 +275,67 @@ pub fn parse_script(input: &str, manager: &mut TermManager) -> Result<Vec<Comman
     Ok(commands)
 }
 
+/// Persistent parser symbol tables — the declarations a front-end accumulates
+/// across multiple [`parse_script_with_env`] calls.
+///
+/// Each `parse_script` call builds a fresh [`Parser`] whose declared-function,
+/// constant, sort-alias, defined-function and datatype-constructor tables are
+/// local to that call.  When a front-end feeds commands ONE at a time (a
+/// streaming stdin loop, or an embedder replaying commands incrementally), a
+/// later `(assert (... (f x) ...))` is parsed with an empty table and a
+/// non-Bool function application like `(f x)` silently defaults to the `Bool`
+/// sort (see `terms.rs`), which breaks every theory's reasoning about it
+/// (e.g. `(= (f 3) 3)` and `(= (f 3) 4)` are no longer recognised as a
+/// contradiction).  `ParserEnv` carries these tables forward so a function's
+/// declared sort is known on every subsequent command.
+#[derive(Debug, Clone, Default)]
+pub struct ParserEnv {
+    /// Declared constants (`declare-const`, nullary `declare-fun`).
+    pub constants: FxHashMap<String, SortId>,
+    /// Declared functions (`declare-fun` with ≥1 argument): name → (args, ret).
+    pub functions: FxHashMap<String, (Vec<SortId>, SortId)>,
+    /// Sort aliases (`define-sort`): name → (params, body).
+    pub sort_aliases: FxHashMap<String, (Vec<String>, String)>,
+    /// Defined functions (`define-fun`): name → (params, body term).
+    pub function_defs: FxHashMap<String, (Vec<(String, String)>, TermId)>,
+    /// Datatype constructor names → their datatype sort.
+    pub dt_constructors: FxHashMap<String, SortId>,
+}
+
+/// Parse an SMT-LIB2 script, seeding the parser with `env` (the declarations
+/// from prior commands) and writing any new declarations back into `env`.
+///
+/// Use this instead of [`parse_script`] whenever the script is one slice of a
+/// larger session fed across calls — it keeps declared-function sorts visible
+/// on later commands so applications resolve to their real sort rather than
+/// defaulting to `Bool`.
+pub fn parse_script_with_env(
+    input: &str,
+    manager: &mut TermManager,
+    env: &mut ParserEnv,
+) -> Result<Vec<Command>> {
+    let mut parser = Parser::new(input, manager);
+    // Seed from prior declarations.
+    parser.constants = env.constants.clone();
+    parser.functions = env.functions.clone();
+    parser.sort_aliases = env.sort_aliases.clone();
+    parser.function_defs = env.function_defs.clone();
+    parser.dt_constructors = env.dt_constructors.clone();
+
+    let mut commands = Vec::new();
+    while let Some(cmd) = parser.parse_command()? {
+        commands.push(cmd);
+    }
+
+    // Persist declarations made by this slice for the next call.
+    env.constants = parser.constants;
+    env.functions = parser.functions;
+    env.sort_aliases = parser.sort_aliases;
+    env.function_defs = parser.function_defs;
+    env.dt_constructors = parser.dt_constructors;
+    Ok(commands)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

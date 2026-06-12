@@ -7,7 +7,7 @@ use oxiz_core::ast::{TermId, TermKind, TermManager};
 #[cfg(feature = "std")]
 use oxiz_core::error::Result;
 #[cfg(feature = "std")]
-use oxiz_core::smtlib::{Command, parse_script};
+use oxiz_core::smtlib::{Command, ParserEnv, parse_script_with_env};
 use oxiz_core::sort::SortId;
 #[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
@@ -111,6 +111,13 @@ pub struct Context {
     fun_name_to_index: crate::prelude::HashMap<String, usize>,
     /// Last check-sat result
     last_result: Option<SolverResult>,
+    /// Persistent parser symbol tables (declared funcs / consts / sorts /
+    /// defined funcs / datatype constructors), carried across `execute_script`
+    /// calls so that a function's declared sort is known on every command even
+    /// when a front-end feeds them one at a time (streaming stdin, embedded
+    /// per-command replay).  Without this a later `(f x)` defaults to `Bool`
+    /// and theory reasoning over it silently breaks.
+    parser_env: ParserEnv,
     /// Options
     options: crate::prelude::HashMap<String, String>,
     /// Optional path for binary proof logging.
@@ -145,6 +152,7 @@ impl Context {
             fun_stack: Vec::new(),
             fun_name_to_index: crate::prelude::HashMap::new(),
             last_result: None,
+            parser_env: ParserEnv::default(),
             options: crate::prelude::HashMap::new(),
             #[cfg(feature = "std")]
             proof_log_path: None,
@@ -856,7 +864,14 @@ impl Context {
     /// Execute an SMT-LIB2 script
     #[cfg(feature = "std")]
     pub fn execute_script(&mut self, script: &str) -> Result<Vec<String>> {
-        let commands = parse_script(script, &mut self.terms)?;
+        // Seed the parser with declarations from prior `execute_script` calls
+        // (and persist this script's) so that applications of a function
+        // declared in an EARLIER call still resolve to the function's real
+        // sort.  A fed-one-command-at-a-time session (streaming CLI, embedded
+        // per-command replay) would otherwise re-parse each command with an
+        // empty symbol table, defaulting a non-Bool `(f x)` to `Bool` and
+        // breaking theory reasoning over it.
+        let commands = parse_script_with_env(script, &mut self.terms, &mut self.parser_env)?;
         let mut output = Vec::new();
 
         for cmd in commands {

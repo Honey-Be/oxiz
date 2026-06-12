@@ -792,6 +792,42 @@ impl<'a> TheoryManager<'a> {
                         [array_node, index_node],
                     );
                 }
+                TermKind::IntConst(n) => {
+                    // Maintain pairwise disequalities between *distinct* integer
+                    // constant VALUES, keyed by a single canonical EUF node per
+                    // value (mirrors `intern_term_deep` and the `BitVecConst` arm
+                    // below).  Without this, an equality chain that merges a UF
+                    // term of integer sort with two distinct literals — e.g.
+                    // `f(3)=3`, `f(3)=4`, or the MBQI instance `f(3)=3` against an
+                    // asserted `f(3)=4` — lands `3` and `4` in one congruence class
+                    // with no `3 != 4` edge, so EUF reports no conflict and the
+                    // application term never reaches the ArithSolver (it is not a
+                    // parsed linear constraint).  The result was an unsound `sat`
+                    // (the `forall a. f(a)=a; f(3)=4` e-matching repro returned
+                    // `sat`; see docs/QUANTIFIER_EMATCH_SOUNDNESS_BUG.md).
+                    //
+                    // A disequality between two genuinely distinct constant values
+                    // is a tautology, so it can only fire a conflict when asserted
+                    // equalities have *already* forced `3 = 4` — a real
+                    // contradiction, never a spurious one.  Numeric *inequality*
+                    // reasoning over arithmetic VARIABLES stays in the ArithSolver;
+                    // this only pins distinct ground literals apart in EUF.
+                    if let Some(val) = n.to_i64() {
+                        let new_node = self.euf.intern(term);
+                        if let Some(&canonical) = self.interned_int_constants.get(&val) {
+                            let _ = self.euf.merge(new_node, canonical, term);
+                            return canonical;
+                        }
+                        let diseq_targets: Vec<u32> =
+                            self.interned_int_constants.values().copied().collect();
+                        for other_node in diseq_targets {
+                            self.euf.assert_diseq(new_node, other_node, term);
+                        }
+                        self.interned_int_constants.insert(val, new_node);
+                        return new_node;
+                    }
+                    // BigInt too large for i64 — fall through to plain intern.
+                }
                 TermKind::BitVecConst { value, width } => {
                     // Register the BV constant as an EUF node and maintain pairwise
                     // disequalities between *distinct* same-width constant values.

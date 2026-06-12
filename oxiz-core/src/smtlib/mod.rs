@@ -10,5 +10,5 @@ mod parser;
 mod printer;
 
 pub use lexer::{Lexer, Token, TokenKind};
-pub use parser::{Command, parse_script, parse_term};
+pub use parser::{Command, ParserEnv, parse_script, parse_script_with_env, parse_term};
 pub use printer::Printer;
