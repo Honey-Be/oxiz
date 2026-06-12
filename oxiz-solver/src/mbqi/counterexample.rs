@@ -218,7 +218,7 @@ impl CounterExampleGenerator {
         self.stats.num_searches += 1;
 
         // Build candidate lists for each bound variable
-        let candidates = self.build_candidate_lists(&quantifier.bound_vars, model, manager);
+        let candidates = self.build_candidate_lists(&quantifier.bound_vars, model, manager, true);
 
         // Enumerate combinations of candidates
         let combinations = self.enumerate_combinations(
@@ -297,18 +297,28 @@ impl CounterExampleGenerator {
         }
     }
 
-    /// Build candidate lists for bound variables
+    /// Build candidate lists for bound variables.
+    ///
+    /// `include_defaults` controls Strategy 3 (synthetic small-integer / Bool
+    /// values).  With it `false` the domain is restricted to terms that already
+    /// exist in the problem — the universe of an uninterpreted sort plus the
+    /// current model's witnesses — which is what conflict-driven instantiation
+    /// ([`Self::generate_ground_conflicts`]) ranges over: instantiating only at
+    /// existing ground terms keeps the search finite and never fabricates a
+    /// fresh `f(v)` that would re-trigger e-matching.  The synthetic-value cache
+    /// is bypassed in that mode so the two domains don't contaminate each other.
     fn build_candidate_lists(
         &mut self,
         bound_vars: &[(Spur, SortId)],
         model: &CompletedModel,
         manager: &mut TermManager,
+        include_defaults: bool,
     ) -> Vec<Vec<TermId>> {
         let mut result = Vec::new();
 
         for &(_var_name, sort) in bound_vars {
-            // Check cache first
-            if let Some(cached) = self.candidate_cache.get(&sort) {
+            // Check cache first (only the full, defaults-included domain is cached).
+            if include_defaults && let Some(cached) = self.candidate_cache.get(&sort) {
                 result.push(cached.clone());
                 continue;
             }
@@ -330,19 +340,80 @@ impl CounterExampleGenerator {
                 }
             }
 
-            // Strategy 3: Add default values based on sort
-            self.add_default_candidates(sort, &mut candidates, manager);
+            // Strategy 3: Add default values based on sort (full domain only).
+            if include_defaults {
+                self.add_default_candidates(sort, &mut candidates, manager);
+            }
 
             // Limit candidates
             candidates.truncate(self.max_candidates_per_var);
 
-            // Cache for future use
-            self.candidate_cache.insert(sort, candidates.clone());
+            // Cache for future use (full domain only).
+            if include_defaults {
+                self.candidate_cache.insert(sort, candidates.clone());
+            }
 
             result.push(candidates);
         }
 
         result
+    }
+
+    /// **Conflict-driven instantiation (CDQI).**  Find instantiations of the
+    /// quantifier at EXISTING ground terms whose body is *false* under the
+    /// current model — i.e. instances that immediately conflict with the ground
+    /// state.  Unlike [`Self::generate`] this fabricates no synthetic domain
+    /// values, so it is cheap, terminating, and its lemmas are guaranteed to
+    /// prune (a conflicting instance refutes the candidate model in one step).
+    /// Returns the conflicting counterexamples, best-quality first.
+    pub fn generate_ground_conflicts(
+        &mut self,
+        quantifier: &QuantifiedFormula,
+        model: &CompletedModel,
+        manager: &mut TermManager,
+    ) -> Vec<CounterExample> {
+        let candidates = self.build_candidate_lists(&quantifier.bound_vars, model, manager, false);
+        if candidates.iter().any(|c| c.is_empty()) {
+            return Vec::new();
+        }
+        let combinations = self.enumerate_combinations(
+            &candidates,
+            self.max_candidates_per_var,
+            self.max_cex_per_quantifier * 20,
+        );
+
+        let mut conflicts = Vec::new();
+        for combo in combinations {
+            if conflicts.len() >= self.max_cex_per_quantifier {
+                break;
+            }
+            let mut assignment = FxHashMap::default();
+            for (i, &candidate) in combo.iter().enumerate() {
+                if let Some(var_name) = quantifier.var_name(i) {
+                    assignment.insert(var_name, candidate);
+                }
+            }
+            let substituted = self.apply_substitution(quantifier.body, &assignment, manager);
+            let evaluated = self.evaluate_under_model(substituted, model, manager);
+            // A conflict is a counterexample that resolved to a *concrete*
+            // false (universal) — only those are guaranteed to prune.
+            if self.is_ground_boolean(evaluated, manager)
+                && self.is_counterexample(evaluated, quantifier.is_universal, manager)
+            {
+                let mut cex =
+                    CounterExample::new(quantifier.term, assignment, combo, model.generation);
+                cex.body_value = Some(evaluated);
+                cex.calculate_quality(manager);
+                conflicts.push(cex);
+            }
+        }
+        conflicts.sort_by(|a, b| {
+            b.quality
+                .partial_cmp(&a.quality)
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        conflicts.truncate(self.max_cex_per_quantifier);
+        conflicts
     }
 
     /// Add default candidate values for a sort

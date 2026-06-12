@@ -124,7 +124,11 @@ fn axiomatized_add_consistent_ground_fact_is_sat() {
         "(assert (= (Add 2 3) 5))",
         "(check-sat)",
     ]);
-    assert_eq!(r, SolverResult::Sat, "Add(2,3)=5 is consistent with the axiom");
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "Add(2,3)=5 is consistent with the axiom"
+    );
 }
 
 #[test]
@@ -176,4 +180,42 @@ fn axiomatized_add_satisfiable_countermodel_is_sat() {
         "(check-sat)",
     ]);
     assert_eq!(r, SolverResult::Sat, "a countermodel exists (x ≪ 0)");
+}
+
+// --- Conflict-Driven Quantifier Instantiation (CDQI) ---------------------
+// A TRIGGER-FREE universal (no `:pattern`) is handled by the model-based
+// path. CDQI instantiates it at terms that ALREADY exist and keeps the
+// instance whose body is false under the model — a conflicting instance that
+// prunes in one step, without fabricating synthetic domain values.
+
+#[test]
+fn cdqi_finds_a_conflict_at_an_existing_ground_term() {
+    // ∀a. f(a)>0 (NO pattern), with the existing ground term f(7) forced to
+    // -3. CDQI instantiates at a=7 (an existing term), the body `f(7)>0` is
+    // false → conflict → unsat. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(declare-const c Int)",
+        "(assert (forall ((a Int)) (> (f a) 0)))",
+        "(assert (= c (f 7)))",
+        "(assert (= c (- 3)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "CDQI must instantiate at a=7");
+}
+
+#[test]
+fn cdqi_no_false_conflict_when_existing_terms_are_consistent() {
+    // Same axiom, but f(7)=5 is consistent with ∀a. f(a)>0 — CDQI finds no
+    // conflicting instance over the existing terms, so the model stands.
+    // (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(declare-const c Int)",
+        "(assert (forall ((a Int)) (> (f a) 0)))",
+        "(assert (= c (f 7)))",
+        "(assert (= c 5))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat);
 }

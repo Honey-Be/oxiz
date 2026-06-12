@@ -249,8 +249,39 @@ impl MBQIIntegration {
             self.cex_generator
                 .inject_extra_candidates(&self.extra_candidates);
 
-            // Use the counterexample generator directly to find
-            // assignments that falsify the quantifier body
+            // Conflict-Driven Quantifier Instantiation (CDQI), tried FIRST.
+            // Find an instance over terms that ALREADY exist in the problem
+            // whose body is false under the current model — a conflicting
+            // instance that refutes the candidate model in one step.  Because
+            // it fabricates no synthetic domain values it is cheap and its
+            // lemmas are guaranteed to prune, so when it fires we add those
+            // (the strongest, most relevant lemmas) and skip the constructing
+            // enumeration for this quantifier this round.  (Reynolds et al.,
+            // "Finding Conflicting Instances of Quantified Formulas in SMT",
+            // FMCAD 2014.)
+            let cdqi =
+                self.cex_generator
+                    .generate_ground_conflicts(quantifier, &completed_model, manager);
+            if !cdqi.is_empty() {
+                self.stats.num_counterexamples += cdqi.len();
+                for cex in &cdqi {
+                    if !self.budget.consume(quantifier.term, 1) {
+                        break;
+                    }
+                    let ground_body =
+                        self.apply_substitution(quantifier.body, &cex.assignment, manager);
+                    let inst = cex.to_instantiation(ground_body);
+                    if !self.is_duplicate(&inst) {
+                        self.record_instantiation(&inst);
+                        callback.on_instantiation(&inst);
+                        all_instantiations.push(inst);
+                    }
+                }
+                continue;
+            }
+
+            // No conflicting instance over existing terms — fall back to the
+            // model-based search, which may fabricate domain values.
             let cex_result = self
                 .cex_generator
                 .generate(quantifier, &completed_model, manager);
