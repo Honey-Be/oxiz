@@ -72,6 +72,18 @@ pub(crate) struct TheoryManager {
     processed_count: usize,
     /// Theory checking mode
     theory_mode: TheoryMode,
+    /// Whether the `arith` stale-bound suppression guards are ACTIVE.
+    ///
+    /// A stale-bound pseudo-conflict is an atom left in the simplex under both
+    /// polarities by a SAT backtrack the theory frame did not retract; the
+    /// guards suppress it (else a spurious UNSAT). The §4 lock-step hooks driver
+    /// makes such a frame UNREPRESENTABLE (per-literal `unassign_hook` retracts
+    /// the bound the instant its literal leaves the trail), so the guards are
+    /// DEAD on the hooks path and are switched OFF there — both to realise the
+    /// "make it unrepresentable, not guarded" thesis and to keep the hooks path
+    /// from masking a lock-step bug. The legacy `TheoryCallback` fallback has no
+    /// such guarantee, so the guards stay ON for it. (`true` = legacy.)
+    suppress_stale_bounds: bool,
     /// Pending assignments for lazy theory checking
     pending_assignments: Vec<(Lit, bool)>,
     /// §4 hooks path (Phase 2b): theory propagations captured during the eager
@@ -524,6 +536,7 @@ impl TheoryManager {
         max_conflicts: u64,
         max_decisions: u64,
         has_bv_arith_ops: bool,
+        suppress_stale_bounds: bool,
     ) -> Self {
         let TheoryParts {
             manager,
@@ -550,6 +563,7 @@ impl TheoryManager {
             level_stack: vec![0],
             processed_count: 0,
             theory_mode,
+            suppress_stale_bounds,
             pending_assignments: Vec::new(),
             pending_theory_propagations: Vec::new(),
             pending_arith_eq_reasons: Vec::new(),
@@ -700,7 +714,9 @@ impl TheoryManager {
                         // assertions of one atom under opposite polarities left
                         // in the simplex by a SAT backtrack the theory frame did
                         // not retract); reporting it would be a spurious UNSAT.
-                        if !self.arith.last_conflict_is_stale_bound() {
+                        if !self.suppress_stale_bounds
+                            || !self.arith.last_conflict_is_stale_bound()
+                        {
                             let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
                             return TheoryCheckResult::Conflict(conflict_lits);
                         }
@@ -1253,7 +1269,9 @@ impl TheoryManager {
                         use oxiz_theories::TheoryCheckResult as TheoryCheckResultEnum;
                         if let Ok(TheoryCheckResultEnum::Unsat(conflict_terms)) = self.arith.check()
                         {
-                            if !self.arith.last_conflict_is_stale_bound() {
+                            if !self.suppress_stale_bounds
+                                || !self.arith.last_conflict_is_stale_bound()
+                            {
                                 let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
                                 return TheoryCheckResult::Conflict(conflict_lits);
                             }
@@ -1661,7 +1679,9 @@ impl TheoryManager {
                             // in the simplex under both polarities by a SAT
                             // backtrack the theory frame did not retract) — it is
                             // satisfiable and reporting it yields spurious UNSAT.
-                            if !self.arith.last_conflict_is_stale_bound() {
+                            if !self.suppress_stale_bounds
+                                || !self.arith.last_conflict_is_stale_bound()
+                            {
                                 let conflict_lits =
                                     self.terms_to_conflict_clause(&conflict_terms);
                                 return TheoryCheckResult::Conflict(conflict_lits);
@@ -1947,7 +1967,7 @@ impl TheoryManager {
                         // theory frame did not retract) — it is satisfiable, so
                         // reporting it would be a spurious UNSAT.  Fall through to
                         // the model-based combination check instead.
-                        if self.arith.last_conflict_is_stale_bound() {
+                        if self.suppress_stale_bounds && self.arith.last_conflict_is_stale_bound() {
                             return self.model_based_combination();
                         }
 

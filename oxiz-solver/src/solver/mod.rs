@@ -397,6 +397,9 @@ impl Solver {
             self.config.max_conflicts,
             self.config.max_decisions,
             self.has_bv_arith_ops,
+            // Stale-bound suppression is needed ONLY by the legacy driver; the
+            // lock-step hooks path makes a stale frame unrepresentable.
+            !self.config.use_hooks_driver,
         )
     }
 
