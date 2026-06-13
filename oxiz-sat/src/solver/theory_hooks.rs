@@ -59,8 +59,24 @@ pub trait TheoryHooks: Send + Sync + core::any::Any {
     /// gap — `backtrack_to_size`/`clear`).
     fn pop_frame(&mut self, level: u32);
 
-    /// A full theory check at a propagation fixpoint (the completeness oracle).
+    /// A theory check at a propagation fixpoint. Fired by the driver after EVERY
+    /// Boolean fixpoint, so a theory should keep it CHEAP — the incremental
+    /// per-assignment work (assert each newly-trail'd atom, surface a direct
+    /// conflict, emit a theory propagation). The expensive global consistency
+    /// check belongs in `final_check_complete`.
     fn final_check(&mut self) -> TheoryStep;
+
+    /// The COMPLETE theory check, fired by the driver only once the SAT
+    /// assignment is total (no branch variable left) — the last gate before
+    /// `Sat`. A theory whose `final_check` is already complete need not override
+    /// this (the default delegates to `final_check`); a theory that defers an
+    /// expensive global consistency battery (congruence-closure conflict scan,
+    /// simplex feasibility, model-based combination) runs it HERE so it executes
+    /// once per full assignment instead of at every intermediate fixpoint. It
+    /// must be sound-complete: returning `Ok` authorises the `Sat` verdict.
+    fn final_check_complete(&mut self) -> TheoryStep {
+        self.final_check()
+    }
 
     /// Model-evaluation oracle: the theory's value for `atom`, if determined.
     fn eval(&mut self, atom: Var) -> Option<bool>;

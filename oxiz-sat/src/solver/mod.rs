@@ -1432,9 +1432,45 @@ impl Solver {
                 let lit = if polarity { Lit::pos(var) } else { Lit::neg(var) };
                 self.trail.assign_decision(lit); // fires assign_hook
             } else {
-                // All variables assigned and the theory is at a fixpoint ⇒ SAT.
-                self.save_model();
-                return SolverResult::Sat;
+                // All variables assigned. Run the COMPLETE theory check — the
+                // expensive global consistency battery a theory defers to here so
+                // it executes once per full assignment, not at every intermediate
+                // fixpoint (`final_check`). Only a clean complete check is `Sat`.
+                let step = match self.trail.theory_mut() {
+                    Some(t) => t.final_check_complete(),
+                    None => TheoryStep::Ok,
+                };
+                match step {
+                    TheoryStep::Ok => {
+                        self.save_model();
+                        return SolverResult::Sat;
+                    }
+                    TheoryStep::Conflict { explanation } => {
+                        if self.handle_theory_conflict_hooks(&explanation).is_unsat() {
+                            return SolverResult::Unsat;
+                        }
+                        // Conflict resolved (learn + backtrack) — keep solving.
+                    }
+                    TheoryStep::Propagate { lit, reason } => {
+                        // A propagation at a TOTAL assignment is degenerate (every
+                        // literal is decided). Route it through the same value check
+                        // the inner loop uses: satisfied ⇒ Sat; falsified ⇒ conflict.
+                        match self.trail.lit_value(lit) {
+                            LBool::True | LBool::Undef => {
+                                self.save_model();
+                                return SolverResult::Sat;
+                            }
+                            LBool::False => {
+                                let mut conflict_lits: SmallVec<[Lit; 16]> = SmallVec::new();
+                                conflict_lits.push(lit);
+                                conflict_lits.extend(reason.explanation.iter().copied());
+                                if self.handle_theory_conflict_hooks(&conflict_lits).is_unsat() {
+                                    return SolverResult::Unsat;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

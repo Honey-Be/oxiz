@@ -5,7 +5,7 @@ use crate::prelude::*;
 use num_rational::Rational64;
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
-use oxiz_sat::{Lit, TheoryCallback, TheoryCheckResult, TheoryHooks, TheoryStep, Var};
+use oxiz_sat::{Lit, TheoryCallback, TheoryCheckResult, TheoryHooks, TheoryReason, TheoryStep, Var};
 use oxiz_theories::arithmetic::ArithSolver;
 use oxiz_theories::bv::BvSolver;
 use oxiz_theories::euf::EufSolver;
@@ -74,6 +74,14 @@ pub(crate) struct TheoryManager {
     theory_mode: TheoryMode,
     /// Pending assignments for lazy theory checking
     pending_assignments: Vec<(Lit, bool)>,
+    /// §4 hooks path (Phase 2b): theory propagations captured during the eager
+    /// drain in `TheoryHooks::final_check`, awaiting emission one-per-poll to the
+    /// `solve_with_hooks` driver as `TheoryStep::Propagate`. Each entry is the
+    /// legacy `(propagated_lit, reason_clause_lits)` shape `process_constraint`
+    /// returns; `reason_clause_lits` are the TRUE justifying literals that
+    /// `add_theory_reason_clause` consumes directly. Empty except mid-fixpoint;
+    /// cleared on backtrack (`pop_frame`) so a stale propagation never survives.
+    pending_theory_propagations: Vec<(Lit, SmallVec<[Lit; 8]>)>,
     /// Theory decision hints for branching
     #[allow(dead_code)]
     decision_hints: Vec<TheoryDecision>,
@@ -534,6 +542,7 @@ impl TheoryManager {
             processed_count: 0,
             theory_mode,
             pending_assignments: Vec::new(),
+            pending_theory_propagations: Vec::new(),
             decision_hints: Vec::new(),
             pending_equalities: Vec::new(),
             processed_equalities: FxHashMap::default(),
@@ -1683,6 +1692,133 @@ impl TheoryCallback for TheoryManager {
             self.pending_assignments.clear();
         }
 
+        self.theory_consistency_check()
+    }
+
+    fn on_new_level(&mut self, level: u32) {
+        // Push theory state when a new decision level is created
+        // Ensure we have enough levels in the stack
+        while self.level_stack.len() < (level as usize + 1) {
+            self.level_stack.push(self.processed_count);
+            self.euf.push();
+            self.arith.push();
+            self.bv.push();
+        }
+    }
+
+    fn on_backtrack(&mut self, level: u32) {
+        // Pop EUF, Arith, and BV states if needed
+        while self.level_stack.len() > (level as usize + 1) {
+            self.level_stack.pop();
+            self.euf.pop();
+            self.arith.pop();
+            self.bv.pop();
+        }
+        self.processed_count = *self.level_stack.last().unwrap_or(&0);
+
+        // Evict stale integer-constant canonicals whose EUF nodes were removed
+        // by the preceding pop().  After truncation, any node index >=
+        // euf.node_count() is invalid; keeping such entries would cause an
+        // out-of-bounds access in `intern_term_deep` when `merge` is called
+        // against the stale canonical.  Evicting them forces re-registration
+        // (and fresh disequality assertions) the next time those values appear.
+        let live_nodes = self.euf.node_count();
+        self.interned_int_constants
+            .retain(|_val, &mut canonical| (canonical as usize) < live_nodes);
+
+        // Evict stale bit-vector-constant canonicals for the same reason.
+        self.interned_bv_constants
+            .retain(|_key, &mut canonical| (canonical as usize) < live_nodes);
+
+        // Evict stale Boolean canonical nodes
+        if let Some(t) = self.bool_true_node {
+            if (t as usize) >= live_nodes {
+                self.bool_true_node = None;
+            }
+        }
+        if let Some(f) = self.bool_false_node {
+            if (f as usize) >= live_nodes {
+                self.bool_false_node = None;
+            }
+        }
+
+        // Clear pending assignments on backtrack (in lazy mode)
+        if self.theory_mode == TheoryMode::Lazy {
+            self.pending_assignments.clear();
+        }
+    }
+}
+
+/// Build the driver-facing `TheoryReason` from the legacy `(propagated_lit,
+/// reason_clause_lits)` shape `process_constraint` returns. `reason_clause_lits`
+/// are the TRUE justifying literals that `add_theory_reason_clause` consumes
+/// directly; the `solve_with_hooks` driver reconstructs them by NEGATING
+/// `reason.explanation`, so store their negations (round-trips exactly).
+fn theory_reason_from_clause(asserting: Lit, reason_lits: &[Lit]) -> TheoryReason {
+    let explanation: SmallVec<[Lit; 8]> = reason_lits.iter().map(|l| l.negate()).collect();
+    TheoryReason {
+        asserting,
+        explanation,
+    }
+}
+
+impl TheoryManager {
+    /// Pop the next theory propagation still worth emitting — one whose
+    /// literal's variable is currently UNASSIGNED. Mirrors the legacy
+    /// `if !self.trail.is_assigned(lit.var())` guard: an already-assigned
+    /// propagation is either satisfied or a contradiction the consistency
+    /// battery will catch, so it is dropped rather than emitted (emitting a
+    /// satisfied literal would make the driver treat it as a fixpoint and stop
+    /// draining the buffer). `assigned_phase` holds exactly the currently
+    /// assigned vars (maintained by `assign_hook`/`unassign_hook`), so it is the
+    /// trail's `is_assigned` shadow.
+    fn next_emittable_propagation(&mut self) -> Option<(Lit, SmallVec<[Lit; 8]>)> {
+        while let Some(entry) = self.pending_theory_propagations.pop() {
+            if !self.assigned_phase.contains_key(&entry.0.var()) {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Drain the assignment queue through `process_constraint`: assert each
+    /// newly-trail'd atom into euf/arith/bv (the cheap incremental work),
+    /// return `Some(explanation)` on the FIRST direct conflict, and buffer any
+    /// theory propagations for later emission. `None` ⇒ drained with no direct
+    /// conflict. Shared by the hooks `final_check` / `final_check_complete`.
+    fn drain_queue(&mut self) -> Option<SmallVec<[Lit; 8]>> {
+        let pending = core::mem::take(&mut self.pending_assignments);
+        for (lit, is_positive) in pending {
+            let var = lit.var();
+            let Some(constraint) = self.var_to_constraint.get(&var).cloned() else {
+                continue;
+            };
+            self.statistics.theory_propagations += 1;
+            // Transient handle, independent of the `&mut self` borrow.
+            let mgr = Arc::clone(&self.manager);
+            match self.process_constraint(var, constraint, is_positive, &mgr) {
+                TheoryCheckResult::Sat => {}
+                TheoryCheckResult::Conflict(explanation) => {
+                    self.statistics.theory_conflicts += 1;
+                    self.statistics.conflicts += 1;
+                    // A conflict invalidates anything buffered this fixpoint.
+                    self.pending_theory_propagations.clear();
+                    return Some(explanation);
+                }
+                TheoryCheckResult::Propagated(props) => {
+                    self.pending_theory_propagations.extend(props);
+                }
+            }
+        }
+        None
+    }
+
+    /// The euf → euf-to-arith → arith → model-based-combination consistency
+    /// battery. Shared by the legacy `TheoryCallback::final_check` (run after its
+    /// lazy queue drain) and the §4 `TheoryHooks::final_check` (run after its
+    /// eager, propagation-capturing drain). Self-contained — it never touches
+    /// `pending_assignments`, so either drain discipline may precede it.
+    fn theory_consistency_check(&mut self) -> TheoryCheckResult {
         // Check EUF for conflicts
         if let Some(conflict_terms) = self.euf.check_conflicts() {
             // Convert TermIds to Lits for the conflict clause
@@ -1758,59 +1894,6 @@ impl TheoryCallback for TheoryManager {
             }
         }
     }
-
-    fn on_new_level(&mut self, level: u32) {
-        // Push theory state when a new decision level is created
-        // Ensure we have enough levels in the stack
-        while self.level_stack.len() < (level as usize + 1) {
-            self.level_stack.push(self.processed_count);
-            self.euf.push();
-            self.arith.push();
-            self.bv.push();
-        }
-    }
-
-    fn on_backtrack(&mut self, level: u32) {
-        // Pop EUF, Arith, and BV states if needed
-        while self.level_stack.len() > (level as usize + 1) {
-            self.level_stack.pop();
-            self.euf.pop();
-            self.arith.pop();
-            self.bv.pop();
-        }
-        self.processed_count = *self.level_stack.last().unwrap_or(&0);
-
-        // Evict stale integer-constant canonicals whose EUF nodes were removed
-        // by the preceding pop().  After truncation, any node index >=
-        // euf.node_count() is invalid; keeping such entries would cause an
-        // out-of-bounds access in `intern_term_deep` when `merge` is called
-        // against the stale canonical.  Evicting them forces re-registration
-        // (and fresh disequality assertions) the next time those values appear.
-        let live_nodes = self.euf.node_count();
-        self.interned_int_constants
-            .retain(|_val, &mut canonical| (canonical as usize) < live_nodes);
-
-        // Evict stale bit-vector-constant canonicals for the same reason.
-        self.interned_bv_constants
-            .retain(|_key, &mut canonical| (canonical as usize) < live_nodes);
-
-        // Evict stale Boolean canonical nodes
-        if let Some(t) = self.bool_true_node {
-            if (t as usize) >= live_nodes {
-                self.bool_true_node = None;
-            }
-        }
-        if let Some(f) = self.bool_false_node {
-            if (f as usize) >= live_nodes {
-                self.bool_false_node = None;
-            }
-        }
-
-        // Clear pending assignments on backtrack (in lazy mode)
-        if self.theory_mode == TheoryMode::Lazy {
-            self.pending_assignments.clear();
-        }
-    }
 }
 
 /// §4.2 redesign: drive the SAME real theory state through the lock-step
@@ -1826,10 +1909,11 @@ impl TheoryCallback for TheoryManager {
 ///     eviction; per-literal retraction is `unassign_hook` (fired by the trail).
 ///   * `on_assignment` → `assign_hook`  — record phase + QUEUE the atom. The driver
 ///     discards `assign_hook`'s return, so all checking flows through `final_check`.
-///   * `final_check`   → `final_check`  — reuse the legacy `final_check` in its
-///     lazy-drain configuration (drains the queue through `process_constraint`, then
-///     the euf/arith/Nelson-Oppen consistency battery), converting its
-///     `TheoryCheckResult` to a `TheoryStep`.
+///   * `final_check`   → `final_check`  — Phase 2b EAGER check: drain the queue
+///     through `process_constraint`, surfacing a conflict immediately and EMITTING
+///     theory propagations (one per poll) so the SAT search is pruned exactly as in
+///     the legacy eager path; then the shared euf/arith/Nelson-Oppen
+///     `theory_consistency_check` battery. Returns `Conflict`/`Propagate`/`Ok`.
 impl TheoryHooks for TheoryManager {
     fn assign_hook(&mut self, lit: Lit, _level: u32) -> TheoryStep {
         let var = lit.var();
@@ -1874,6 +1958,10 @@ impl TheoryHooks for TheoryManager {
         self.euf.pop();
         self.arith.pop();
         self.bv.pop();
+        // Any propagation buffered for emission referred to the assignment we are
+        // now unwinding — drop it so a stale theory propagation never survives a
+        // backtrack (the driver re-derives fresh ones at the next fixpoint).
+        self.pending_theory_propagations.clear();
         // Evict canonical EUF nodes the pop invalidated (identical to the legacy
         // `on_backtrack` eviction — keeps `intern_term_deep` from indexing a
         // truncated node vector; see the field docs on `interned_int_constants`).
@@ -1895,24 +1983,50 @@ impl TheoryHooks for TheoryManager {
     }
 
     fn final_check(&mut self) -> TheoryStep {
-        // Reuse the legacy `final_check` in its lazy-drain configuration. Forcing
-        // `TheoryMode::Lazy` for the call is what enables the queue drain
-        // (`assign_hook` always queues; the driver discards its return, so ALL
-        // checking must flow through here). Behaviour matches the battle-tested lazy
-        // path; the verdict is Sat or Conflict.
-        let saved_mode = self.theory_mode;
-        self.theory_mode = TheoryMode::Lazy;
-        let result = <Self as TheoryCallback>::final_check(self);
-        self.theory_mode = saved_mode;
-        match result {
+        // Phase 2b — CHEAP per-fixpoint check (fired after every Boolean
+        // fixpoint). Drain each newly-trail'd atom's constraint through
+        // `process_constraint` — the incremental assert + direct-conflict detect
+        // — and emit theory propagations one-per-poll. The EXPENSIVE global
+        // consistency battery is DEFERRED to `final_check_complete` (full
+        // assignment); running it here, at every fixpoint, was ~100× slower with
+        // no verdict difference (the legacy eager path defers it the same way).
+
+        // Emit a propagation buffered from an earlier poll this fixpoint.
+        if let Some((lit, reason_lits)) = self.next_emittable_propagation() {
+            return TheoryStep::Propagate {
+                lit,
+                reason: theory_reason_from_clause(lit, &reason_lits),
+            };
+        }
+        // Drain the queue (a direct conflict returns immediately; propagations
+        // are buffered for emission).
+        if let Some(explanation) = self.drain_queue() {
+            // `terms_to_conflict_clause` already emits the all-false set.
+            return TheoryStep::Conflict { explanation };
+        }
+        // Emit a propagation produced by the drain just now.
+        if let Some((lit, reason_lits)) = self.next_emittable_propagation() {
+            return TheoryStep::Propagate {
+                lit,
+                reason: theory_reason_from_clause(lit, &reason_lits),
+            };
+        }
+        TheoryStep::Ok
+    }
+
+    fn final_check_complete(&mut self) -> TheoryStep {
+        // Full assignment: drain any residual queue for a direct conflict
+        // (propagations are pointless — every literal is decided), then run the
+        // EXPENSIVE euf → euf-to-arith → arith → model-based-combination battery
+        // ONCE. Only a clean battery authorises the `Sat` verdict (this is the
+        // global consistency check the legacy path also defers to here).
+        if let Some(explanation) = self.drain_queue() {
+            return TheoryStep::Conflict { explanation };
+        }
+        match self.theory_consistency_check() {
             TheoryCheckResult::Sat => TheoryStep::Ok,
-            // `terms_to_conflict_clause` already emits FALSE-under-assignment literals
-            // — exactly the all-false conflict set `TheoryStep::Conflict` wants (no
-            // negation).
             TheoryCheckResult::Conflict(explanation) => TheoryStep::Conflict { explanation },
-            // The lazy `final_check` never returns `Propagated`; dropping it would be
-            // sound regardless (the SAT search decides the atom and final_check
-            // re-detects any conflict), so this arm is a defensive no-op.
+            // The battery emits no propagations; sound to treat as a fixpoint.
             TheoryCheckResult::Propagated(_) => TheoryStep::Ok,
         }
     }
