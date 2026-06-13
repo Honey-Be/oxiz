@@ -457,8 +457,14 @@ impl Solver {
                     && let Reason::Propagation(reason_clause) = self.trail.reason(var)
                     && let Some(clause) = self.clauses.get(reason_clause)
                 {
-                    // Get reason and process its literals
-                    for &lit in &clause.lits[1..] {
+                    // Get reason and process EVERY literal: the pivot `var` is
+                    // already `seen` so the guard below skips it.  Do NOT skip
+                    // `lits[0]` by index — oxiz does not guarantee a propagation
+                    // reason keeps its implied literal at index 0 (the same
+                    // defect just fixed in the Boolean `analyze`); skipping it
+                    // dropped a current-level antecedent → undercounted
+                    // `counter` → an unsound theory-conflict learned clause.
+                    for &lit in &clause.lits {
                         let reason_var = lit.var();
                         let level = self.trail.level(reason_var);
 
