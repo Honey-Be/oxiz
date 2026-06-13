@@ -499,6 +499,7 @@ impl Solver {
         let reason = match self.trail.reason(var) {
             Reason::Decision => return false,
             Reason::Theory => return false, // Theory propagations can't be minimized
+            Reason::TheoryLemma(_) => return false, // typed theory reason — same
             Reason::Propagation(c) => c,
         };
 

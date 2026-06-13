@@ -7,7 +7,10 @@ mod incremental;
 mod learn;
 mod propagate;
 
+pub mod theory_hooks;
+
 pub use heuristic::{BoxedBranchingHeuristic, BranchingHeuristic};
+pub use theory_hooks::{TheoryHooks, TheoryStep};
 
 /// Instrumentation for the theory-conflict placeholder leak (feature `theory-probe`).
 #[cfg(feature = "theory-probe")]

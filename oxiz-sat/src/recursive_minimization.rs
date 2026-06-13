@@ -166,6 +166,10 @@ impl RecursiveMinimizer {
                     // Theory propagation - treat as non-redundant for now
                     return false;
                 }
+                Reason::TheoryLemma(_) => {
+                    // Typed theory propagation (§4.3) - also non-redundant
+                    return false;
+                }
                 Reason::Propagation(clause_id) => {
                     // Check all literals in the reason clause
                     let Some(clause) = clauses.get(*clause_id) else {

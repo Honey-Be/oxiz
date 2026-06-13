@@ -230,7 +230,7 @@ pub use symmetry::{
 #[cfg(feature = "std")]
 pub use tactics::{CubeImproveTactic, SymmetryBreakTactic};
 pub use target_phase::{PhaseMode, TargetPhaseSelector, TargetPhaseStats};
-pub use trail::{Reason, Trail};
+pub use trail::{Reason, TheoryReason, TheoryReasonId, Trail};
 pub use trail_saving::{SavedTrail, TrailSavingManager, TrailSavingStats};
 pub use uip_strategies::{UipAnalysisResult, UipAnalyzer, UipConfig, UipStats, UipStrategy};
 pub use unsat_core::UnsatCore;
