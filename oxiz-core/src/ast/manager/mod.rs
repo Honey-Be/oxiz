@@ -7,7 +7,7 @@ use crate::ast::arena::TermArena;
 use crate::interner::{Rodeo, Spur};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::sort::{SortId, SortManager};
+use crate::sort::{Sort, SortId, SortManager};
 use portable_atomic::{AtomicU32, Ordering};
 
 mod builder;
@@ -31,8 +31,14 @@ pub struct GCStatistics {
 /// Manager for term allocation and interning
 #[derive(Debug)]
 pub struct TermManager {
-    /// Arena for term storage
-    pub(super) terms: Vec<Term>,
+    /// Append-only term arena behind an `Arc` so a cheap read-only head
+    /// (`read_view`) can be shared with the §4 theory-hooks path (Phase 2) as a
+    /// `'static + Send + Sync` object. Appends go through `Arc::make_mut`, which is
+    /// O(1) while no read-head is outstanding (the read-head only lives for the span
+    /// of a single solve, during which the arena is not extended). Terms are
+    /// hash-consed/immutable once created, so the prefix a read-head captures never
+    /// changes.
+    pub(super) terms: Arc<Vec<Term>>,
     /// Next term ID
     pub(super) next_id: AtomicU32,
     /// String interner for symbols
@@ -66,7 +72,7 @@ impl TermManager {
         let bool_sort = sorts.bool_sort;
 
         let mut manager = Self {
-            terms: Vec::with_capacity(1024),
+            terms: Arc::new(Vec::with_capacity(1024)),
             next_id: AtomicU32::new(0),
             interner: Rodeo::default(),
             sorts,
@@ -112,7 +118,7 @@ impl TermManager {
             let _ = self.arena.alloc_term(id, kind.clone(), sort);
         }
 
-        self.terms.push(term);
+        Arc::make_mut(&mut self.terms).push(term);
         self.cache.insert(kind, id);
         id
     }
@@ -385,6 +391,81 @@ impl SubstitutionBuilder {
 impl Default for SubstitutionBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Read-only access to a term + sort arena. Implemented by BOTH the read-write
+/// `TermManager` and the cheap read-only `TermReadView`, so theory code that only
+/// reads terms/sorts can be written generically over `&impl TermRead` and reused
+/// on both the legacy (borrowing) and the §4 hooks (owning) paths.
+pub trait TermRead {
+    /// Get a term by id.
+    fn get(&self, id: TermId) -> Option<&Term>;
+    /// Get a sort by id.
+    fn sort_of(&self, id: SortId) -> Option<&Sort>;
+    /// The interned `true` term id.
+    fn true_id(&self) -> TermId;
+    /// The interned `false` term id.
+    fn false_id(&self) -> TermId;
+}
+
+impl TermRead for TermManager {
+    fn get(&self, id: TermId) -> Option<&Term> {
+        self.terms.get(id.0 as usize)
+    }
+    fn sort_of(&self, id: SortId) -> Option<&Sort> {
+        self.sorts.get(id)
+    }
+    fn true_id(&self) -> TermId {
+        self.true_id
+    }
+    fn false_id(&self) -> TermId {
+        self.false_id
+    }
+}
+
+/// A cheap, shareable READ-ONLY head over the term + sort arenas — the data the
+/// theory `process_constraint`-style work reads during a solve. Cloning it is two
+/// `Arc` pointer-bumps (no DAG copy); it is `'static + Send + Sync`, so it can be
+/// owned by a `Box<dyn TheoryHooks>` installed on the SAT trail (§4 Phase 2). The
+/// arenas are append-only/hash-consed, so the prefix this view captures is stable
+/// for the view's lifetime.
+#[derive(Clone)]
+pub struct TermReadView {
+    terms: Arc<Vec<Term>>,
+    sorts: Arc<Vec<Sort>>,
+    true_id: TermId,
+    false_id: TermId,
+}
+
+impl TermRead for TermReadView {
+    fn get(&self, id: TermId) -> Option<&Term> {
+        self.terms.get(id.0 as usize)
+    }
+    fn sort_of(&self, id: SortId) -> Option<&Sort> {
+        self.sorts.get(id.0 as usize)
+    }
+    fn true_id(&self) -> TermId {
+        self.true_id
+    }
+    fn false_id(&self) -> TermId {
+        self.false_id
+    }
+}
+
+impl TermManager {
+    /// Take a cheap read-only head (`Arc` pointer-bumps) over the current term/sort
+    /// arenas. Valid for as long as the returned view lives; new terms appended
+    /// afterwards extend the arena beyond it (and, since terms are immutable once
+    /// created, never change what the view sees).
+    #[must_use]
+    pub fn read_view(&self) -> TermReadView {
+        TermReadView {
+            terms: Arc::clone(&self.terms),
+            sorts: self.sorts.sorts_arc(),
+            true_id: self.true_id,
+            false_id: self.false_id,
+        }
     }
 }
 

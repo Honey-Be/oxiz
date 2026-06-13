@@ -37,7 +37,7 @@ pub use congruence::{CongruenceClosure, Explanation};
 pub use context::{Context, NamedAssertion, NamedContext};
 pub use egraph::{EClass, EClassId, EGraph, EGraphStats, ENode, ENodeKind};
 pub use interpolation::{InterpolationContext, InterpolationStats};
-pub use manager::{GCStatistics, SubstitutionBuilder, TermManager};
+pub use manager::{GCStatistics, SubstitutionBuilder, TermManager, TermRead, TermReadView};
 pub use model::{FunctionInterpretation, Model, ModelValue};
 pub use normal_forms::{
     eliminate_universal_quantifiers, extract_cnf_clauses, is_cnf, is_dnf, is_nnf, simplify_boolean,

@@ -197,7 +197,10 @@ pub struct DataTypeDef {
 /// Manager for sorts, handling canonicalization and interning
 #[derive(Debug)]
 pub struct SortManager {
-    sorts: Vec<Sort>,
+    /// Append-only sort arena behind an `Arc` so a cheap read-only head
+    /// (`sorts_arc`) can be shared with the §4 theory-hooks path (Phase 2). Appends
+    /// go through `Arc::make_mut` (O(1) while no read-head is outstanding).
+    sorts: Arc<Vec<Sort>>,
     cache: FxHashMap<SortKind, SortId>,
     next_id: AtomicU32,
     /// Pre-allocated common sorts
@@ -236,7 +239,7 @@ impl SortManager {
     #[must_use]
     pub fn new() -> Self {
         let mut manager = Self {
-            sorts: Vec::with_capacity(64),
+            sorts: Arc::new(Vec::with_capacity(64)),
             cache: FxHashMap::default(),
             next_id: AtomicU32::new(0),
             bool_sort: SortId(0),
@@ -273,9 +276,17 @@ impl SortManager {
             id,
             kind: kind.clone(),
         };
-        self.sorts.push(sort);
+        Arc::make_mut(&mut self.sorts).push(sort);
         self.cache.insert(kind, id);
         id
+    }
+
+    /// A cheap read-only head over the sort arena (an `Arc` pointer-bump). Used by
+    /// the §4 theory-hooks path so a `'static + Send + Sync` theory object can read
+    /// sorts without borrowing the (read-write) `SortManager`/`TermManager`.
+    #[must_use]
+    pub fn sorts_arc(&self) -> Arc<Vec<Sort>> {
+        Arc::clone(&self.sorts)
     }
 
     /// Get a sort by its ID
