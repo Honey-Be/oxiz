@@ -145,6 +145,36 @@ fn main() {
     }
     let mut solver = Solver::with_config(config);
 
+    // DRAT proof emission (opt-in): when OXIZ_DRAT is set, write the DRAT proof
+    // to a temp file and print its path on stdout as `c DRAT <path>`. The fuzz
+    // harness's --drat mode parses this line and, on UNSAT, runs
+    // `drat-trim <cnf> <path>` to independently certify the UNSAT result.
+    // If OXIZ_DRAT names a non-empty value other than "1"/"auto", it is used as
+    // the literal output path (useful for manual inspection).
+    let drat_path: Option<String> = match std::env::var("OXIZ_DRAT") {
+        Ok(v) if !v.is_empty() => {
+            let p = if v == "1" || v == "auto" {
+                let mut tmp = std::env::temp_dir();
+                tmp.push(format!("oxiz_drat_{}.drat", std::process::id()));
+                tmp.to_string_lossy().into_owned()
+            } else {
+                v
+            };
+            match solver.enable_drat(&p) {
+                Ok(()) => {
+                    println!("c DRAT {p}");
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("c DRAT-enable-failed: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let _ = &drat_path; // path already printed; kept for clarity
+
     let file = std::fs::File::open(&path).expect("open cnf");
     let reader = BufReader::new(file);
     let mut parser = DimacsParser::new();

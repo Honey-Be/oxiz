@@ -3,6 +3,81 @@
 use super::*;
 use smallvec::SmallVec;
 
+/// Instrumentation for the theory-conflict placeholder leak (feature `theory-probe`).
+///
+/// `analyze_theory_conflict` initialises `learnt[0]` to `Lit::from_code(0)` (the
+/// positive literal of variable 0) as a placeholder, and only overwrites it when a
+/// UIP `p` is found. If the trail-walk ends with `p == None` the placeholder leaks
+/// into the returned learned clause. This module counts how often that happens so a
+/// fuzz harness can decide whether the leak is reachable in practice.
+#[cfg(feature = "theory-probe")]
+pub mod theory_probe {
+    use core::cell::Cell;
+
+    thread_local! {
+        /// Number of analyze_theory_conflict calls.
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+        /// Number of calls that reached the `p == None` (no-UIP) branch — the
+        /// structural precondition for the placeholder leak (some conflict lit at
+        /// 0 < lvl < cur, none at cur, and not all at level 0).
+        static NO_UIP: Cell<u64> = const { Cell::new(0) };
+        /// Number of calls whose RETURNED learned clause still contained the var-0
+        /// placeholder `Lit::from_code(0)`. This is the actual leak. Post-fix: 0.
+        static PLACEHOLDER_IN_CLAUSE: Cell<u64> = const { Cell::new(0) };
+        /// Number of calls that took neither the all-level-0 early return nor the
+        /// UIP loop because the current-level conflict-literal count was zero.
+        static ZERO_COUNTER_NONROOT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset all counters to zero.
+    pub fn reset() {
+        CALLS.with(|c| c.set(0));
+        NO_UIP.with(|c| c.set(0));
+        PLACEHOLDER_IN_CLAUSE.with(|c| c.set(0));
+        ZERO_COUNTER_NONROOT.with(|c| c.set(0));
+    }
+
+    pub(super) fn note_call() {
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_no_uip() {
+        NO_UIP.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_placeholder_in_clause() {
+        PLACEHOLDER_IN_CLAUSE.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_zero_counter_nonroot() {
+        ZERO_COUNTER_NONROOT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Snapshot of all counters.
+    #[must_use]
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            calls: CALLS.with(Cell::get),
+            no_uip: NO_UIP.with(Cell::get),
+            placeholder_in_clause: PLACEHOLDER_IN_CLAUSE.with(Cell::get),
+            zero_counter_nonroot: ZERO_COUNTER_NONROOT.with(Cell::get),
+        }
+    }
+
+    /// Counters captured by [`snapshot`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct Snapshot {
+        /// Total `analyze_theory_conflict` calls.
+        pub calls: u64,
+        /// Calls that hit the no-UIP (`p == None`) branch.
+        pub no_uip: u64,
+        /// Calls whose returned clause still held the var-0 placeholder (the leak).
+        pub placeholder_in_clause: u64,
+        /// Calls with zero current-level conflict literals (leak precondition).
+        pub zero_counter_nonroot: u64,
+    }
+}
+
 /// Compute LBD (Literals per Block Distance / "glue" score) from a set of clause literals.
 ///
 /// LBD = number of distinct decision levels among the literals, excluding level 0.
@@ -60,13 +135,87 @@ impl Solver {
             }
         }
 
+        let current_level = self.trail.decision_level();
+
+        // SOUNDNESS GUARD for a DEGENERATE conflict — one with NO literal at the
+        // current decision level. The textbook 1-UIP analysis below assumes the
+        // standard CDCL invariant "every conflict has ≥1 literal at the current
+        // level" (that is how the conflicting propagation arose). In CDCL(T) that
+        // invariant can be broken: theory propagation/learning installs assignments
+        // at lower levels that falsify an original clause, and the conflict only
+        // surfaces (via watched-literal propagation) once the engine is already at a
+        // higher decision level. Running the UIP walk on such a conflict fabricates
+        // garbage — an arbitrary `p`, duplicated literals (e.g. `[-1, -1]`), or a
+        // unit contradicting a level-0 unit — and yields an UNSOUND verdict
+        // (spurious SAT/UNSAT, with the returned model violating an input clause).
+        //
+        // Handle it directly and soundly. The conflict clause C is fully falsified.
+        // The learned clause is exactly C (its literals, deduplicated); it is
+        // trivially entailed (C is an original/learned clause of the formula). We
+        // backtrack to one below the highest level present in C so that the
+        // highest-level literal becomes the single unassigned (asserting) literal.
+        // See the regression test `theory_callback_fuzz::regress_bool_analyze_all_level0_sat`.
+        if let Some(c) = self.clauses.get(conflict) {
+            let no_current_level = c
+                .lits
+                .iter()
+                .all(|&lit| self.trail.level(lit.var()) != current_level);
+            if !c.lits.is_empty() && no_current_level {
+                // Deduplicate while preserving the clause literals.
+                let mut uniq: SmallVec<[Lit; 16]> = SmallVec::new();
+                for &lit in &c.lits {
+                    if !uniq.contains(&lit) {
+                        uniq.push(lit);
+                    }
+                }
+                // All literals at level 0 ⇒ a level-0 contradiction ⇒ UNSAT.
+                if uniq.iter().all(|&lit| self.trail.level(lit.var()) == 0) {
+                    self.learnt.clear();
+                    return (0, SmallVec::new());
+                }
+                // Otherwise: put the highest-level literal at index 0 (asserting),
+                // and backtrack to the SECOND-highest level so it goes unit there.
+                let mut hi_idx = 0;
+                let mut hi_lvl = self.trail.level(uniq[0].var());
+                for i in 1..uniq.len() {
+                    let lvl = self.trail.level(uniq[i].var());
+                    if lvl > hi_lvl {
+                        hi_lvl = lvl;
+                        hi_idx = i;
+                    }
+                }
+                uniq.swap(0, hi_idx);
+                // Put the SECOND-highest-level literal at index 1. `learn_clause`
+                // watches lits[0]/lits[1] and asserts lits[0]; for the two-watched-
+                // literal invariant to survive future backtracks the second watch
+                // must be the highest-level literal among the rest — exactly the
+                // `swap(1, max_idx)` the normal 1-UIP path performs. Without this the
+                // clause could later be fully falsified without a watch firing (a
+                // missed conflict ⇒ unsound SAT), so we arrange it explicitly here.
+                let mut second = 0;
+                let mut second_idx = 1;
+                for i in 1..uniq.len() {
+                    let lvl = self.trail.level(uniq[i].var());
+                    if lvl > second {
+                        second = lvl;
+                        second_idx = i;
+                    }
+                }
+                if uniq.len() >= 2 {
+                    uniq.swap(1, second_idx);
+                }
+                self.learnt.clear();
+                self.learnt.extend(uniq.iter().copied());
+                return (second, self.learnt.clone());
+            }
+        }
+
         self.learnt.clear();
         self.learnt.push(Lit::from_code(0)); // Placeholder for asserting literal
 
         let mut counter = 0;
         let mut p = None;
         let mut index = self.trail.assignments().len();
-        let current_level = self.trail.decision_level();
 
         // Reset seen flags
         for s in &mut self.seen {
@@ -390,6 +539,9 @@ impl Solver {
         &mut self,
         conflict_lits: &[Lit],
     ) -> (u32, SmallVec<[Lit; 16]>) {
+        #[cfg(feature = "theory-probe")]
+        theory_probe::note_call();
+
         self.learnt.clear();
         self.learnt.push(Lit::from_code(0)); // Placeholder
 
@@ -432,6 +584,14 @@ impl Solver {
         // with backtrack_level=0 as a signal.
         if !conflict_lits.is_empty() && all_level_zero {
             return (0, SmallVec::new());
+        }
+
+        // Instrumentation: counter == 0 here (with not-all-level-0) is the exact
+        // structural precondition for the placeholder leak — the UIP loop below is
+        // skipped, so `p` stays None and learnt[0] keeps Lit::from_code(0).
+        #[cfg(feature = "theory-probe")]
+        if counter == 0 {
+            theory_probe::note_zero_counter_nonroot();
         }
 
         // Find UIP by walking back through trail
@@ -489,9 +649,49 @@ impl Solver {
         self.chb.bump_batch(&vars_to_bump);
         self.lrb.on_reason_batch(&vars_to_bump);
 
-        // Set asserting literal
+        // Set asserting literal.
+        //
+        // If a UIP `p` was found, slot 0 becomes its negation (the asserting
+        // literal). If NO UIP was found (`p == None`), the `while counter > 0`
+        // loop never ran — this happens when no conflict literal is at the current
+        // decision level (yet not all are at level 0, which returned early above).
+        // In that case slot 0 still holds the `Lit::from_code(0)` placeholder; it
+        // is NOT a real literal of the conflict and MUST NOT survive: leaving it
+        // would (a) put a bogus var-0 literal into the learned clause and (b) make
+        // learn_clause assign it as a spurious propagation. Drop the placeholder
+        // slot; the genuine learned clause is exactly the below-current-level
+        // conflict literals already collected in `learnt[1..]`.
         if let Some(uip) = p {
             self.learnt[0] = uip.negate();
+        } else {
+            #[cfg(feature = "theory-probe")]
+            theory_probe::note_no_uip();
+            // Remove the placeholder at index 0 (cheap: swap with last then pop).
+            if !self.learnt.is_empty() {
+                let last = self.learnt.len() - 1;
+                self.learnt.swap(0, last);
+                self.learnt.pop();
+            }
+            // If that emptied the clause, every conflict literal was filtered out
+            // (all level 0) — signal fundamental UNSAT, matching the early return.
+            if self.learnt.is_empty() {
+                return (0, SmallVec::new());
+            }
+            // Make slot 0 the HIGHEST-level literal of the clause so it becomes the
+            // asserting literal after backtracking. (With no current-level UIP,
+            // every literal is below the current level; the highest of them is the
+            // one to flip — the clause goes unit on it once we backtrack below its
+            // level, which the backtrack-level computation below arranges.)
+            let mut hi_idx = 0;
+            let mut hi_lvl = self.trail.level(self.learnt[0].var());
+            for i in 1..self.learnt.len() {
+                let lvl = self.trail.level(self.learnt[i].var());
+                if lvl > hi_lvl {
+                    hi_lvl = lvl;
+                    hi_idx = i;
+                }
+            }
+            self.learnt.swap(0, hi_idx);
         }
 
         // Minimize
@@ -530,6 +730,15 @@ impl Solver {
             self.learnt.swap(1, max_idx);
             max_level
         };
+
+        // True-leak detector: does the var-0 placeholder `Lit::from_code(0)` still
+        // appear in the clause we are about to return? Post-fix this must be 0 (the
+        // placeholder is removed). Pre-fix it fired whenever p == None. This is the
+        // metric that distinguishes "no-UIP path taken" from "placeholder leaked".
+        #[cfg(feature = "theory-probe")]
+        if self.learnt.iter().any(|&l| l == Lit::from_code(0)) {
+            theory_probe::note_placeholder_in_clause();
+        }
 
         (backtrack_level, self.learnt.clone())
     }

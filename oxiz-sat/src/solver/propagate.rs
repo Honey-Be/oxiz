@@ -174,6 +174,10 @@ impl Solver {
             // The binary clause is: other_lit | implied
             // This means: ~other_lit -> implied, and ~implied -> other_lit
             if !self.has_binary_implication(other_lit.negate(), implied) {
+                // DRAT: this lazily-derived binary clause is a RUP consequence
+                // of the reason clause and the current level-0 unit prefix, so
+                // log it as a learned-clause addition. No-op unless DRAT is on.
+                self.drat_add(&binary_clause_lits);
                 // Learn this binary clause on-the-fly
                 let clause_id = self.clauses.add_learned(binary_clause_lits.iter().copied());
                 // Add correct implications: ~A -> B and ~B -> A for clause (A | B)

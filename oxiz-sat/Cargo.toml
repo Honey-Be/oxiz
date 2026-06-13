@@ -15,6 +15,9 @@ std = ["rayon", "tracing", "rustc-hash/std", "oxiz-core/std"]
 profiling = ["std", "oxiz-core/profiling"]
 # Enable verbose debug output in conflict analysis
 analyze-debug = []
+# Instrument analyze_theory_conflict to detect the p==None / Lit::from_code(0)
+# placeholder leak (off by default; used by the theory-callback fuzz harness).
+theory-probe = []
 # GPU acceleration backends (placeholder for future implementation)
 cuda = []
 opencl = []

@@ -9,6 +9,10 @@ mod propagate;
 
 pub use heuristic::{BoxedBranchingHeuristic, BranchingHeuristic};
 
+/// Instrumentation for the theory-conflict placeholder leak (feature `theory-probe`).
+#[cfg(feature = "theory-probe")]
+pub use conflict::theory_probe;
+
 use crate::chb::CHB;
 use crate::chrono::ChronoBacktrack;
 use crate::clause::{ClauseDatabase, ClauseId};
@@ -17,6 +21,7 @@ use crate::lrb::LRB;
 use crate::memory_opt::{MemoryAction, MemoryOptimizer};
 #[allow(unused_imports)]
 use crate::prelude::*;
+use crate::proof::DratWriter;
 use crate::trail::{Reason, Trail};
 use crate::vsids::VSIDS;
 use crate::watched::{WatchLists, Watcher};
@@ -395,6 +400,13 @@ pub struct Solver {
     pub(super) clause_bump_increment: f64,
     /// Memory optimizer with size-class pools for clause allocation
     pub(super) memory_optimizer: MemoryOptimizer,
+    /// Optional DRAT proof writer. `None` (the default) means no proof is
+    /// emitted and every `drat_*` helper is a no-op, so the default build and
+    /// hot path are completely unaffected. When `Some`, learned-clause
+    /// additions/deletions and in-place clause mutations are logged in DRAT
+    /// format and the empty clause is emitted at the UNSAT terminus so the
+    /// proof can be checked by `drat-trim <cnf> <proof>`.
+    pub(super) drat: Option<DratWriter>,
 }
 
 impl Default for Solver {
@@ -452,6 +464,73 @@ impl Solver {
             chrono_backtrack: ChronoBacktrack::new(chrono_enabled, chrono_threshold),
             clause_bump_increment: 1.0,
             memory_optimizer: MemoryOptimizer::new(),
+            drat: None,
+        }
+    }
+
+    /// Enable DRAT proof emission to `path`.
+    ///
+    /// Off by default (`drat` is `None`). When enabled, the solver logs every
+    /// learned-clause addition, every learned-clause deletion (database
+    /// reduction, subsumption, incremental forget), every in-place clause
+    /// mutation (vivification / strengthening, as delete-old + add-new), and —
+    /// when `solve()` concludes UNSAT — the empty clause, then flushes. Original
+    /// input clauses are NOT logged (they are the CNF that `drat-trim` reads
+    /// separately). The resulting proof is checkable with
+    /// `drat-trim <input.cnf> <path>`.
+    ///
+    /// # Errors
+    /// Returns the I/O error if the proof file cannot be created.
+    pub fn enable_drat(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let mut w = DratWriter::new();
+        w.enable(path)?;
+        self.drat = Some(w);
+        Ok(())
+    }
+
+    /// DRAT: log a learned-clause addition. No-op unless DRAT is enabled.
+    #[inline]
+    pub(super) fn drat_add(&mut self, lits: &[Lit]) {
+        if let Some(d) = self.drat.as_mut() {
+            let _ = d.add_clause(lits);
+        }
+    }
+
+    /// DRAT: log a learned-clause deletion by literals. No-op unless enabled.
+    #[inline]
+    pub(super) fn drat_delete(&mut self, lits: &[Lit]) {
+        if let Some(d) = self.drat.as_mut() {
+            let _ = d.delete_clause(lits);
+        }
+    }
+
+    /// DRAT: log deletion of a clause identified by its id, reading its current
+    /// literals from the database *before* it is removed. Only emits for
+    /// LEARNED clauses — deleting an original (input) clause is not a derivation
+    /// step and must not appear in the proof (the input clauses live in the CNF
+    /// drat-trim reads). No-op unless DRAT is enabled. Returns nothing; call
+    /// this *before* `clauses.remove(id)`.
+    #[inline]
+    pub(super) fn drat_delete_clause_id(&mut self, id: ClauseId) {
+        if self.drat.is_none() {
+            return;
+        }
+        if let Some(clause) = self.clauses.get(id)
+            && clause.learned
+            && !clause.deleted
+        {
+            let lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
+            self.drat_delete(&lits);
+        }
+    }
+
+    /// DRAT: emit the empty clause (the UNSAT terminus) and flush. No-op unless
+    /// DRAT is enabled.
+    #[inline]
+    pub(super) fn drat_finish_unsat(&mut self) {
+        if let Some(d) = self.drat.as_mut() {
+            let _ = d.add_clause(&[]);
+            let _ = d.flush();
         }
     }
 
@@ -668,11 +747,17 @@ impl Solver {
     pub fn solve(&mut self) -> SolverResult {
         // Check if trivially unsatisfiable
         if self.trivially_unsat {
+            // The contradiction is already present in the input clause set
+            // (e.g. an empty clause was added). DRAT proves UNSAT by deriving
+            // the empty clause; here it is the input itself, so the empty
+            // clause is RUP-trivially derivable. Emit it for completeness.
+            self.drat_finish_unsat();
             return SolverResult::Unsat;
         }
 
         // Initial propagation
         if self.propagate().is_some() {
+            self.drat_finish_unsat();
             return SolverResult::Unsat;
         }
 
@@ -683,17 +768,31 @@ impl Solver {
                 self.conflicts_since_inprocessing += 1;
 
                 if self.trail.decision_level() == 0 {
+                    self.drat_finish_unsat();
                     return SolverResult::Unsat;
                 }
 
                 // Analyze conflict
                 let (backtrack_level, learnt_clause) = self.analyze(conflict);
 
+                // An empty learned clause signals an all-level-0 conflict (a level-0
+                // contradiction): the formula is unsatisfiable. In the pure-Boolean
+                // path the analyze() degenerate-conflict guard cannot fire (every
+                // Boolean conflict has a current-level literal), but the check keeps
+                // the contract uniform and avoids indexing an empty clause below.
+                if learnt_clause.is_empty() {
+                    self.drat_finish_unsat();
+                    self.trivially_unsat = true;
+                    return SolverResult::Unsat;
+                }
+
                 // Backtrack with phase saving
                 self.backtrack_with_phase_saving(backtrack_level);
 
                 // Learn clause
                 if learnt_clause.len() == 1 {
+                    // DRAT: log the learned unit before installing it.
+                    self.drat_add(&learnt_clause);
                     // Store unit learned clause in database for persistence
                     let clause_id = self.clauses.add_learned(learnt_clause.iter().copied());
                     self.stats.learned_clauses += 1;
@@ -722,6 +821,8 @@ impl Solver {
                         self.recent_lbd_count /= 2;
                     }
 
+                    // DRAT: log the learned clause before installing it.
+                    self.drat_add(&learnt_clause);
                     let clause_id = self.clauses.add_learned(learnt_clause.iter().copied());
                     self.stats.learned_clauses += 1;
 
@@ -893,6 +994,13 @@ impl Solver {
                 }
 
                 let (bt_level, learnt_clause) = self.analyze(conflict);
+                // Empty learned clause => all-level-0 conflict => UNSAT (return the
+                // assumption core, consistent with the past-assumptions branch above).
+                if learnt_clause.is_empty() {
+                    let core = self.analyze_assumption_conflict(assumptions);
+                    self.backtrack(assumption_level_start);
+                    return (SolverResult::Unsat, Some(core));
+                }
                 self.backtrack_with_phase_saving(bt_level.max(assumption_level_start + 1));
                 self.learn_clause(learnt_clause);
 
@@ -959,6 +1067,12 @@ impl Solver {
                 }
 
                 let (backtrack_level, learnt_clause) = self.analyze(conflict);
+                // Empty learned clause => degenerate/all-level-0 conflict => UNSAT
+                // (the analyze() degenerate-conflict guard can return this).
+                if learnt_clause.is_empty() {
+                    self.trivially_unsat = true;
+                    return SolverResult::Unsat;
+                }
                 theory.on_backtrack(backtrack_level);
                 self.backtrack_with_phase_saving(backtrack_level);
                 // After backtrack, the trail may be shorter; update processed count
@@ -1021,6 +1135,30 @@ impl Solver {
                     theory_processed = theory_processed.min(self.trail.assignments().len());
                     self.learn_clause(learnt_clause);
 
+                    // SOUNDNESS: settle the Boolean consequences of the just-learned
+                    // theory clause (e.g. a unit asserted at level 0) BEFORE looping
+                    // back to the theory or deciding. Otherwise a Boolean conflict
+                    // created by the learned unit — in particular a LEVEL-0
+                    // contradiction with an original clause — goes undetected, the
+                    // engine decides over it, and terminates with a spurious SAT
+                    // whose model violates that clause. See the regression test
+                    // `theory_callback_fuzz::regress_post_theory_conflict_propagation_sat`.
+                    if let Some(bool_conflict) = self.propagate() {
+                        self.stats.conflicts += 1;
+                        if self.trail.decision_level() == 0 {
+                            return SolverResult::Unsat;
+                        }
+                        let (bt2, learnt2) = self.analyze(bool_conflict);
+                        if learnt2.is_empty() {
+                            self.trivially_unsat = true;
+                            return SolverResult::Unsat;
+                        }
+                        theory.on_backtrack(bt2);
+                        self.backtrack_with_phase_saving(bt2);
+                        theory_processed = theory_processed.min(self.trail.assignments().len());
+                        self.learn_clause(learnt2);
+                    }
+
                     self.vsids.decay();
                     self.clauses.decay_activity(self.config.clause_decay);
                     if self.handle_clause_deletion_and_restart() {
@@ -1050,6 +1188,11 @@ impl Solver {
                         }
 
                         let (backtrack_level, learnt_clause) = self.analyze(conflict);
+                        // Empty learned clause => degenerate/all-level-0 conflict => UNSAT.
+                        if learnt_clause.is_empty() {
+                            self.trivially_unsat = true;
+                            return SolverResult::Unsat;
+                        }
                         theory.on_backtrack(backtrack_level);
                         self.backtrack_with_phase_saving(backtrack_level);
                         // After backtrack, the trail is shorter; update processed count
@@ -1396,6 +1539,62 @@ mod tests {
         solver.add_clause_dimacs(&[-1]);
 
         assert_eq!(solver.solve(), SolverResult::Unsat);
+    }
+
+    #[test]
+    fn test_drat_disabled_by_default() {
+        // Default build must not allocate or touch a DRAT writer.
+        let solver = Solver::new();
+        assert!(solver.drat.is_none());
+    }
+
+    #[test]
+    fn test_drat_emits_empty_clause_on_unsat() {
+        // Enabling DRAT on a small UNSAT instance must produce a proof that
+        // ends with the empty clause ("0\n"). This guards the UNSAT terminus
+        // wiring. (Full drat-trim certification is exercised by the
+        // `sat_diff_fuzz_pure_drat.py` harness.)
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oxiz_drat_unit_{}.drat", std::process::id()));
+        let mut solver = Solver::new();
+        solver.enable_drat(&path).expect("enable drat");
+        solver.new_var();
+        solver.new_var();
+        // (1 | 2) & ~1 & ~2  -> UNSAT
+        solver.add_clause_dimacs(&[1, 2]);
+        solver.add_clause_dimacs(&[-1]);
+        solver.add_clause_dimacs(&[-2]);
+        assert_eq!(solver.solve(), SolverResult::Unsat);
+        // Drop the solver so the writer flushes fully.
+        drop(solver);
+        let contents = std::fs::read_to_string(&path).expect("read drat proof");
+        // The proof must contain the empty clause as a standalone "0" line.
+        assert!(
+            contents.lines().any(|l| l.trim() == "0"),
+            "DRAT proof should end with the empty clause; got:\n{contents}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_drat_no_empty_clause_on_sat() {
+        // A SAT instance must NOT emit the empty clause.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oxiz_drat_sat_{}.drat", std::process::id()));
+        let mut solver = Solver::new();
+        solver.enable_drat(&path).expect("enable drat");
+        solver.new_var();
+        solver.new_var();
+        solver.add_clause_dimacs(&[1, 2]);
+        solver.add_clause_dimacs(&[-1, 2]);
+        assert_eq!(solver.solve(), SolverResult::Sat);
+        drop(solver);
+        let contents = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !contents.lines().any(|l| l.trim() == "0"),
+            "SAT proof must not contain the empty clause; got:\n{contents}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -216,6 +216,9 @@ pub use solver::{
     BoxedBranchingHeuristic, BranchingHeuristic, RestartStrategy, Solver, SolverConfig,
     SolverResult, SolverStats, TheoryCallback, TheoryCheckResult,
 };
+/// Instrumentation for the theory-conflict placeholder leak (feature `theory-probe`).
+#[cfg(feature = "theory-probe")]
+pub use solver::theory_probe;
 pub use stabilization::{
     SearchMode, StabilizationConfig, StabilizationManager, StabilizationStats,
 };

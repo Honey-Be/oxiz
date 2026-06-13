@@ -26,6 +26,10 @@ impl Solver {
     /// Includes on-the-fly subsumption check
     /// Tracks allocation via memory optimizer for size-class pool accounting
     pub(super) fn learn_clause(&mut self, learnt_clause: SmallVec<[Lit; 16]>) {
+        // DRAT: log the learned clause once, before any of the length-specific
+        // `add_learned` branches install it. No-op unless DRAT is enabled.
+        self.drat_add(&learnt_clause);
+
         // Track allocation in memory optimizer for pool accounting
         let _pool_buf = self.memory_optimizer.allocate(learnt_clause.len());
 
@@ -125,6 +129,8 @@ impl Solver {
 
         // Remove subsumed clauses
         for cid in to_remove {
+            // DRAT: log the deletion (learned clauses only) before removal.
+            self.drat_delete_clause_id(cid);
             self.clauses.remove(cid);
             self.stats.deleted_clauses += 1;
         }
@@ -143,6 +149,11 @@ impl Solver {
             clause_lits.push(lit.negate());
         }
 
+        // NOTE: deliberately NOT logged to DRAT. A theory reason clause is a
+        // theory lemma, not a propositional (RUP/RAT) consequence of the CNF, so
+        // emitting it would produce a clause drat-trim cannot justify. DRAT proof
+        // emission is supported for the pure Boolean `solve()` loop only; the
+        // CDCL(T) (`solve_with_theory`) path is out of scope for DRAT.
         let clause_id = self.clauses.add_learned(clause_lits.iter().copied());
 
         // Set up watches
@@ -222,6 +233,8 @@ impl Solver {
                 let buf = self.memory_optimizer.allocate(num_lits);
                 self.memory_optimizer.free(buf, num_lits);
             }
+            // DRAT: log the deletion (learned clauses only) before removal.
+            self.drat_delete_clause_id(*cid);
             self.clauses.remove(*cid);
             self.stats.deleted_clauses += 1;
         }
@@ -232,6 +245,7 @@ impl Solver {
                 let buf = self.memory_optimizer.allocate(num_lits);
                 self.memory_optimizer.free(buf, num_lits);
             }
+            self.drat_delete_clause_id(*cid);
             self.clauses.remove(*cid);
             self.stats.deleted_clauses += 1;
         }
@@ -242,6 +256,7 @@ impl Solver {
                 let buf = self.memory_optimizer.allocate(num_lits);
                 self.memory_optimizer.free(buf, num_lits);
             }
+            self.drat_delete_clause_id(*cid);
             self.clauses.remove(*cid);
             self.stats.deleted_clauses += 1;
         }
@@ -390,9 +405,24 @@ impl Solver {
                     && clause.lits.len() > 2
                 {
                     // The literal at skip_idx is implied by the rest
-                    // We can remove it from the clause (vivification succeeded)
+                    // We can remove it from the clause (vivification succeeded).
+                    // DRAT models an in-place strengthening as delete-old +
+                    // add-new: capture both literal sets, then (after the mutable
+                    // borrow ends) emit `d old` followed by `new`. The DRAT
+                    // helpers no-op unless DRAT is enabled, so this is free in
+                    // the default build.
+                    let old_lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
                     clause.lits.remove(skip_idx);
+                    let new_lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
                     vivified_count += 1;
+                    if self.drat.is_some() {
+                        // Add the strengthened clause first, then delete the
+                        // original. Ordering does not matter for drat-trim's
+                        // backward check, but add-then-delete keeps the active
+                        // set consistent at every prefix.
+                        self.drat_add(&new_lits);
+                        self.drat_delete(&old_lits);
+                    }
                     break; // Done with this clause
                 }
             }
@@ -515,13 +545,27 @@ impl Solver {
             // Apply strengthening if we found literals to remove
             if !literals_to_remove.is_empty() {
                 // First, remove literals
+                let mut old_lits: SmallVec<[Lit; 16]> = SmallVec::new();
                 if let Some(clause) = self.clauses.get_mut(*clause_id) {
+                    // DRAT: capture the pre-mutation literal set so we can emit
+                    // delete-old + add-new (an in-place strengthening).
+                    old_lits = clause.lits.iter().copied().collect();
                     // Remove literals in reverse order to preserve indices
                     for &idx in literals_to_remove.iter().rev() {
                         if idx < clause.lits.len() {
                             clause.lits.remove(idx);
                         }
                     }
+                }
+
+                // DRAT: emit the strengthened clause, then delete the original.
+                if self.drat.is_some() {
+                    let new_lits: SmallVec<[Lit; 16]> = match self.clauses.get(*clause_id) {
+                        Some(c) => c.lits.iter().copied().collect(),
+                        None => SmallVec::new(),
+                    };
+                    self.drat_add(&new_lits);
+                    self.drat_delete(&old_lits);
                 }
 
                 // Then, recompute LBD (after the mutable borrow ends)

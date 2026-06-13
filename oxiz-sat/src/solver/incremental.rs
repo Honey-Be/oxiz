@@ -43,6 +43,8 @@ impl Solver {
         }
         let to_remove: Vec<ClauseId> = self.learned_clause_ids.split_off(checkpoint);
         for id in to_remove {
+            // DRAT: log the deletion (learned clauses only) before removal.
+            self.drat_delete_clause_id(id);
             self.clauses.remove(id);
         }
     }
