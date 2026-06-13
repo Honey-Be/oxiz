@@ -10,7 +10,7 @@ mod propagate;
 pub mod theory_hooks;
 
 pub use heuristic::{BoxedBranchingHeuristic, BranchingHeuristic};
-pub use theory_hooks::{TheoryHooks, TheoryStep};
+pub use theory_hooks::{TheoryHooks, TheoryStep, ToyImplTheory};
 
 /// Instrumentation for the theory-conflict placeholder leak (feature `theory-probe`).
 #[cfg(feature = "theory-probe")]
@@ -102,6 +102,20 @@ pub enum SolverResult {
     Unsat,
     /// Unknown (e.g., timeout, resource limit)
     Unknown,
+}
+
+/// Internal outcome of a conflict handler on the `solve_with_hooks` path.
+enum ConflictOutcome {
+    /// Conflict resolved (learn + backtrack); keep solving.
+    Continue,
+    /// A level-0 / empty-clause conflict ⇒ the formula is UNSAT.
+    Unsat,
+}
+
+impl ConflictOutcome {
+    fn is_unsat(self) -> bool {
+        matches!(self, ConflictOutcome::Unsat)
+    }
 }
 
 /// Solver configuration
@@ -1282,6 +1296,179 @@ impl Solver {
         }
     }
 
+    /// CDCL(T) solve against a theory implementing the §4.2 `TheoryHooks` contract
+    /// (the redesign's NEW driver, parallel to `solve_with_theory`).
+    ///
+    /// The theory is installed ON the trail, so:
+    ///   * `push_frame`/`pop_frame` and `assign_hook`/`unassign_hook` fire from
+    ///     inside the trail's mutators — there is NO `theory_processed` re-scan index
+    ///     and NO hand-written `on_backtrack`/`on_new_level` call site (the desync
+    ///     bug class is structurally impossible);
+    ///   * theory propagations are recorded as typed `Reason::TheoryLemma` (no
+    ///     synthesized reason clause, no `Lit::from_code(0)` placeholder).
+    ///
+    /// Phase 1 is final-check-driven: the theory is polled with `final_check` at each
+    /// propagation fixpoint. The theory is returned to the caller so its `eval` model
+    /// can be inspected after a `Sat` verdict.
+    pub fn solve_with_hooks(
+        &mut self,
+        theory: Box<dyn TheoryHooks>,
+    ) -> (SolverResult, Box<dyn TheoryHooks>) {
+        self.trail.set_theory(theory);
+        let result = self.solve_with_hooks_inner();
+        let theory = self
+            .trail
+            .take_theory()
+            .expect("theory installed for the duration of solve_with_hooks");
+        (result, theory)
+    }
+
+    fn solve_with_hooks_inner(&mut self) -> SolverResult {
+        if self.trivially_unsat {
+            return SolverResult::Unsat;
+        }
+        if self.propagate().is_some() {
+            return SolverResult::Unsat;
+        }
+
+        loop {
+            // (1) Boolean propagation.
+            if let Some(conflict) = self.propagate() {
+                if self.handle_boolean_conflict_hooks(conflict).is_unsat() {
+                    return SolverResult::Unsat;
+                }
+                continue;
+            }
+
+            // (2) Drive the theory to a fixpoint via `final_check`.
+            let mut restart_outer = false;
+            loop {
+                let step = match self.trail.theory_mut() {
+                    Some(t) => t.final_check(),
+                    None => TheoryStep::Ok,
+                };
+                match step {
+                    TheoryStep::Ok => break,
+                    TheoryStep::Conflict { explanation } => {
+                        if self.handle_theory_conflict_hooks(&explanation).is_unsat() {
+                            return SolverResult::Unsat;
+                        }
+                        restart_outer = true;
+                        break;
+                    }
+                    TheoryStep::Propagate { lit, reason } => {
+                        match self.trail.lit_value(lit) {
+                            LBool::True => {
+                                // Already satisfied — a correct theory will not
+                                // re-propose it (its asserted set has the literal), so
+                                // breaking reaches a genuine fixpoint.
+                                break;
+                            }
+                            LBool::False => {
+                                // The theory wants `lit` true but it is false: the
+                                // clause (lit ∨ explanation) is fully false → a real
+                                // conflict. Build the all-false conflict set and learn.
+                                let mut conflict_lits: SmallVec<[Lit; 16]> = SmallVec::new();
+                                conflict_lits.push(lit);
+                                conflict_lits.extend(reason.explanation.iter().copied());
+                                if self.handle_theory_conflict_hooks(&conflict_lits).is_unsat() {
+                                    return SolverResult::Unsat;
+                                }
+                                restart_outer = true;
+                                break;
+                            }
+                            LBool::Undef => {
+                                let id = self.trail.add_theory_reason(reason);
+                                self.trail.assign_theory_lemma(lit, id);
+                                // Settle Boolean consequences of the theory unit.
+                                if let Some(conflict) = self.propagate() {
+                                    if self.handle_boolean_conflict_hooks(conflict).is_unsat() {
+                                        return SolverResult::Unsat;
+                                    }
+                                    restart_outer = true;
+                                    break;
+                                }
+                                // else: re-poll `final_check` (inner loop continues).
+                            }
+                        }
+                    }
+                }
+            }
+            if restart_outer {
+                continue;
+            }
+
+            // (3) Decide. §4.5: BCP is at a fixpoint and the theory returned `Ok`, so
+            // no decision is taken over pending propagation (the BUG-3 invariant).
+            debug_assert!(
+                !self.trail.has_pending_propagation(),
+                "decide with pending BCP (BUG-3 invariant violated)"
+            );
+            if let Some(var) = self.pick_branch_var() {
+                self.stats.decisions += 1;
+                self.trail.new_decision_level(); // fires push_frame
+                let polarity = if self.rand_bool(self.config.random_polarity_prob) {
+                    self.rand_bool(0.5)
+                } else {
+                    self.phase[var.index()]
+                };
+                let lit = if polarity { Lit::pos(var) } else { Lit::neg(var) };
+                self.trail.assign_decision(lit); // fires assign_hook
+            } else {
+                // All variables assigned and the theory is at a fixpoint ⇒ SAT.
+                self.save_model();
+                return SolverResult::Sat;
+            }
+        }
+    }
+
+    /// Shared handler: a Boolean conflict on the hooks path. Returns whether the
+    /// formula is now UNSAT. Backtracking fires `pop_frame`/`unassign_hook` via the
+    /// trail, so no explicit theory notification is needed.
+    fn handle_boolean_conflict_hooks(&mut self, conflict: ClauseId) -> ConflictOutcome {
+        self.stats.conflicts += 1;
+        if self.trail.decision_level() == 0 {
+            return ConflictOutcome::Unsat;
+        }
+        let (backtrack_level, learnt_clause) = self.analyze(conflict);
+        if learnt_clause.is_empty() {
+            self.trivially_unsat = true;
+            return ConflictOutcome::Unsat;
+        }
+        self.backtrack_with_phase_saving(backtrack_level);
+        self.learn_clause(learnt_clause);
+        self.vsids.decay();
+        self.clauses.decay_activity(self.config.clause_decay);
+        let _ = self.handle_clause_deletion_and_restart();
+        ConflictOutcome::Continue
+    }
+
+    /// Shared handler: a theory conflict on the hooks path. Includes the BUG-3
+    /// post-conflict BCP-settle.
+    fn handle_theory_conflict_hooks(&mut self, conflict_lits: &[Lit]) -> ConflictOutcome {
+        self.stats.conflicts += 1;
+        if self.trail.decision_level() == 0 {
+            return ConflictOutcome::Unsat;
+        }
+        let (backtrack_level, learnt_clause) = self.analyze_theory_conflict(conflict_lits);
+        if learnt_clause.is_empty() {
+            self.trivially_unsat = true;
+            return ConflictOutcome::Unsat;
+        }
+        self.backtrack_with_phase_saving(backtrack_level);
+        self.learn_clause(learnt_clause);
+        // BUG-3: settle Boolean consequences (a level-0 unit etc.) before continuing.
+        if let Some(bool_conflict) = self.propagate() {
+            if self.handle_boolean_conflict_hooks(bool_conflict).is_unsat() {
+                return ConflictOutcome::Unsat;
+            }
+        }
+        self.vsids.decay();
+        self.clauses.decay_activity(self.config.clause_decay);
+        let _ = self.handle_clause_deletion_and_restart();
+        ConflictOutcome::Continue
+    }
+
     /// Get the model (if sat)
     #[must_use]
     pub fn model(&self) -> &[LBool] {
@@ -1939,6 +2126,86 @@ mod tests {
 
         let result = solver.solve_with_theory(&mut theory);
         assert_eq!(result, SolverResult::Unsat);
+    }
+
+    // ----------------------------------------------------------------------------
+    // §4 redesign: `solve_with_hooks` + the `TheoryHooks` toy theory (Phase 1).
+    // ----------------------------------------------------------------------------
+
+    #[test]
+    fn test_hooks_sat_no_active_axiom() {
+        // (x0 ∨ x1) with a toy axiom whose premise is never forced true ⇒ SAT.
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        solver.add_clause([Lit::pos(x0), Lit::pos(x1)]);
+        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let (result, _theory) = solver.solve_with_hooks(theory);
+        assert_eq!(result, SolverResult::Sat);
+        // The returned model must satisfy the input clause.
+        assert!(
+            solver.model_value(x0).is_true() || solver.model_value(x1).is_true(),
+            "model must satisfy (x0 ∨ x1)"
+        );
+    }
+
+    #[test]
+    fn test_hooks_theory_propagation_sat() {
+        // Force x0 true; toy axiom (x0 ⇒ x1) must propagate x1 true via TheoryLemma.
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        solver.add_clause_dimacs(&[1]); // x0 = true
+        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let (result, _theory) = solver.solve_with_hooks(theory);
+        assert_eq!(result, SolverResult::Sat);
+        assert!(solver.model_value(x0).is_true());
+        assert!(
+            solver.model_value(x1).is_true(),
+            "x1 should be theory-propagated true"
+        );
+    }
+
+    #[test]
+    fn test_hooks_theory_conflict_unsat() {
+        // Force x0 true AND x1 false; axiom (x0 ⇒ x1) makes this theory-inconsistent
+        // at level 0 ⇒ UNSAT (the dangerous direction must NOT be a spurious SAT).
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        solver.add_clause_dimacs(&[1]); // x0 = true
+        solver.add_clause_dimacs(&[-2]); // x1 = false
+        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let (result, _theory) = solver.solve_with_hooks(theory);
+        assert_eq!(result, SolverResult::Unsat);
+    }
+
+    #[test]
+    fn test_hooks_pure_boolean_matches_solve() {
+        // With no axioms the toy theory is inert; the hooks driver must agree with
+        // plain `solve()` on a pure-Boolean instance (here: unsatisfiable).
+        let mut s1 = Solver::new();
+        let a = s1.new_var();
+        s1.add_clause([Lit::pos(a)]);
+        s1.add_clause([Lit::neg(a)]); // a ∧ ¬a ⇒ UNSAT
+        let theory = Box::new(ToyImplTheory::new(vec![]));
+        let (result, _t) = s1.solve_with_hooks(theory);
+        assert_eq!(result, SolverResult::Unsat);
+    }
+
+    #[test]
+    fn test_hooks_eval_oracle_after_sat() {
+        // After SAT, the toy theory's `eval` returns its tracked truth value for a
+        // theory-relevant atom (exercises the eval oracle + theory state tracking).
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        solver.add_clause_dimacs(&[1]); // x0 = true
+        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let (result, mut theory) = solver.solve_with_hooks(theory);
+        assert_eq!(result, SolverResult::Sat);
+        // x1 was theory-propagated true, so the theory still tracks it as true.
+        assert_eq!(theory.eval(x1), Some(true));
     }
 
     #[test]

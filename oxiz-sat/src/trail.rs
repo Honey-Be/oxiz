@@ -120,9 +120,28 @@ impl Trail {
     }
 
     /// Install a theory on the trail (§4.1). Subsequent level/assignment mutations
-    /// fire its hooks atomically.
+    /// fire its hooks atomically. The freshly-installed theory is SYNCED with the
+    /// current trail state first — every live decision level is replayed as a
+    /// `push_frame` and every existing assignment as an `assign_hook` (in trail
+    /// order) — so assignments made before installation (e.g. level-0 units enqueued
+    /// while building the formula) are not invisible to the theory.
     pub fn set_theory(&mut self, theory: Box<dyn TheoryHooks>) {
+        // Precompute (lit, level) pairs before borrowing `self.theory` mutably.
+        let cur = self.current_level;
+        let pairs: Vec<(Lit, u32)> = self
+            .assignments
+            .iter()
+            .map(|&lit| (lit, self.var_info[lit.var().index()].level))
+            .collect();
         self.theory = Some(theory);
+        if let Some(t) = self.theory.as_mut() {
+            for lvl in 1..=cur {
+                t.push_frame(lvl);
+            }
+            for (lit, lvl) in pairs {
+                let _ = t.assign_hook(lit, lvl);
+            }
+        }
     }
 
     /// Borrow the installed theory mutably (for loop-driven calls — `final_check`,
@@ -214,6 +233,12 @@ impl Trail {
     /// Assign a literal due to theory propagation
     pub fn assign_theory(&mut self, lit: Lit) {
         self.assign(lit, Reason::Theory);
+    }
+
+    /// Assign a literal due to a typed theory propagation (§4.3). `id` indexes the
+    /// theory-reason store (see `add_theory_reason`).
+    pub fn assign_theory_lemma(&mut self, lit: Lit, id: TheoryReasonId) {
+        self.assign(lit, Reason::TheoryLemma(id));
     }
 
     fn assign(&mut self, lit: Lit, reason: Reason) {
