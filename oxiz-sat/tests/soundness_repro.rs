@@ -9,10 +9,11 @@
 //!   v1=F v2=F v3=F v4=T v5=T v6=T
 //! which all four reference solvers confirm.
 //!
-//! NOTE: this test currently FAILS on the engine as of branch 0.2.4-feat/cdqi,
-//! documenting the live soundness bug. It is a `#[ignore]`d test so it does not
-//! break unrelated CI while the engine is being redesigned; run with
-//!   cargo test -p oxiz-sat --test soundness_repro -- --ignored
+//! STATUS: FIXED. The 1-UIP defect was corrected in `cc3872c` (process every
+//! reason literal; never assume the implied literal sits at `lits[0]`). This is
+//! now a regular `#[test]` (no longer `#[ignore]`d) and PASSES, guarding against
+//! regression of the spurious-UNSAT. Run with
+//!   cargo test -p oxiz-sat --test soundness_repro
 use oxiz_sat::{Lit, Solver, SolverResult};
 
 fn lit(d: i32) -> Lit {
