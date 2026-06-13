@@ -13,9 +13,10 @@ use oxiz_solver::Context;
 fn verdict_with(script: &str, hooks: bool) -> &'static str {
     let mut ctx = Context::new();
     ctx.set_timeout_ms(10_000);
-    if hooks {
-        ctx.set_option("oxiz.use-hooks-driver", "true");
-    }
+    // Set the driver EXPLICITLY (both ways): the production default is now the
+    // hooks driver, so leaving it unset would make the `false` arm also resolve
+    // to hooks and stop cross-checking the legacy path.
+    ctx.set_option("oxiz.use-hooks-driver", if hooks { "true" } else { "false" });
     match ctx.execute_script(script) {
         Ok(out) => out
             .iter()

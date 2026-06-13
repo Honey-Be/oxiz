@@ -282,10 +282,13 @@ pub struct SolverConfig {
     /// EUF/arith/BV theory state (`TheoryManager` implements both traits); the
     /// hooks path additionally enforces the §4.1 `|frames| == level+1`
     /// invariant by construction (per-literal `unassign_hook` + per-level
-    /// `pop_frame` make a desynced theory frame unrepresentable). **Off by
-    /// default** until the new path is validated verdict-for-verdict against the
-    /// legacy path; flipping it on is how the redesign retires the parallel
-    /// `level_stack` + the stale-bound suppression guards.
+    /// `pop_frame` make a desynced theory frame unrepresentable). **ON by
+    /// default** (Phase 2 step 5): validated verdict-for-verdict against the
+    /// legacy path (full suite + z3 differential, both drivers, zero spurious
+    /// UNSAT). The legacy `TheoryCallback` path is retained as an opt-out
+    /// (`false`) cross-check fallback. Because lock-step makes a stale theory
+    /// frame unrepresentable, the hooks path also skips the `arith`
+    /// stale-bound suppression guards (kept active for the legacy fallback).
     pub use_hooks_driver: bool,
 }
 
@@ -320,7 +323,7 @@ impl SolverConfig {
             enable_inprocessing: false, // No inprocessing for speed
             inprocessing_interval: 0,
             clean_mbqi: false,
-            use_hooks_driver: false,
+            use_hooks_driver: true,
         }
     }
 
@@ -348,7 +351,7 @@ impl SolverConfig {
             enable_inprocessing: true,
             inprocessing_interval: 10000,
             clean_mbqi: false,
-            use_hooks_driver: false,
+            use_hooks_driver: true,
         }
     }
 
@@ -376,7 +379,7 @@ impl SolverConfig {
             enable_inprocessing: true,
             inprocessing_interval: 5000, // More frequent inprocessing
             clean_mbqi: false,
-            use_hooks_driver: false,
+            use_hooks_driver: true,
         }
     }
 
@@ -404,7 +407,7 @@ impl SolverConfig {
             enable_inprocessing: false,
             inprocessing_interval: 0,
             clean_mbqi: false,
-            use_hooks_driver: false,
+            use_hooks_driver: true,
         }
     }
 

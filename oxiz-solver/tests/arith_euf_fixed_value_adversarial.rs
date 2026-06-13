@@ -7,7 +7,7 @@
 //! is ZERO spurious UNSAT (oxiz=unsat where z3=sat) on EITHER driver — the
 //! dangerous direction. Run through both the legacy and the §4 hooks driver.
 use oxiz_solver::Context;
-fn run(s:&str,h:bool)->&'static str{let mut c=Context::new();c.set_timeout_ms(8000);if h{c.set_option("oxiz.use-hooks-driver","true");}match c.execute_script(s){Ok(o)=>o.iter().rev().find_map(|l|match l.trim(){"sat"=>Some("sat"),"unsat"=>Some("unsat"),"unknown"=>Some("unknown"),_=>None}).unwrap_or("unknown"),Err(_)=>"unknown"}}
+fn run(s:&str,h:bool)->&'static str{let mut c=Context::new();c.set_timeout_ms(8000);c.set_option("oxiz.use-hooks-driver",if h{"true"}else{"false"});match c.execute_script(s){Ok(o)=>o.iter().rev().find_map(|l|match l.trim(){"sat"=>Some("sat"),"unsat"=>Some("unsat"),"unknown"=>Some("unknown"),_=>None}).unwrap_or("unknown"),Err(_)=>"unknown"}}
 const CASES:&[(&str,&str,&str)]=&[
 ("sat_decoy_fixed_term_off_path","(set-logic QF_UFLIA)\n(declare-fun f (Int) Int)\n(assert (>= (f 1) 5))\n(assert (<= (f 1) 5))\n(assert (>= (f 5) 9))\n(assert (<= (f 5) 9))\n(assert (>= (f 3) 9))\n(assert (<= (f 3) 9))\n(assert (= (f (f 1)) 9))\n(check-sat)","sat"),
 ("unsat_genuine_congruence_value_clash","(set-logic QF_UFLIA)\n(declare-fun f (Int) Int)\n(assert (>= (f 1) 5))\n(assert (<= (f 1) 5))\n(assert (>= (f 5) 9))\n(assert (<= (f 5) 9))\n(assert (= (f (f 1)) 2))\n(check-sat)","unsat"),
