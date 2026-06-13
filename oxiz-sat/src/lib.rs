@@ -214,7 +214,8 @@ pub use resolution_graph::{
 pub use smoothed_lbd::{SmoothedLbdStats, SmoothedLbdTracker};
 pub use solver::{
     BoxedBranchingHeuristic, BranchingHeuristic, RestartStrategy, Solver, SolverConfig,
-    SolverResult, SolverStats, TheoryCallback, TheoryCheckResult,
+    SolverResult, SolverStats, TheoryCallback, TheoryCheckResult, TheoryHooks, TheoryStep,
+    ToyImplTheory,
 };
 /// Instrumentation for the theory-conflict placeholder leak (feature `theory-probe`).
 #[cfg(feature = "theory-probe")]

@@ -1378,8 +1378,23 @@ impl Solver {
                                 break;
                             }
                             LBool::Undef => {
-                                let id = self.trail.add_theory_reason(reason);
-                                self.trail.assign_theory_lemma(lit, id);
+                                // Materialise the theory reason as a real clause so
+                                // 1-UIP conflict analysis can RESOLVE this propagation
+                                // (a `Reason::TheoryLemma` is opaque to `analyze`,
+                                // which would treat the propagated literal as a
+                                // decision — an over-strong learned clause → spurious
+                                // UNSAT; caught by `hooks_diff_fuzz`). The typed
+                                // `TheoryReason` still carries the asserting literal
+                                // (the §4.3 placeholder-elimination); lazy TheoryLemma
+                                // expansion inside `analyze` is a deferred refinement.
+                                // `reason.explanation` holds the FALSE non-asserting
+                                // literals; `add_theory_reason_clause` wants the TRUE
+                                // justifying literals (it negates them), so pass their
+                                // negations.
+                                let true_lits: SmallVec<[Lit; 8]> =
+                                    reason.explanation.iter().map(|l| l.negate()).collect();
+                                let clause_id = self.add_theory_reason_clause(&true_lits, lit);
+                                self.trail.assign_propagation(lit, clause_id);
                                 // Settle Boolean consequences of the theory unit.
                                 if let Some(conflict) = self.propagate() {
                                     if self.handle_boolean_conflict_hooks(conflict).is_unsat() {
