@@ -609,8 +609,14 @@ impl<'a> TheoryManager<'a> {
                     use oxiz_theories::Theory;
                     use oxiz_theories::TheoryCheckResult as TheoryCheckResultEnum;
                     if let Ok(TheoryCheckResultEnum::Unsat(conflict_terms)) = self.arith.check() {
-                        let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
-                        return TheoryCheckResult::Conflict(conflict_lits);
+                        // Suppress a stale-bound pseudo-conflict (two distinct
+                        // assertions of one atom under opposite polarities left
+                        // in the simplex by a SAT backtrack the theory frame did
+                        // not retract); reporting it would be a spurious UNSAT.
+                        if !self.arith.last_conflict_is_stale_bound() {
+                            let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
+                            return TheoryCheckResult::Conflict(conflict_lits);
+                        }
                     }
                 }
             }
@@ -1083,8 +1089,10 @@ impl<'a> TheoryManager<'a> {
                         use oxiz_theories::TheoryCheckResult as TheoryCheckResultEnum;
                         if let Ok(TheoryCheckResultEnum::Unsat(conflict_terms)) = self.arith.check()
                         {
-                            let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
-                            return TheoryCheckResult::Conflict(conflict_lits);
+                            if !self.arith.last_conflict_is_stale_bound() {
+                                let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
+                                return TheoryCheckResult::Conflict(conflict_lits);
+                            }
                         }
                     }
 
@@ -1485,8 +1493,15 @@ impl<'a> TheoryManager<'a> {
                     let arith_result = self.arith.check();
                     match arith_result {
                         Ok(TheoryCheckResultEnum::Unsat(conflict_terms)) => {
-                            let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
-                            return TheoryCheckResult::Conflict(conflict_lits);
+                            // Suppress a stale-bound pseudo-conflict (an atom left
+                            // in the simplex under both polarities by a SAT
+                            // backtrack the theory frame did not retract) — it is
+                            // satisfiable and reporting it yields spurious UNSAT.
+                            if !self.arith.last_conflict_is_stale_bound() {
+                                let conflict_lits =
+                                    self.terms_to_conflict_clause(&conflict_terms);
+                                return TheoryCheckResult::Conflict(conflict_lits);
+                            }
                         }
                         Ok(TheoryCheckResultEnum::Sat) => {}
                         other => {
@@ -1631,6 +1646,15 @@ impl TheoryCallback for TheoryManager<'_> {
                         self.model_based_combination()
                     }
                     oxiz_theories::TheoryCheckResult::Unsat(conflict_terms) => {
+                        // Suppress a stale-bound pseudo-conflict (an atom left in
+                        // the simplex under both polarities by a SAT backtrack the
+                        // theory frame did not retract) — it is satisfiable, so
+                        // reporting it would be a spurious UNSAT.  Fall through to
+                        // the model-based combination check instead.
+                        if self.arith.last_conflict_is_stale_bound() {
+                            return self.model_based_combination();
+                        }
+
                         // Arithmetic conflict detected - convert to SAT conflict clause
                         let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
                         self.statistics.theory_conflicts += 1;

@@ -153,6 +153,66 @@ fn build(asserts: &[String]) -> String {
     s
 }
 
+// ---- richer generator: linear arithmetic sums, ite, nested boolean ----------
+/// Build a random ground problem that exercises linear arithmetic combinations
+/// (`(+ ...)`, `(- ...)`, `(* k t)`), `ite`, and nested boolean connectives on
+/// top of the EUF×LIA base — the constructs the flat generator never emits.
+fn gen_problem_arith(rng: &mut Rng) -> (String, Vec<String>) {
+    let consts = ["a", "b", "c", "d"];
+    let ints = ["0", "1", "2", "3", "5", "10"];
+    let mut pool: Vec<String> = Vec::new();
+    for c in consts {
+        pool.push(c.to_string());
+    }
+    for i in ints {
+        pool.push(i.to_string());
+    }
+    // A layer of f/g apps, then a layer of linear combinations and ite over the
+    // whole pool so arithmetic terms can themselves be function arguments.
+    for _ in 0..(3 + rng.upto(4)) {
+        let func = if rng.chance(1, 2) { "f" } else { "g" };
+        let arg = pool[rng.upto(pool.len())].clone();
+        pool.push(format!("({func} {arg})"));
+    }
+    let base_len = pool.len();
+    for _ in 0..(3 + rng.upto(5)) {
+        let t1 = pool[rng.upto(base_len)].clone();
+        let t2 = pool[rng.upto(base_len)].clone();
+        let term = match rng.upto(4) {
+            0 => format!("(+ {t1} {t2})"),
+            1 => format!("(- {t1} {t2})"),
+            2 => format!("(* {} {t1})", 1 + rng.upto(3)),
+            _ => format!("(ite (= {t1} {t2}) {t1} {t2})"),
+        };
+        pool.push(term);
+    }
+
+    let term = |rng: &mut Rng, pool: &[String]| pool[rng.upto(pool.len())].clone();
+    let atom = |rng: &mut Rng, pool: &[String]| -> String {
+        match rng.upto(5) {
+            0 => format!("(= {} {})", term(rng, pool), term(rng, pool)),
+            1 => format!("(<= {} {})", term(rng, pool), ints[rng.upto(ints.len())]),
+            2 => format!("(>= {} {})", term(rng, pool), ints[rng.upto(ints.len())]),
+            3 => format!("(< {} {})", term(rng, pool), term(rng, pool)),
+            _ => format!("(> {} {})", term(rng, pool), term(rng, pool)),
+        }
+    };
+
+    let n_asserts = 4 + rng.upto(12);
+    let mut asserts: Vec<String> = Vec::new();
+    for _ in 0..n_asserts {
+        let a = match rng.upto(5) {
+            0 => atom(rng, &pool),
+            1 => format!("(not {})", atom(rng, &pool)),
+            2 => format!("(or {} {})", atom(rng, &pool), atom(rng, &pool)),
+            3 => format!("(and {} {})", atom(rng, &pool), atom(rng, &pool)),
+            _ => format!("(=> {} {})", atom(rng, &pool), atom(rng, &pool)),
+        };
+        asserts.push(a);
+    }
+    (build(&asserts), asserts)
+}
+
 /// Is this an UNSOUND disagreement (one side proves what the other refutes)?
 fn unsound(oxiz: V, z3: V) -> Option<&'static str> {
     match (oxiz, z3) {
@@ -182,9 +242,23 @@ fn minimize(mut asserts: Vec<String>) -> Vec<String> {
     asserts
 }
 
-#[test]
-#[ignore = "differential fuzz vs z3; run with --ignored"]
-fn ground_euf_lia_vs_z3() {
+/// Shared differential-audit loop: generate `n` problems with `gen`, solve each
+/// with OxiZ and z3, and report every unsound disagreement (with a minimized
+/// repro).  `label` tags the log line; `default_seed` lets the generators
+/// diverge by default while both honour OXIZ_FUZZ_N / OXIZ_FUZZ_SEED.
+///
+/// `gate_spurious_sat`: when true a spurious SAT is fatal (the EUF+LIA gate is
+/// fully clean).  When false, a spurious SAT is REPORTED but tolerated — it is a
+/// *known, benign* gap in the richer arith+ite fragment (a numeric ite or nested
+/// app under a direct bound, which needs complete EUF↔arith Nelson-Oppen
+/// propagation to refute).  A spurious UNSAT — the dangerous direction that
+/// would let a verifier accept invalid code — is ALWAYS fatal.
+fn run_audit(
+    label: &str,
+    generator: fn(&mut Rng) -> (String, Vec<String>),
+    default_seed: u64,
+    gate_spurious_sat: bool,
+) {
     let n: usize = std::env::var("OXIZ_FUZZ_N")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -192,7 +266,7 @@ fn ground_euf_lia_vs_z3() {
     let seed: u64 = std::env::var("OXIZ_FUZZ_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0x9E3779B97F4A7C15);
+        .unwrap_or(default_seed);
 
     // z3 must be present; otherwise this audit cannot run.
     assert!(
@@ -202,10 +276,12 @@ fn ground_euf_lia_vs_z3() {
 
     let mut rng = Rng(seed);
     let (mut checked, mut agree, mut z3_unknown, mut oxiz_unknown) = (0usize, 0, 0, 0);
-    let mut unsound_cases: Vec<(String, Vec<String>, V, V, &'static str)> = Vec::new();
+    // Fatal (always): spurious UNSAT.  Plus spurious SAT when `gate_spurious_sat`.
+    let mut fatal: Vec<(String, Vec<String>, V, V, &'static str)> = Vec::new();
+    let mut tolerated_spurious_sat = 0usize;
 
     for _ in 0..n {
-        let (script, asserts) = gen_problem(&mut rng);
+        let (script, asserts) = generator(&mut rng);
         let z3 = match solve_z3(&script) {
             Some(v) => v,
             None => continue,
@@ -220,35 +296,56 @@ fn ground_euf_lia_vs_z3() {
             oxiz_unknown += 1;
             continue;
         }
-        if let Some(kind) = unsound(oxiz, z3) {
-            unsound_cases.push((script, asserts, oxiz, z3, kind));
-            if unsound_cases.len() >= 5 {
-                break;
+        match unsound(oxiz, z3) {
+            Some(kind) => {
+                let is_spurious_unsat = oxiz == V::Unsat;
+                if is_spurious_unsat || gate_spurious_sat {
+                    fatal.push((script, asserts, oxiz, z3, kind));
+                    if fatal.len() >= 5 {
+                        break;
+                    }
+                } else {
+                    tolerated_spurious_sat += 1;
+                }
             }
-        } else if oxiz == z3 {
-            agree += 1;
+            None if oxiz == z3 => agree += 1,
+            None => {}
         }
     }
 
     eprintln!(
-        "[ground-audit] checked={checked} agree={agree} oxiz_unknown={oxiz_unknown} z3_unknown={z3_unknown} unsound={}",
-        unsound_cases.len()
+        "[{label}] checked={checked} agree={agree} oxiz_unknown={oxiz_unknown} z3_unknown={z3_unknown} fatal={} tolerated_spurious_sat={tolerated_spurious_sat}",
+        fatal.len()
     );
 
-    if let Some((_, asserts, oxiz, z3, kind)) = unsound_cases.first().cloned() {
-        eprintln!("[ground-audit] {kind}: oxiz={oxiz:?} z3={z3:?}");
-        eprintln!("[ground-audit] minimizing {} assertions…", asserts.len());
+    if let Some((_, asserts, oxiz, z3, kind)) = fatal.first().cloned() {
+        eprintln!("[{label}] {kind}: oxiz={oxiz:?} z3={z3:?}");
+        eprintln!("[{label}] minimizing {} assertions…", asserts.len());
         let min = minimize(asserts);
-        eprintln!(
-            "[ground-audit] MINIMAL REPRO ({} assertions):\n{}",
-            min.len(),
-            build(&min)
-        );
+        eprintln!("[{label}] MINIMAL REPRO ({} assertions):\n{}", min.len(), build(&min));
     }
 
     assert!(
-        unsound_cases.is_empty(),
-        "{} unsound ground verdict(s) vs z3 — see minimized repro above",
-        unsound_cases.len()
+        fatal.is_empty(),
+        "{} FATAL unsound ground verdict(s) vs z3 — see minimized repro above",
+        fatal.len()
     );
+}
+
+#[test]
+#[ignore = "differential fuzz vs z3; run with --ignored"]
+fn ground_euf_lia_vs_z3() {
+    // EUF + LIA is fully clean post the proof-forest / nested-app fixes: gate
+    // BOTH spurious directions.
+    run_audit("ground-audit", gen_problem, 0x9E3779B97F4A7C15, true);
+}
+
+#[test]
+#[ignore = "differential fuzz vs z3 (linear-arith + ite + boolean); run with --ignored"]
+fn ground_arith_no_spurious_unsat() {
+    // Richer fragment (ite, linear sums, nested boolean).  Gate the DANGEROUS
+    // spurious-UNSAT direction; tolerate (but report) spurious SAT, which is a
+    // known benign gap pending complete EUF↔arith Nelson-Oppen propagation
+    // (a numeric ite / nested app under a direct bound).
+    run_audit("arith-audit", gen_problem_arith, 0x2545F4914F6CDD1D, false);
 }

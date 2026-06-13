@@ -65,6 +65,40 @@ fn gcd_infeasible_equality_is_unsat() {
     );
 }
 
+/// Stale-bound pseudo-conflict: a SAT backtrack + re-decision left the atom
+/// `(>= (f 2) 5)` asserted into the simplex under BOTH polarities (`f(2)<=4` AND
+/// `f(2)>=5`), so arith reported a vacuous self-conflict over a single atom →
+/// the SAT layer learned a malformed `[¬v, ¬v]` unit and concluded a spurious
+/// UNSAT.  The whole script is satisfiable.  Detected by
+/// `ArithSolver::last_conflict_is_stale_bound` (>=2 distinct reason-ids
+/// collapsing onto <2 distinct atom terms) and suppressed at the theory-manager
+/// conflict sites.  NOTE: this is a surgical guard against the dangerous
+/// (accepts-invalid) direction; the underlying theory-frame/SAT-trail desync is
+/// documented as a known root-cause for a later resync fix.
+#[test]
+fn stale_bound_pseudo_conflict_is_sat() {
+    let script = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(declare-fun g (Int) Int)
+(declare-fun a () Int)
+(declare-fun b () Int)
+(declare-fun c () Int)
+(declare-fun d () Int)
+(assert (or (>= (+ a 5) 3) (> a 0)))
+(assert (=> (>= (- c a) 5) (>= (f 2) 5)))
+(assert (or (< d (- c a)) (< 10 (f 2))))
+(assert (not (< c 10)))
+(assert (not (<= c 5)))
+(assert (=> (> (- c a) c) (>= d 3)))
+(assert (and (= c d) (<= 5 5)))
+(assert (or (>= (g 5) 5) (> (f 2) (- c a))))
+(assert (=> (> 5 1) (< (f 2) b)))
+(check-sat)
+";
+    assert_eq!(verdict(script), "sat", "stale-bound pseudo-conflict must not force unsat");
+}
+
 /// Bug (a): a nested application carrying a DIRECT numeric constraint must reach
 /// the arithmetic solver.  `f(g(10)) = 20` together with `f(g(10)) <= 10` is a
 /// contradiction (20 <= 10 is false), so the script is UNSAT.  Dropping the

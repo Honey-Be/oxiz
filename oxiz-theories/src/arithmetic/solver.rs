@@ -40,6 +40,17 @@ pub struct ArithSolver {
     context_stack: Vec<ContextState>,
     /// Accumulated shared equalities (from notify_equality calls)
     shared_equalities: Vec<EqualityNotification>,
+    /// Diagnostics for the most recent `check()` conflict, used by the theory
+    /// manager to detect a *stale-bound* pseudo-conflict (see `check`):
+    /// `(number of distinct reason-ids, number of distinct reason atom terms)`.
+    /// A real conflict over a single self-infeasible atom (e.g. `(< x x)` or the
+    /// LIA GCD branch) reports its contradictory bounds under ONE reason-id, so
+    /// `distinct_ids == 1`.  TWO OR MORE distinct ids that collapse onto a
+    /// single atom term mean the same atom was asserted under BOTH polarities
+    /// into the live simplex — a transient stale bound from a SAT backtrack +
+    /// re-decision the theory frame stack did not retract.
+    last_conflict_distinct_ids: usize,
+    last_conflict_distinct_terms: usize,
 }
 
 /// State for push/pop
@@ -69,7 +80,29 @@ impl ArithSolver {
             is_integer,
             context_stack: Vec::new(),
             shared_equalities: Vec::new(),
+            last_conflict_distinct_ids: 0,
+            last_conflict_distinct_terms: 0,
         }
+    }
+
+    /// Distinct (reason-id count, atom-term count) of the most recent `check()`
+    /// conflict.  See the field docs and `is_stale_bound_conflict`.
+    #[must_use]
+    pub fn last_conflict_shape(&self) -> (usize, usize) {
+        (
+            self.last_conflict_distinct_ids,
+            self.last_conflict_distinct_terms,
+        )
+    }
+
+    /// Whether the most recent `check()` conflict is a stale-bound artifact:
+    /// two or more distinct assertions (reason-ids) collapsing onto fewer than
+    /// two distinct atom terms.  Such a "conflict" is unsound to report — the
+    /// currently-assigned constraints are jointly satisfiable; the contradiction
+    /// only exists because an atom's previous-polarity bound was never retracted.
+    #[must_use]
+    pub fn last_conflict_is_stale_bound(&self) -> bool {
+        self.last_conflict_distinct_ids >= 2 && self.last_conflict_distinct_terms < 2
     }
 
     /// Create a new LRA solver
@@ -487,6 +520,25 @@ impl Theory for ArithSolver {
         match self.simplex.check() {
             Ok(()) => Ok(TheoryResult::Sat),
             Err(reasons) => {
+                // Record the conflict shape so the theory manager can recognise
+                // a stale-bound pseudo-conflict (see `last_conflict_is_stale_bound`).
+                let mut distinct_ids: Vec<u32> = Vec::new();
+                for &r in &reasons {
+                    if !distinct_ids.contains(&r) {
+                        distinct_ids.push(r);
+                    }
+                }
+                let mut distinct_terms: Vec<TermId> = Vec::new();
+                for &r in &distinct_ids {
+                    if let Some(&t) = self.reasons.get(r as usize)
+                        && !distinct_terms.contains(&t)
+                    {
+                        distinct_terms.push(t);
+                    }
+                }
+                self.last_conflict_distinct_ids = distinct_ids.len();
+                self.last_conflict_distinct_terms = distinct_terms.len();
+
                 let terms: Vec<_> = reasons
                     .iter()
                     .filter_map(|&r| self.reasons.get(r as usize).copied())
