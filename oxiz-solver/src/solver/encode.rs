@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
 use num_rational::Rational64;
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{CheckedAdd, CheckedMul, One, ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_sat::{Lit, Var};
 use smallvec::SmallVec;
@@ -304,7 +304,13 @@ impl Solver {
             // Integer constant
             TermKind::IntConst(n) => {
                 if let Some(val) = n.to_i64() {
-                    *constant += scale * Rational64::from_integer(val);
+                    // Checked: an i64-rational overflow here must make the
+                    // comparison OPAQUE (return None), never silently wrap into
+                    // a wrong coefficient — wrapping fabricates a spurious arith
+                    // conflict (the prelude-scale `-V adsmt` false-`unsat`). i128
+                    // widening for completeness is a tracked follow-up.
+                    *constant =
+                        constant.checked_add(&scale.checked_mul(&Rational64::from_integer(val))?)?;
                     Some(())
                 } else {
                     // BigInt too large, skip for now
@@ -314,14 +320,20 @@ impl Solver {
 
             // Rational constant
             TermKind::RealConst(r) => {
-                *constant += scale * *r;
+                *constant = constant.checked_add(&scale.checked_mul(r)?)?;
                 Some(())
             }
 
             // Bitvector constant - treat as integer
             TermKind::BitVecConst { value, .. } => {
                 if let Some(val) = value.to_i64() {
-                    *constant += scale * Rational64::from_integer(val);
+                    // Checked: an i64-rational overflow here must make the
+                    // comparison OPAQUE (return None), never silently wrap into
+                    // a wrong coefficient — wrapping fabricates a spurious arith
+                    // conflict (the prelude-scale `-V adsmt` false-`unsat`). i128
+                    // widening for completeness is a tracked follow-up.
+                    *constant =
+                        constant.checked_add(&scale.checked_mul(&Rational64::from_integer(val))?)?;
                     Some(())
                 } else {
                     // BigInt too large, skip for now
@@ -422,8 +434,8 @@ impl Solver {
                     )?;
 
                     if sub_terms.is_empty() {
-                        // Pure constant factor — absorb into product.
-                        const_product *= sub_constant;
+                        // Pure constant factor — absorb into product (checked).
+                        const_product = const_product.checked_mul(&sub_constant)?;
                     } else if sub_terms.len() == 1 && sub_constant.is_zero() {
                         // Exactly one scaled variable with no additive constant,
                         // e.g. `x`, `(- x)`, `(* 2 x)`.  Record as the variable
@@ -441,14 +453,14 @@ impl Solver {
                     }
                 }
 
-                let new_scale = scale * const_product;
+                let new_scale = scale.checked_mul(&const_product)?;
                 match var_factor {
                     Some((v, coef)) => {
-                        terms.push((v, new_scale * coef));
+                        terms.push((v, new_scale.checked_mul(&coef)?));
                         Some(())
                     }
                     None => {
-                        *constant += new_scale;
+                        *constant = constant.checked_add(&new_scale)?;
                         Some(())
                     }
                 }

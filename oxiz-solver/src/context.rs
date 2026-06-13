@@ -754,6 +754,17 @@ impl Context {
                 config.use_hooks_driver = value == "true";
                 self.solver.set_config(config);
             }
+            // The clean-room MBQI engine (`oxiz-mbqi`, never-conclude-unsat) is
+            // the DEFAULT quantifier path. `(set-option :oxiz.clean-mbqi false)`
+            // opts back into the legacy `mbqi/` heuristics — kept reachable for
+            // A/B regression + the legacy completeness it still wins, but it is
+            // the unsound-by-whack-a-mole path (verus-fork trigger A..F family),
+            // so production should leave it on.
+            "oxiz.clean-mbqi" => {
+                let mut config = self.solver.config().clone();
+                config.clean_mbqi = value == "true";
+                self.solver.set_config(config);
+            }
             _ => {}
         }
     }

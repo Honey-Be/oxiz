@@ -315,9 +315,109 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         self.assign.get(&quant) != Some(&self.false_id)
     }
 
-    // eval_forall: v1 leaves trigger-free quantifiers unverified (`None` ⇒ the
-    // engine reports `Inconclusive` ⇒ host `Unknown`). Sound (matches native
-    // lu-smt / z3-times-out); a model-completion verifier that returns
-    // `Some(true)` for satisfiable definitional axioms (to reach `Sat`) is a
-    // follow-up. The default `None` is inherited.
+    /// **M3 model-based verification (tautology fragment).** Returns `Some(true)`
+    /// only when the quantifier *body* is a logical TAUTOLOGY — valid in every
+    /// interpretation, for every value of the bound variables — recognised
+    /// purely structurally (see [`SolverModel::body_is_valid`]). It never
+    /// consults the model's sampled function values, so it cannot mistake
+    /// "agrees on the sampled points" for "holds universally": a body like
+    /// `∀x. f(x)=g(x)` that merely happens to hold on the current model's
+    /// witnesses stays `None`. That firewall is what keeps `Some(true)` sound —
+    /// the engine turns it straight into a `Saturated`/`Sat` verdict.
+    ///
+    /// `None` otherwise (the engine reports the quantifier unverified →
+    /// `Unknown`, never a guess). This recovers the completeness lost by the
+    /// conservative `clean_mbqi` default on the trivially-valid cases (e.g.
+    /// `∀x. f(x)=f(x)`, a reflexive-equality axiom) without admitting any
+    /// model-sample-based (unsound) `sat`.
+    fn eval_forall(&self, lang: &OxizHost<'a>, quant: TermId) -> Option<bool> {
+        let TermView::Quant { body, .. } = lang.view(quant) else {
+            return None;
+        };
+        // Validity is monotone under universal closure: if `body` is valid for
+        // all valuations then so is `∀x̄. body`. A non-tautology stays `None`.
+        if self.body_is_valid(lang, body, 64) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
+impl SolverModel {
+    /// Read-only, model-INDEPENDENT structural tautology check: is `t` true in
+    /// every interpretation, for every value of any free (bound) variable it
+    /// contains?  Every arm below is a logical validity, so a `true` result is
+    /// sound to hand to [`SolverModel::eval_forall`] (and thence to a `Sat`
+    /// verdict).  Anything not provably valid this way returns `false`
+    /// (conservative — the caller then yields the sound `Unknown`).
+    ///
+    /// `depth` bounds the DAG recursion so a deeply-nested body cannot blow the
+    /// stack; running out of budget returns `false` (sound under-approximation).
+    fn body_is_valid(&self, lang: &OxizHost<'_>, t: TermId, depth: u32) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if t == self.true_id {
+            return true;
+        }
+        match lang.view(t) {
+            TermView::App { sym } => {
+                let args = lang.children(t);
+                match sym {
+                    // Reflexivity: `a = a`, `a ≤ a`, `a ≥ a` hold for all `a`
+                    // (NOT `<`/`>`, which are irreflexive).
+                    OP_EQ | OP_LE | OP_GE if args.len() == 2 && args[0] == args[1] => true,
+                    // `¬φ` is valid iff `φ` is a contradiction.
+                    OP_NOT if args.len() == 1 => self.body_is_unsat(lang, args[0], depth - 1),
+                    // `∧` of valid conjuncts is valid.
+                    OP_AND => args.iter().all(|&a| self.body_is_valid(lang, a, depth - 1)),
+                    // `∨` is valid if any disjunct is valid.
+                    OP_OR => args.iter().any(|&a| self.body_is_valid(lang, a, depth - 1)),
+                    // `a ⇒ b` is valid if `b` is valid or `a` is a contradiction
+                    // (covers `p ⇒ p` via `args[0] == args[1]` too).
+                    OP_IMPLIES if args.len() == 2 => {
+                        args[0] == args[1]
+                            || self.body_is_valid(lang, args[1], depth - 1)
+                            || self.body_is_unsat(lang, args[0], depth - 1)
+                    }
+                    // `ite(c, t, e)` is valid when both branches are valid.
+                    OP_ITE if args.len() == 3 => {
+                        self.body_is_valid(lang, args[1], depth - 1)
+                            && self.body_is_valid(lang, args[2], depth - 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Dual of [`Self::body_is_valid`]: is `t` false in every interpretation?
+    /// Used only to discharge `¬φ` / `a ⇒ φ`. Conservative `false` when unsure.
+    fn body_is_unsat(&self, lang: &OxizHost<'_>, t: TermId, depth: u32) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if t == self.false_id {
+            return true;
+        }
+        match lang.view(t) {
+            TermView::App { sym } => {
+                let args = lang.children(t);
+                match sym {
+                    // `a < a`, `a > a`, `distinct(a, a)` are unsatisfiable.
+                    OP_LT | OP_GT | OP_DISTINCT if args.len() == 2 && args[0] == args[1] => true,
+                    // `¬φ` is a contradiction iff `φ` is valid.
+                    OP_NOT if args.len() == 1 => self.body_is_valid(lang, args[0], depth - 1),
+                    // `∧` is unsat if any conjunct is unsat.
+                    OP_AND => args.iter().any(|&a| self.body_is_unsat(lang, a, depth - 1)),
+                    // `∨` is unsat only if every disjunct is unsat.
+                    OP_OR => args.iter().all(|&a| self.body_is_unsat(lang, a, depth - 1)),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
 }

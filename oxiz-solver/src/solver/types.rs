@@ -322,7 +322,7 @@ impl SolverConfig {
             enable_symmetry_breaking: false,
             enable_inprocessing: false, // No inprocessing for speed
             inprocessing_interval: 0,
-            clean_mbqi: false,
+            clean_mbqi: true,
             use_hooks_driver: true,
         }
     }
@@ -350,7 +350,7 @@ impl SolverConfig {
             enable_symmetry_breaking: false, // Still expensive
             enable_inprocessing: true,
             inprocessing_interval: 10000,
-            clean_mbqi: false,
+            clean_mbqi: true,
             use_hooks_driver: true,
         }
     }
@@ -378,7 +378,7 @@ impl SolverConfig {
             enable_symmetry_breaking: true, // Enable for hard problems
             enable_inprocessing: true,
             inprocessing_interval: 5000, // More frequent inprocessing
-            clean_mbqi: false,
+            clean_mbqi: true,
             use_hooks_driver: true,
         }
     }
@@ -406,7 +406,7 @@ impl SolverConfig {
             enable_symmetry_breaking: false,
             enable_inprocessing: false,
             inprocessing_interval: 0,
-            clean_mbqi: false,
+            clean_mbqi: true,
             use_hooks_driver: true,
         }
     }

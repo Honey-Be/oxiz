@@ -397,9 +397,15 @@ impl Solver {
             self.config.max_conflicts,
             self.config.max_decisions,
             self.has_bv_arith_ops,
-            // Stale-bound suppression is needed ONLY by the legacy driver; the
-            // lock-step hooks path makes a stale frame unrepresentable.
-            !self.config.use_hooks_driver,
+            // Stale-bound suppression stays ON for BOTH drivers. 369a3a8
+            // retired it on the hooks path claiming a lock-step frame makes a
+            // stale bound unrepresentable — but verus-fork's trigger-F family
+            // (a `height_lt`/arith interaction) still leaves a retracted atom
+            // asserting a simplex bound on the hooks path, so the claim has a
+            // hole. The guard is sound regardless of driver (it suppresses only
+            // a conflict with <2 distinct atom terms — provably no real reason),
+            // so always-on restores soundness without risking a spurious sat.
+            true,
         )
     }
 
@@ -827,15 +833,46 @@ impl Solver {
                                 for l in lemmas {
                                     match manager.get(l).map(|t| t.kind.clone()) {
                                         Some(TermKind::Implies(q, phi)) => {
-                                            // Defensive groundness guard: the host
+                                            // Defensive substitution guard: the host
                                             // `substitute` is total over FO/UF/LIA
                                             // but not (yet) over BV/string/nested
                                             // quantifiers, so an instance could
-                                            // retain a free variable. Adding such a
-                                            // clause would be unsound (a stray free
-                                            // var is implicitly closed); DROP it
-                                            // instead — costs only completeness.
-                                            if !manager.free_vars(phi).is_empty() {
+                                            // retain one of THIS quantifier's BOUND
+                                            // variables (incomplete substitution).
+                                            // Adding such a clause would be unsound
+                                            // (the stray bound var is implicitly
+                                            // closed); DROP it — costs only
+                                            // completeness.
+                                            //
+                                            // Crucially the test is "retains a BOUND
+                                            // variable", NOT "has any free var":
+                                            // OxiZ models declared constants as `Var`
+                                            // terms too, so a perfectly ground
+                                            // instance like `Add(x,y)=x+y` over
+                                            // declared constants `x,y` has non-empty
+                                            // `free_vars`. The old `is_empty()` check
+                                            // over-rejected it, dropping the lemma
+                                            // that entails the conflict → a spurious
+                                            // `Saturated`/`sat` (regression:
+                                            // `patterned_quantifier_still_instantiates_at_real_ground_terms`).
+                                            let bound_names: smallvec::SmallVec<
+                                                [oxiz_core::interner::Spur; 2],
+                                            > = match manager.get(q).map(|t| &t.kind) {
+                                                Some(
+                                                    TermKind::Forall { vars, .. }
+                                                    | TermKind::Exists { vars, .. },
+                                                ) => vars.iter().map(|(n, _)| *n).collect(),
+                                                _ => Default::default(),
+                                            };
+                                            let retains_bound =
+                                                manager.free_vars(phi).into_iter().any(|v| {
+                                                    matches!(
+                                                        manager.get(v).map(|t| &t.kind),
+                                                        Some(TermKind::Var(n))
+                                                            if bound_names.contains(n)
+                                                    )
+                                                });
+                                            if retains_bound {
                                                 continue;
                                             }
                                             // Record the GROUND instance body (a
