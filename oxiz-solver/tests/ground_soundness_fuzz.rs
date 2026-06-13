@@ -54,6 +54,11 @@ fn solve_oxiz(script: &str) -> V {
     // quantifiers, so neither engine instantiates.
     let mut ctx = Context::new();
     ctx.set_timeout_ms(4000);
+    // §4 redesign validation lever: `OXIZ_USE_HOOKS=1` routes this differential
+    // through the lock-step `TheoryHooks` driver instead of the legacy one.
+    if std::env::var("OXIZ_USE_HOOKS").as_deref() == Ok("1") {
+        ctx.set_option("oxiz.use-hooks-driver", "true");
+    }
     match ctx.execute_script(script) {
         Ok(out) => out
             .iter()
