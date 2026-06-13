@@ -28,26 +28,44 @@ pub struct TheoryDecision {
     pub priority: i32,
 }
 
-/// Theory manager that bridges the SAT solver with theory solvers
-pub(crate) struct TheoryManager<'a> {
-    /// Reference to the term manager
-    manager: &'a TermManager,
-    /// Reference to the EUF solver
-    euf: &'a mut EufSolver,
-    /// Reference to the arithmetic solver
-    arith: &'a mut ArithSolver,
-    /// Reference to the bitvector solver
-    bv: &'a mut BvSolver,
+/// Theory manager that bridges the SAT solver with theory solvers.
+///
+/// §4 redesign (Phase 2): this used to BORROW the term manager and the theory
+/// solvers (`TheoryManager<'a>`); it now OWNS them. Ownership removes the
+/// lifetime parameter so the same struct can satisfy the `'static` bound of the
+/// lock-step `TheoryHooks` driver (`solve_with_hooks`) while still handing each
+/// theory method a concrete `&TermManager` (zero generic/`&dyn` cascade into
+/// oxiz-theories). The owner (`Solver::check`) MOVES its real state in for the
+/// span of one solve and MOVES it back out afterward (see `take_theory_manager`
+/// / `restore_theory_manager` + `into_parts`); the maps are read-only during a
+/// solve so the relocation is O(1) and behaviour-identical to the old borrow.
+pub(crate) struct TheoryManager {
+    /// The term manager, behind an `Arc` so the per-assignment theory entry
+    /// points (`on_assignment`/`final_check`) can hand `process_constraint` a
+    /// `&TermManager` that is INDEPENDENT of the `&mut self` borrow it needs:
+    /// `Arc::clone` (O(1) refcount bump) produces a transient handle, dropped at
+    /// the end of the call, so the refcount is back to 1 by the time `check`
+    /// reclaims the manager via `Arc::try_unwrap` (the old code got the same
+    /// "handle not tied to self" property for free because `&'a TermManager` is
+    /// `Copy` and pointed outside `self`). No `Arc` clone is ever stored, so the
+    /// arena is never extended through a shared head.
+    manager: Arc<TermManager>,
+    /// EUF solver
+    euf: EufSolver,
+    /// Arithmetic solver
+    arith: ArithSolver,
+    /// Bitvector solver
+    bv: BvSolver,
     /// Bitvector terms (for identifying BV variables)
-    bv_terms: &'a FxHashSet<TermId>,
+    bv_terms: FxHashSet<TermId>,
     /// Mapping from SAT variables to constraints
-    var_to_constraint: &'a FxHashMap<Var, Constraint>,
+    var_to_constraint: FxHashMap<Var, Constraint>,
     /// Mapping from SAT variables to parsed arithmetic constraints
-    var_to_parsed_arith: &'a FxHashMap<Var, ParsedArithConstraint>,
+    var_to_parsed_arith: FxHashMap<Var, ParsedArithConstraint>,
     /// Mapping from terms to SAT variables (for conflict clause generation)
-    term_to_var: &'a FxHashMap<TermId, Var>,
+    term_to_var: FxHashMap<TermId, Var>,
     /// Reverse mapping from SAT variables to terms (for EUF merge reasons)
-    var_to_term: &'a Vec<TermId>,
+    var_to_term: Vec<TermId>,
     /// Current decision level stack for backtracking
     level_stack: Vec<usize>,
     /// Number of processed assignments
@@ -63,8 +81,8 @@ pub(crate) struct TheoryManager<'a> {
     pending_equalities: Vec<EqualityNotification>,
     /// Processed equalities (to avoid duplicates)
     processed_equalities: FxHashMap<(TermId, TermId), bool>,
-    /// Reference to solver statistics (for tracking)
-    statistics: &'a mut Statistics,
+    /// Solver statistics (for tracking)
+    statistics: Statistics,
     /// Maximum conflicts allowed (0 = unlimited)
     max_conflicts: u64,
     /// Maximum decisions allowed (0 = unlimited)
@@ -459,26 +477,51 @@ fn encode_bv_term_recursive(
     true
 }
 
-impl<'a> TheoryManager<'a> {
-    #[allow(clippy::too_many_arguments)]
+/// The owned state that a `TheoryManager` holds for the span of one solve and
+/// hands back to `Solver::check` afterward.
+///
+/// Bundling the moved-in/moved-out fields into one struct keeps the
+/// move-in (`TheoryManager::new`) and move-out (`into_parts`) at the call site a
+/// single value instead of ten loose arguments. Only the PERSISTENT theory
+/// state lives here (the per-solve scratch — `level_stack`, `pending_*`,
+/// `interned_*`, `assigned_phase`, … — is freshly initialised by `new` and
+/// dropped by `into_parts`, exactly mirroring the old "recreate the manager each
+/// MBQI iteration" semantics).
+pub(crate) struct TheoryParts {
+    pub manager: TermManager,
+    pub euf: EufSolver,
+    pub arith: ArithSolver,
+    pub bv: BvSolver,
+    pub bv_terms: FxHashSet<TermId>,
+    pub var_to_constraint: FxHashMap<Var, Constraint>,
+    pub var_to_parsed_arith: FxHashMap<Var, ParsedArithConstraint>,
+    pub term_to_var: FxHashMap<TermId, Var>,
+    pub var_to_term: Vec<TermId>,
+    pub statistics: Statistics,
+}
+
+impl TheoryManager {
     pub(crate) fn new(
-        manager: &'a TermManager,
-        euf: &'a mut EufSolver,
-        arith: &'a mut ArithSolver,
-        bv: &'a mut BvSolver,
-        bv_terms: &'a FxHashSet<TermId>,
-        var_to_constraint: &'a FxHashMap<Var, Constraint>,
-        var_to_parsed_arith: &'a FxHashMap<Var, ParsedArithConstraint>,
-        term_to_var: &'a FxHashMap<TermId, Var>,
-        var_to_term: &'a Vec<TermId>,
+        parts: TheoryParts,
         theory_mode: TheoryMode,
-        statistics: &'a mut Statistics,
         max_conflicts: u64,
         max_decisions: u64,
         has_bv_arith_ops: bool,
     ) -> Self {
-        Self {
+        let TheoryParts {
             manager,
+            euf,
+            arith,
+            bv,
+            bv_terms,
+            var_to_constraint,
+            var_to_parsed_arith,
+            term_to_var,
+            var_to_term,
+            statistics,
+        } = parts;
+        Self {
+            manager: Arc::new(manager),
             euf,
             arith,
             bv,
@@ -503,6 +546,31 @@ impl<'a> TheoryManager<'a> {
             assigned_phase: FxHashMap::default(),
             bool_true_node: None,
             bool_false_node: None,
+        }
+    }
+
+    /// Move the persistent theory state back out (dropping the per-solve
+    /// scratch), so the owner can reinstall it into `Solver` + the real
+    /// `TermManager` after a solve.
+    pub(crate) fn into_parts(self) -> TheoryParts {
+        // The `Arc` must be uniquely owned here: the only clones are the
+        // transient handles taken inside `on_assignment`/`final_check`, all
+        // dropped before the solve returns, and none are ever stored. Reclaim
+        // the real `TermManager` by value so the owner can reinstall it.
+        let manager = Arc::try_unwrap(self.manager).unwrap_or_else(|_| {
+            unreachable!("theory-manager Arc<TermManager> outstanding after solve")
+        });
+        TheoryParts {
+            manager,
+            euf: self.euf,
+            arith: self.arith,
+            bv: self.bv,
+            bv_terms: self.bv_terms,
+            var_to_constraint: self.var_to_constraint,
+            var_to_parsed_arith: self.var_to_parsed_arith,
+            term_to_var: self.term_to_var,
+            var_to_term: self.var_to_term,
+            statistics: self.statistics,
         }
     }
 
@@ -975,10 +1043,10 @@ impl<'a> TheoryManager<'a> {
             _ => return false,
         };
         let mut encoded: FxHashSet<TermId> = FxHashSet::default();
-        if !encode_bv_term_recursive(self.bv, lhs, manager, &mut encoded) {
+        if !encode_bv_term_recursive(&mut self.bv, lhs, manager, &mut encoded) {
             self.bv.new_bv(lhs, lw);
         }
-        if !encode_bv_term_recursive(self.bv, rhs, manager, &mut encoded) {
+        if !encode_bv_term_recursive(&mut self.bv, rhs, manager, &mut encoded) {
             self.bv.new_bv(rhs, rw);
         }
         true
@@ -1177,8 +1245,8 @@ impl<'a> TheoryManager<'a> {
                         // are detected by the embedded SAT solver.
                         if lhs_is_op && rhs_is_op {
                             if let Some(_width) = get_bv_width(lhs) {
-                                encode_bv_term_recursive(self.bv, lhs, manager, &mut bv_encoded);
-                                encode_bv_term_recursive(self.bv, rhs, manager, &mut bv_encoded);
+                                encode_bv_term_recursive(&mut self.bv, lhs, manager, &mut bv_encoded);
+                                encode_bv_term_recursive(&mut self.bv, rhs, manager, &mut bv_encoded);
                                 self.bv.assert_eq(lhs, rhs);
                                 did_assert = true;
                             }
@@ -1187,7 +1255,7 @@ impl<'a> TheoryManager<'a> {
                         else if lhs_is_op {
                             if let Some(width) = get_bv_width(lhs) {
                                 // Recursively encode the LHS operation and all its sub-terms
-                                encode_bv_term_recursive(self.bv, lhs, manager, &mut bv_encoded);
+                                encode_bv_term_recursive(&mut self.bv, lhs, manager, &mut bv_encoded);
 
                                 if let Some((val, _)) = rhs_const_info {
                                     // Assert operation result = constant
@@ -1205,7 +1273,7 @@ impl<'a> TheoryManager<'a> {
                         else if rhs_is_op {
                             if let Some(width) = get_bv_width(rhs) {
                                 // Recursively encode the RHS operation and all its sub-terms
-                                encode_bv_term_recursive(self.bv, rhs, manager, &mut bv_encoded);
+                                encode_bv_term_recursive(&mut self.bv, rhs, manager, &mut bv_encoded);
 
                                 if let Some((val, _)) = lhs_const_info {
                                     // Assert operation result = constant
@@ -1535,7 +1603,7 @@ impl<'a> TheoryManager<'a> {
     }
 }
 
-impl TheoryCallback for TheoryManager<'_> {
+impl TheoryCallback for TheoryManager {
     fn on_assignment(&mut self, lit: Lit) -> TheoryCheckResult {
         let var = lit.var();
         let is_positive = !lit.is_neg();
@@ -1565,7 +1633,10 @@ impl TheoryCallback for TheoryManager<'_> {
         self.processed_count += 1;
         self.statistics.theory_propagations += 1;
 
-        let result = self.process_constraint(var, constraint, is_positive, self.manager);
+        // Transient handle to the term manager, independent of the `&mut self`
+        // borrow `process_constraint` takes (dropped at the end of this call).
+        let mgr = Arc::clone(&self.manager);
+        let result = self.process_constraint(var, constraint, is_positive, &mgr);
 
         // Track theory conflicts
         if matches!(result, TheoryCheckResult::Conflict(_)) {
@@ -1592,8 +1663,10 @@ impl TheoryCallback for TheoryManager<'_> {
 
                 self.statistics.theory_propagations += 1;
 
-                // Process the constraint (same logic as eager mode)
-                let result = self.process_constraint(var, constraint, is_positive, self.manager);
+                // Process the constraint (same logic as eager mode).
+                // Transient handle, independent of the `&mut self` borrow.
+                let mgr = Arc::clone(&self.manager);
+                let result = self.process_constraint(var, constraint, is_positive, &mgr);
                 if let TheoryCheckResult::Conflict(conflict) = result {
                     self.statistics.theory_conflicts += 1;
                     self.statistics.conflicts += 1;

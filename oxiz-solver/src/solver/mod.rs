@@ -39,7 +39,7 @@ use oxiz_theories::arithmetic::ArithSolver;
 use oxiz_theories::bv::BvSolver;
 use oxiz_theories::euf::EufSolver;
 
-use theory_manager::TheoryManager;
+use theory_manager::{TheoryManager, TheoryParts};
 use trail::{ContextState, TrailOp};
 use types::{Constraint, ParsedArithConstraint, Polarity};
 
@@ -365,6 +365,58 @@ impl Solver {
         }
     }
 
+    /// Move this solver's persistent theory state — the EUF/arith/BV solvers,
+    /// the statistics, the read-only atom maps — together with the real
+    /// `TermManager` into an OWNING [`TheoryManager`] for the span of one solve.
+    ///
+    /// §4 redesign (Phase 2): the theory manager used to BORROW all of this; it
+    /// now owns it (no lifetime ⇒ it fits the `'static` lock-step hooks driver).
+    /// The maps are read-only during a solve so the relocation is a set of O(1)
+    /// `mem::take`s (a throwaway `TermManager::default()` is parked in `*manager`
+    /// for the duration). [`restore_theory_manager`] is the exact inverse, run
+    /// immediately after the solve, so observable behaviour is identical to the
+    /// old borrowing manager — and the per-iteration take/restore reproduces the
+    /// old "recreate the theory manager each MBQI round" semantics (the scratch
+    /// state is reinitialised every round; only euf/arith/bv persist).
+    fn take_theory_manager(&mut self, manager: &mut TermManager) -> TheoryManager {
+        let parts = TheoryParts {
+            manager: core::mem::take(manager),
+            euf: core::mem::take(&mut self.euf),
+            arith: core::mem::take(&mut self.arith),
+            bv: core::mem::take(&mut self.bv),
+            bv_terms: core::mem::take(&mut self.bv_terms),
+            var_to_constraint: core::mem::take(&mut self.var_to_constraint),
+            var_to_parsed_arith: core::mem::take(&mut self.var_to_parsed_arith),
+            term_to_var: core::mem::take(&mut self.term_to_var),
+            var_to_term: core::mem::take(&mut self.var_to_term),
+            statistics: core::mem::take(&mut self.statistics),
+        };
+        TheoryManager::new(
+            parts,
+            self.config.theory_mode,
+            self.config.max_conflicts,
+            self.config.max_decisions,
+            self.has_bv_arith_ops,
+        )
+    }
+
+    /// Reinstall the persistent theory state (and the real `TermManager`) after
+    /// a solve, dropping the per-solve scratch. Inverse of
+    /// [`take_theory_manager`].
+    fn restore_theory_manager(&mut self, manager: &mut TermManager, tm: TheoryManager) {
+        let parts = tm.into_parts();
+        *manager = parts.manager;
+        self.euf = parts.euf;
+        self.arith = parts.arith;
+        self.bv = parts.bv;
+        self.bv_terms = parts.bv_terms;
+        self.var_to_constraint = parts.var_to_constraint;
+        self.var_to_parsed_arith = parts.var_to_parsed_arith;
+        self.term_to_var = parts.term_to_var;
+        self.var_to_term = parts.var_to_term;
+        self.statistics = parts.statistics;
+    }
+
     /// Get a SAT variable for a term, then check satisfiability
     pub fn check(&mut self, manager: &mut TermManager) -> SolverResult {
         // Check for trivial unsat (false assertion)
@@ -427,25 +479,16 @@ impl Solver {
             return SolverResult::Unknown;
         }
 
-        // Run SAT solver with theory integration
-        let mut theory_manager = TheoryManager::new(
-            manager,
-            &mut self.euf,
-            &mut self.arith,
-            &mut self.bv,
-            &self.bv_terms,
-            &self.var_to_constraint,
-            &self.var_to_parsed_arith,
-            &self.term_to_var,
-            &self.var_to_term,
-            self.config.theory_mode,
-            &mut self.statistics,
-            self.config.max_conflicts,
-            self.config.max_decisions,
-            self.has_bv_arith_ops,
-        );
-
-        // MBQI loop for quantified formulas
+        // MBQI loop for quantified formulas.
+        //
+        // §4 redesign (Phase 2): the owning `TheoryManager` is constructed fresh
+        // at the top of EACH iteration via `take_theory_manager` (moving the
+        // persistent euf/arith/bv state + the real `TermManager` in) and torn
+        // down via `restore_theory_manager` right after the solve. This replaces
+        // the old "construct once before the loop, recreate at the loop tail"
+        // dance — same effect (scratch reinitialised per round, theory state
+        // persists), but the manager no longer needs to outlive a `&mut` borrow
+        // of `self`/`manager` across the MBQI instantiation work.
         let max_mbqi_iterations = 100;
         let mut mbqi_iteration = 0;
 
@@ -489,7 +532,12 @@ impl Solver {
             {
                 return SolverResult::Unknown;
             }
+            // Move the persistent theory state + the real term manager into an
+            // owning theory manager for this solve, then move it all back out
+            // (the MBQI body below mutates `self.euf`/`manager` directly).
+            let mut theory_manager = self.take_theory_manager(manager);
             let sat_result = self.sat.solve_with_theory(&mut theory_manager);
+            self.restore_theory_manager(manager, theory_manager);
             match sat_result {
                 SatResult::Unsat => {
                     // The clean engine never *concludes* `unsat` — that is the
@@ -833,27 +881,12 @@ impl Solver {
                         return SolverResult::Unknown;
                     }
 
-                    // Recreate theory manager for next iteration.
-                    // Do NOT reset theory solvers here - resetting EUF/Arith/BV
-                    // state causes spurious conflicts when accumulated lemmas from
-                    // MBQI instantiations interact with theory state that was cleared.
-                    // The theory state accumulates correctly across iterations.
-                    theory_manager = TheoryManager::new(
-                        manager,
-                        &mut self.euf,
-                        &mut self.arith,
-                        &mut self.bv,
-                        &self.bv_terms,
-                        &self.var_to_constraint,
-                        &self.var_to_parsed_arith,
-                        &self.term_to_var,
-                        &self.var_to_term,
-                        self.config.theory_mode,
-                        &mut self.statistics,
-                        self.config.max_conflicts,
-                        self.config.max_decisions,
-                        self.has_bv_arith_ops,
-                    );
+                    // The theory manager is rebuilt at the top of the next loop
+                    // iteration via `take_theory_manager` (which moves the
+                    // persistent euf/arith/bv state back in). Theory state is NOT
+                    // reset here: resetting EUF/Arith/BV would cause spurious
+                    // conflicts when accumulated MBQI lemmas interact with state
+                    // that was cleared — it accumulates correctly across rounds.
                 }
             }
         }
