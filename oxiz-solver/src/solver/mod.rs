@@ -536,7 +536,17 @@ impl Solver {
             // owning theory manager for this solve, then move it all back out
             // (the MBQI body below mutates `self.euf`/`manager` directly).
             let mut theory_manager = self.take_theory_manager(manager);
-            let sat_result = self.sat.solve_with_theory(&mut theory_manager);
+            let sat_result = if self.config.use_hooks_driver {
+                // §4 redesign path: lock-step `TheoryHooks` driver. It CONSUMES the
+                // owning theory manager and hands it back (the trail stores it
+                // type-erased for the solve), so we rebind.
+                let (result, tm) = self.sat.solve_with_hooks(theory_manager);
+                theory_manager = tm;
+                result
+            } else {
+                // Legacy path: advisory `TheoryCallback`.
+                self.sat.solve_with_theory(&mut theory_manager)
+            };
             self.restore_theory_manager(manager, theory_manager);
             match sat_result {
                 SatResult::Unsat => {

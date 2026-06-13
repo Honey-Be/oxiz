@@ -276,6 +276,17 @@ pub struct SolverConfig {
     /// verdict), so it is **off by default** and opted into by the
     /// verifier-backend path. See `clean_mbqi.rs` and `oxiz-mbqi`.
     pub clean_mbqi: bool,
+    /// §4 redesign (Phase 2): drive the CDCL(T) loop through the lock-step
+    /// `TheoryHooks` contract (`SatSolver::solve_with_hooks`) instead of the
+    /// advisory `TheoryCallback` (`solve_with_theory`). Both run the SAME real
+    /// EUF/arith/BV theory state (`TheoryManager` implements both traits); the
+    /// hooks path additionally enforces the §4.1 `|frames| == level+1`
+    /// invariant by construction (per-literal `unassign_hook` + per-level
+    /// `pop_frame` make a desynced theory frame unrepresentable). **Off by
+    /// default** until the new path is validated verdict-for-verdict against the
+    /// legacy path; flipping it on is how the redesign retires the parallel
+    /// `level_stack` + the stale-bound suppression guards.
+    pub use_hooks_driver: bool,
 }
 
 impl Default for SolverConfig {
@@ -309,6 +320,7 @@ impl SolverConfig {
             enable_inprocessing: false, // No inprocessing for speed
             inprocessing_interval: 0,
             clean_mbqi: false,
+            use_hooks_driver: false,
         }
     }
 
@@ -336,6 +348,7 @@ impl SolverConfig {
             enable_inprocessing: true,
             inprocessing_interval: 10000,
             clean_mbqi: false,
+            use_hooks_driver: false,
         }
     }
 
@@ -363,6 +376,7 @@ impl SolverConfig {
             enable_inprocessing: true,
             inprocessing_interval: 5000, // More frequent inprocessing
             clean_mbqi: false,
+            use_hooks_driver: false,
         }
     }
 
@@ -390,6 +404,7 @@ impl SolverConfig {
             enable_inprocessing: false,
             inprocessing_interval: 0,
             clean_mbqi: false,
+            use_hooks_driver: false,
         }
     }
 

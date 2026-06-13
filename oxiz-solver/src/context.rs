@@ -746,6 +746,14 @@ impl Context {
             "produce-unsat-cores" => {
                 self.solver.set_produce_unsat_cores(value == "true");
             }
+            // §4 redesign (Phase 2): opt into the lock-step `TheoryHooks` CDCL(T)
+            // driver instead of the legacy `TheoryCallback`. Off by default; both
+            // run the same real theory state, so this only changes the driver.
+            "oxiz.use-hooks-driver" => {
+                let mut config = self.solver.config().clone();
+                config.use_hooks_driver = value == "true";
+                self.solver.set_config(config);
+            }
             _ => {}
         }
     }

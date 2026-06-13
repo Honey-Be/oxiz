@@ -5,7 +5,7 @@ use crate::prelude::*;
 use num_rational::Rational64;
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
-use oxiz_sat::{Lit, TheoryCallback, TheoryCheckResult, Var};
+use oxiz_sat::{Lit, TheoryCallback, TheoryCheckResult, TheoryHooks, TheoryStep, Var};
 use oxiz_theories::arithmetic::ArithSolver;
 use oxiz_theories::bv::BvSolver;
 use oxiz_theories::euf::EufSolver;
@@ -1810,6 +1810,117 @@ impl TheoryCallback for TheoryManager {
         if self.theory_mode == TheoryMode::Lazy {
             self.pending_assignments.clear();
         }
+    }
+}
+
+/// §4.2 redesign: drive the SAME real theory state through the lock-step
+/// `TheoryHooks` contract (the new `solve_with_hooks` driver) instead of the
+/// advisory `TheoryCallback`. This is opt-in behind `SolverConfig::use_hooks_driver`
+/// (default OFF) until validated; the legacy `impl TheoryCallback` above is the
+/// production path and stays untouched.
+///
+/// The mapping (4 callbacks → 6 hooks):
+///   * `on_new_level`  → `push_frame`   — one euf/arith/bv frame per level (the
+///     trail fires it once per single level-up, so no catch-up loop).
+///   * `on_backtrack`  → `pop_frame`    — pop one frame + the stale-canonical
+///     eviction; per-literal retraction is `unassign_hook` (fired by the trail).
+///   * `on_assignment` → `assign_hook`  — record phase + QUEUE the atom. The driver
+///     discards `assign_hook`'s return, so all checking flows through `final_check`.
+///   * `final_check`   → `final_check`  — reuse the legacy `final_check` in its
+///     lazy-drain configuration (drains the queue through `process_constraint`, then
+///     the euf/arith/Nelson-Oppen consistency battery), converting its
+///     `TheoryCheckResult` to a `TheoryStep`.
+impl TheoryHooks for TheoryManager {
+    fn assign_hook(&mut self, lit: Lit, _level: u32) -> TheoryStep {
+        let var = lit.var();
+        let is_positive = !lit.is_neg();
+        // Phase for conflict-clause polarity (see `assigned_phase`).
+        self.assigned_phase.insert(var, is_positive);
+        self.statistics.propagations += 1;
+        // Final-check-driven: queue theory-bearing atoms; the work happens in
+        // `final_check` (the driver acts on its return, not this one).
+        if self.var_to_constraint.contains_key(&var) {
+            self.pending_assignments.push((lit, is_positive));
+        }
+        TheoryStep::Ok
+    }
+
+    fn unassign_hook(&mut self, lit: Lit, _level: u32) {
+        let var = lit.var();
+        // Drop the literal's phase + any not-yet-drained queue entry the instant it
+        // leaves the trail (its euf/arith effects are undone by the matching
+        // `pop_frame`). A stale phase/queue entry for a retracted var is now
+        // unrepresentable — the §4 "make the desync unrepresentable" property.
+        self.assigned_phase.remove(&var);
+        if let Some(pos) = self
+            .pending_assignments
+            .iter()
+            .rposition(|&(l, _)| l == lit)
+        {
+            self.pending_assignments.remove(pos);
+        }
+    }
+
+    fn push_frame(&mut self, _level: u32) {
+        // §4.1 lock-step: exactly one theory frame per decision level, pushed
+        // atomically with the level-up.
+        self.euf.push();
+        self.arith.push();
+        self.bv.push();
+    }
+
+    fn pop_frame(&mut self, _level: u32) {
+        // §4.1 lock-step: pop exactly one frame, atomically with the level-down.
+        self.euf.pop();
+        self.arith.pop();
+        self.bv.pop();
+        // Evict canonical EUF nodes the pop invalidated (identical to the legacy
+        // `on_backtrack` eviction — keeps `intern_term_deep` from indexing a
+        // truncated node vector; see the field docs on `interned_int_constants`).
+        let live_nodes = self.euf.node_count();
+        self.interned_int_constants
+            .retain(|_val, &mut canonical| (canonical as usize) < live_nodes);
+        self.interned_bv_constants
+            .retain(|_key, &mut canonical| (canonical as usize) < live_nodes);
+        if let Some(t) = self.bool_true_node {
+            if (t as usize) >= live_nodes {
+                self.bool_true_node = None;
+            }
+        }
+        if let Some(f) = self.bool_false_node {
+            if (f as usize) >= live_nodes {
+                self.bool_false_node = None;
+            }
+        }
+    }
+
+    fn final_check(&mut self) -> TheoryStep {
+        // Reuse the legacy `final_check` in its lazy-drain configuration. Forcing
+        // `TheoryMode::Lazy` for the call is what enables the queue drain
+        // (`assign_hook` always queues; the driver discards its return, so ALL
+        // checking must flow through here). Behaviour matches the battle-tested lazy
+        // path; the verdict is Sat or Conflict.
+        let saved_mode = self.theory_mode;
+        self.theory_mode = TheoryMode::Lazy;
+        let result = <Self as TheoryCallback>::final_check(self);
+        self.theory_mode = saved_mode;
+        match result {
+            TheoryCheckResult::Sat => TheoryStep::Ok,
+            // `terms_to_conflict_clause` already emits FALSE-under-assignment literals
+            // — exactly the all-false conflict set `TheoryStep::Conflict` wants (no
+            // negation).
+            TheoryCheckResult::Conflict(explanation) => TheoryStep::Conflict { explanation },
+            // The lazy `final_check` never returns `Propagated`; dropping it would be
+            // sound regardless (the SAT search decides the atom and final_check
+            // re-detects any conflict), so this arm is a defensive no-op.
+            TheoryCheckResult::Propagated(_) => TheoryStep::Ok,
+        }
+    }
+
+    fn eval(&mut self, _atom: Var) -> Option<bool> {
+        // The SMT model is built separately (`Solver::build_model`); the hooks driver
+        // needs no theory-evaluation oracle, so stay conservative.
+        None
     }
 }
 
