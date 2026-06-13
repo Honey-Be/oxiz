@@ -178,3 +178,91 @@ fn bounded_injectivity_nested_is_sat() {
     s.push_str("(check-sat)\n");
     assert_eq!(verdict(&s), "sat", "bounded-injectivity corpus is satisfiable");
 }
+
+/// §4 Phase-2 completeness fix: arith→EUF entailed-equality propagation.
+///
+/// `f(1)` is pinned to 5 by its two bounds; that ENTAILED equality must be
+/// propagated into EUF so congruence derives `f(f(1)) = f(5)`, closing the
+/// contradiction `f(5) >= 10` (via `f(f(1))`) vs `f(5) <= 1`.  Before the fix
+/// `model_based_combination` only DETECTED disagreements and never propagated an
+/// arith-fixed term into EUF, so this was a spurious SAT (oxiz=sat, z3=unsat).
+#[test]
+fn arith_fixed_value_drives_congruence_is_unsat() {
+    let script = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(assert (>= (f 1) 5))
+(assert (>= (f (f 1)) 10))
+(assert (<= (f 1) 5))
+(assert (<= (f 5) 1))
+(check-sat)
+";
+    assert_eq!(
+        verdict(script),
+        "unsat",
+        "f(1)=5 ⊢ f(f(1))=f(5); f(5)>=10 vs f(5)<=1 is unsat",
+    );
+}
+
+/// Companion that the fix must NOT over-strengthen into a spurious UNSAT:
+/// identical shape but the second-level bound is satisfiable (`f(5) >= 1`
+/// instead of `<= 1`), so the whole thing is SAT.  A too-eager conflict clause
+/// (omitting a pinning bound) would wrongly report unsat here.
+#[test]
+fn arith_fixed_value_congruence_consistent_is_sat() {
+    let script = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(assert (>= (f 1) 5))
+(assert (>= (f (f 1)) 10))
+(assert (<= (f 1) 5))
+(assert (>= (f 5) 1))
+(check-sat)
+";
+    assert_eq!(
+        verdict(script),
+        "sat",
+        "f(f(1))=f(5)>=10 is consistent with f(5)>=1 — must stay sat",
+    );
+}
+
+/// Deeper arith→EUF congruence chains the fixed-value propagation must close
+/// (one merge fixes a deeper term — the bounded fixpoint loop in
+/// `model_based_combination`). All z3-confirmed `unsat`.
+#[test]
+fn arith_fixed_value_congruence_deep_and_negative_are_unsat() {
+    // 3-level nesting: f(1)=5 ⊢ f(f(1))=f(5)=7 ⊢ f(f(f(1)))=f(7); f(f(f(1)))>=100 vs f(7)<=1.
+    let deep = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(assert (>= (f 1) 5))(assert (<= (f 1) 5))
+(assert (>= (f 5) 7))(assert (<= (f 5) 7))
+(assert (>= (f (f (f 1))) 100))(assert (<= (f 7) 1))
+(check-sat)
+";
+    assert_eq!(verdict(deep), "unsat", "3-level fixed-value congruence chain");
+
+    // Negative constant: the `mk_neg` sanitizer makes `(- 3)` an IntConst(-3) so it
+    // has a canonical EUF node. f(1)=-3 ⊢ f(f(1))=f(-3); f(f(1))>=9 vs f(-3)<=2.
+    let neg = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(assert (>= (f 1) (- 3)))(assert (<= (f 1) (- 3)))
+(assert (>= (f (f 1)) 9))(assert (<= (f (- 3)) 2))
+(check-sat)
+";
+    assert_eq!(verdict(neg), "unsat", "negative fixed value drives congruence");
+
+    // Two functions, both nested-fixed, sharing a value: f(f(1))=g(g(1)) but f(2)!=g(3).
+    let twofun = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(declare-fun g (Int) Int)
+(assert (>= (f 1) 2))(assert (<= (f 1) 2))
+(assert (>= (g 1) 3))(assert (<= (g 1) 3))
+(assert (= (f (f 1)) (g (g 1))))
+(assert (not (= (f 2) (g 3))))
+(check-sat)
+";
+    assert_eq!(verdict(twofun), "unsat", "two-function fixed-value congruence");
+}

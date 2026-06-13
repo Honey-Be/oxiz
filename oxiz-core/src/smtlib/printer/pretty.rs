@@ -82,7 +82,7 @@ impl<'a> PrettyPrinter<'a> {
                 let _ = write!(w, "false");
             }
             TermKind::IntConst(n) => {
-                let _ = write!(w, "{n}");
+                let _ = write!(w, "{}", super::int_literal_smtlib(n));
             }
             TermKind::RealConst(r) => {
                 let _ = write!(w, "{r}");

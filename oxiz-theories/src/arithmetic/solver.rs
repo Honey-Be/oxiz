@@ -443,6 +443,79 @@ impl ArithSolver {
         })
     }
 
+    /// If `term` is FIXED to a single value by the current arithmetic bounds,
+    /// return `(value, reason_atoms)` — `reason_atoms` being the currently
+    /// asserted constraint atoms (TermIds) that pin the value. Returns `None`
+    /// when `term` is not arith-known or is not pinned to a single value.
+    ///
+    /// This is the arith→EUF interface query for theory combination: a fixed
+    /// term `t = v` is an ENTAILED equality, so it is sound to merge `t` with the
+    /// constant node for `v` in EUF (firing congruence), and the returned reason
+    /// atoms are exactly the literals that must appear (negated) in any conflict
+    /// the resulting congruence produces.
+    ///
+    /// Implementation: a scratch probe. `t` is fixed to `v` iff BOTH half-spaces
+    /// `t > v` and `t < v` (or, for integers, `t >= v+1` and `t <= v-1`) are
+    /// infeasible; each infeasibility's reason set (minus the scratch sentinel
+    /// `term` itself, which is the placeholder reason of the probe assertion —
+    /// never a real Bool atom) is one side's pinning bound. The scratch frame is
+    /// pushed and popped, so `reasons`/`reason_counter`/simplex are fully
+    /// restored (the probe leaves NO residue — verified against `push`/`pop`).
+    #[must_use]
+    pub fn fixed_value_with_reasons(&mut self, term: TermId) -> Option<(Rational64, Vec<TermId>)> {
+        let v = self.value(term)?;
+        let one = Rational64::from_integer(1);
+        let mut reasons: Vec<TermId> = Vec::new();
+
+        // HIGH side: prove `term` cannot exceed `v`.
+        self.push();
+        if self.is_integer {
+            self.assert_ge(&[(term, one)], v + one, term); // term >= v+1
+        } else {
+            self.assert_gt(&[(term, one)], v, term); // term > v
+        }
+        let high_infeasible = match self.check() {
+            Ok(TheoryResult::Unsat(rs)) => {
+                for r in rs {
+                    if r != term && !reasons.contains(&r) {
+                        reasons.push(r);
+                    }
+                }
+                true
+            }
+            _ => false,
+        };
+        self.pop();
+        if !high_infeasible {
+            return None;
+        }
+
+        // LOW side: prove `term` cannot fall below `v`.
+        self.push();
+        if self.is_integer {
+            self.assert_le(&[(term, one)], v - one, term); // term <= v-1
+        } else {
+            self.assert_lt(&[(term, one)], v, term); // term < v
+        }
+        let low_infeasible = match self.check() {
+            Ok(TheoryResult::Unsat(rs)) => {
+                for r in rs {
+                    if r != term && !reasons.contains(&r) {
+                        reasons.push(r);
+                    }
+                }
+                true
+            }
+            _ => false,
+        };
+        self.pop();
+        if !low_infeasible {
+            return None;
+        }
+
+        Some((v, reasons))
+    }
+
     /// Tighten a rational bound for integer variables
     ///
     /// For integer variables:
@@ -796,6 +869,50 @@ mod tests {
 
         let result = solver.check().expect("test operation should succeed");
         assert!(matches!(result, TheoryResult::Sat));
+    }
+
+    #[test]
+    fn test_fixed_value_with_reasons() {
+        let mut solver = ArithSolver::lia();
+        let x = TermId::new(1);
+        let ge = TermId::new(50); // reason atom for x >= 5
+        let le = TermId::new(51); // reason atom for x <= 5
+        solver.assert_ge(&[(x, Rational64::one())], Rational64::from_integer(5), ge);
+        solver.assert_le(&[(x, Rational64::one())], Rational64::from_integer(5), le);
+        assert!(matches!(solver.check().unwrap(), TheoryResult::Sat));
+
+        // No-leak baseline.
+        let reasons_before = solver.reasons.len();
+
+        let fixed = solver.fixed_value_with_reasons(x);
+        assert!(fixed.is_some(), "x is pinned to 5 by its two bounds");
+        let (v, rs) = fixed.unwrap();
+        assert_eq!(v, Rational64::from_integer(5));
+        assert!(
+            rs.contains(&ge) && rs.contains(&le),
+            "both pinning bounds are reasons: {rs:?}"
+        );
+        assert!(!rs.contains(&x), "scratch sentinel (the term) is filtered out");
+
+        // The probe must leave NO residue (this is the #1 spurious-UNSAT risk).
+        assert_eq!(
+            solver.reasons.len(),
+            reasons_before,
+            "probe left reason residue"
+        );
+        assert!(
+            matches!(solver.check().unwrap(), TheoryResult::Sat),
+            "solver state intact after probe"
+        );
+
+        // A non-pinned term returns None.
+        let y = TermId::new(2);
+        let gy = TermId::new(60);
+        solver.assert_ge(&[(y, Rational64::one())], Rational64::from_integer(0), gy);
+        assert!(
+            solver.fixed_value_with_reasons(y).is_none(),
+            "y has only a lower bound, not pinned"
+        );
     }
 
     #[test]

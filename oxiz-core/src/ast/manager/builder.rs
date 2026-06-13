@@ -290,8 +290,24 @@ impl TermManager {
         self.intern(TermKind::Sub(lhs, rhs), sort)
     }
 
-    /// Create arithmetic negation
+    /// Create arithmetic negation.
+    ///
+    /// SANITIZER: `Neg(IntConst(n))` folds to `IntConst(-n)`. SMT-LIB has no
+    /// negative-integer literal token, so a source `(- 3)` parses to
+    /// `Neg(IntConst(3))`; normalising it to the constant `IntConst(-3)` lets
+    /// EVERY `IntConst` fast-path see the negative value — notably the EUF
+    /// constant-node interning the arith↔EUF theory combination relies on
+    /// (otherwise a term arith-fixed to a negative value finds no constant node
+    /// to merge with). The printer's "unsanitizer" renders such a constant back
+    /// as `(- n)` (see `int_literal_smtlib`).
     pub fn mk_neg(&mut self, arg: TermId) -> TermId {
+        let folded: Option<num_bigint::BigInt> = match self.get(arg).map(|t| &t.kind) {
+            Some(TermKind::IntConst(n)) => Some(-n.clone()),
+            _ => None,
+        };
+        if let Some(neg) = folded {
+            return self.intern(TermKind::IntConst(neg), self.sorts.int_sort);
+        }
         let sort = self.get(arg).map_or(self.sorts.int_sort, |t| t.sort);
         self.intern(TermKind::Neg(arg), sort)
     }

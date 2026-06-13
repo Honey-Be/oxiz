@@ -599,7 +599,7 @@ impl Context {
         match self.terms.get(term).map(|t| &t.kind) {
             Some(TermKind::True) => "true".to_string(),
             Some(TermKind::False) => "false".to_string(),
-            Some(TermKind::IntConst(n)) => n.to_string(),
+            Some(TermKind::IntConst(n)) => oxiz_core::smtlib::int_literal_smtlib(n),
             Some(TermKind::RealConst(r)) => {
                 if *r.denom() == 1 {
                     format!("{}.0", r.numer())

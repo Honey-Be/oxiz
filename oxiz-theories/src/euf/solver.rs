@@ -895,6 +895,16 @@ impl EufSolver {
         self.term_to_node.get(&term).copied()
     }
 
+    /// The TermIds currently interned in this EUF context (the keys of the
+    /// internal term→node map). Used by theory combination to enumerate the
+    /// shared terms eligible for congruence-driven equality propagation — these
+    /// are the function-application / constant sub-terms (e.g. `f(1)`, `5`),
+    /// NOT the Bool atoms the SAT solver assigns.
+    #[must_use]
+    pub fn interned_term_ids(&self) -> Vec<TermId> {
+        self.term_to_node.keys().copied().collect()
+    }
+
     /// Iterate over all node indices that are function applications of a given function symbol.
     /// Returns a Vec of node indices.
     pub fn apps_by_func(&self, func_id: u32) -> Vec<u32> {

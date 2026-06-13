@@ -15,6 +15,23 @@ mod proof;
 
 // Re-export public types
 pub use basic::Printer;
+
+/// Render an integer constant as valid SMT-LIB2 text.
+///
+/// UNSANITIZER (mirror of the `TermManager::mk_neg` sanitizer): SMT-LIB2 has no
+/// negative-integer literal token, so a negative `IntConst(-n)` — which the
+/// sanitizer produces from a source `(- n)` — must print as `(- n)`, not the
+/// bare `-n` that `BigInt::to_string` yields. EVERY SMT-LIB text renderer of an
+/// `IntConst` routes through this so round-tripping stays valid.
+#[must_use]
+pub fn int_literal_smtlib(n: &num_bigint::BigInt) -> String {
+    if n.sign() == num_bigint::Sign::Minus {
+        format!("(- {})", -n)
+    } else {
+        n.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,6 +46,25 @@ mod tests {
 
         assert_eq!(printer.print_term(manager.mk_true()), "true");
         assert_eq!(printer.print_term(manager.mk_false()), "false");
+    }
+
+    #[test]
+    fn negative_int_literal_sanitize_unsanitize_roundtrip() {
+        let mut manager = TermManager::new();
+        // `(- 3)` constructs via mk_neg; the SANITIZER folds it to IntConst(-3).
+        let three = manager.mk_int(3);
+        let neg = manager.mk_neg(three);
+        assert!(
+            matches!(manager.get(neg).map(|t| &t.kind),
+                     Some(crate::ast::TermKind::IntConst(n)) if *n == num_bigint::BigInt::from(-3)),
+            "mk_neg(IntConst(3)) must fold to IntConst(-3)",
+        );
+        // The UNSANITIZER prints it back as valid SMT-LIB `(- 3)`, never `-3`.
+        let printer = Printer::new(&manager);
+        assert_eq!(printer.print_term(neg), "(- 3)");
+        // Positive literals are unaffected.
+        let pos = manager.mk_int(7);
+        assert_eq!(Printer::new(&manager).print_term(pos), "7");
     }
 
     #[test]

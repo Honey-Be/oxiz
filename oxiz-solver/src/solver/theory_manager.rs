@@ -82,6 +82,15 @@ pub(crate) struct TheoryManager {
     /// `add_theory_reason_clause` consumes directly. Empty except mid-fixpoint;
     /// cleared on backtrack (`pop_frame`) so a stale propagation never survives.
     pending_theory_propagations: Vec<(Lit, SmallVec<[Lit; 8]>)>,
+    /// Arith→EUF entailed-equality propagation (Nelson-Oppen): the reason atoms
+    /// (currently-asserted bound TermIds) for every arith-FIXED term that
+    /// `model_based_combination` merged into its constant's EUF node THIS round.
+    /// When the resulting congruence produces a conflict, these atoms MUST be
+    /// added (negated) to the conflict clause — the clause `propagate_euf_…`
+    /// builds otherwise OMITS the bounds that entail the equality, which is
+    /// exactly the trap that flips to a spurious UNSAT. Cleared at the start of
+    /// each `model_based_combination`; never crosses a check boundary.
+    pending_arith_eq_reasons: Vec<TermId>,
     /// Theory decision hints for branching
     #[allow(dead_code)]
     decision_hints: Vec<TheoryDecision>,
@@ -543,6 +552,7 @@ impl TheoryManager {
             theory_mode,
             pending_assignments: Vec::new(),
             pending_theory_propagations: Vec::new(),
+            pending_arith_eq_reasons: Vec::new(),
             decision_hints: Vec::new(),
             pending_equalities: Vec::new(),
             processed_equalities: FxHashMap::default(),
@@ -706,8 +716,85 @@ impl TheoryManager {
     /// Detects conflicts where EUF has derived an equality between two terms
     /// but the arithmetic solver assigns them different values.
     fn model_based_combination(&mut self) -> TheoryCheckResult {
-        // Check: EUF equality vs arith disagreement
         let shared_terms: Vec<TermId> = self.term_to_var.keys().copied().collect();
+
+        // ── Arith→EUF entailed-equality propagation (Nelson-Oppen) ──────────
+        // An arith-FIXED term `t = v` is an ENTAILED equality. Merge `t` with the
+        // canonical EUF node for the integer constant `v` so congruence fires
+        // (e.g. fixing `f(1)=5` lets EUF derive `f(f(1))=f(5)`). The merge's EUF
+        // reason is a placeholder; the conflict clause is rebuilt from
+        // `pending_arith_eq_reasons` (the real pinning bounds) so it stays sound.
+        self.pending_arith_eq_reasons.clear();
+        // The terms eligible for congruence are the EUF-interned SUB-terms
+        // (`f(1)`, `f(5)`, the constant `5`, …) — NOT the Bool atoms in
+        // `term_to_var`. Snapshot them; the merge loop mutates EUF. Negative
+        // constants are reachable too: the `mk_neg` sanitizer normalises `(- 3)`
+        // to `IntConst(-3)`, so `interned_int_constants` holds the canonical node
+        // for negative values just like positive ones.
+        let euf_terms: Vec<TermId> = self.euf.interned_term_ids();
+        let mut propagated = false;
+        // Bounded fixpoint: one merge can fix a deeper term — re-scan until
+        // quiescent, capped by the term count.
+        for _round in 0..=euf_terms.len() {
+            let mut progress = false;
+            for &t in &euf_terms {
+                let Some(t_node) = self.euf.term_to_node(t) else {
+                    continue;
+                };
+                let Some((v, reasons)) = self.arith.fixed_value_with_reasons(t) else {
+                    continue;
+                };
+                if !v.is_integer() {
+                    continue;
+                }
+                let iv = v.to_integer();
+                let Some(&const_node) = self.interned_int_constants.get(&iv) else {
+                    continue;
+                };
+                if t_node == const_node || self.euf.are_equal(t_node, const_node) {
+                    continue;
+                }
+                // Entailed merge: fires congruence; reason is a placeholder.
+                let _ = self.euf.merge(t_node, const_node, t);
+                self.pending_arith_eq_reasons.extend(reasons);
+                progress = true;
+                propagated = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+
+        if propagated {
+            // (A) The new congruence may expose an EUF disequality conflict.
+            if let Some(conflict_terms) = self.euf.check_conflicts() {
+                let mut terms = conflict_terms;
+                for &r in &self.pending_arith_eq_reasons {
+                    if !terms.contains(&r) {
+                        terms.push(r);
+                    }
+                }
+                return TheoryCheckResult::Conflict(self.terms_to_conflict_clause(&terms));
+            }
+            // (B) The new equalities may make arith infeasible. The clause
+            // `propagate_euf_equalities_to_arith` builds OMITS the pinning bounds
+            // (they are arith reasons, not EUF ones), so AUGMENT it with them —
+            // otherwise the learned clause is not theory-valid and a spurious
+            // UNSAT leaks. The augmented clause stays all-false (every pinning
+            // bound is a currently-asserted atom).
+            if let TheoryCheckResult::Conflict(mut lits) = self.propagate_euf_equalities_to_arith()
+            {
+                let fix_lits = self.terms_to_conflict_clause(&self.pending_arith_eq_reasons);
+                for l in fix_lits {
+                    if !lits.contains(&l) {
+                        lits.push(l);
+                    }
+                }
+                return TheoryCheckResult::Conflict(lits);
+            }
+        }
+
+        // Check: EUF equality vs arith disagreement
         for i in 0..shared_terms.len() {
             for j in (i + 1)..shared_terms.len() {
                 let t1 = shared_terms[i];

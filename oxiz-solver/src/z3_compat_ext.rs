@@ -436,7 +436,7 @@ impl Z3Optimize {
         use oxiz_core::ast::TermKind;
         if let Some(t) = tm.get(id) {
             match &t.kind {
-                TermKind::IntConst(n) => return n.to_string(),
+                TermKind::IntConst(n) => return oxiz_core::smtlib::int_literal_smtlib(n),
                 TermKind::RealConst(r) => return r.to_string(),
                 TermKind::True => return "true".to_string(),
                 TermKind::False => return "false".to_string(),
