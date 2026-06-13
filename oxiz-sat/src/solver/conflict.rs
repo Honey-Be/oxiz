@@ -80,7 +80,6 @@ impl Solver {
 
         while let Some(clause) = self.clauses.get(reason_clause) {
             // Process reason clause (must exist, as it's either conflict or a propagation reason)
-            let start = if p.is_some() { 1 } else { 0 };
             let is_learned = clause.learned;
 
             // Record clause usage for tier promotion and bump activity (if it's a learned clause)
@@ -97,7 +96,16 @@ impl Solver {
             let Some(clause) = self.clauses.get(reason_clause) else {
                 break;
             };
-            for &lit in &clause.lits[start..] {
+            // Process EVERY literal of the reason clause; the pivot `p` being
+            // resolved is already `seen` (it was selected off the trail because
+            // `seen[p]` is true), so the `!seen` guard below skips it.  We must
+            // NOT skip `lits[0]` by index: oxiz does not guarantee a propagation
+            // reason clause keeps its implied literal at index 0, so skipping
+            // index 0 dropped a current-level antecedent → undercounted
+            // `counter` → the trail walk stopped at a non-dominating literal and
+            // learned an unsound unit clause (spurious UNSAT). See the regression
+            // test `soundness_repro::minimal_spurious_unsat_default_config`.
+            for &lit in &clause.lits {
                 let var = lit.var();
                 let level = self.trail.level(var);
 
