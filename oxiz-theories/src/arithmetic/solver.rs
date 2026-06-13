@@ -254,10 +254,16 @@ impl ArithSolver {
             let const_term = if expr.constant.denom() == &1 {
                 -*expr.constant.numer()
             } else {
-                // Non-integer constant in equality - infeasible for integers
+                // Non-integer constant in equality - infeasible for integers.
+                // Record THIS assertion's reason so the resulting simplex
+                // conflict explains itself (a hardcoded reason 0 would resolve to
+                // an unrelated term, producing a conflict clause that omits this
+                // equality's literal → the SAT solver cannot flip an OR to its
+                // satisfiable disjunct → spurious UNSAT).
                 if let Some(&(var, _)) = expr.terms.first() {
-                    self.simplex.set_lower(var, Rational64::from_integer(1), 0);
-                    self.simplex.set_upper(var, Rational64::from_integer(0), 0);
+                    let reason_id = self.add_reason(reason);
+                    self.simplex.set_lower(var, Rational64::from_integer(1), reason_id);
+                    self.simplex.set_upper(var, Rational64::from_integer(0), reason_id);
                 }
                 return;
             };
@@ -268,11 +274,15 @@ impl ArithSolver {
                 let g = coeffs.iter().fold(0i64, |acc, &c| gcd_i64(acc, c.abs()));
 
                 if g > 0 && const_term % g != 0 {
-                    // GCD infeasibility detected!
-                    // Add contradictory constraints: x >= 1 and x <= 0
+                    // GCD infeasibility detected (e.g. 2c = 3)!
+                    // Add contradictory constraints: x >= 1 and x <= 0, BOTH
+                    // tagged with this assertion's reason (see the note above) so
+                    // the simplex conflict resolves back to this equality's atom
+                    // and the learned clause soundly blocks only this disjunct.
                     if let Some(&(var, _)) = expr.terms.first() {
-                        self.simplex.set_lower(var, Rational64::from_integer(1), 0);
-                        self.simplex.set_upper(var, Rational64::from_integer(0), 0);
+                        let reason_id = self.add_reason(reason);
+                        self.simplex.set_lower(var, Rational64::from_integer(1), reason_id);
+                        self.simplex.set_upper(var, Rational64::from_integer(0), reason_id);
                     }
                     return;
                 }

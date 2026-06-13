@@ -24,6 +24,47 @@ fn verdict(script: &str) -> &'static str {
     }
 }
 
+/// GCD-infeasibility reason bug: an infeasible integer equality `2c = 3` inside
+/// an OR with a satisfiable disjunct (`10 >= 3`) must NOT make the whole script
+/// unsat — the OR is satisfiable via the other disjunct.  The arith solver's
+/// GCD-infeasibility branch used to tag the contradictory simplex bounds with a
+/// hardcoded reason `0`, so the learned conflict clause was built over an
+/// unrelated term and OMITTED the disjunct literal → the SAT solver could not
+/// flip the OR → spurious UNSAT.  The second assertion is only a catalyst that
+/// perturbs decision order to expose the latent reason loss.
+#[test]
+fn gcd_infeasible_disjunct_is_sat() {
+    let script = "\
+(set-logic QF_LIA)
+(declare-const c Int)
+(declare-const x Int)
+(declare-const y Int)
+(declare-const p Bool)
+(assert (or (= c (- 3 c)) (>= 10 3)))
+(assert (=> p (= x y)))
+(check-sat)
+";
+    assert_eq!(verdict(script), "sat", "GCD-infeasible OR disjunct must not force unsat");
+}
+
+/// The companion genuine-UNSAT cases the GCD reason fix must preserve: an
+/// unconditionally-asserted infeasible integer equality is still unsat.
+#[test]
+fn gcd_infeasible_equality_is_unsat() {
+    // 2c = 3 has no integer solution.
+    assert_eq!(
+        verdict("(set-logic QF_LIA)\n(declare-const c Int)\n(assert (= c (- 3 c)))\n(check-sat)\n"),
+        "unsat",
+        "2c=3 is genuinely unsat",
+    );
+    // 2x + 2y = 7: gcd(2,2)=2 does not divide 7.
+    assert_eq!(
+        verdict("(set-logic QF_LIA)\n(declare-const x Int)\n(declare-const y Int)\n(assert (= (+ (* 2 x) (* 2 y)) 7))\n(check-sat)\n"),
+        "unsat",
+        "2x+2y=7 is genuinely unsat (GCD)",
+    );
+}
+
 /// Bug (a): a nested application carrying a DIRECT numeric constraint must reach
 /// the arithmetic solver.  `f(g(10)) = 20` together with `f(g(10)) <= 10` is a
 /// contradiction (20 <= 10 is false), so the script is UNSAT.  Dropping the
