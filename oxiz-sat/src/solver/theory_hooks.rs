@@ -39,7 +39,10 @@ pub enum TheoryStep {
 /// `Send + Sync` so that a `Trail` (and therefore a `Solver`) carrying an installed
 /// theory stays `Send + Sync` — the `oxiz-theories` `Theory` trait and the parallel
 /// engine require it. Every concrete theory is single-threaded data, so this is free.
-pub trait TheoryHooks: Send + Sync {
+/// `Any` so `solve_with_hooks` can hand the CONCRETE theory back to the caller
+/// (downcast the returned `Box<dyn TheoryHooks>`) — used by the SMT path to recover
+/// its owned EUF/arith/bv solvers after a solve.
+pub trait TheoryHooks: Send + Sync + core::any::Any {
     /// Fired once per newly-assigned trail literal, in trail order, by `Trail::assign`.
     fn assign_hook(&mut self, lit: Lit, level: u32) -> TheoryStep;
 

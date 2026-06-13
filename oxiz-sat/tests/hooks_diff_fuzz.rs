@@ -116,9 +116,9 @@ fn run_campaign(seed: u64, iters: usize) -> (usize, usize) {
         for c in &clauses {
             solver.add_clause(c.iter().map(|&l| to_lit(l)));
         }
-        let theory = Box::new(ToyImplTheory::new(
+        let theory = ToyImplTheory::new(
             axioms.iter().map(|&(p, c)| (to_lit(p), to_lit(c))).collect(),
-        ));
+        );
         let (result, _t) = solver.solve_with_hooks(theory);
 
         checked += 1;

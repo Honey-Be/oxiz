@@ -1310,16 +1310,18 @@ impl Solver {
     /// Phase 1 is final-check-driven: the theory is polled with `final_check` at each
     /// propagation fixpoint. The theory is returned to the caller so its `eval` model
     /// can be inspected after a `Sat` verdict.
-    pub fn solve_with_hooks(
-        &mut self,
-        theory: Box<dyn TheoryHooks>,
-    ) -> (SolverResult, Box<dyn TheoryHooks>) {
-        self.trail.set_theory(theory);
+    pub fn solve_with_hooks<H: TheoryHooks + 'static>(&mut self, theory: H) -> (SolverResult, H) {
+        self.trail.set_theory(Box::new(theory));
         let result = self.solve_with_hooks_inner();
-        let theory = self
+        let boxed = self
             .trail
             .take_theory()
             .expect("theory installed for the duration of solve_with_hooks");
+        // Recover the CONCRETE theory `H` (the trail stores it type-erased). This is
+        // what lets the SMT path move its owned EUF/arith/bv solvers back out.
+        let theory = *(boxed as Box<dyn core::any::Any>)
+            .downcast::<H>()
+            .expect("returned theory has the type it was installed with");
         (result, theory)
     }
 
@@ -2154,7 +2156,7 @@ mod tests {
         let x0 = solver.new_var();
         let x1 = solver.new_var();
         solver.add_clause([Lit::pos(x0), Lit::pos(x1)]);
-        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let theory = ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]);
         let (result, _theory) = solver.solve_with_hooks(theory);
         assert_eq!(result, SolverResult::Sat);
         // The returned model must satisfy the input clause.
@@ -2171,7 +2173,7 @@ mod tests {
         let x0 = solver.new_var();
         let x1 = solver.new_var();
         solver.add_clause_dimacs(&[1]); // x0 = true
-        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let theory = ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]);
         let (result, _theory) = solver.solve_with_hooks(theory);
         assert_eq!(result, SolverResult::Sat);
         assert!(solver.model_value(x0).is_true());
@@ -2190,7 +2192,7 @@ mod tests {
         let x1 = solver.new_var();
         solver.add_clause_dimacs(&[1]); // x0 = true
         solver.add_clause_dimacs(&[-2]); // x1 = false
-        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let theory = ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]);
         let (result, _theory) = solver.solve_with_hooks(theory);
         assert_eq!(result, SolverResult::Unsat);
     }
@@ -2203,7 +2205,7 @@ mod tests {
         let a = s1.new_var();
         s1.add_clause([Lit::pos(a)]);
         s1.add_clause([Lit::neg(a)]); // a ∧ ¬a ⇒ UNSAT
-        let theory = Box::new(ToyImplTheory::new(vec![]));
+        let theory = ToyImplTheory::new(vec![]);
         let (result, _t) = s1.solve_with_hooks(theory);
         assert_eq!(result, SolverResult::Unsat);
     }
@@ -2216,7 +2218,7 @@ mod tests {
         let x0 = solver.new_var();
         let x1 = solver.new_var();
         solver.add_clause_dimacs(&[1]); // x0 = true
-        let theory = Box::new(ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]));
+        let theory = ToyImplTheory::new(vec![(Lit::pos(x0), Lit::pos(x1))]);
         let (result, mut theory) = solver.solve_with_hooks(theory);
         assert_eq!(result, SolverResult::Sat);
         // x1 was theory-propagated true, so the theory still tracks it as true.
