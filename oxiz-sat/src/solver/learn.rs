@@ -266,8 +266,18 @@ impl Solver {
         }
     }
 
-    /// Handle clause deletion check and restart check
-    pub(super) fn handle_clause_deletion_and_restart(&mut self) {
+    /// Handle clause deletion check and restart check.
+    ///
+    /// Returns `true` if a restart fired (the trail was backtracked to level 0).
+    /// In the theory-aware loop the caller MUST then notify the theory with
+    /// `theory.on_backtrack(0)` — otherwise the theory's frame stack keeps the
+    /// (now-stale) level-1.. frames while the SAT trail is at level 0, and the
+    /// next `on_new_level` reuses those stale frames (their bounds linger) —
+    /// the restart sibling of the stale-bound desync, which can yield a spurious
+    /// theory conflict (and, unlike the single-atom case, may span several atoms
+    /// so the `last_conflict_is_stale_bound` guard would NOT catch it).
+    #[must_use]
+    pub(super) fn handle_clause_deletion_and_restart(&mut self) -> bool {
         self.conflicts_since_deletion += 1;
 
         if self.conflicts_since_deletion >= self.config.clause_deletion_threshold as u64 {
@@ -277,7 +287,9 @@ impl Solver {
 
         if self.stats.conflicts >= self.restart_threshold {
             self.restart();
+            return true;
         }
+        false
     }
 
     /// Handle clause deletion and restart, but don't backtrack past assumptions

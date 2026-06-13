@@ -967,7 +967,9 @@ impl Solver {
 
                 self.vsids.decay();
                 self.clauses.decay_activity(self.config.clause_decay);
-                self.handle_clause_deletion_and_restart();
+                if self.handle_clause_deletion_and_restart() {
+                    theory.on_backtrack(0);
+                }
                 continue;
             }
 
@@ -1021,7 +1023,9 @@ impl Solver {
 
                     self.vsids.decay();
                     self.clauses.decay_activity(self.config.clause_decay);
-                    self.handle_clause_deletion_and_restart();
+                    if self.handle_clause_deletion_and_restart() {
+                        theory.on_backtrack(0);
+                    }
                     continue;
                 }
 
@@ -1054,7 +1058,9 @@ impl Solver {
 
                         self.vsids.decay();
                         self.clauses.decay_activity(self.config.clause_decay);
-                        self.handle_clause_deletion_and_restart();
+                        if self.handle_clause_deletion_and_restart() {
+                            theory.on_backtrack(0);
+                        }
                     }
                     continue;
                 }
@@ -1112,7 +1118,9 @@ impl Solver {
 
                         self.vsids.decay();
                         self.clauses.decay_activity(self.config.clause_decay);
-                        self.handle_clause_deletion_and_restart();
+                        if self.handle_clause_deletion_and_restart() {
+                            theory.on_backtrack(0);
+                        }
                     }
                     TheoryCheckResult::Propagated(props) => {
                         // Handle late propagations
