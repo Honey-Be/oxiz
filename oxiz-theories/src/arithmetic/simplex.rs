@@ -1388,25 +1388,36 @@ impl Simplex {
                 for item in self.basic.iter_mut().skip(restore_len) {
                     *item = false;
                 }
-            } else {
-                // Fallback: clean up stale entries (shouldn't be reached in normal use).
-                let num_vars = self.assignment.len();
-                self.tableau.retain(|&var, expr| {
-                    if (var as usize) >= num_vars {
-                        return false;
-                    }
-                    for (v, _) in &expr.terms {
-                        if (*v as usize) >= num_vars {
-                            return false;
-                        }
-                    }
-                    true
-                });
-                for i in 0..num_vars {
-                    let var_id = i as VarId;
-                    if self.basic[i] && !self.tableau.contains_key(&var_id) {
-                        self.basic[i] = false;
-                    }
+            }
+            // Scrub stale-variable references from the restored tableau, for BOTH
+            // the snapshot and the no-snapshot paths. The trail undo above is the
+            // authority on which variables are live (it pops exactly this scope's
+            // `NewVar`/`NewSlack`), so `assignment.len()` is the live count. A
+            // restored tableau row keyed by — or whose expression references — a
+            // variable id `>= assignment.len()` is a leftover of a popped scope
+            // (the snapshot path can carry one in from a previously-dirty
+            // snapshot, propagating it forward). Dropping such rows enforces the
+            // invariant "the tableau only references live variables", without
+            // which a later `pivot` indexes the parallel arrays out of bounds —
+            // a hard panic on otherwise-valid push/pop input (surfaced by the
+            // persistent OxiZ delegation feeding a prelude-scale multi-`(push)`
+            // session: `simplex.rs` pivot OOB, `basic.len`=N vs a tableau var id
+            // `>N`). A popped variable is not a real variable, so dropping its
+            // (corrupt) row is sound.
+            let num_vars = self.assignment.len();
+            self.tableau.retain(|&var, expr| {
+                (var as usize) < num_vars
+                    && expr.terms.iter().all(|(v, _)| (*v as usize) < num_vars)
+            });
+            // Keep the basic-flag vector consistent with the live variable set:
+            // size it to `num_vars`, and clear the flag of any variable no longer
+            // carrying a tableau row (it cannot be basic without one).
+            if self.basic.len() != num_vars {
+                self.basic.resize(num_vars, false);
+            }
+            for i in 0..num_vars {
+                if self.basic[i] && !self.tableau.contains_key(&(i as VarId)) {
+                    self.basic[i] = false;
                 }
             }
 

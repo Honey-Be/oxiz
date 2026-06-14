@@ -632,6 +632,19 @@ impl Theory for ArithSolver {
 
     fn pop(&mut self) {
         if let Some(state) = self.context_stack.pop() {
+            // Roll back the FORWARD map `term_to_var` too, not just the reverse
+            // `var_to_term`. Every term interned in this scope holds a simplex
+            // `VarId >= state.num_vars`; `simplex.pop()` below discards those
+            // variables, so a stale `term_to_var` entry would make a later
+            // `intern()` of the same term return a VarId the simplex no longer
+            // has — and the next constraint/pivot on it indexes the simplex
+            // arrays out of bounds (a hard panic on otherwise-valid push/pop
+            // input, surfaced by the persistent OxiZ delegation replaying a
+            // prelude-scale multi-`(push)` session). The popped scope's terms
+            // are exactly `var_to_term[state.num_vars..]`.
+            for &term in &self.var_to_term[state.num_vars..] {
+                self.term_to_var.remove(&term);
+            }
             self.var_to_term.truncate(state.num_vars);
             self.reasons.truncate(state.num_reasons);
             self.reason_counter = state.num_reasons as u32;
