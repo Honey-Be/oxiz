@@ -678,6 +678,29 @@ impl TheoryManager {
         // `euf.intern(t)` looks up `term_to_node` first, so two terms that
         // share the same EUF node (via congruence at intern-time) correctly
         // return the same node index.
+        // App-intern every function-application / Select arith term into EUF
+        // *as a congruence node* (via `intern_term_for_congruence`, which calls
+        // `intern_app`), so the are_equal check below can see congruence.
+        // Without this, a function app that appears only NESTED inside an arith
+        // operator — e.g. `f(b)` inside `(+ (f b) 1)` — is never interned as an
+        // app (the `+` is an opaque EUF leaf that is not recursed into), so the
+        // congruence `a=b ⟹ f(a)=f(b)` never reaches the arith solver and a
+        // genuinely-UNSAT instance like `a=b ∧ f(a)=f(b)+1` is reported `sat`
+        // (verus-fork 2026-06-17 spurious-SAT survey #65). Restricted to
+        // Apply/Select: interning IntConst arith terms here would add the
+        // pairwise-disequality edges that `intern_term_for_congruence` warns can
+        // cause spurious UNSAT when the ArithSolver is the one tracking numerics.
+        // Interning an app node is sound — it registers the term and lets
+        // congruence (an entailed equality) fire; it never asserts anything new.
+        let mgr = Arc::clone(&self.manager);
+        for &t in &arith_terms {
+            let is_app_or_select = mgr
+                .get(t)
+                .is_some_and(|td| matches!(td.kind, TermKind::Apply { .. } | TermKind::Select(..)));
+            if is_app_or_select && self.euf.term_to_node(t).is_none() {
+                self.intern_term_for_congruence(t, &mgr);
+            }
+        }
         for i in 0..arith_terms.len() {
             for j in (i + 1)..arith_terms.len() {
                 let t1 = arith_terms[i];

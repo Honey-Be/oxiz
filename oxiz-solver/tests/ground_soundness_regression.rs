@@ -351,3 +351,40 @@ fn genuine_disequality_unsat_preserved() {
 ";
     assert_eq!(verdict(g2), "unsat", "positive disequality + bounds pinning x=0 is unsat");
 }
+
+/// verus-fork 2026-06-17 spurious-SAT survey #65: `a=b ∧ f(a)=f(b)+1` is
+/// genuinely UNSAT (congruence: a=b ⟹ f(a)=f(b), so f(a)=f(b)+1 ⟹ 0=1) but was
+/// reported `sat`. The arith constraint `f(a)=f(b)+1` carries `f(b)` NESTED
+/// inside `(+ (f b) 1)`; `intern_term_for_congruence` treated the `+` as an
+/// opaque EUF leaf and never recursed to `f(b)`, so `f(b)` was never interned as
+/// a congruence app and `propagate_euf_equalities_to_arith` never saw f(a)=f(b).
+/// Fix: that propagation now app-interns every Apply/Select arith term first, so
+/// congruence fires over function applications buried in arithmetic. Sound (only
+/// adds an entailed congruence equality); restricted to Apply/Select to avoid the
+/// IntConst pairwise-disequality edges that can themselves cause spurious UNSAT.
+#[test]
+fn euf_congruence_into_nested_arith_app_is_unsat() {
+    // a=b ⟹ f(a)=f(b); with f(a)=f(b)+1 → contradiction.
+    let s = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(declare-const a Int)
+(declare-const b Int)
+(assert (= a b))
+(assert (= (f a) (+ (f b) 1)))
+(check-sat)
+";
+    assert_eq!(verdict(s), "unsat", "a=b ∧ f(a)=f(b)+1 must be unsat via congruence");
+
+    // The SAT companion the fix must NOT break: drop a=b → satisfiable
+    // (f(a)=f(b)+1 with f(a),f(b) free).
+    let sat = "\
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(declare-const a Int)
+(declare-const b Int)
+(assert (= (f a) (+ (f b) 1)))
+(check-sat)
+";
+    assert_ne!(verdict(sat), "unsat", "without a=b the instance is satisfiable");
+}
