@@ -388,3 +388,107 @@ fn euf_congruence_into_nested_arith_app_is_unsat() {
 ";
     assert_ne!(verdict(sat), "unsat", "without a=b the instance is satisfiable");
 }
+
+/// Split a script into top-level s-expression commands (paren-depth, quote-aware),
+/// mirroring how the adsmt delegation (`oxiz_inproc`) feeds one command at a time.
+fn split_commands(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut cur = String::new();
+    let mut in_str = false;
+    for c in script.chars() {
+        if c == '"' {
+            in_str = !in_str;
+        }
+        if !in_str {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            }
+        }
+        cur.push(c);
+        if !in_str && depth == 0 && c == ')' {
+            out.push(cur.trim().to_string());
+            cur.clear();
+        }
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// Verdict of the LAST `(check-sat)`, executing each top-level command in its
+/// own `execute_script` call on ONE persistent `Context` — the exact shape of
+/// the adsmt in-process delegation.
+fn verdict_incremental(script: &str) -> &'static str {
+    let mut ctx = Context::new();
+    ctx.set_timeout_ms(5000);
+    let mut last = "unknown";
+    for cmd in split_commands(script) {
+        if let Ok(out) = ctx.execute_script(&cmd) {
+            for l in out {
+                match l.trim() {
+                    "sat" => last = "sat",
+                    "unsat" => last = "unsat",
+                    "unknown" => last = "unknown",
+                    _ => {}
+                }
+            }
+        }
+    }
+    last
+}
+
+/// Incremental theory-frame leak across `(pop)` (verus-fork consistency-gate
+/// poison). A `(check-sat)` that returns at a deep decision level (here the
+/// MBQI loop over the `ens` axiom solving `Sat`/`Unknown` while branched) used
+/// to leave one EUF/arith theory frame per leftover decision level: `Solver`'s
+/// `push`/`pop` re-base only the SAT trail to level 0 (with the theory
+/// detached), so the per-decision theory frames survived. The next `(pop)`
+/// then unwound just ONE frame, leaving the inner solve's `x! ~ 0` EUF merge
+/// in the union-find (with its proof-forest edge already rolled back). The
+/// following consistency `(check-sat)` of `x! != 0` then hit that stale merge
+/// → spurious `unsat`. Fixed by re-basing the trail to level 0 inside
+/// `solve_with_hooks` (theory still attached → `pop_frame` unwinds every frame).
+///
+/// Ground truth: `F ∧ x! != 0` is satisfiable (the `ens` axiom does not pin
+/// `x!`), so the final `(check-sat)` must NOT be `unsat`.
+#[test]
+fn incremental_checksat_pop_does_not_leak_theory_frame() {
+    let script = "\
+(declare-fun ens (Int) Bool)
+(assert (forall ((x Int)) (! (= (ens x) (not (= x 0))) :pattern ((ens x)))))
+(declare-const x! Int)
+(push)
+ (declare-const L Bool)
+ (assert (not (=> L (not (= x! 0)))))
+ (check-sat)
+ (pop)
+(assert (not (= x! 0)))
+(check-sat)
+";
+    assert_ne!(
+        verdict_incremental(script),
+        "unsat",
+        "a prior (push)(check-sat)(pop) over a quantified axiom must not leak an \
+         x!~0 theory frame and force the later x!!=0 consistency check unsat",
+    );
+}
+
+/// The genuine-UNSAT companion the re-base must preserve: assert `x! = 0`
+/// unconditionally (no scope to pop) and then `x! != 0` — a real contradiction.
+#[test]
+fn incremental_genuine_contradiction_still_unsat() {
+    let script = "\
+(declare-fun ens (Int) Bool)
+(assert (forall ((x Int)) (! (= (ens x) (not (= x 0))) :pattern ((ens x)))))
+(declare-const x! Int)
+(assert (= x! 0))
+(assert (not (= x! 0)))
+(check-sat)
+";
+    assert_eq!(
+        verdict_incremental(script),
+        "unsat",
+        "x!=0 ∧ x!!=0 is a genuine contradiction the frame re-base must not mask",
+    );
+}

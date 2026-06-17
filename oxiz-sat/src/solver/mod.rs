@@ -1335,6 +1335,31 @@ impl Solver {
     pub fn solve_with_hooks<H: TheoryHooks + 'static>(&mut self, theory: H) -> (SolverResult, H) {
         self.trail.set_theory(Box::new(theory));
         let result = self.solve_with_hooks_inner();
+        // Re-base the search to decision level 0 BEFORE detaching the theory.
+        //
+        // Incremental CDCL(T) discipline: a finished solve must leave the solver
+        // at the assertion base so the next `(push)`/`(pop)`/`(check-sat)` starts
+        // clean. `Solver::push`/`pop` already `backtrack_with_phase_saving(0)` the
+        // SAT trail — but they run with the theory DETACHED (it lives in the
+        // owning `TheoryManager` between solves), so that backtrack fires no
+        // `pop_frame` and the per-decision EUF/arith/bv theory frames are left
+        // behind. A solve that returns `Sat`/`Unknown` at a deep level (e.g. the
+        // MBQI loop giving up via the iteration cap after a `Sat` round) thus
+        // strands one theory frame per leftover decision level; the next `(pop)`
+        // unwinds only ONE, so an inner-scope EUF merge / simplex bound survives
+        // the pop and poisons the following `(check-sat)` with a spurious `unsat`
+        // (verus-fork consistency-gate-poison repro; the §4.1 frame/level
+        // lock-step invariant `|frames| == level+1` holds DURING a solve but was
+        // never re-established AFTER it). Doing the backtrack here — while the
+        // theory is still on the trail — fires `pop_frame` for every level, so
+        // the only theory frames that survive are the genuine `(push)` scopes.
+        //
+        // The reported verdict is already fixed in `result`, and any model was
+        // snapshotted by `save_model` (read via `self.model`, not the live
+        // trail), so dropping the live assignment here changes neither.
+        if self.trail.decision_level() > 0 {
+            self.backtrack_with_phase_saving(0);
+        }
         let boxed = self
             .trail
             .take_theory()
