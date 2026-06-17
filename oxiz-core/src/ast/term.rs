@@ -6,6 +6,7 @@ use crate::prelude::*;
 use crate::sort::SortId;
 use num_bigint::BigInt;
 use num_rational::Rational64;
+use portable_bijectives::DenseIndex;
 use smallvec::SmallVec;
 
 /// IEEE 754 rounding modes for floating-point operations
@@ -45,6 +46,18 @@ impl TermId {
 impl From<u32> for TermId {
     fn from(id: u32) -> Self {
         Self(id)
+    }
+}
+
+// A `TermId` is a dense, (near-)monotonic hash-cons pool index, so it is the
+// ideal `FlatRadixBimap` key: id-as-index, O(1), one cache miss, zero compares.
+// The orphan rule requires this `impl` (foreign trait, local type) to live in
+// the crate that owns `TermId`, even though the only consumer today is the
+// arithmetic theory's term↔var interner in `oxiz-theories`.
+impl DenseIndex for TermId {
+    #[inline]
+    fn to_index(self) -> usize {
+        self.0 as usize
     }
 }
 

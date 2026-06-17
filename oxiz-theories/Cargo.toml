@@ -21,6 +21,10 @@ num-bigint = { workspace = true, default-features = false }
 num-traits = { workspace = true, default-features = false }
 hashbrown.workspace = true
 portable-atomic-util = { workspace = true }
+# `FlatRadixBimap` — the dense-id term↔var interner backend for `ArithSolver`.
+# `FlatRadixBimap` lives behind the crate's `ifstdoralloc!` gate, so it needs at
+# least `alloc`; `std` is forwarded below for the no_std-off default build.
+portable-bijectives = { workspace = true, default-features = false, features = ["alloc"] }
 
 # Optional (std-only)
 egg = { workspace = true, optional = true }
@@ -40,6 +44,7 @@ std = [
     "num-bigint/std",
     "num-traits/std",
     "rustc-hash/std",
+    "portable-bijectives/std",
 ]
 profiling = ["std", "oxiz-core/profiling", "oxiz-sat/profiling"]
 

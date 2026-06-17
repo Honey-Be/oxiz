@@ -1,6 +1,7 @@
 //! Arithmetic Theory Solver
 
 use super::simplex::{LinExpr, Simplex, VarId};
+use core::fmt;
 #[allow(unused_imports)]
 use crate::prelude::*;
 use crate::theory::{EqualityNotification, Theory, TheoryCombination, TheoryId, TheoryResult};
@@ -8,6 +9,7 @@ use num_rational::Rational64;
 use num_traits::{One, Signed};
 use oxiz_core::ast::TermId;
 use oxiz_core::error::Result;
+use portable_bijectives::FlatRadixBimap;
 
 /// Compute GCD of two i64 values
 fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
@@ -22,14 +24,19 @@ fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
 }
 
 /// Arithmetic Theory Solver (LRA/LIA)
-#[derive(Debug)]
 pub struct ArithSolver {
     /// Simplex instance
     simplex: Simplex,
-    /// Term to variable mapping
-    term_to_var: FxHashMap<TermId, VarId>,
-    /// Variable to term mapping
-    var_to_term: Vec<TermId>,
+    /// Term ↔ simplex-variable interner. ONE bijection replaces the old
+    /// `term_to_var` (forward) + `var_to_term` (reverse / intern-order) pair:
+    /// a scope `pop` now rolls BOTH directions back in a single `truncate`, so
+    /// the desync that pair once allowed — the forward map left un-rolled-back,
+    /// handing a later `intern()` a stale `VarId` the popped simplex no longer
+    /// had → a pivot index-out-of-bounds panic — is structurally
+    /// unrepresentable. `FlatRadixBimap` (the dense-id radix backend) is the
+    /// benchmarked winner for these dense, (near-)monotonic `TermId`/`VarId`s
+    /// (id-as-index lookup: O(1), zero compares, one cache miss).
+    interner: FlatRadixBimap<TermId, VarId>,
     /// Reason counter
     reason_counter: u32,
     /// Reason to term mapping
@@ -67,14 +74,28 @@ impl Default for ArithSolver {
     }
 }
 
+// `FlatRadixBimap` is not `Debug`, so derive cannot apply; summarise the
+// interner by its size rather than dumping its index vectors.
+impl fmt::Debug for ArithSolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArithSolver")
+            .field("simplex", &self.simplex)
+            .field("interned_terms", &self.interner.len())
+            .field("is_integer", &self.is_integer)
+            .field("context_depth", &self.context_stack.len())
+            .field("reasons", &self.reasons.len())
+            .field("shared_equalities", &self.shared_equalities.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ArithSolver {
     /// Create a new arithmetic solver
     #[must_use]
     pub fn new(is_integer: bool) -> Self {
         Self {
             simplex: Simplex::new(),
-            term_to_var: FxHashMap::default(),
-            var_to_term: Vec::new(),
+            interner: FlatRadixBimap::new(),
             reason_counter: 0,
             reasons: Vec::new(),
             is_integer,
@@ -125,13 +146,21 @@ impl ArithSolver {
 
     /// Intern a term as a variable
     pub fn intern(&mut self, term: TermId) -> VarId {
-        if let Some(&var) = self.term_to_var.get(&term) {
+        if let Some(&var) = self.interner.get(&term) {
             return var;
         }
 
         let var = self.simplex.new_var();
-        self.term_to_var.insert(term, var);
-        self.var_to_term.push(term);
+        // Bijectivity holds by construction: `term` just missed the `get` above,
+        // and `var` is a freshly minted simplex id whose reverse bimap slot was
+        // cleared on the last `pop` — so neither side is already mapped and the
+        // insert cannot fail. Run the insert unconditionally (NOT inside the
+        // assert, which is compiled out in release) and only check the verdict.
+        let inserted = self.interner.insert(term, var).is_ok();
+        debug_assert!(
+            inserted,
+            "arith interner bijectivity violated: fresh term/var pair must insert"
+        );
         var
     }
 
@@ -402,7 +431,7 @@ impl ArithSolver {
     /// - If value is `r - δ` (negative delta), return `floor(r)` for integers
     #[must_use]
     pub fn value(&self, term: TermId) -> Option<Rational64> {
-        self.term_to_var.get(&term).map(|&var| {
+        self.interner.get(&term).map(|&var| {
             if self.is_integer {
                 // Get the full delta-rational value
                 let dval = self.simplex.delta_value(var);
@@ -623,7 +652,7 @@ impl Theory for ArithSolver {
 
     fn push(&mut self) {
         self.context_stack.push(ContextState {
-            num_vars: self.var_to_term.len(),
+            num_vars: self.interner.len(),
             num_reasons: self.reasons.len(),
             num_shared_equalities: self.shared_equalities.len(),
         });
@@ -632,20 +661,17 @@ impl Theory for ArithSolver {
 
     fn pop(&mut self) {
         if let Some(state) = self.context_stack.pop() {
-            // Roll back the FORWARD map `term_to_var` too, not just the reverse
-            // `var_to_term`. Every term interned in this scope holds a simplex
-            // `VarId >= state.num_vars`; `simplex.pop()` below discards those
-            // variables, so a stale `term_to_var` entry would make a later
-            // `intern()` of the same term return a VarId the simplex no longer
-            // has — and the next constraint/pivot on it indexes the simplex
-            // arrays out of bounds (a hard panic on otherwise-valid push/pop
-            // input, surfaced by the persistent OxiZ delegation replaying a
-            // prelude-scale multi-`(push)` session). The popped scope's terms
-            // are exactly `var_to_term[state.num_vars..]`.
-            for &term in &self.var_to_term[state.num_vars..] {
-                self.term_to_var.remove(&term);
-            }
-            self.var_to_term.truncate(state.num_vars);
+            // Roll the interner back to its push-time size. Because it is now a
+            // single bijection, this `truncate` discards BOTH directions in one
+            // step — there is no forward map that can be left holding a stale
+            // `VarId` for a term whose simplex variable `simplex.pop()` below
+            // discards. (The old two-map form could roll back the reverse log
+            // and forget the forward map, so a later `intern()` of the same term
+            // returned a VarId the popped simplex no longer had → a pivot index-
+            // out-of-bounds panic on otherwise-valid push/pop input, surfaced by
+            // the persistent OxiZ delegation replaying a prelude-scale multi-
+            // `(push)` session. That desync is now structurally unrepresentable.)
+            self.interner.truncate(state.num_vars);
             self.reasons.truncate(state.num_reasons);
             self.reason_counter = state.num_reasons as u32;
             self.shared_equalities.truncate(state.num_shared_equalities);
@@ -655,8 +681,7 @@ impl Theory for ArithSolver {
 
     fn reset(&mut self) {
         self.simplex.reset();
-        self.term_to_var.clear();
-        self.var_to_term.clear();
+        self.interner.clear();
         self.reason_counter = 0;
         self.reasons.clear();
         self.context_stack.clear();
@@ -673,8 +698,8 @@ impl Theory for ArithSolver {
 impl TheoryCombination for ArithSolver {
     fn notify_equality(&mut self, eq: EqualityNotification) -> bool {
         // Check if both terms are relevant to arithmetic
-        let lhs_var = self.term_to_var.get(&eq.lhs).copied();
-        let rhs_var = self.term_to_var.get(&eq.rhs).copied();
+        let lhs_var = self.interner.get(&eq.lhs).copied();
+        let rhs_var = self.interner.get(&eq.rhs).copied();
 
         if let (Some(lhs), Some(rhs)) = (lhs_var, rhs_var) {
             // Enforce lhs = rhs in the simplex by asserting lhs - rhs <= 0 and rhs - lhs <= 0.
@@ -737,7 +762,7 @@ impl TheoryCombination for ArithSolver {
 
     fn is_relevant(&self, term: TermId) -> bool {
         // Check if this term has been interned in the arithmetic solver
-        self.term_to_var.contains_key(&term)
+        self.interner.contains_key(&term)
     }
 }
 
@@ -753,22 +778,20 @@ impl ArithSolver {
     ///
     /// Uses probe-and-pop to avoid permanently modifying the simplex state.
     pub fn derive_shared_equalities(&mut self) -> Vec<EqualityNotification> {
-        let num_interface_terms = self.var_to_term.len();
+        let num_interface_terms = self.interner.len();
         if num_interface_terms < 2 {
             return self.shared_equalities.clone();
         }
 
-        // Collect (delta_value, VarId, TermId) for all interned variables.
+        // Collect (delta_value, VarId, TermId) for all interned variables. The
+        // bijection yields the `(TermId, VarId)` pairs directly in intern order,
+        // so there is no second forward-map lookup to keep in sync.
         let mut candidates: Vec<(super::delta::DeltaRational, VarId, TermId)> = self
-            .var_to_term
+            .interner
             .iter()
-            .enumerate()
-            .filter_map(|(idx, &term)| {
-                // term_to_var maps TermId → VarId; we stored in var_to_term in order
-                let var = self.term_to_var.get(&term).copied()?;
-                let _ = idx; // suppress warning
+            .map(|(&term, &var)| {
                 let dval = self.simplex.delta_value(var);
-                Some((dval, var, term))
+                (dval, var, term)
             })
             .collect();
 
@@ -1199,7 +1222,7 @@ mod tests {
         let y = TermId::new(2);
         let reason = TermId::new(100);
 
-        // Intern both so they appear in var_to_term.
+        // Intern both so they appear in the interner.
         solver.intern(x);
         solver.intern(y);
 
@@ -1299,6 +1322,59 @@ mod tests {
             matches!(result, TheoryResult::Unsat(_)),
             "Expected UNSAT when x=y is enforced and x<y is added; got {:?}",
             result
+        );
+        solver.pop();
+    }
+
+    /// Regression: re-interning a term after the scope it was first interned in
+    /// is popped must hand out a FRESH simplex variable, never the stale id the
+    /// popped simplex no longer has. With the old two-map interner a `pop` that
+    /// rolled back only the reverse log left the forward map holding the stale
+    /// `VarId`, so this re-`intern()` returned it and the next constraint pivot
+    /// indexed the simplex arrays out of bounds (a hard panic on otherwise-valid
+    /// push/pop input). The single `FlatRadixBimap` rolls both directions back in
+    /// one `truncate`, so the desync — and this panic — is unrepresentable.
+    #[test]
+    fn test_reintern_after_pop_gets_fresh_var_no_oob_panic() {
+        let mut solver = ArithSolver::lra();
+
+        let a = TermId::new(1);
+        let reason = TermId::new(100);
+
+        // Scope 1: intern `a` and constrain it, so it acquires a live simplex var.
+        solver.push();
+        let v1 = solver.intern(a);
+        solver.assert_ge(
+            &[(a, Rational64::one())],
+            Rational64::from_integer(0),
+            reason,
+        );
+        assert!(matches!(
+            solver.check().expect("scope-1 check should not error"),
+            TheoryResult::Sat
+        ));
+        // Pop scope 1: `simplex.pop()` discards `v1`; the interner truncates so
+        // `a` is no longer mapped to it.
+        solver.pop();
+        assert!(
+            !solver.is_relevant(a),
+            "after pop, `a` must no longer be interned"
+        );
+
+        // Re-intern `a`. It must get a fresh simplex var (the popped one is gone),
+        // and using it in a fresh constraint must NOT panic (the old OOB pivot).
+        solver.push();
+        let v2 = solver.intern(a);
+        solver.assert_le(
+            &[(a, Rational64::one())],
+            Rational64::from_integer(5),
+            reason,
+        );
+        let result = solver.check().expect("scope-2 check should not error");
+        assert!(
+            matches!(result, TheoryResult::Sat),
+            "re-interned `a` (var {v2:?}, was {v1:?}) under a satisfiable bound \
+             should be SAT; got {result:?}"
         );
         solver.pop();
     }

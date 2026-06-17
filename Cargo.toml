@@ -84,6 +84,10 @@ oxiz-ml = { version = "0.2.4", path = "oxiz-ml" }
 bumpalo = "3.20"
 indexmap = { version = "2.14", default-features = false }
 lasso = "0.7"
+# Dense-id bijection backend for the arithmetic theory's term↔var interner
+# (FlatRadixBimap). no_std+alloc, tracks portable-collections `main`; the
+# Cargo.lock pins the exact rev per checkout.
+portable-bijectives = { git = "https://github.com/newsniper-org/portable-collections", default-features = false }
 
 # Parsing
 winnow = "1.0"

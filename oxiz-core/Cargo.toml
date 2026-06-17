@@ -23,6 +23,10 @@ num-integer = { workspace = true, default-features = false }
 hashbrown.workspace = true
 portable-atomic = { workspace = true }
 portable-atomic-util = { workspace = true }
+# `DenseIndex` impl for `TermId` (orphan rule → must live in TermId's crate).
+# The trait is heap-free, so the bare-no_std default tier is enough; `std` only
+# adds the `std::error::Error` impls we forward below for parity.
+portable-bijectives = { workspace = true, default-features = false }
 oxiz-math = { workspace = true, default-features = false }
 
 # Optional (std-only)
@@ -54,6 +58,7 @@ std = [
     "num-integer/std",
     "rustc-hash/std",
     "oxiz-math/std",
+    "portable-bijectives/std",
 ]
 arena = ["bumpalo"]
 profiling = ["std"]
