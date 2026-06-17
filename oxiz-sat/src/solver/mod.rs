@@ -28,6 +28,12 @@ use crate::proof::DratWriter;
 use crate::trail::{Reason, Trail};
 use crate::vsids::VSIDS;
 use crate::watched::{WatchLists, Watcher};
+// The per-push clause-id undo ledger. Traits brought in as `_` (only their
+// methods are needed); `Checkpoint` is named (it is the mark type).
+use portable_collection_primitives::{
+    Checkpoint, Container as _, Push as _, ScopedRollback as _, ScopedStack as _,
+};
+use portable_queues::VecScopedStack;
 use smallvec::SmallVec;
 
 /// Binary implication graph for efficient binary clause propagation
@@ -377,8 +383,19 @@ pub struct Solver {
     pub(super) assertion_levels: Vec<usize>,
     /// Trail sizes at each assertion level (for proper pop backtracking)
     pub(super) assertion_trail_sizes: Vec<usize>,
-    /// Clause IDs added at each assertion level (for proper pop)
-    pub(super) assertion_clause_ids: Vec<Vec<ClauseId>>,
+    /// Per-push **clause-id undo ledger**: EVERY clause added to `self.clauses`
+    /// during solving (original, learned, theory-reason, on-the-fly binary) is
+    /// recorded here via [`Self::track_clause`], and `pop` removes exactly the
+    /// suffix added since the matching push (`drain_since`). One scoped append-log
+    /// replaces the old `Vec<Vec<ClauseId>>` so a learn path that forgot to record
+    /// its clause — leaving it live past the `pop` that should drop it → spurious
+    /// `unsat` — is structurally unrepresentable: there is one place to record,
+    /// and one atomic place to unwind.
+    pub(super) clause_ledger: VecScopedStack<ClauseId>,
+    /// Checkpoint into [`Self::clause_ledger`] at each assertion level, kept in
+    /// lock-step with `assertion_levels`/`assertion_trail_sizes`. The base entry
+    /// ([`Checkpoint::ORIGIN`]) is never popped (level-0 clauses are permanent).
+    pub(super) assertion_clause_marks: Vec<Checkpoint>,
     /// Model (if sat)
     pub(super) model: Vec<LBool>,
     /// Whether formula is trivially unsatisfiable
@@ -461,7 +478,8 @@ impl Solver {
             analyze_stack: Vec::new(),
             assertion_levels: vec![0],
             assertion_trail_sizes: vec![0],
-            assertion_clause_ids: vec![Vec::new()],
+            clause_ledger: VecScopedStack::new(),
+            assertion_clause_marks: vec![Checkpoint::ORIGIN],
             model: Vec::new(),
             trivially_unsat: false,
             phase: Vec::new(),
@@ -578,6 +596,20 @@ impl Solver {
         }
     }
 
+    /// Record `id` in the per-push clause-id undo ledger so the matching `pop`
+    /// removes it. The SINGLE funnel every clause added to `self.clauses` during
+    /// solving must pass through — input clauses, CDCL-learned clauses, theory-
+    /// reason lemmas, and on-the-fly binary clauses alike. Recording a clause
+    /// whose scope later pops, but failing to record it, leaves it live past the
+    /// `pop` → an unsound conflict on the next solve (spurious `unsat`); routing
+    /// every add through here makes that omission unrepresentable. At the base
+    /// level (no active push) entries simply accumulate and are never drained
+    /// (level-0 clauses are permanent), matching the previous behaviour.
+    #[inline]
+    pub(super) fn track_clause(&mut self, id: ClauseId) {
+        self.clause_ledger.push(id);
+    }
+
     /// Add a clause
     pub fn add_clause(&mut self, lits: impl IntoIterator<Item = Lit>) -> bool {
         let mut clause_lits: SmallVec<[Lit; 8]> = lits.into_iter().collect();
@@ -667,9 +699,7 @@ impl Solver {
                 if val0.is_true() || val1.is_true() {
                     // Clause already satisfied by current assignment
                     let clause_id = self.clauses.add_original(clause_lits.iter().copied());
-                    if let Some(current_level_clauses) = self.assertion_clause_ids.last_mut() {
-                        current_level_clauses.push(clause_id);
-                    }
+                    self.track_clause(clause_id);
                     self.binary_graph.add(lit0.negate(), lit1, clause_id);
                     self.binary_graph.add(lit1.negate(), lit0, clause_id);
                     self.watches
@@ -700,9 +730,7 @@ impl Solver {
                 // after adding the clause (via next solve())
 
                 let clause_id = self.clauses.add_original(clause_lits.iter().copied());
-                if let Some(current_level_clauses) = self.assertion_clause_ids.last_mut() {
-                    current_level_clauses.push(clause_id);
-                }
+                self.track_clause(clause_id);
                 self.binary_graph.add(lit0.negate(), lit1, clause_id);
                 self.binary_graph.add(lit1.negate(), lit0, clause_id);
                 self.watches
@@ -738,10 +766,8 @@ impl Solver {
 
         let clause_id = self.clauses.add_original(clause_lits.iter().copied());
 
-        // Track clause for incremental solving
-        if let Some(current_level_clauses) = self.assertion_clause_ids.last_mut() {
-            current_level_clauses.push(clause_id);
-        }
+        // Track clause for incremental solving (per-push undo ledger).
+        self.track_clause(clause_id);
 
         // Set up watches - prefer non-false literals for watching
         let lit0 = clause_lits[0];
@@ -816,10 +842,8 @@ impl Solver {
                     self.stats.unit_clauses += 1;
                     self.learned_clause_ids.push(clause_id);
 
-                    // Track for incremental solving
-                    if let Some(current_level_clauses) = self.assertion_clause_ids.last_mut() {
-                        current_level_clauses.push(clause_id);
-                    }
+                    // Track for incremental solving (per-push undo ledger).
+                    self.track_clause(clause_id);
 
                     self.trail.assign_decision(learnt_clause[0]);
                 } else {
@@ -851,10 +875,8 @@ impl Solver {
                     // Track learned clause for potential deletion
                     self.learned_clause_ids.push(clause_id);
 
-                    // Track clause for incremental solving
-                    if let Some(current_level_clauses) = self.assertion_clause_ids.last_mut() {
-                        current_level_clauses.push(clause_id);
-                    }
+                    // Track clause for incremental solving (per-push undo ledger).
+                    self.track_clause(clause_id);
 
                     // Watch first two literals
                     let lit0 = learnt_clause[0];
@@ -1571,7 +1593,8 @@ impl Solver {
 
         self.assertion_levels.push(self.clauses.num_original());
         self.assertion_trail_sizes.push(self.trail.size());
-        self.assertion_clause_ids.push(Vec::new());
+        // Mark the ledger height so this scope's clauses can be drained on pop.
+        self.assertion_clause_marks.push(self.clause_ledger.checkpoint());
     }
 
     /// Pop to previous assertion level
@@ -1582,9 +1605,14 @@ impl Solver {
             // Get the trail size to backtrack to
             let trail_size = self.assertion_trail_sizes.pop().unwrap_or(0);
 
-            // Remove all clauses added at this assertion level
-            if let Some(clause_ids_to_remove) = self.assertion_clause_ids.pop() {
-                for clause_id in clause_ids_to_remove {
+            // Remove EVERY clause added since the matching push — original,
+            // learned, theory-reason, on-the-fly binary alike — by draining the
+            // ledger suffix back to this scope's mark. One atomic unwind: a clause
+            // recorded via `track_clause` cannot be missed here, so none survives
+            // the pop to poison a later solve (the spurious-`unsat` bug).
+            if let Some(mark) = self.assertion_clause_marks.pop() {
+                let removed: SmallVec<[ClauseId; 32]> = self.clause_ledger.drain_since(mark).collect();
+                for clause_id in removed {
                     // Remove from clause database
                     self.clauses.remove(clause_id);
 
@@ -1656,8 +1684,9 @@ impl Solver {
         self.assertion_levels.push(0);
         self.assertion_trail_sizes.clear();
         self.assertion_trail_sizes.push(0);
-        self.assertion_clause_ids.clear();
-        self.assertion_clause_ids.push(Vec::new());
+        self.clause_ledger.clear();
+        self.assertion_clause_marks.clear();
+        self.assertion_clause_marks.push(Checkpoint::ORIGIN);
         self.model.clear();
         self.num_vars = 0;
         self.restart_threshold = self.config.restart_interval;

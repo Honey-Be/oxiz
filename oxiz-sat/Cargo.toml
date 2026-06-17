@@ -11,7 +11,7 @@ categories = ["algorithms"]
 
 [features]
 default = ["std"]
-std = ["rayon", "tracing", "rustc-hash/std", "oxiz-core/std"]
+std = ["rayon", "tracing", "rustc-hash/std", "oxiz-core/std", "portable-queues/std", "portable-collection-primitives/std"]
 profiling = ["std", "oxiz-core/profiling"]
 # Enable verbose debug output in conflict analysis
 analyze-debug = []
@@ -32,6 +32,13 @@ rayon = { workspace = true, optional = true }
 hashbrown.workspace = true
 portable-atomic-util = { workspace = true }
 libm.workspace = true
+# `VecScopedStack<ClauseId>` — the per-push clause-id undo ledger (see
+# `Solver::pop`). Needs `alloc` (the type is behind the crate's `ifstdoralloc!`
+# gate); `std` is forwarded above.
+portable-queues = { workspace = true, default-features = false, features = ["alloc"] }
+# The trait vocabulary `VecScopedStack` implements (Push/ScopedRollback/
+# ScopedStack/Container/Checkpoint) — needed in scope to call its methods.
+portable-collection-primitives = { workspace = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

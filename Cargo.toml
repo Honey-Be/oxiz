@@ -88,6 +88,14 @@ lasso = "0.7"
 # (FlatRadixBimap). no_std+alloc, tracks portable-collections `main`; the
 # Cargo.lock pins the exact rev per checkout.
 portable-bijectives = { git = "https://github.com/newsniper-org/portable-collections", default-features = false }
+# Scoped append-log (VecScopedStack) for the SAT core's per-push clause-id undo
+# ledger — `ScopedRollback`'s `drain_since` makes the "clauses added in a scope ↔
+# clauses removed on pop" desync unrepresentable. Same workspace/rev as above.
+portable-queues = { git = "https://github.com/newsniper-org/portable-collections", default-features = false }
+# The shared trait vocabulary (`ScopedRollback`/`ScopedStack`/`Push`/`Container`/
+# `Checkpoint`) the two backends above implement; a direct dep so consumers can
+# bring the trait methods into scope.
+portable-collection-primitives = { git = "https://github.com/newsniper-org/portable-collections", default-features = false }
 
 # Parsing
 winnow = "1.0"

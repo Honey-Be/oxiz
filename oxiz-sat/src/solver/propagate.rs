@@ -180,6 +180,10 @@ impl Solver {
                 self.drat_add(&binary_clause_lits);
                 // Learn this binary clause on-the-fly
                 let clause_id = self.clauses.add_learned(binary_clause_lits.iter().copied());
+                // Record in the per-push undo ledger so `pop` removes it (this
+                // lazily-derived binary depends on the current clause set, which a
+                // later `pop` may retract).
+                self.track_clause(clause_id);
                 // Add correct implications: ~A -> B and ~B -> A for clause (A | B)
                 self.binary_graph
                     .add(other_lit.negate(), implied, clause_id);

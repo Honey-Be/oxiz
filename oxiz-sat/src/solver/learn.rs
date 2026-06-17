@@ -39,6 +39,9 @@ impl Solver {
             self.stats.learned_clauses += 1;
             self.stats.unit_clauses += 1;
             self.learned_clause_ids.push(clause_id);
+            // Record in the per-push undo ledger so `pop` removes it (a clause
+            // learned under a pushed assertion is unsound once that scope pops).
+            self.track_clause(clause_id);
 
             self.trail.assign_decision(learnt_clause[0]);
         } else if learnt_clause.len() == 2 {
@@ -54,6 +57,7 @@ impl Solver {
             }
 
             self.learned_clause_ids.push(clause_id);
+            self.track_clause(clause_id);
 
             let lit0 = learnt_clause[0];
             let lit1 = learnt_clause[1];
@@ -79,6 +83,7 @@ impl Solver {
             }
 
             self.learned_clause_ids.push(clause_id);
+            self.track_clause(clause_id);
 
             let lit0 = learnt_clause[0];
             let lit1 = learnt_clause[1];
@@ -155,6 +160,9 @@ impl Solver {
         // emission is supported for the pure Boolean `solve()` loop only; the
         // CDCL(T) (`solve_with_theory`) path is out of scope for DRAT.
         let clause_id = self.clauses.add_learned(clause_lits.iter().copied());
+        // Record in the per-push undo ledger: a theory-reason lemma asserted under
+        // a pushed assertion must not survive the `pop` that drops that scope.
+        self.track_clause(clause_id);
 
         // Set up watches
         if clause_lits.len() >= 2 {
@@ -582,5 +590,59 @@ impl Solver {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use crate::literal::{Lit, Var};
+
+    /// Regression: a clause learned *inside* a `push` scope must be removed by
+    /// the matching `pop`. The theory-driver learn paths (`learn_clause`,
+    /// `add_theory_reason_clause`, the on-the-fly binary in `propagate`) once
+    /// added the clause to the DB + `learned_clause_ids` but forgot the per-push
+    /// undo ledger, so it survived the `pop` and an unsound conflict on the next
+    /// solve reported a spurious `unsat` (verus-fork 2026-06-17: a prior
+    /// `(check-sat)` in a pushed scope poisoned a later `(abduce)`). Routing every
+    /// add through `track_clause` (recorded in `clause_ledger`, drained on `pop`)
+    /// makes the omission unrepresentable; this pins it on the exact bug path.
+    #[test]
+    fn pop_removes_theory_reason_clause_learned_in_scope() {
+        let mut s = Solver::new();
+        s.ensure_vars(4);
+        // A permanent base clause at level 0.
+        assert!(s.add_clause([Lit::pos(Var::new(0)), Lit::pos(Var::new(1))]));
+        let base = s.num_clauses();
+
+        s.push();
+        // A theory-reason lemma added during an in-scope solve — the path that
+        // dropped its ledger record before this fix.
+        let _ = s.add_theory_reason_clause(&[Lit::pos(Var::new(2))], Lit::pos(Var::new(3)));
+        assert!(
+            s.num_clauses() > base,
+            "the in-scope theory-reason clause should be in the DB"
+        );
+
+        s.pop();
+        assert_eq!(
+            s.num_clauses(),
+            base,
+            "pop MUST remove the theory-reason clause learned in the scope; \
+             leaving it live poisons the next solve (spurious unsat)"
+        );
+    }
+
+    /// The base level (no active push) keeps its clauses: `pop` only drains
+    /// pushed scopes, never the permanent level-0 prefix.
+    #[test]
+    fn base_level_clauses_survive() {
+        let mut s = Solver::new();
+        s.ensure_vars(2);
+        assert!(s.add_clause([Lit::pos(Var::new(0)), Lit::neg(Var::new(1))]));
+        let base = s.num_clauses();
+        // A pop with no matching push is a no-op (guarded by assertion depth).
+        s.pop();
+        assert_eq!(s.num_clauses(), base, "level-0 clauses are permanent");
     }
 }
