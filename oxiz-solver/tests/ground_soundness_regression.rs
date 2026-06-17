@@ -266,3 +266,88 @@ fn arith_fixed_value_congruence_deep_and_negative_are_unsat() {
 ";
     assert_eq!(verdict(twofun), "unsat", "two-function fixed-value congruence");
 }
+
+/// verus-fork 2026-06-17 P0: `-V adsmt` vacuously verified `ensures x != 0`.
+/// The emitted goal `(not (=> L (not (= x 0))))` (= `L ∧ (x = 0)`, plainly SAT)
+/// was reported `unsat`. Root cause: the eager `Not(Eq(a,b))` arithmetic split
+/// in `encode` (`add_arith_diseq_split`) walked the asserted term syntactically,
+/// blind to polarity, and added the bare disequality `(a<b) OR (a>b)` for the
+/// inner `(not (= x 0))` — which sits at EFFECTIVE positive-equality polarity
+/// under the outer `not`. That forced `x != 0`, clashing with the formula's
+/// `x = 0` → spurious `unsat`. Fix: emit the SOUND trichotomy
+/// `(= a b) OR (a<b) OR (a>b)` (a tautology) instead of the bare split, so it
+/// constrains nothing at any polarity yet still lets the ArithSolver split a
+/// genuinely-false equality. The whole class of disequality / negated-equality
+/// postconditions was affected.
+#[test]
+fn negated_impl_double_neg_equality_is_not_unsat() {
+    // (not (=> L (not (= x 0)))) ≡ L ∧ (x = 0) — SAT (L=true, x=0).
+    let bug = "\
+(set-logic ALL)
+(declare-const x Int)
+(declare-const L Bool)
+(assert (not (=> L (not (= x 0)))))
+(check-sat)
+";
+    assert_ne!(verdict(bug), "unsat", "negated-impl over a negated equality must NOT be unsat");
+
+    // The same with the implication written as its De Morgan disjunction.
+    let or_form = "\
+(set-logic ALL)
+(declare-const x Int)
+(declare-const L Bool)
+(assert (not (or (not L) (not (= x 0)))))
+(check-sat)
+";
+    assert_ne!(verdict(or_form), "unsat", "negated (or (not L) (not (= x 0))) must NOT be unsat");
+
+    // Real sort variant.
+    let real = "\
+(set-logic ALL)
+(declare-const x Real)
+(declare-const L Bool)
+(assert (not (=> L (not (= x 0.0)))))
+(check-sat)
+";
+    assert_ne!(verdict(real), "unsat", "Real-sort negated-impl disequality must NOT be unsat");
+
+    // Even with x=0 asserted alongside, must stay non-unsat (was unsat).
+    let pinned = "\
+(set-logic ALL)
+(declare-const x Int)
+(declare-const L Bool)
+(assert (not (=> L (not (= x 0)))))
+(assert (= x 0))
+(check-sat)
+";
+    assert_ne!(verdict(pinned), "unsat", "x=0 explicitly asserted must not be unsat");
+}
+
+/// The genuine-UNSAT companions the trichotomy fix must preserve: a positively
+/// asserted disequality still drives `!=`, and a contradiction stays unsat.
+#[test]
+fn genuine_disequality_unsat_preserved() {
+    // (not (= x 0)) asserted positively, plus x = 0 → genuinely UNSAT.
+    let g1 = "\
+(set-logic ALL)
+(declare-const x Int)
+(assert (not (= x 0)))
+(assert (= x 0))
+(check-sat)
+";
+    assert_eq!(verdict(g1), "unsat", "positive disequality + equality is unsat");
+
+    // A positive disequality `(not (= x 0))` whose trichotomy lets the SAT
+    // solver set the Eq atom false → ArithSolver must enforce `x != 0`, which
+    // contradicts the bounds pinning `x = 0` → genuinely UNSAT. Confirms the
+    // trichotomy still drives the arithmetic split for a real disequality.
+    let g2 = "\
+(set-logic ALL)
+(declare-const x Int)
+(assert (not (= x 0)))
+(assert (<= x 0))
+(assert (>= x 0))
+(check-sat)
+";
+    assert_eq!(verdict(g2), "unsat", "positive disequality + bounds pinning x=0 is unsat");
+}

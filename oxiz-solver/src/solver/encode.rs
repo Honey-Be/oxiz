@@ -1605,14 +1605,27 @@ impl Solver {
                         });
                         if lhs_is_numeric {
                             let (l, r) = (*lhs, *rhs);
-                            // Build Lt(lhs, rhs) and Gt(lhs, rhs)
+                            // Add the SOUND trichotomy `Eq(a,b) OR Lt(a,b) OR
+                            // Gt(a,b)` — a tautology over Int/Real — NOT the bare
+                            // `Lt OR Gt` disequality. The bare split forces a≠b
+                            // unconditionally, which is unsound at any non-positive
+                            // polarity: this recursion is syntactic (it walks
+                            // through `Not`/`Implies`-rhs/`Ite`/`Or` blind to how
+                            // many negations enclose the `Not(Eq)`), so a
+                            // `Not(Eq(x,0))` sitting at EFFECTIVE positive-equality
+                            // polarity — e.g. `(not (=> L (not (= x 0))))` = `L ∧
+                            // (x = 0)` — would get `x≠0` forced and conflict with
+                            // the formula's `x = 0` → spurious `unsat` (verus-fork
+                            // 2026-06-17: `ensures x != 0` verified vacuously).
+                            // The trichotomy keeps the intent (when SAT sets the Eq
+                            // atom false, it derives `Lt OR Gt` for the ArithSolver)
+                            // while adding NO constraint of its own.
+                            let eq_lit = self.encode(inner_id, manager);
                             let lt_term = manager.mk_lt(l, r);
                             let gt_term = manager.mk_gt(l, r);
-
-                            // Encode both and add the disjunction
                             let lt_lit = self.encode(lt_term, manager);
                             let gt_lit = self.encode(gt_term, manager);
-                            self.sat.add_clause([lt_lit, gt_lit]);
+                            self.sat.add_clause([eq_lit, lt_lit, gt_lit]);
                         }
                     }
                 }
