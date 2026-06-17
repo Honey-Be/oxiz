@@ -399,15 +399,24 @@ impl<'a> Parser<'a> {
                 self.manager.mk_implies(lhs, rhs)
             }
             "xor" => {
-                let lhs = self.parse_term()?;
-                let rhs = self.parse_term()?;
-                self.expect_rparen()?;
-                // XOR = (a and not b) or (not a and b)
-                let not_lhs = self.manager.mk_not(lhs);
-                let not_rhs = self.manager.mk_not(rhs);
-                let and1 = self.manager.mk_and([lhs, not_rhs]);
-                let and2 = self.manager.mk_and([not_lhs, rhs]);
-                self.manager.mk_or([and1, and2])
+                // SMT-LIB Core declares `xor` as `:left-assoc`, so
+                // `(xor t1 t2 ... tn)` ≡ `(xor (... (xor t1 t2) ...) tn)` — a
+                // LEFT fold of binary xor, i.e. true iff an ODD number of the
+                // operands are true (parity). Read the whole arg list (like
+                // and/or) and fold; each binary step expands to
+                // `(a∧¬b)∨(¬a∧b)`, so the 2-arg case is byte-identical to
+                // before. (`parse_term_list` consumes the closing `)`.)
+                let args = self.parse_term_list()?;
+                let mut iter = args.into_iter();
+                let mut acc = iter.next().unwrap_or(self.manager.false_id);
+                for rhs in iter {
+                    let not_acc = self.manager.mk_not(acc);
+                    let not_rhs = self.manager.mk_not(rhs);
+                    let and1 = self.manager.mk_and([acc, not_rhs]);
+                    let and2 = self.manager.mk_and([not_acc, rhs]);
+                    acc = self.manager.mk_or([and1, and2]);
+                }
+                acc
             }
             "ite" => {
                 let cond = self.parse_term()?;
