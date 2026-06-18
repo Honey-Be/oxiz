@@ -253,7 +253,16 @@ impl Solver {
             .as_ref()
             .map(|m| m.assignments().clone())
             .unwrap_or_default();
-        SolverModel::new(assign, manager.mk_true(), manager.mk_false())
+        let model = SolverModel::new(assign, manager.mk_true(), manager.mk_false());
+        // Attach the global model-completion facts only when there are
+        // quantifiers (the M3 recognizers in `eval_forall` need them; for a
+        // quantifier-free problem they would never fire). Cheap: one linear
+        // walk of the asserted formula.
+        if self.has_quantifiers {
+            model.with_completion_facts(manager, &self.assertions)
+        } else {
+            model
+        }
     }
 
     /// Confirm a clean-engine `unsat` with a SINGLE-SHOT ground solve.

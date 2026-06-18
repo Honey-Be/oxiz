@@ -32,7 +32,7 @@ use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_core::sort::SortId;
 use oxiz_mbqi::{Binding, ModelEval, Sig, TermLang, TermView};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // Reserved syms for structured connectives/operators. A `Spur` is a
 // `NonZeroU32` (< 2^32), so any value with bit 60 set never collides with an
@@ -215,6 +215,11 @@ pub struct SolverModel {
     assign: FxHashMap<TermId, TermId>,
     true_id: TermId,
     false_id: TermId,
+    /// Model-INDEPENDENT facts about the whole asserted formula, for the
+    /// `eval_forall` M3 model-completion recognizers. `None` ⇒ those
+    /// recognizers are disabled (only the structural-tautology fragment runs);
+    /// always sound, just less complete.
+    facts: Option<CompletionFacts>,
 }
 
 impl SolverModel {
@@ -225,7 +230,17 @@ impl SolverModel {
             assign,
             true_id,
             false_id,
+            facts: None,
         }
+    }
+
+    /// Attach model-completion facts computed from the full assertion set.
+    /// Enables the M3 definitional / pure-polarity / function-completion
+    /// recognizers in [`SolverModel::eval_forall`]. Only worth computing when
+    /// the problem has quantifiers; cheap (one linear walk of the assertions).
+    pub fn with_completion_facts(mut self, manager: &TermManager, assertions: &[TermId]) -> Self {
+        self.facts = Some(CompletionFacts::analyze(manager, assertions));
+        self
     }
 
     /// The model value of `t` (the assignment, else `t` itself if it is its
@@ -233,6 +248,218 @@ impl SolverModel {
     #[inline]
     fn value(&self, t: TermId) -> TermId {
         self.assign.get(&t).copied().unwrap_or(t)
+    }
+}
+
+/// Model-independent facts about the whole asserted formula, used by the
+/// `eval_forall` model-completion recognizers (M3). Conservative everywhere — a
+/// missed fact only costs completeness, never soundness.
+#[derive(Default)]
+struct CompletionFacts {
+    /// Quantifier body-roots that are a conservative DEFINITION
+    /// `∀x̄. (= (f x̄) rhs)`: `f` uninterpreted, applied to exactly the distinct
+    /// bound vars, not occurring in `rhs`, and occurring NOWHERE else in the
+    /// problem. Such an axiom is always satisfiable (define `f := λx̄. rhs`), so
+    /// it never blocks `Sat`.
+    definitional_quants: FxHashSet<TermId>,
+    /// Polarity of each uninterpreted **predicate** symbol across all
+    /// NON-definitional assertions (a definition does not constrain the symbols
+    /// in its rhs). A symbol in `occurs_pos` but neither `occurs_neg` nor
+    /// `occurs_mixed` occurs only positively ⇒ can be set true; symmetric for
+    /// `occurs_neg`. `occurs_mixed` = appears in a non-monotone context
+    /// (Eq/Xor/Ite/arith/term position) ⇒ NOT freely settable.
+    occurs_pos: FxHashSet<u64>,
+    occurs_neg: FxHashSet<u64>,
+    occurs_mixed: FxHashSet<u64>,
+    /// How many DISTINCT non-definitional quantifier bodies mention each
+    /// uninterpreted symbol (the single-function range-completion gate requires
+    /// exactly one). Keyed on the `view`-style `u64` symbol (`spur_sym`).
+    quant_count: FxHashMap<u64, u32>,
+}
+
+impl CompletionFacts {
+    fn analyze(m: &TermManager, assertions: &[TermId]) -> Self {
+        let mut f = CompletionFacts::default();
+
+        // Pass 0: global occurrence count of every uninterpreted symbol, so a
+        // definitional head can be confirmed to occur NOWHERE else.
+        let mut global_occ: FxHashMap<u64, u32> = FxHashMap::default();
+        for &a in assertions {
+            count_syms(m, a, &mut global_occ);
+        }
+
+        // Pass 1: identify definitional axioms `∀x̄. (= (f x̄) rhs)` with `f`
+        // occurring exactly once globally (so only as this defining head).
+        for &a in assertions {
+            if let Some(f_sym) = definitional_head(m, a) {
+                if global_occ.get(&f_sym).copied() == Some(1) {
+                    f.definitional_quants.insert(a);
+                }
+            }
+        }
+
+        // Pass 2: polarity + per-quantifier mention counts over NON-definitional
+        // assertions (a definition constrains nothing but its own fresh head).
+        for &a in assertions {
+            if f.definitional_quants.contains(&a) {
+                continue;
+            }
+            walk_polarity(m, a, true, &mut f);
+            if matches!(
+                m.get(a).map(|t| &t.kind),
+                Some(TermKind::Forall { .. } | TermKind::Exists { .. })
+            ) {
+                let mut occ: FxHashMap<u64, u32> = FxHashMap::default();
+                count_syms(m, a, &mut occ);
+                for s in occ.into_keys() {
+                    *f.quant_count.entry(s).or_insert(0) += 1;
+                }
+            }
+        }
+        f
+    }
+
+    #[inline]
+    fn is_pure_pos(&self, s: u64) -> bool {
+        self.occurs_pos.contains(&s) && !self.occurs_neg.contains(&s) && !self.occurs_mixed.contains(&s)
+    }
+    #[inline]
+    fn is_pure_neg(&self, s: u64) -> bool {
+        self.occurs_neg.contains(&s) && !self.occurs_pos.contains(&s) && !self.occurs_mixed.contains(&s)
+    }
+}
+
+/// All immediate sub-terms of `t` (including a quantifier's body), for the
+/// recursive `count_syms` / `mark_mixed` walks. Mirrors `OxizHost::children`
+/// but over `TermKind` directly and descends into quantifier bodies.
+fn subterms(m: &TermManager, t: TermId) -> Vec<TermId> {
+    let Some(term) = m.get(t) else { return Vec::new() };
+    match &term.kind {
+        TermKind::Apply { args, .. } => args.to_vec(),
+        TermKind::And(a) | TermKind::Or(a) | TermKind::Add(a) | TermKind::Mul(a)
+        | TermKind::Distinct(a) => a.to_vec(),
+        TermKind::Not(a) | TermKind::Neg(a) => vec![*a],
+        TermKind::Xor(a, b)
+        | TermKind::Implies(a, b)
+        | TermKind::Eq(a, b)
+        | TermKind::Sub(a, b)
+        | TermKind::Div(a, b)
+        | TermKind::Mod(a, b)
+        | TermKind::Lt(a, b)
+        | TermKind::Le(a, b)
+        | TermKind::Gt(a, b)
+        | TermKind::Ge(a, b)
+        | TermKind::Select(a, b) => vec![*a, *b],
+        TermKind::Ite(a, b, c) | TermKind::Store(a, b, c) => vec![*a, *b, *c],
+        TermKind::Forall { body, .. } | TermKind::Exists { body, .. } => vec![*body],
+        _ => Vec::new(),
+    }
+}
+
+/// Count occurrences of each uninterpreted `Apply` head (keyed on the
+/// `view`-style `u64` symbol) in `t` and all its sub-terms.
+fn count_syms(m: &TermManager, t: TermId, out: &mut FxHashMap<u64, u32>) {
+    if let Some(TermKind::Apply { func, .. }) = m.get(t).map(|x| &x.kind) {
+        *out.entry(spur_sym(*func)).or_insert(0) += 1;
+    }
+    for c in subterms(m, t) {
+        count_syms(m, c, out);
+    }
+}
+
+/// Mark every uninterpreted symbol in `t`'s subtree as non-monotone (`mixed`):
+/// it sits in a term / non-monotone context where it cannot be freely set.
+fn mark_mixed(m: &TermManager, t: TermId, f: &mut CompletionFacts) {
+    if let Some(TermKind::Apply { func, .. }) = m.get(t).map(|x| &x.kind) {
+        f.occurs_mixed.insert(spur_sym(*func));
+    }
+    for c in subterms(m, t) {
+        mark_mixed(m, c, f);
+    }
+}
+
+/// If `a` is a conservative definition `∀x̄. (= (f x̄) rhs)` — `f` uninterpreted,
+/// applied to exactly the distinct bound vars, not occurring in `rhs` — return
+/// `f`'s `view`-style symbol. (The caller still checks `f` occurs nowhere else.)
+fn definitional_head(m: &TermManager, a: TermId) -> Option<u64> {
+    let TermKind::Forall { vars, body, .. } = &m.get(a)?.kind else {
+        return None;
+    };
+    let TermKind::Eq(lhs, rhs) = &m.get(*body)?.kind else {
+        return None;
+    };
+    let (lhs, rhs) = (*lhs, *rhs);
+    let TermKind::Apply { func, args } = &m.get(lhs)?.kind else {
+        return None;
+    };
+    if args.len() != vars.len() {
+        return None;
+    }
+    let bound: Vec<Spur> = vars.iter().map(|(n, _)| *n).collect();
+    let mut seen: FxHashSet<Spur> = FxHashSet::default();
+    for &arg in args.iter() {
+        let TermKind::Var(s) = &m.get(arg)?.kind else {
+            return None;
+        };
+        if !bound.contains(s) || !seen.insert(*s) {
+            return None;
+        }
+    }
+    // `f` must not occur in the rhs (else the equation constrains `f`).
+    let fsym = spur_sym(*func);
+    let mut rhs_occ: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(m, rhs, &mut rhs_occ);
+    if rhs_occ.contains_key(&fsym) {
+        return None;
+    }
+    Some(fsym)
+}
+
+/// Walk the boolean skeleton of `t` recording each uninterpreted PREDICATE
+/// symbol's polarity (`pos`/`neg`); a symbol reached in a non-monotone context
+/// (Eq/Xor/Ite/Distinct/arith comparison) or in term (argument) position is
+/// marked `mixed` and is therefore never set by the pure-polarity recognizer.
+fn walk_polarity(m: &TermManager, t: TermId, pos: bool, f: &mut CompletionFacts) {
+    let Some(term) = m.get(t) else { return };
+    match &term.kind {
+        TermKind::Not(a) => walk_polarity(m, *a, !pos, f),
+        TermKind::And(args) | TermKind::Or(args) => {
+            for &c in args.iter() {
+                walk_polarity(m, c, pos, f);
+            }
+        }
+        TermKind::Implies(a, b) => {
+            walk_polarity(m, *a, !pos, f);
+            walk_polarity(m, *b, pos, f);
+        }
+        TermKind::Forall { body, .. } | TermKind::Exists { body, .. } => {
+            walk_polarity(m, *body, pos, f);
+        }
+        TermKind::Apply { func, args } => {
+            // A predicate atom in the boolean skeleton: its head takes the
+            // current polarity; its arguments are TERMS (data, not settable).
+            let s = spur_sym(*func);
+            if pos {
+                f.occurs_pos.insert(s);
+            } else {
+                f.occurs_neg.insert(s);
+            }
+            for &c in args.iter() {
+                mark_mixed(m, c, f);
+            }
+        }
+        // Non-monotone boolean atoms / arithmetic comparisons: every
+        // uninterpreted symbol inside is in a non-monotone or term position.
+        TermKind::Eq(..)
+        | TermKind::Distinct(..)
+        | TermKind::Xor(..)
+        | TermKind::Ite(..)
+        | TermKind::Lt(..)
+        | TermKind::Le(..)
+        | TermKind::Gt(..)
+        | TermKind::Ge(..) => mark_mixed(m, t, f),
+        // Leaves (True/False/Var/literals) carry no uninterpreted symbol.
+        _ => mark_mixed(m, t, f),
     }
 }
 
@@ -331,16 +558,44 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
     /// `∀x. f(x)=f(x)`, a reflexive-equality axiom) without admitting any
     /// model-sample-based (unsound) `sat`.
     fn eval_forall(&self, lang: &OxizHost<'a>, quant: TermId) -> Option<bool> {
-        let TermView::Quant { body, .. } = lang.view(quant) else {
+        let TermView::Quant { body, vars, .. } = lang.view(quant) else {
             return None;
         };
-        // Validity is monotone under universal closure: if `body` is valid for
-        // all valuations then so is `∀x̄. body`. A non-tautology stays `None`.
+        // (1) Structural tautology — valid in every interpretation. Monotone
+        // under universal closure: if `body` is valid for all valuations then so
+        // is `∀x̄. body`. Model-independent, always sound.
         if self.body_is_valid(lang, body, 64) {
-            Some(true)
-        } else {
-            None
+            return Some(true);
         }
+        // (2..4) M3 model-completion recognizers. Each builds (a fragment of) a
+        // model that satisfies the axiom, GUARDED by global facts about the
+        // whole formula so the per-quantifier `Some(true)`s compose into one
+        // consistent model. Disabled (→ sound `None`) when facts are absent.
+        let Some(facts) = &self.facts else {
+            return None;
+        };
+        let bound: Vec<Spur> = vars.iter().map(|(n, _)| *n).collect();
+        // (2) Definitional axiom `∀x̄. (= (f x̄) rhs)`, `f` fresh ⇒ conservative
+        // extension (define `f := λx̄. rhs`), always satisfiable.
+        if facts.definitional_quants.contains(&quant) {
+            return Some(true);
+        }
+        // (3) Pure-polarity predicate: a single-literal body whose uninterpreted
+        // predicate occurs ONLY positively (resp. negatively) everywhere ⇒ set
+        // it ≡ true (resp. false). Composes: a pure-positive symbol is never
+        // needed false by any axiom.
+        if let Some(b) = self.try_pure_predicate(lang, body, facts) {
+            return Some(b);
+        }
+        // (4) Single-function range completion: the bound vars feed ONLY one
+        // uninterpreted function `f` (constrained by no other quantifier), the
+        // other operand is ground, and the atom is satisfiable for some value of
+        // `f`'s result ⇒ complete `f` to that constant off the (already
+        // consistent) ground points.
+        if self.try_function_completion(lang, body, &bound, facts) {
+            return Some(true);
+        }
+        None
     }
 }
 
@@ -418,6 +673,109 @@ impl SolverModel {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// **M3 recognizer — pure-polarity predicate.** A single-literal body that
+    /// is an uninterpreted predicate atom `(P …)` whose symbol occurs ONLY
+    /// positively across the whole (non-definitional) formula ⇒ the model with
+    /// `P ≡ true` satisfies every occurrence, so `∀x̄.(P …)` holds. Symmetric for
+    /// `(not (P …))` with `P` purely negative ⇒ `P ≡ false`. Compositional: a
+    /// purely-positive symbol is never required false by any axiom, so setting
+    /// it true cannot break another quantifier's `Some(true)`.
+    fn try_pure_predicate(
+        &self,
+        lang: &OxizHost<'_>,
+        body: TermId,
+        facts: &CompletionFacts,
+    ) -> Option<bool> {
+        let TermView::App { sym } = lang.view(body) else {
+            return None;
+        };
+        if sym & OP == 0 {
+            // Bare uninterpreted predicate atom (the quantifier body is Bool, so
+            // `P` is a predicate). Pure-positive ⇒ set `P ≡ true`.
+            return facts.is_pure_pos(sym).then_some(true);
+        }
+        if sym == OP_NOT {
+            let args = lang.children(body);
+            if let Some(&inner) = args.first() {
+                if let TermView::App { sym: isym } = lang.view(inner) {
+                    if isym & OP == 0 && facts.is_pure_neg(isym) {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// **M3 recognizer — single-function range completion.** A comparison atom
+    /// `(cmp (f x̄) g)` (or `(cmp g (f x̄))`) where `g` is ground, `f` is
+    /// uninterpreted, the bound vars feed ONLY that one application, and `f` is
+    /// constrained by NO other quantifier. The atom is satisfiable for some
+    /// value of `(f x̄)` (the operands are distinct terms), so `f` can be
+    /// completed to a constant meeting it on every non-ground argument — the
+    /// ground arguments are already consistent (the engine reached saturation
+    /// with no conflict). Hence `∀x̄. body` holds.
+    fn try_function_completion(
+        &self,
+        lang: &OxizHost<'_>,
+        body: TermId,
+        bound: &[Spur],
+        facts: &CompletionFacts,
+    ) -> bool {
+        if bound.is_empty() {
+            return false;
+        }
+        let TermView::App { sym } = lang.view(body) else {
+            return false;
+        };
+        if !matches!(sym, OP_LT | OP_LE | OP_GT | OP_GE | OP_EQ) {
+            return false;
+        }
+        let args = lang.children(body);
+        if args.len() != 2 {
+            return false;
+        }
+        let (l, r) = (args[0], args[1]);
+        // Exactly one operand mentions the bound vars; the other must be ground.
+        let app_side = match (
+            self.has_bound(lang, l, bound, 256),
+            self.has_bound(lang, r, bound, 256),
+        ) {
+            (true, false) => l,
+            (false, true) => r,
+            _ => return false,
+        };
+        // The bound side must be a single application of one uninterpreted
+        // function (so a constant completion of `f` makes its value uniform).
+        let TermView::App { sym: fsym } = lang.view(app_side) else {
+            return false;
+        };
+        if fsym & OP != 0 {
+            return false; // a builtin op, not an uninterpreted function
+        }
+        // `f` must be this axiom's SOLE universal constraint (no cross-quantifier
+        // requirement that a single constant completion could violate).
+        facts.quant_count.get(&fsym).copied() == Some(1)
+    }
+
+    /// Does `t` mention any of the `bound` variable names? Depth-bounded;
+    /// running out returns `true` (conservative — never under-reports a bound
+    /// variable, which would unsoundly classify a side as "ground").
+    fn has_bound(&self, lang: &OxizHost<'_>, t: TermId, bound: &[Spur], depth: u32) -> bool {
+        if depth == 0 {
+            return true;
+        }
+        match lang.view(t) {
+            TermView::Var { name } => bound.contains(&name),
+            TermView::App { .. } => lang
+                .children(t)
+                .iter()
+                .any(|&c| self.has_bound(lang, c, bound, depth - 1)),
+            TermView::Quant { body, .. } => self.has_bound(lang, body, bound, depth - 1),
+            TermView::Opaque => false,
         }
     }
 }

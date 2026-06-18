@@ -173,6 +173,22 @@ impl<S: Sig> Engine<S> {
             //    fabricated witness ⇒ D bug impossible). Completeness over the
             //    ground universe; the model-based check below decides Sat vs
             //    Unknown once it saturates.
+            //
+            // NOTE (M3, #260): a pre-enumeration model-completion short-circuit
+            // (`eval_forall == Some(true)` ⇒ skip) is NOT sound for an
+            // ARITHMETIC body like `∀a. f(a) > 0`: the clean model oracle does
+            // not fold `>` over concrete values, so a model-falsified existing
+            // ground instance (e.g. `f(7) = -3`) is detected ONLY by asserting
+            // the enumerated instance and letting the arithmetic theory refute
+            // it — exactly the enumeration step. Skipping it would hide that
+            // `unsat`. Reaching the completion verdict soundly for such bodies
+            // needs an arithmetic-aware oracle + a "verify existing ground
+            // instances" gate (#260). Until then the arithmetic
+            // function-completion case stays the sound `Unknown` (the `f`-tower
+            // enumeration runs to the iteration cap). The
+            // definitional / pure-polarity recognizers in `eval_forall` (which
+            // need no ground instances and cannot loop) DO fire here once
+            // enumeration saturates.
             self.enumerate(lang, qi, &mut lemmas);
         }
         // Advance the frontier watermark for every quantifier scanned this

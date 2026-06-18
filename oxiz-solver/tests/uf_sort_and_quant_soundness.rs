@@ -210,15 +210,18 @@ fn cdqi_no_false_conflict_when_existing_terms_are_consistent() {
     // conflicting instance over the existing terms, so the model stands.
     // (z3: sat.)
     //
-    // The clean-room MBQI is conservative: with no conflicting instance it
-    // reports the SOUND `Unknown` rather than guessing `Sat`, because
-    // concluding `Sat` here needs M3 model completion (verify `∀a.f(a)>0` holds
-    // in a *completed* interpretation of `f` — positive everywhere, consistent
-    // with f(7)=5). A heuristic "no conflict ⇒ Sat" would risk the very
-    // spurious-`sat` the rewrite was built to exclude, so the sound verdict is
-    // `Unknown` until the model-completion verifier lands (M4e). We therefore
-    // assert only that it is NOT a (spurious) `Unsat`; both `Sat` and `Unknown`
-    // are sound here.
+    // The clean-room MBQI is conservative here: with no conflicting instance it
+    // reports the SOUND `Unknown` rather than guessing `Sat`. The
+    // function-completion fragment that WOULD discharge this (`f` ≡ a positive
+    // constant off the consistent ground point f(7)=5) is recognised by
+    // `eval_forall` (Condition C), but cannot fire yet: the body is ARITHMETIC
+    // (`f(a)>0`), and the clean model oracle does not fold `>` over concrete
+    // values, so a model-falsified existing ground instance is detected only by
+    // asserting the enumerated instance — and that enumeration loops on the
+    // `f`-tower (`a := f(7)` ⇒ `f(f(7))` ⇒ …) to the iteration cap before
+    // saturating. Reaching the completion soundly needs an arithmetic-aware
+    // oracle + a verify-existing-ground-instances gate (#260). Both `Sat` and
+    // `Unknown` are sound, so assert only the non-`unsat` property. (z3: sat.)
     let r = solve_streamed(&[
         "(declare-fun f (Int) Int)",
         "(declare-const c Int)",
@@ -231,7 +234,8 @@ fn cdqi_no_false_conflict_when_existing_terms_are_consistent() {
         r,
         SolverResult::Unsat,
         "f(7)=5 is consistent with ∀a.f(a)>0 — must NOT be a spurious unsat \
-         (clean MBQI reports the sound Unknown pending M3 model completion)"
+         (clean MBQI reports the sound Unknown; full Sat is M3 arithmetic \
+         function completion, #260)"
     );
 }
 
@@ -300,19 +304,70 @@ fn trigger_free_partial_order_axioms_are_sat() {
             (= (height_lt x y) (and (partial-order x y) (not (= x y))))))",
         "(check-sat)",
     ]);
-    // The headline soundness property — this must never be a spurious `unsat`
-    // (that was verus-fork P0 "Bug C", now fixed on both engines). Reaching the
-    // full `Sat` verdict needs M3 model completion (no ground `Height` term
-    // exists, so the trigger-free axioms can only be discharged by verifying
-    // them in a completed model). The clean-room MBQI keeps to the SOUND
-    // `Unknown` until that verifier lands (M4e) rather than guess `Sat`; both
-    // `Sat` and `Unknown` are sound, so assert only the non-`unsat` property.
-    assert_ne!(
+    // M3 model completion (#264) now reaches the full `Sat` verdict: `lt`
+    // (height_lt) occurs only as the head of its defining biconditional, so it
+    // is a conservative DEFINITION (`lt := λx y. po(x,y) ∧ x≠y`); `po`
+    // (partial-order) occurs ONLY positively across the (non-definitional)
+    // formula, so the model `po ≡ true` satisfies the reflexivity axiom. Both
+    // model fragments are independent (distinct symbols), so they compose into
+    // one satisfying model — built host-side, no witness crosses into the
+    // engine. (z3: sat.)
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "reflexivity (pure-positive po ≡ true) + strict-order definition (fresh \
+         lt) over an uninterpreted sort — M3 model completion makes it Sat"
+    );
+}
+
+#[test]
+fn definitional_recognizer_does_not_mask_a_ground_contradiction() {
+    // M3 soundness guard (#264): the definitional recognizer reports the
+    // `height_lt` axiom `Some(true)` (it is a conservative definition), but the
+    // ground facts `(po a b)` ∧ `(not (po a b))` are a contradiction INDEPENDENT
+    // of that definition. Concluding `Sat` here would be a spurious sat: the
+    // SAT/EUF solve must surface the ground `unsat` regardless of the M3
+    // certificate for the definitional quantifier.
+    let r = solve_streamed(&[
+        "(declare-sort S 0)",
+        "(declare-fun lt (S S) Bool)",
+        "(declare-fun po (S S) Bool)",
+        "(declare-const a S)",
+        "(declare-const b S)",
+        "(assert (forall ((x S) (y S)) (= (lt x y) (and (po x y) (not (= x y))))))",
+        "(assert (po a b))",
+        "(assert (not (po a b)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
         r,
         SolverResult::Unsat,
-        "reflexivity + strict-order def over an uninterpreted sort is satisfiable \
-         — must NOT be a spurious unsat (clean MBQI reports the sound Unknown \
-         pending M3 model completion)"
+        "a ground contradiction must NOT be masked by the definitional M3 \
+         certificate for the (fresh) lt-definition axiom"
+    );
+}
+
+#[test]
+fn pure_polarity_guard_excludes_a_negatively_used_predicate() {
+    // M3 soundness guard (#264): `∀x. (po x x)` alone would let the pure-polarity
+    // recognizer set `po ≡ true`. But the ground `(not (po a a))` makes `po`
+    // occur NEGATIVELY, so it is no longer pure-positive — the recognizer must
+    // NOT fire, the reflexivity axiom is enumerated at `a`, and `po(a,a)` clashes
+    // with `(not (po a a))` → the sound `Unsat`. A spurious `Sat` here would mean
+    // the polarity guard ignored the negative occurrence.
+    let r = solve_streamed(&[
+        "(declare-sort S 0)",
+        "(declare-fun po (S S) Bool)",
+        "(declare-const a S)",
+        "(assert (forall ((x S)) (po x x)))",
+        "(assert (not (po a a)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "∀x.po(x,x) ∧ ¬po(a,a) is unsat — the pure-polarity recognizer must not \
+         fire when po occurs negatively"
     );
 }
 
