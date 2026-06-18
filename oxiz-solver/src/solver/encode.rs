@@ -2,11 +2,28 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use num_rational::{Ratio, Rational64};
 use num_traits::{CheckedAdd, CheckedMul, One, ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_sat::{Lit, Var};
 use smallvec::SmallVec;
+
+/// Narrow a 128-bit linear-arithmetic coefficient back to the simplex's
+/// `Rational64`. `extract_linear_terms` accumulates in `Ratio<i128>` so an
+/// INTERMEDIATE product/sum that would overflow `i64` (e.g. `scale * coeff`
+/// before like terms cancel) no longer forces the comparison opaque; the final
+/// reduced coefficient is narrowed here. `None` (⇒ the comparison stays opaque,
+/// exactly as the old `i64` path) iff the FINAL value does not fit `i64` — the
+/// downstream LRA core is `i64`, so this preserves parity: every input that did
+/// not overflow `i64` intermediates yields a byte-identical `Rational64`, and
+/// only previously-bailing intermediates are recovered. `Ratio` is kept reduced,
+/// so `numer`/`denom` are already minimal here.
+#[inline]
+fn narrow_r128(r: Ratio<i128>) -> Option<Rational64> {
+    let n = i64::try_from(*r.numer()).ok()?;
+    let d = i64::try_from(*r.denom()).ok()?;
+    Some(Rational64::new(n, d))
+}
 
 use super::Solver;
 use super::trail::TrailOp;
@@ -246,12 +263,15 @@ impl Solver {
             return cached.clone();
         }
 
-        let mut terms: SmallVec<[(TermId, Rational64); 4]> = SmallVec::new();
-        let mut constant = Rational64::zero();
+        // Accumulate in `Ratio<i128>` so an intermediate `i64` overflow widens
+        // the bail point (see `narrow_r128`); the result is narrowed to the
+        // simplex's `Rational64` at the boundary below.
+        let mut terms: SmallVec<[(TermId, Ratio<i128>); 4]> = SmallVec::new();
+        let mut constant: Ratio<i128> = Ratio::zero();
 
         // Parse LHS (add positive coefficients)
         let lhs_ok =
-            self.extract_linear_terms(lhs, Rational64::one(), &mut terms, &mut constant, manager);
+            self.extract_linear_terms(lhs, Ratio::one(), &mut terms, &mut constant, manager);
         if lhs_ok.is_none() {
             self.arith_parse_cache.insert(reason, None);
             return None;
@@ -260,25 +280,42 @@ impl Solver {
         // Parse RHS (subtract, so coefficients are negated)
         // For lhs OP rhs, we want lhs - rhs OP 0
         let rhs_ok =
-            self.extract_linear_terms(rhs, -Rational64::one(), &mut terms, &mut constant, manager);
+            self.extract_linear_terms(rhs, -Ratio::<i128>::one(), &mut terms, &mut constant, manager);
         if rhs_ok.is_none() {
             self.arith_parse_cache.insert(reason, None);
             return None;
         }
 
         // Combine like terms
-        let mut combined: FxHashMap<TermId, Rational64> = FxHashMap::default();
+        let mut combined: FxHashMap<TermId, Ratio<i128>> = FxHashMap::default();
         for (term, coef) in terms {
-            *combined.entry(term).or_insert(Rational64::zero()) += coef;
+            *combined.entry(term).or_insert_with(Ratio::zero) += coef;
         }
 
-        // Remove zero coefficients
-        let final_terms: SmallVec<[(TermId, Rational64); 4]> =
-            combined.into_iter().filter(|(_, c)| !c.is_zero()).collect();
+        // Remove zero coefficients and narrow each surviving coefficient back to
+        // `Rational64`. A final coefficient that does not fit `i64` makes the
+        // comparison opaque (the LRA core is `i64`) — identical to the old path.
+        let mut final_terms: SmallVec<[(TermId, Rational64); 4]> = SmallVec::new();
+        for (term, coef) in combined {
+            if coef.is_zero() {
+                continue;
+            }
+            let Some(c64) = narrow_r128(coef) else {
+                self.arith_parse_cache.insert(reason, None);
+                return None;
+            };
+            final_terms.push((term, c64));
+        }
+
+        // Move constant to RHS, then narrow.
+        let Some(constant64) = narrow_r128(-constant) else {
+            self.arith_parse_cache.insert(reason, None);
+            return None;
+        };
 
         let result = ParsedArithConstraint {
             terms: final_terms,
-            constant: -constant, // Move constant to RHS
+            constant: constant64,
             constraint_type,
             reason_term: reason,
         };
@@ -293,9 +330,9 @@ impl Solver {
     pub(super) fn extract_linear_terms(
         &self,
         term_id: TermId,
-        scale: Rational64,
-        terms: &mut SmallVec<[(TermId, Rational64); 4]>,
-        constant: &mut Rational64,
+        scale: Ratio<i128>,
+        terms: &mut SmallVec<[(TermId, Ratio<i128>); 4]>,
+        constant: &mut Ratio<i128>,
         manager: &TermManager,
     ) -> Option<()> {
         let term = manager.get(term_id)?;
@@ -303,40 +340,42 @@ impl Solver {
         match &term.kind {
             // Integer constant
             TermKind::IntConst(n) => {
-                if let Some(val) = n.to_i64() {
-                    // Checked: an i64-rational overflow here must make the
+                if let Some(val) = n.to_i128() {
+                    // Checked: an i128-rational overflow here must make the
                     // comparison OPAQUE (return None), never silently wrap into
                     // a wrong coefficient — wrapping fabricates a spurious arith
-                    // conflict (the prelude-scale `-V adsmt` false-`unsat`). i128
-                    // widening for completeness is a tracked follow-up.
+                    // conflict (the prelude-scale `-V adsmt` false-`unsat`). The
+                    // accumulation is `i128` (#261) so the bail point is widened
+                    // from the old `i64`; the final coefficient is narrowed back
+                    // to `Rational64` in `parse_linear_comparison`.
                     *constant =
-                        constant.checked_add(&scale.checked_mul(&Rational64::from_integer(val))?)?;
+                        constant.checked_add(&scale.checked_mul(&Ratio::from_integer(val))?)?;
                     Some(())
                 } else {
-                    // BigInt too large, skip for now
+                    // BigInt beyond i128, skip (opaque).
                     None
                 }
             }
 
             // Rational constant
             TermKind::RealConst(r) => {
-                *constant = constant.checked_add(&scale.checked_mul(r)?)?;
+                // Widen the `Rational64` literal to `i128` (lossless) before the
+                // checked product/sum.
+                let r128 = Ratio::new(i128::from(*r.numer()), i128::from(*r.denom()));
+                *constant = constant.checked_add(&scale.checked_mul(&r128)?)?;
                 Some(())
             }
 
             // Bitvector constant - treat as integer
             TermKind::BitVecConst { value, .. } => {
-                if let Some(val) = value.to_i64() {
-                    // Checked: an i64-rational overflow here must make the
-                    // comparison OPAQUE (return None), never silently wrap into
-                    // a wrong coefficient — wrapping fabricates a spurious arith
-                    // conflict (the prelude-scale `-V adsmt` false-`unsat`). i128
-                    // widening for completeness is a tracked follow-up.
+                if let Some(val) = value.to_i128() {
+                    // Checked (see the `IntConst` note): `i128` accumulation,
+                    // narrowed back to `Rational64` at the boundary (#261).
                     *constant =
-                        constant.checked_add(&scale.checked_mul(&Rational64::from_integer(val))?)?;
+                        constant.checked_add(&scale.checked_mul(&Ratio::from_integer(val))?)?;
                     Some(())
                 } else {
-                    // BigInt too large, skip for now
+                    // BigInt beyond i128, skip (opaque).
                     None
                 }
             }
@@ -415,19 +454,19 @@ impl Solver {
             // expression that reduces to a pure constant (e.g. `(- 3.0)`,
             // `(+ 1 2)`) or to a single scaled variable (e.g. `(- x)`).
             TermKind::Mul(args) => {
-                let mut const_product = Rational64::one();
+                let mut const_product: Ratio<i128> = Ratio::one();
                 // The single non-constant factor, if any, represented as a sum of
                 // (variable, coefficient) pairs.  The factor must be linear-as-a-whole
                 // (exactly one variable term, no additive constant) for the product
                 // to remain linear.
-                let mut var_factor: Option<(TermId, Rational64)> = None;
+                let mut var_factor: Option<(TermId, Ratio<i128>)> = None;
 
                 for &arg in args {
-                    let mut sub_terms: SmallVec<[(TermId, Rational64); 4]> = SmallVec::new();
-                    let mut sub_constant = Rational64::zero();
+                    let mut sub_terms: SmallVec<[(TermId, Ratio<i128>); 4]> = SmallVec::new();
+                    let mut sub_constant: Ratio<i128> = Ratio::zero();
                     self.extract_linear_terms(
                         arg,
-                        Rational64::one(),
+                        Ratio::one(),
                         &mut sub_terms,
                         &mut sub_constant,
                         manager,

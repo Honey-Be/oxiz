@@ -183,3 +183,47 @@ fn test_lia_fractional_constant_in_equality() {
         result
     );
 }
+
+/// #261: `extract_linear_terms` accumulates in `Ratio<i128>`, so an INTERMEDIATE
+/// coefficient that overflows `i64` no longer forces the comparison opaque when
+/// it cancels (or reduces) back to an `i64`-fitting final value.
+///
+/// Here `4e9 * 3e9 = 1.2e19` overflows `i64` but the two `1.2e19 * x` terms
+/// cancel, leaving `y = 5`. The old `i64` path bailed on the overflowing
+/// intermediate ⇒ the whole `(= … 5)` became an opaque boolean atom ⇒ `y = 5`
+/// was invisible to arithmetic ⇒ a spurious SAT against `y = 6`. The `i128` path
+/// computes the coefficients, cancels them in the (i128) like-term combine, and
+/// narrows the surviving `y = 5` back to `Rational64`, so the conflict with
+/// `y = 6` is found. (z3: unsat.)
+#[test]
+fn i128_widening_recovers_a_cancelling_overflow_intermediate() {
+    let mut ctx = Context::new();
+    ctx.set_logic("QF_LIA");
+    let int = ctx.terms.sorts.int_sort;
+    let x = ctx.declare_const("x", int);
+    let y = ctx.declare_const("y", int);
+
+    // big = (4e9 * 3e9) * x  — the constant product overflows i64.
+    let c1 = ctx.terms.mk_int(4_000_000_000_i64);
+    let c2 = ctx.terms.mk_int(3_000_000_000_i64);
+    let big = ctx.terms.mk_mul(vec![c1, c2, x]);
+
+    // (big + y) - big = 5  ⇒  y = 5  (the 1.2e19 coefficients cancel).
+    let five = ctx.terms.mk_int(5);
+    let big_plus_y = ctx.terms.mk_add(vec![big, y]);
+    let lhs = ctx.terms.mk_sub(big_plus_y, big);
+    let eq5 = ctx.terms.mk_eq(lhs, five);
+    ctx.assert(eq5);
+
+    let six = ctx.terms.mk_int(6);
+    let eq6 = ctx.terms.mk_eq(y, six);
+    ctx.assert(eq6);
+
+    let result = ctx.check_sat();
+    assert!(
+        matches!(result, oxiz_solver::SolverResult::Unsat),
+        "y=5 (after the 1.2e19 coefficients cancel) contradicts y=6 — i128 \
+         widening must recover the constraint the i64 intermediate dropped, got {:?}",
+        result
+    );
+}
