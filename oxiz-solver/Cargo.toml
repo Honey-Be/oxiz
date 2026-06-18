@@ -55,6 +55,9 @@ profiling = [
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+# Test-only: parallelise the heavy `clean_mbqi_corpus` 168-case sweep
+# (work-stealing over independent per-case solves). Not a runtime dep.
+rayon = { workspace = true }
 
 [[bench]]
 name = "solver_benchmarks"

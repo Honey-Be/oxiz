@@ -96,20 +96,61 @@ fn clean_engine_corpus_no_spurious_verdict() {
     let cases = load_manifest();
     assert!(cases.len() >= 150, "expected the full z3-parity corpus");
 
+    // Solve the cases in PARALLEL: each `solve_clean` builds its own `Context`
+    // (fresh `TermManager`, hence its own interner — the interner is a manager
+    // FIELD, not a global) and shares no mutable state with any other case, so
+    // the solves are independent. OxiZ's only process globals are thread-safe
+    // (atomic profiling counters, a read-only `OnceLock` tactic registry, a
+    // per-thread `thread_local!` conflict scratch — reused across cases on one
+    // worker exactly as the old single-thread loop reused it across all cases).
+    // The soundness gate is unaffected: under CPU contention a case may hit its
+    // wall-clock deadline and report the sound `Unknown` instead of a decisive
+    // verdict, but a spurious sat/unsat is a wrong conclusion reached FAST, which
+    // contention cannot manufacture. rayon work-steals, which matters here
+    // because per-case solve time is highly skewed (instant ↔ the 1 s cap).
+    use rayon::prelude::*;
+    // BOUND the parallelism. Each prelude-scale case holds a large hash-consed
+    // term DAG (the corpus solve is ~75% term construction / hash-consing, and
+    // the per-case wall-clock cap bounds only the SOLVE loop, not parsing), so
+    // all-core parallelism exhausts RAM → OOM SIGKILL. Only `jobs` Contexts are
+    // ever alive at once (each is dropped when its closure returns), so a small
+    // pool bounds peak memory. Default conservative; override with
+    // OXIZ_PARITY_JOBS (RAYON_NUM_THREADS does NOT apply — we build our own pool).
+    let jobs = std::env::var("OXIZ_PARITY_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(2)
+        });
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .expect("build rayon pool");
+    let results: Vec<(&str, Verdict, Verdict)> = pool.install(|| {
+        cases
+            .par_iter()
+            .map(|c| {
+                let got = solve_clean(&corpus_root().join("benchmarks").join(&c.relpath));
+                eprintln!("[clean-corpus] {} z3={:?} oxiz={:?}", c.relpath, c.z3, got);
+                (c.relpath.as_str(), c.z3, got)
+            })
+            .collect()
+    });
+
+    // Classify serially (cheap; keeps the accumulation race-free).
     let (mut agree, mut weaker, mut stronger, mut unknown) = (0usize, 0usize, 0usize, 0usize);
     let mut spurious: Vec<String> = Vec::new();
-
-    for c in &cases {
-        eprintln!("[clean-corpus] solving {} (z3={:?})", c.relpath, c.z3);
-        let got = solve_clean(&corpus_root().join("benchmarks").join(&c.relpath));
-        eprintln!("[clean-corpus]   -> {:?}", got);
-        match (c.z3, got) {
+    for (relpath, z3, got) in results {
+        match (z3, got) {
             // SOUNDNESS VIOLATIONS — the gate.
             (Verdict::Sat, Verdict::Unsat) | (Verdict::Unknown, Verdict::Unsat) => {
-                spurious.push(format!("SPURIOUS UNSAT: {} (z3={:?})", c.relpath, c.z3));
+                spurious.push(format!("SPURIOUS UNSAT: {relpath} (z3={z3:?})"));
             }
             (Verdict::Unsat, Verdict::Sat) => {
-                spurious.push(format!("SPURIOUS SAT: {} (z3=Unsat)", c.relpath));
+                spurious.push(format!("SPURIOUS SAT: {relpath} (z3=Unsat)"));
             }
             // Sound outcomes.
             (_, Verdict::Unknown) => unknown += 1,
