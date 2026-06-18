@@ -212,30 +212,20 @@ impl<S: Sig> Engine<S> {
         // once e-matching adds nothing; a trigger-free, ACTIVE one must be
         // model-verified (inactive ones are vacuously satisfied). The host's
         // synthetic witnesses never cross into the engine → nothing fabricated.
+        //
+        // NOTE: a bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`) is NOT
+        // auto-satisfied just because all its instances were emitted. The earlier
+        // "finite exhaustion ⇒ sat" shortcut trusted that `Saturated` implied the
+        // ground solve had a CONSISTENT model of those instances — but the
+        // incremental CDCL(T) can MISS a conflict that is GLOBAL across the
+        // instances (e.g. pigeonhole: `n+1` holes pairwise-distinct in `[1,n]` is
+        // unsat, yet the incremental model stays `sat`), so the shortcut reported
+        // a spurious `sat`. The bounded enumeration above still defuses the
+        // `f`-tower (no hang); the VERDICT now defers to `eval_forall`, which is
+        // sound (a bounded quantifier it cannot verify yields the sound
+        // `Unknown`, never a guessed `Sat`).
         for q in &self.quants {
             if q.triggers.is_empty() && model.is_active(lang, q.term) {
-                // Bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`): every
-                // bound var has a finite literal domain whose product fits the
-                // per-quant enumeration cap, so ALL its non-vacuous instances were
-                // emitted (saturation ⇒ none new this round ⇒ all in `seen`) and
-                // the model satisfies them (Saturated ⇒ the ground solve is
-                // consistent); everything outside the guard is vacuous. Hence the
-                // quantifier holds — no model-completion needed, sound by finite
-                // exhaustion. (The cap guard is essential: if the product exceeded
-                // the cap, enumeration would truncate and "saturate" without
-                // covering the tail, so we must NOT claim satisfaction then.)
-                let finitely_exhausted = q.var_domains.as_ref().is_some_and(|vds| {
-                    !vds.is_empty()
-                        && vds.iter().all(|d| d.is_some())
-                        && vds
-                            .iter()
-                            .map(|d| d.as_ref().map_or(0, Vec::len))
-                            .fold(1usize, usize::saturating_mul)
-                            <= self.cfg.max_tuples_per_quant
-                });
-                if finitely_exhausted {
-                    continue;
-                }
                 match model.eval_forall(lang, q.term) {
                     Some(true) => {}
                     Some(false) | None => return Verdict::Inconclusive,

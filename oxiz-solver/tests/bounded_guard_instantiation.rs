@@ -5,13 +5,21 @@
 //! latter makes a `∀m,n` whose body mentions a function `f` instantiate `m,n`
 //! across `f`'s own applications → an `f`-of-`f` matching loop. The synthetic
 //! `UFLIA/ackermann.smt2` corpus case (bounded positivity `∀m,n.(0≤m≤2 ∧
-//! 0≤n≤5) ⇒ ack(m,n)>0`) used to spin at 100% CPU forever; with the bounded
-//! domain it is `Sat` (= z3) in milliseconds.
+//! 0≤n≤5) ⇒ ack(m,n)>0`) used to spin at 100% CPU forever; the bounded domain
+//! defuses that — it solves in milliseconds with no hang.
+//!
+//! VERDICT NOTE: the bounded enumeration prevents the hang, but the clean
+//! engine does NOT auto-conclude `Sat` from "all bounded instances emitted".
+//! An earlier "finite exhaustion ⇒ sat" shortcut trusted the incremental
+//! model, which can MISS a GLOBAL conflict among the instances (pigeonhole) and
+//! so reported a spurious `sat`. The verdict now defers to `eval_forall`, so a
+//! bounded grid the engine cannot model-verify reports the sound `Unknown` —
+//! never a guessed `Sat`, and never the spurious `Unsat`.
 
 use oxiz_solver::Context;
 
 #[test]
-fn bounded_grid_positivity_is_sat_not_hang() {
+fn bounded_grid_positivity_terminates_soundly_no_hang() {
     let script = "\
         (set-logic UFLIA)\
         (declare-fun ack (Int Int) Int)\
@@ -35,10 +43,12 @@ fn bounded_grid_positivity_is_sat_not_hang() {
         "unknown" => Some("unknown"),
         _ => None,
     });
-    // z3: sat. The bounded-guard finite instantiation + finite-exhaustion
-    // saturation must reach Sat (and certainly never the spurious Unsat, nor
-    // hang into the iteration cap).
-    assert_eq!(verdict, Some("sat"), "bounded ackermann grid must be Sat, got {out:?}");
+    // z3: sat. The bounded enumeration must terminate (no `f`-tower hang) and be
+    // SOUND: the clean engine reports `Unknown` here (it cannot model-verify the
+    // bounded monotonicity grid), NEVER the spurious `Unsat` and never a guessed
+    // `Sat`. (Recovering the decisive `Sat` would need a sound finite-domain
+    // model check — see task #277 follow-up.)
+    assert_eq!(verdict, Some("unknown"), "bounded ackermann grid must be sound Unknown, got {out:?}");
 }
 
 #[test]
@@ -66,9 +76,12 @@ fn out_of_guard_unsat_still_caught() {
 }
 
 #[test]
-fn corpus_ackermann_file_is_sat() {
+fn corpus_ackermann_file_is_sound_not_hang() {
     // The vendored `UFLIA/ackermann.smt2` (positivity via bounded monotonicity,
-    // #benchmark-fix) must solve `Sat` (= z3 4.16) under the clean engine.
+    // #benchmark-fix) must terminate soundly under the clean engine: the bounded
+    // enumeration defuses the `f`-tower hang, and the verdict is the sound
+    // `Unknown` (z3: sat — the clean engine is incomplete here, but NEVER
+    // unsound: no spurious `Unsat`, no guessed `Sat`).
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/corpus/z3_parity/benchmarks/UFLIA/ackermann.smt2"
@@ -84,5 +97,5 @@ fn corpus_ackermann_file_is_sat() {
         "unknown" => Some("unknown"),
         _ => None,
     });
-    assert_eq!(verdict, Some("sat"), "corpus ackermann.smt2 must be Sat, got {out:?}");
+    assert_eq!(verdict, Some("unknown"), "corpus ackermann.smt2 must be sound Unknown, got {out:?}");
 }
