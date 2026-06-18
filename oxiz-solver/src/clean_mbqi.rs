@@ -412,6 +412,21 @@ struct CompletionFacts {
     /// uninterpreted symbol (the single-function range-completion gate requires
     /// exactly one). Keyed on the `view`-style `u64` symbol (`spur_sym`).
     quant_count: FxHashMap<u64, u32>,
+    /// Every GROUND application (no variable anywhere in its subtree) of each
+    /// uninterpreted function, keyed on the `view`-style `u64` symbol. These are
+    /// the points a constant range-completion of `f` must NOT violate. Unlike
+    /// the model's `assign` map, this includes applications constrained only by
+    /// an INEQUALITY (e.g. `(< (f 5) 0)` pins no concrete value into `assign`
+    /// yet still forbids completing `f(5)` to a constant ≥ 0) — missing them was
+    /// the #260 spurious-`sat` hole.
+    ground_apps: FxHashMap<u64, Vec<TermId>>,
+    /// For each ground term that a TOP-LEVEL equation pins (`(= lhs rhs)` not
+    /// under any disjunction/negation/quantifier), the other side(s) of that
+    /// equation. The function-completion verify resolves these to a concrete
+    /// integer — the only value the model reflects faithfully for a ground
+    /// `f`-application (its own `assign` entry is a poisoned default when it is
+    /// merely inequality-constrained). Keyed by the pinned term's `TermId`.
+    eq_pins: FxHashMap<TermId, Vec<TermId>>,
 }
 
 impl CompletionFacts {
@@ -452,6 +467,23 @@ impl CompletionFacts {
                     *f.quant_count.entry(s).or_insert(0) += 1;
                 }
             }
+        }
+
+        // Pass 3: collect every GROUND function application across ALL
+        // assertions (a ground `f`-point constrains `f` regardless of where it
+        // appears). The function-completion verify scans these — not just the
+        // model's concretely-assigned points — so an inequality-only constraint
+        // such as `(< (f 5) 0)` is not silently ignored.
+        for &a in assertions {
+            collect_ground_apps(m, a, &mut f.ground_apps);
+        }
+
+        // Pass 4: collect TOP-LEVEL equality pins (`(= lhs rhs)` reached through
+        // conjunctions only — never under a disjunction, negation, or
+        // quantifier, where the equation is not unconditionally true). These are
+        // the faithful concrete values for the function-completion verify.
+        for &a in assertions {
+            collect_eq_pins(m, a, &mut f.eq_pins);
         }
         f
     }
@@ -501,6 +533,84 @@ fn count_syms(m: &TermManager, t: TermId, out: &mut FxHashMap<u64, u32>) {
     }
     for c in subterms(m, t) {
         count_syms(m, c, out);
+    }
+}
+
+/// Record every GROUND function application (one whose entire subtree contains
+/// no variable) under its `view`-style symbol, returning whether `t` itself is
+/// ground. Descends through quantifier bodies, but an application that mentions
+/// a bound variable (e.g. `(f x)` under `∀x`) is non-ground and therefore NOT
+/// recorded — exactly the pinned/free split the completion verify needs.
+fn collect_ground_apps(m: &TermManager, t: TermId, out: &mut FxHashMap<u64, Vec<TermId>>) -> bool {
+    let Some(term) = m.get(t) else {
+        return true; // a missing node carries no variable
+    };
+    if let TermKind::Var(_) = &term.kind {
+        return false;
+    }
+    // Recurse into EVERY child (so nested ground apps are recorded even when the
+    // parent is non-ground); `t` is ground iff all children are.
+    let mut ground = true;
+    for c in subterms(m, t) {
+        if !collect_ground_apps(m, c, out) {
+            ground = false;
+        }
+    }
+    if ground {
+        if let TermKind::Apply { func, .. } = &term.kind {
+            out.entry(spur_sym(*func)).or_default().push(t);
+        }
+    }
+    ground
+}
+
+/// Record TOP-LEVEL equality pins: for `(= a b)` reached through conjunctions
+/// only (never under a disjunction, negation, quantifier, or other non-monotone
+/// context, where the equation is not unconditionally true), pin each side to
+/// the other. Such an equation holds in EVERY model, so following the pins to a
+/// literal yields a faithful concrete value. We descend only through `And` and
+/// stop at `Eq`, so every term reached is at top level — outside any quantifier,
+/// hence any `Var` here is a free constant, never a bound variable; that is why
+/// no groundness gate is needed.
+fn collect_eq_pins(m: &TermManager, t: TermId, out: &mut FxHashMap<TermId, Vec<TermId>>) {
+    match m.get(t).map(|x| &x.kind) {
+        Some(TermKind::And(args)) => {
+            for &c in args.iter() {
+                collect_eq_pins(m, c, out);
+            }
+        }
+        Some(TermKind::Eq(a, b)) => {
+            let (a, b) = (*a, *b);
+            out.entry(a).or_default().push(b);
+            out.entry(b).or_default().push(a);
+        }
+        // Any other shape (Or / Not / Implies / Ite / quantifier / inequality /
+        // …) is NOT an unconditionally-true equation — do not descend.
+        _ => {}
+    }
+}
+
+/// Resolve `t` to a concrete integer using ONLY equality pins and integer
+/// literals — NEVER the model's `assign` map, which defaults an
+/// inequality-constrained term (UF application OR plain constant) to a poisoned
+/// `0`. Follows `(= t k)` chains to an `IntConst`; `None` if it does not bottom
+/// out at one. Depth-bounded against equality cycles.
+fn resolve_eq_concrete(
+    m: &TermManager,
+    t: TermId,
+    eq_pins: &FxHashMap<TermId, Vec<TermId>>,
+    depth: u32,
+) -> Option<num_bigint::BigInt> {
+    if depth == 0 {
+        return None;
+    }
+    match m.get(t).map(|x| &x.kind) {
+        Some(TermKind::IntConst(b)) => Some(b.clone()),
+        Some(TermKind::Neg(x)) => resolve_eq_concrete(m, *x, eq_pins, depth - 1).map(|v| -v),
+        _ => eq_pins
+            .get(&t)?
+            .iter()
+            .find_map(|&p| resolve_eq_concrete(m, p, eq_pins, depth - 1)),
     }
 }
 
@@ -918,26 +1028,43 @@ impl SolverModel {
             return false;
         }
         // VERIFY (the #260 soundness gate). The constant completion is valid only
-        // if every EXISTING ground `f`-application already satisfies the
-        // comparison in the model — otherwise asserting that instance would
+        // if every GROUND `f`-application the FORMULA constrains already
+        // satisfies the comparison — otherwise asserting that instance would
         // refute (an `unsat` we must never hide behind a `Some(true)`). Scan the
-        // model's `f`-applications and arith-fold `cmp(·, g)`; bail (do not
-        // certify) on any FALSE or any value we cannot resolve. The
-        // yet-to-be-generated `f`-tower terms are not in the model, so they
-        // impose no obligation — exactly why completing `f` to a constant is
-        // sound. This is independent of CDQI's tuple budget, so it cannot miss a
-        // pinned conflict.
+        // formula's ground `f`-points (`facts.ground_apps`, NOT the model's
+        // `assign` map): an inequality-only constraint such as `(< (f 5) 0)`
+        // pins no concrete value into `assign`, yet still forbids completing
+        // `f(5)` to a constant ≥ 0 — scanning `assign` alone silently dropped it
+        // (the #260 spurious-`sat`). Arith-fold `cmp(·, g)` on each; bail (do not
+        // certify) on any FALSE or any value we cannot resolve to a concrete
+        // integer (a constrained point we cannot evaluate ⇒ conservative). The
+        // yet-to-be-generated `f`-tower terms never appear ground in the formula,
+        // so they impose no obligation — exactly why completing `f` to a constant
+        // is sound. This is independent of CDQI's tuple budget, so it cannot miss
+        // a pinned conflict.
         let g = if app_side == l { r } else { l };
         let app_is_left = app_side == l;
-        let Some(gv) = self.int_of(lang, g) else {
-            return false; // ground operand not concrete ⇒ cannot verify
+        let Some(gv) = resolve_eq_concrete(lang.m(), g, &facts.eq_pins, 16) else {
+            return false; // ground operand not a concrete (eq-pinned) integer ⇒ cannot verify
         };
-        for &k in self.assign.keys() {
-            if !matches!(lang.view(k), TermView::App { sym: s } if s == fsym) {
-                continue;
-            }
-            let Some(av) = self.int_of(lang, k) else {
-                return false; // a pinned `f`-point we cannot evaluate ⇒ conservative
+        let Some(points) = facts.ground_apps.get(&fsym) else {
+            return true; // no ground `f`-point constrains `f` ⇒ free to complete
+        };
+        // Each ground `f`-point must be EQUALITY-pinned, at top level, to a
+        // concrete value that satisfies the comparison. We deliberately do NOT
+        // read the point's own model value: an inequality-constrained UF
+        // application (e.g. `(< (f 5) 0)`) is poisoned to a DEFAULT (0) in the
+        // model's `assign` — its EUF representative carries no arithmetic value —
+        // so trusting it certified `0 ≥ 0` and hid the refuting instance (the
+        // #260 spurious-`sat`). A top-level equation `(= (f t̄) k)` is the only
+        // value the model reflects faithfully; anything else (an inequality, an
+        // unconstrained point, a pin we cannot resolve to a concrete) is bailed
+        // conservatively — the engine then enumerates and the theory refutes
+        // (or, for the rare consistent-inequality case, reports the sound
+        // `Unknown`).
+        for &k in points {
+            let Some(av) = resolve_eq_concrete(lang.m(), k, &facts.eq_pins, 16) else {
+                return false; // not equality-pinned to a concrete ⇒ value not faithfully known
             };
             let (lo, hi) = if app_is_left { (av, gv.clone()) } else { (gv.clone(), av) };
             let holds = match sym {

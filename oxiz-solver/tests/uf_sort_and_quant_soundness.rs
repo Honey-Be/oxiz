@@ -338,6 +338,77 @@ fn function_completion_respects_a_second_violating_ground_point() {
 }
 
 #[test]
+fn function_completion_respects_an_inequality_constrained_ground_point() {
+    // M3 #260 soundness REGRESSION (the masked corpus spurious-`sat`,
+    // AUFLIRA/auflira_quantified): `∀x. f(x) ≥ 0` with `(< (f 5) 0)`. The
+    // refuting point f(5) is constrained by an INEQUALITY, not an equality, so
+    // the model's `assign` defaults its value to a poisoned `0` — the original
+    // verify scanned `assign` and "confirmed" 0 ≥ 0, certifying the axiom and
+    // hiding the conflict (spurious `sat`). The fix verifies against the
+    // formula's top-level EQUALITY pins only (never the poisoned model value);
+    // f(5) has none, so the axiom is NOT certified and enumeration refutes
+    // f(5) ≥ 0 against f(5) < 0. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int)) (>= (f x) 0)))",
+        "(assert (< (f 5) 0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "f(5)<0 refutes ∀x.f(x)≥0 — an inequality-constrained ground point must \
+         not be trusted from the poisoned model value"
+    );
+}
+
+#[test]
+fn function_completion_respects_a_chained_inequality_ground_point() {
+    // Adversarial sharpening: f(5) is EQUALITY-pinned, but to a constant `d`
+    // that is itself only INEQUALITY-constrained (`d < 0`). The pin chain
+    // f(5)=d must resolve to a concrete via equalities ALONE — `d` has no
+    // equality to a literal, so the value is not faithfully known and the axiom
+    // is NOT certified (a model-based resolution of `d` would read the poisoned
+    // default 0 and wrongly certify). (z3: unsat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(declare-const d Int)",
+        "(assert (forall ((x Int)) (>= (f x) 0)))",
+        "(assert (= (f 5) d))",
+        "(assert (< d 0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "f(5)=d ∧ d<0 refutes ∀x.f(x)≥0 — the pin must resolve through equalities \
+         to a literal, never the poisoned model value of d"
+    );
+}
+
+#[test]
+fn function_completion_certifies_through_an_equality_chain() {
+    // Completeness companion (no regression): the SAME recognizer must still
+    // certify the genuinely-satisfiable axiom when the ground point is pinned to
+    // a SATISFYING concrete THROUGH an equality chain `f(7)=c`, `c=5`. Resolving
+    // f(7) → c → 5 (≥ 0) lets the constant completion stand. (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(declare-const c Int)",
+        "(assert (forall ((x Int)) (>= (f x) 0)))",
+        "(assert (= (f 7) c))",
+        "(assert (= c 5))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "f(7)=c=5 (≥0) is consistent with ∀x.f(x)≥0 — the chained equality pin \
+         must still resolve to certify the completion"
+    );
+}
+
+#[test]
 fn definitional_recognizer_does_not_mask_a_ground_contradiction() {
     // M3 soundness guard (#264): the definitional recognizer reports the
     // `height_lt` axiom `Some(true)` (it is a conservative definition), but the
