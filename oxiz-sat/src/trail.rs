@@ -210,7 +210,9 @@ impl Trail {
     }
 
     /// Start a new decision level. §4.1: pushes a theory frame ATOMICALLY with the
-    /// level bump, so `|frames| == level + 1` holds immediately after.
+    /// level bump, so `|frames| == level + 1` holds immediately after. This is the
+    /// growth half of the §4 spine — the ONLY writer that pushes a frame, mirroring
+    /// `retract_trail_to` which is the only writer that pops one.
     pub fn new_decision_level(&mut self) {
         self.current_level += 1;
         self.level_starts.push(self.assignments.len());
@@ -300,59 +302,37 @@ impl Trail {
         self.assignments.len()
     }
 
-    /// Backtrack to a specific trail size (number of assignments)
-    /// This is useful for incremental solving where we want to restore
-    /// the exact state at a push point
-    pub fn backtrack_to_size(&mut self, target_size: usize) {
-        while self.assignments.len() > target_size {
-            let lit = self
-                .assignments
-                .pop()
-                .expect("assignments non-empty in loop condition");
-            let var = lit.var();
-            let lvl = self.var_info[var.index()].level;
-            self.var_info[var.index()].value = LBool::Undef;
-            // §4.1 four-writer fix: route this hook-BYPASSING level writer through
-            // the theory hook too. The Verus model proves an un-hooked
-            // `backtrack_to_size` breaks the lock-step invariant; here we pop the
-            // frames and retract the literals so it does not.
-            if let Some(t) = self.theory.as_mut() {
-                t.unassign_hook(lit, lvl);
-            }
-        }
-        // Pop every theory frame down to the root (this writer resets to level 0).
-        let mut l = self.current_level;
-        while l > 0 {
-            if let Some(t) = self.theory.as_mut() {
-                t.pop_frame(l);
-            }
-            l -= 1;
-        }
-        // Reset decision level tracking
-        self.current_level = 0;
-        self.level_starts.truncate(1);
-        self.prop_head = self.assignments.len();
-    }
-
-    /// Backtrack to a given decision level
-    pub fn backtrack_to(&mut self, level: u32) {
-        self.backtrack_to_with_callback(level, |_| {});
-    }
-
-    /// Backtrack to a given decision level, calling the callback for each unassigned literal
-    pub fn backtrack_to_with_callback<F>(&mut self, level: u32, mut callback: F)
-    where
-        F: FnMut(Lit),
-    {
-        if level >= self.current_level {
-            return;
-        }
-
-        let target_idx = self.level_starts[(level + 1) as usize];
-
-        // Unassign all literals above the target level. §4.2: fire `unassign_hook`
-        // for each retracted literal (so a retracted theory atom's state is dropped
-        // the instant its literal leaves the trail — a stale bound is unrepresentable).
+    /// §4 anti-drift spine — the SINGLE trail-shrinking primitive.
+    ///
+    /// Retract every assignment newer than `target_idx`, then pop one theory frame
+    /// for every decision level above `target_level`, ATOMICALLY re-basing the level
+    /// bookkeeping so the §4.1 lock-step invariant `|theory frames| ==
+    /// decision_level + 1` holds on return. Every shrinking level-writer
+    /// (`backtrack_to_with_callback`, `backtrack_to_size`, `clear`) routes through
+    /// here, so the hook-firing discipline is written ONCE and cannot drift across
+    /// the writers. That is the whole point: the cross-writer desync class (the
+    /// `38019b0` consistency-gate / trigger-F family, where one writer popped frames
+    /// the other writers forgot — or got the level arithmetic subtly different) is
+    /// made structurally unreachable rather than caught by review on each new
+    /// writer. (`new_decision_level` is the symmetric growth half — the only writer
+    /// that pushes a frame.)
+    ///
+    /// * `fire_unassign` — fire `unassign_hook` per retracted literal (incremental
+    ///   retraction, the instant the literal leaves the trail). `clear` passes
+    ///   `false`: a full wipe resets the theory wholesale, not literal-by-literal.
+    /// * `on_lit` — the caller's per-retracted-literal callback (phase saving, the
+    ///   conflict-analysis literal sink), invoked once per literal in reverse trail
+    ///   order before its hook fires.
+    fn retract_trail_to(
+        &mut self,
+        target_idx: usize,
+        target_level: u32,
+        fire_unassign: bool,
+        mut on_lit: impl FnMut(Lit),
+    ) {
+        debug_assert!(target_idx <= self.assignments.len());
+        debug_assert!(target_level <= self.current_level);
+        // 1. Retract assignments above `target_idx`, newest-first.
         while self.assignments.len() > target_idx {
             let lit = self
                 .assignments
@@ -361,25 +341,55 @@ impl Trail {
             let var = lit.var();
             let lvl = self.var_info[var.index()].level;
             self.var_info[var.index()].value = LBool::Undef;
-            callback(lit);
-            if let Some(t) = self.theory.as_mut() {
-                t.unassign_hook(lit, lvl);
+            on_lit(lit);
+            if fire_unassign {
+                if let Some(t) = self.theory.as_mut() {
+                    t.unassign_hook(lit, lvl);
+                }
             }
         }
-
-        // §4.1: pop a theory frame for every decision level crossed, ATOMICALLY with
-        // the level move — so `|frames| == level + 1` holds after backtracking.
+        // 2. Pop one theory frame per crossed decision level (atomic with the move).
         let mut l = self.current_level;
-        while l > level {
+        while l > target_level {
             if let Some(t) = self.theory.as_mut() {
                 t.pop_frame(l);
             }
             l -= 1;
         }
-
-        self.level_starts.truncate((level + 1) as usize);
-        self.current_level = level;
+        // 3. Re-base the level bookkeeping to `target_level`.
+        //    `level_starts[0]` is invariantly 0, so `truncate(target_level + 1)`
+        //    leaves exactly the surviving levels (and `[0]` when target_level == 0).
+        self.level_starts.truncate((target_level + 1) as usize);
+        self.current_level = target_level;
         self.prop_head = self.assignments.len();
+    }
+
+    /// Backtrack to a specific trail size (number of assignments)
+    /// This is useful for incremental solving where we want to restore
+    /// the exact state at a push point. Resets to decision level 0 (the push
+    /// baseline); routes through the `retract_trail_to` spine so the
+    /// frame-pop / unassign discipline is the same one every writer uses.
+    pub fn backtrack_to_size(&mut self, target_size: usize) {
+        self.retract_trail_to(target_size, 0, true, |_| {});
+    }
+
+    /// Backtrack to a given decision level
+    pub fn backtrack_to(&mut self, level: u32) {
+        self.backtrack_to_with_callback(level, |_| {});
+    }
+
+    /// Backtrack to a given decision level, calling the callback for each unassigned
+    /// literal. Routes through the `retract_trail_to` spine (fires `unassign_hook`
+    /// per retracted literal + one `pop_frame` per crossed level).
+    pub fn backtrack_to_with_callback<F>(&mut self, level: u32, callback: F)
+    where
+        F: FnMut(Lit),
+    {
+        if level >= self.current_level {
+            return;
+        }
+        let target_idx = self.level_starts[(level + 1) as usize];
+        self.retract_trail_to(target_idx, level, true, callback);
     }
 
     /// Get the number of assigned variables
@@ -408,28 +418,13 @@ impl Trail {
         }
     }
 
-    /// Clear the trail completely
+    /// Clear the trail completely. Full reset to decision level 0; routes through
+    /// the `retract_trail_to` spine with `fire_unassign = false` — a wipe resets the
+    /// theory wholesale (every frame popped to the root) rather than retracting
+    /// literal-by-literal. The theory-reason store is cleared too (it is owned by
+    /// the trail and meaningless once the trail is empty).
     pub fn clear(&mut self) {
-        for lit in &self.assignments {
-            self.var_info[lit.var().index()].value = LBool::Undef;
-        }
-        // §4.1 four-writer fix: `clear` is a full reset (level → 0). Pop every
-        // theory frame down to the root so the lock-step invariant holds afterward
-        // (frames == [root], level == 0). `clear` is a wipe, so per-literal
-        // `unassign_hook` is intentionally skipped — the theory is reset, not
-        // incrementally retracted.
-        let mut l = self.current_level;
-        while l > 0 {
-            if let Some(t) = self.theory.as_mut() {
-                t.pop_frame(l);
-            }
-            l -= 1;
-        }
-        self.assignments.clear();
-        self.level_starts.clear();
-        self.level_starts.push(0);
-        self.current_level = 0;
-        self.prop_head = 0;
+        self.retract_trail_to(0, 0, false, |_| {});
         self.theory_reasons.clear();
     }
 }
@@ -513,6 +508,58 @@ mod tests {
         assert_eq!(trail.decision_level(), 0);
         // Reaching here without a debug `pop_frame` underflow panic witnesses that
         // the toy theory's frame count stayed == level + 1 throughout.
+    }
+
+    /// Stronger than the underflow check above: assert `|frames| == decision_level
+    /// + 1` EXPLICITLY after each writer. `CountingTheory::pop_frame`'s `frames -= 1`
+    /// underflow only catches OVER-popping; an UNDER-pop (a writer that forgets to
+    /// pop a crossed frame — exactly the 38019b0 / trigger-F desync, where stale
+    /// frames linger above the new level) leaves `frames > level + 1` and slips past
+    /// it. Routing every shrinking writer through the single `retract_trail_to`
+    /// spine makes both directions impossible; this witnesses it for all four.
+    #[test]
+    fn test_lockstep_frames_equal_level_plus_one() {
+        use core::any::Any;
+        let mut trail = Trail::new(8);
+        let mut theory = Box::new(CountingTheory::default());
+        theory.frames = 1; // root frame for level 0
+        trail.set_theory(theory);
+
+        fn frames(trail: &mut Trail) -> u32 {
+            let any: &mut dyn Any = trail.theory_mut().expect("theory installed");
+            any.downcast_mut::<CountingTheory>()
+                .expect("CountingTheory")
+                .frames
+        }
+        macro_rules! check {
+            () => {{
+                let lvl = trail.decision_level();
+                assert_eq!(frames(&mut trail), lvl + 1, "frames must equal level + 1");
+            }};
+        }
+
+        check!(); // level 0 → 1 frame
+        for _ in 0..3 {
+            trail.new_decision_level();
+        }
+        trail.assign_decision(Lit::from_dimacs(1));
+        check!(); // level 3 → 4 frames
+
+        // backtrack_to_with_callback: pop exactly the crossed frames.
+        trail.backtrack_to_with_callback(1, |_| {});
+        check!(); // level 1 → 2 frames
+
+        // backtrack_to_size: the incremental-restore bypass writer.
+        trail.new_decision_level();
+        trail.assign_decision(Lit::from_dimacs(2));
+        trail.backtrack_to_size(0);
+        check!(); // level 0 → 1 frame
+
+        // clear: the wholesale-wipe bypass writer.
+        trail.new_decision_level();
+        trail.new_decision_level();
+        trail.clear();
+        check!(); // level 0 → 1 frame
     }
 
     #[test]
