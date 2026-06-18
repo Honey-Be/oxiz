@@ -64,3 +64,25 @@ fn out_of_guard_unsat_still_caught() {
     });
     assert_eq!(verdict, Some("unsat"), "the single finite instance contradicts ¬p(1), got {out:?}");
 }
+
+#[test]
+fn corpus_ackermann_file_is_sat() {
+    // The vendored `UFLIA/ackermann.smt2` (positivity via bounded monotonicity,
+    // #benchmark-fix) must solve `Sat` (= z3 4.16) under the clean engine.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/corpus/z3_parity/benchmarks/UFLIA/ackermann.smt2"
+    );
+    let script = std::fs::read_to_string(path).expect("corpus file present");
+    let mut ctx = Context::new();
+    ctx.set_clean_mbqi(true);
+    ctx.set_timeout_ms(2000);
+    let out = ctx.execute_script(&script).expect("script runs");
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_eq!(verdict, Some("sat"), "corpus ackermann.smt2 must be Sat, got {out:?}");
+}

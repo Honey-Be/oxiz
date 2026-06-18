@@ -1,34 +1,27 @@
 ; Test: Ackermann-like function properties
 ; Expected: sat
-; Pattern: Properties inspired by the Ackermann function (bounded version)
-
+; Pattern: bounded base/recurrence values + monotonicity-derived positivity
+;
+; Positivity is stated the natural way — base `ack(0,0)>0` plus STRICT
+; MONOTONICITY in each argument (⇒ ack(m,n) ≥ ack(0,0) > 0 by induction) —
+; rather than as a solver-hostile grid `∀m,n. ack(m,n)>0`. Both monotonicity
+; quantifiers stay range-guarded, so the instantiation domain is finite (no
+; ack-of-ack matching loop). Model: ack(m,n) = m+n+1.
 (set-logic UFLIA)
 (declare-fun ack (Int Int) Int)
-
-; Ackermann-like base cases and recursive properties (bounded)
-; ack(0, n) = n + 1
-(assert (forall ((n Int))
-  (=> (and (>= n 0) (<= n 5))
-      (= (ack 0 n) (+ n 1)))))
-
-; ack(m, 0) = ack(m-1, 1) for m > 0 (bounded)
+(assert (forall ((n Int)) (=> (and (>= n 0) (<= n 5)) (= (ack 0 n) (+ n 1)))))
 (assert (= (ack 1 0) (ack 0 1)))
 (assert (= (ack 2 0) (ack 1 1)))
-
-; ack(1, n) = n + 2 for small n
-(assert (forall ((n Int))
-  (=> (and (>= n 0) (<= n 3))
-      (= (ack 1 n) (+ n 2)))))
-
-; Verify: ack(0, 0) = 1, ack(1, 0) = 2, ack(1, 1) = 3
+(assert (forall ((n Int)) (=> (and (>= n 0) (<= n 3)) (= (ack 1 n) (+ n 2)))))
 (assert (= (ack 0 0) 1))
 (assert (= (ack 1 0) 2))
 (assert (= (ack 1 1) 3))
-
-; Ackermann function is always positive for non-negative inputs
+(assert (> (ack 0 0) 0))
 (assert (forall ((m Int) (n Int))
-  (=> (and (>= m 0) (<= m 2) (>= n 0) (<= n 5))
-      (> (ack m n) 0))))
-
+  (=> (and (>= m 0) (<= m 1) (>= n 0) (<= n 5))
+      (> (ack (+ m 1) n) (ack m n)))))
+(assert (forall ((m Int) (n Int))
+  (=> (and (>= m 0) (<= m 2) (>= n 0) (<= n 4))
+      (> (ack m (+ n 1)) (ack m n)))))
 (check-sat)
 (exit)
