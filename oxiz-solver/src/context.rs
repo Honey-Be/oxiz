@@ -755,11 +755,11 @@ impl Context {
                 self.solver.set_config(config);
             }
             // The clean-room MBQI engine (`oxiz-mbqi`, never-conclude-unsat) is
-            // the DEFAULT quantifier path. `(set-option :oxiz.clean-mbqi false)`
-            // opts back into the legacy `mbqi/` heuristics — kept reachable for
-            // A/B regression + the legacy completeness it still wins, but it is
-            // the unsound-by-whack-a-mole path (verus-fork trigger A..F family),
-            // so production should leave it on.
+            // the solver's only quantifier path (the legacy `mbqi/` heuristics
+            // were removed, #262). `(set-option :oxiz.clean-mbqi false)` now
+            // forces a ground-only solve (quantifiers encoded as opaque boolean
+            // proxies, never instantiated) — incomplete, so production leaves it
+            // on. The option is retained for A/B / ground-only diagnostics.
             "oxiz.clean-mbqi" => {
                 let mut config = self.solver.config().clone();
                 config.clean_mbqi = value == "true";

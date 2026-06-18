@@ -126,10 +126,9 @@ pub mod propagation;
 pub mod propagation_pipeline;
 pub mod shared_terms;
 
-// MBQI module (Model-Based Quantifier Instantiation)
-pub mod mbqi;
-
-// Clean-room quantifier engine host (M4 port of `oxiz-mbqi`).
+// Model-Based Quantifier Instantiation — the clean-room quantifier engine
+// host (M4 port of `oxiz-mbqi`). The legacy in-tree `mbqi/` subsystem was
+// removed once `clean_mbqi` became the suite-validated default (#262).
 pub mod clean_mbqi;
 
 // Z3 API compatibility layer (std-only)

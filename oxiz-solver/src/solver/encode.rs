@@ -1167,99 +1167,21 @@ impl Solver {
                 }
                 Lit::pos(var)
             }
-            TermKind::Forall {
-                patterns,
-                body,
-                vars,
-            } => {
-                // Universal quantifiers: register with MBQI
+            TermKind::Forall { .. } => {
+                // Universal quantifiers are encoded as a single boolean proxy
+                // literal; instantiation is the clean-room quantifier engine's
+                // job (`clean_mbqi`), which rebuilds its own ground-term index
+                // and pattern set from the asserted formula on each solve. No
+                // encode-time MBQI/e-matching registration is needed (the legacy
+                // `mbqi/` subsystem that consumed it was removed, #262).
                 self.has_quantifiers = true;
-
-                // Check if body is Exists — if so, Skolemize the nested existential.
-                // This handles the Forall-Exists pattern: ∀x. ∃y. φ(x,y) → ∀x. φ(x, f(x))
-                let body_id = *body;
-                let _vars_clone = vars.clone();
-                let patterns_clone = patterns.clone();
-                // Only quantifiers with EXPLICIT `:pattern` triggers are driven
-                // by Phase-1 e-matching.  A trigger-free `forall` (e.g.
-                // reflexivity `∀x. po(x,x)`, or a strict-order biconditional)
-                // has only AUTO-generated triggers, which fire against
-                // model-completion witnesses and can manufacture an unsound
-                // instantiation — so it must be left to the model-based MBQI
-                // (Phase 2) instead.  Registering only explicitly-triggered
-                // quantifiers with the e-matching engine keeps the two phases
-                // disjoint and matches the z3/cvc5 discipline (explicit pattern
-                // ⇒ e-match; no pattern ⇒ MBQI).
-                let has_explicit_patterns = !patterns.is_empty();
-                let body_is_exists = manager
-                    .get(body_id)
-                    .map(|t| matches!(t.kind, TermKind::Exists { .. }))
-                    .unwrap_or(false);
-
-                if body_is_exists {
-                    // Skolemize: ∀x. ∃y. φ(x,y) → ∀x. φ(x, sk(x))
-                    // This eliminates the nested existential so MBQI can handle
-                    // the resulting universal quantifier directly.
-                    #[cfg(feature = "std")]
-                    {
-                        let mut sk_ctx = crate::skolemization::SkolemizationContext::new();
-                        if let Ok(skolemized) = sk_ctx.skolemize(manager, term) {
-                            // Register the Skolemized version with MBQI
-                            self.mbqi.add_quantifier(skolemized, manager);
-                            // Register with E-matching engine (explicit triggers only).
-                            if has_explicit_patterns {
-                                let _ = self.ematch_engine.register_quantifier(skolemized, manager);
-                            }
-
-                            // Also collect Skolem function application terms from the
-                            // Skolemized body as MBQI candidates.  These terms (e.g.
-                            // sk(x)) must appear in the candidate pool so that other
-                            // universal quantifiers can be instantiated with them.
-                            self.collect_skolem_candidates(skolemized, manager);
-                        } else {
-                            // Skolemization failed — fall back to original
-                            self.mbqi.add_quantifier(term, manager);
-                            if has_explicit_patterns {
-                                let _ = self.ematch_engine.register_quantifier(term, manager);
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        self.mbqi.add_quantifier(term, manager);
-                        if has_explicit_patterns {
-                            let _ = self.ematch_engine.register_quantifier(term, manager);
-                        }
-                    }
-                } else {
-                    self.mbqi.add_quantifier(term, manager);
-                    // Register with E-matching engine for trigger-based instantiation
-                    if has_explicit_patterns {
-                        let _ = self.ematch_engine.register_quantifier(term, manager);
-                    }
-                }
-
-                // Collect ground terms from patterns as candidates
-                for pattern in &patterns_clone {
-                    for &trigger in pattern {
-                        self.mbqi.collect_ground_terms(trigger, manager);
-                    }
-                }
-                // Create a boolean variable for the quantifier
                 let var = self.get_or_create_var(term);
                 Lit::pos(var)
             }
-            TermKind::Exists { patterns, .. } => {
-                // Existential quantifiers: register with MBQI for tracking
+            TermKind::Exists { .. } => {
+                // Existential quantifiers are likewise encoded as a boolean
+                // proxy; the clean engine handles them from the assertion set.
                 self.has_quantifiers = true;
-                self.mbqi.add_quantifier(term, manager);
-                // Collect ground terms from patterns
-                for pattern in patterns {
-                    for &trigger in pattern {
-                        self.mbqi.collect_ground_terms(trigger, manager);
-                    }
-                }
-                // Create a boolean variable for the quantifier
                 let var = self.get_or_create_var(term);
                 Lit::pos(var)
             }
@@ -1360,86 +1282,6 @@ impl Solver {
         }
     }
 
-    /// Walk a (possibly Skolemized) quantifier term and collect Apply terms
-    /// whose function name starts with "sk" as MBQI instantiation candidates.
-    ///
-    /// These Skolem function applications (e.g. `sk!0(x)`) must be in the
-    /// candidate pool so that MBQI can instantiate other universal quantifiers
-    /// with Skolem terms, enabling cross-quantifier contradictions.
-    fn collect_skolem_candidates(&mut self, term: TermId, manager: &TermManager) {
-        let mut visited = FxHashSet::default();
-        self.collect_skolem_candidates_rec(term, manager, &mut visited);
-    }
-
-    fn collect_skolem_candidates_rec(
-        &mut self,
-        term: TermId,
-        manager: &TermManager,
-        visited: &mut FxHashSet<TermId>,
-    ) {
-        if !visited.insert(term) {
-            return;
-        }
-        let Some(t) = manager.get(term) else {
-            return;
-        };
-        match &t.kind {
-            TermKind::Apply { func, args } => {
-                let fname = manager.resolve_str(*func);
-                if fname.starts_with("sk") || fname.starts_with("skf") {
-                    // Register the whole application as a candidate
-                    self.mbqi.add_candidate(term, t.sort);
-                }
-                for &arg in args.iter() {
-                    self.collect_skolem_candidates_rec(arg, manager, visited);
-                }
-            }
-            TermKind::Forall { body, .. } | TermKind::Exists { body, .. } => {
-                self.collect_skolem_candidates_rec(*body, manager, visited);
-            }
-            TermKind::And(args) | TermKind::Or(args) => {
-                for &a in args {
-                    self.collect_skolem_candidates_rec(a, manager, visited);
-                }
-            }
-            TermKind::Not(a) | TermKind::Neg(a) => {
-                self.collect_skolem_candidates_rec(*a, manager, visited);
-            }
-            TermKind::Implies(a, b)
-            | TermKind::Eq(a, b)
-            | TermKind::Lt(a, b)
-            | TermKind::Le(a, b)
-            | TermKind::Gt(a, b)
-            | TermKind::Ge(a, b)
-            | TermKind::Sub(a, b)
-            | TermKind::Div(a, b)
-            | TermKind::Mod(a, b) => {
-                self.collect_skolem_candidates_rec(*a, manager, visited);
-                self.collect_skolem_candidates_rec(*b, manager, visited);
-            }
-            TermKind::Add(args) | TermKind::Mul(args) => {
-                for &a in args.iter() {
-                    self.collect_skolem_candidates_rec(a, manager, visited);
-                }
-            }
-            TermKind::Ite(c, t_br, e) => {
-                self.collect_skolem_candidates_rec(*c, manager, visited);
-                self.collect_skolem_candidates_rec(*t_br, manager, visited);
-                self.collect_skolem_candidates_rec(*e, manager, visited);
-            }
-            TermKind::Select(a, i) => {
-                self.collect_skolem_candidates_rec(*a, manager, visited);
-                self.collect_skolem_candidates_rec(*i, manager, visited);
-            }
-            TermKind::Store(a, i, v) => {
-                self.collect_skolem_candidates_rec(*a, manager, visited);
-                self.collect_skolem_candidates_rec(*i, manager, visited);
-                self.collect_skolem_candidates_rec(*v, manager, visited);
-            }
-            _ => {}
-        }
-    }
-
     /// Scan all Constraint::Eq entries in var_to_constraint that are currently
     /// assigned False by the SAT model and add arithmetic splits `(lhs < rhs)
     /// OR (lhs > rhs)` for each.  This ensures ArithSolver knows about
@@ -1489,91 +1331,6 @@ impl Solver {
         self.add_arith_diseq_split_recursive(term, manager, &mut visited);
     }
 
-    /// Add trichotomy clauses `Eq(a,b) OR Lt(a,b) OR Gt(a,b)` for every
-    /// arithmetic `Eq(a,b)` sub-term in the given MBQI instantiation result.
-    ///
-    /// This ensures that when the SAT solver assigns an arithmetic Eq to false
-    /// (disequality), the ArithSolver learns a strict ordering constraint
-    /// (Lt or Gt) and doesn't assign equal values.
-    ///
-    /// Only called for MBQI instantiation results, not for all assertions,
-    /// to avoid blowing up the clause database on non-quantified problems.
-    pub(super) fn add_arith_eq_trichotomy(&mut self, term: TermId, manager: &mut TermManager) {
-        let mut visited = FxHashSet::default();
-        self.add_arith_eq_trichotomy_recursive(term, manager, &mut visited);
-    }
-
-    fn add_arith_eq_trichotomy_recursive(
-        &mut self,
-        term: TermId,
-        manager: &mut TermManager,
-        visited: &mut FxHashSet<TermId>,
-    ) {
-        if !visited.insert(term) {
-            return;
-        }
-
-        let Some(t) = manager.get(term).cloned() else {
-            return;
-        };
-
-        match &t.kind {
-            TermKind::Eq(lhs, rhs) => {
-                let lhs_is_numeric = manager.get(*lhs).is_some_and(|lt| {
-                    lt.sort == manager.sorts.int_sort || lt.sort == manager.sorts.real_sort
-                });
-                // Only add trichotomy when at least one side is an
-                // uninterpreted function application (Apply). This is the
-                // pattern that appears in injectivity / congruence axioms
-                // where f(a)=f(b) needs to be split into f(a)<f(b) or
-                // f(a)>f(b) when the equality is false.
-                // Avoid Select terms -- the array theory handles those.
-                let lhs_is_apply = manager
-                    .get(*lhs)
-                    .is_some_and(|lt| matches!(lt.kind, TermKind::Apply { .. }));
-                let rhs_is_apply = manager
-                    .get(*rhs)
-                    .is_some_and(|rt| matches!(rt.kind, TermKind::Apply { .. }));
-                if lhs_is_numeric && (lhs_is_apply || rhs_is_apply) {
-                    let (l, r) = (*lhs, *rhs);
-                    // Add trichotomy: Eq(a,b) OR Lt(a,b) OR Gt(a,b)
-                    let eq_var = self.get_or_create_var(term);
-                    let eq_lit = Lit::pos(eq_var);
-                    let lt_term = manager.mk_lt(l, r);
-                    let gt_term = manager.mk_gt(l, r);
-                    let lt_lit = self.encode(lt_term, manager);
-                    let gt_lit = self.encode(gt_term, manager);
-                    self.sat.add_clause([eq_lit, lt_lit, gt_lit]);
-                }
-            }
-            TermKind::Not(arg) => {
-                self.add_arith_eq_trichotomy_recursive(*arg, manager, visited);
-            }
-            TermKind::And(args) => {
-                let args_clone: Vec<TermId> = args.iter().copied().collect();
-                for arg in args_clone {
-                    self.add_arith_eq_trichotomy_recursive(arg, manager, visited);
-                }
-            }
-            TermKind::Or(args) => {
-                let args_clone: Vec<TermId> = args.iter().copied().collect();
-                for arg in args_clone {
-                    self.add_arith_eq_trichotomy_recursive(arg, manager, visited);
-                }
-            }
-            TermKind::Implies(lhs, rhs) => {
-                let (l, r) = (*lhs, *rhs);
-                self.add_arith_eq_trichotomy_recursive(l, manager, visited);
-                self.add_arith_eq_trichotomy_recursive(r, manager, visited);
-            }
-            TermKind::Ite(_, then_br, else_br) => {
-                let (t, e) = (*then_br, *else_br);
-                self.add_arith_eq_trichotomy_recursive(t, manager, visited);
-                self.add_arith_eq_trichotomy_recursive(e, manager, visited);
-            }
-            _ => {}
-        }
-    }
 
     /// Recursively walk a term to find all `Not(Eq(a, b))` sub-terms with
     /// arithmetic sorts and add the split `(a < b) OR (a > b)` for each.

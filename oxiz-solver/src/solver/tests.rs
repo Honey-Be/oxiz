@@ -984,33 +984,6 @@ fn test_quantifier_instantiation() {
 }
 
 #[test]
-fn test_quantifier_mbqi_solver_integration() {
-    use crate::mbqi::MBQIIntegration;
-
-    let mut mbqi = MBQIIntegration::new();
-    let mut manager = TermManager::new();
-    let int_sort = manager.sorts.int_sort;
-
-    // Create a universal quantifier
-    let x = manager.mk_var("x", int_sort);
-    let zero = manager.mk_int(0);
-    let x_gt_0 = manager.mk_gt(x, zero);
-    let forall = manager.mk_forall([("x", int_sort)], x_gt_0);
-
-    // Add the quantifier to MBQI
-    mbqi.add_quantifier(forall, &manager);
-
-    // Add some candidate terms
-    let one = manager.mk_int(1);
-    let two = manager.mk_int(2);
-    mbqi.add_candidate(one, int_sort);
-    mbqi.add_candidate(two, int_sort);
-
-    // Check that MBQI tracks the quantifier
-    assert!(mbqi.is_enabled(), "MBQI should be enabled by default");
-}
-
-#[test]
 fn test_quantifier_pattern_matching() {
     let mut solver = Solver::new();
     let mut manager = TermManager::new();

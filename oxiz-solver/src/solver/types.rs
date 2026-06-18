@@ -263,18 +263,23 @@ pub struct SolverConfig {
     pub enable_inprocessing: bool,
     /// Inprocessing interval (number of conflicts between inprocessing)
     pub inprocessing_interval: u64,
-    /// Use the clean-room quantifier engine (`oxiz-mbqi`) for the model-based
-    /// instantiation phase instead of the legacy `mbqi/` subsystem.
+    /// Run the clean-room quantifier engine (`oxiz-mbqi`) model-based
+    /// instantiation phase. **On by default** — it is the solver's only
+    /// quantifier engine (the legacy in-tree `mbqi/` subsystem was removed,
+    /// #262).
     ///
     /// The clean engine is **sound by construction** — it never fabricates a
     /// universe witness and only emits guarded ground instances drawn from the
     /// real ground-term index, so the spurious-`unsat` bug class (e-match
     /// self/sibling capture, fabricated `u!N` MBQI witnesses, dropped fuel
-    /// guards) is structurally impossible. It is currently less *complete*
-    /// than the legacy path (a trigger-free axiom it cannot model-verify yields
-    /// the sound `Unknown` rather than a decisive — and sometimes unsound —
-    /// verdict), so it is **off by default** and opted into by the
-    /// verifier-backend path. See `clean_mbqi.rs` and `oxiz-mbqi`.
+    /// guards) is structurally impossible. A trigger-free axiom it cannot
+    /// model-verify yields the sound `Unknown` rather than a guess.
+    ///
+    /// Setting this `false` makes the solver run **ground-only** (it encodes
+    /// quantifiers as opaque boolean proxies and never instantiates them). That
+    /// is the mode the internal single-shot unsat verifier uses
+    /// (`verify_clean_unsat`); end users should leave it on. See `clean_mbqi.rs`
+    /// and the `oxiz-mbqi` crate.
     pub clean_mbqi: bool,
     /// §4 redesign (Phase 2): drive the CDCL(T) loop through the lock-step
     /// `TheoryHooks` contract (`SatSolver::solve_with_hooks`) instead of the
