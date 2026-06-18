@@ -29,6 +29,11 @@ pub struct Quant<S: Sig> {
     pub body: S::Term,
     /// Universal? (Existentials are skolemized by the host before reaching us.)
     pub universal: bool,
+    /// Per-bound-variable FINITE enumeration domain from a bounded-int guard
+    /// (`TermLang::bounded_var_domains`), computed lazily on first enumeration.
+    /// `None` = not yet computed; once `Some`, each entry is `Some(literals)`
+    /// (restrict to that finite set) or `None` (enumerate over the ground index).
+    pub var_domains: Option<Vec<Option<Vec<S::Term>>>>,
 }
 
 /// Outcome of attempting one instantiation.

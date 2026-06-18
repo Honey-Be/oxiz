@@ -127,6 +127,33 @@ pub trait TermLang {
         a: <Self::Sig as Sig>::Term,
         b: <Self::Sig as Sig>::Term,
     ) -> <Self::Sig as Sig>::Term;
+
+    /// **Bounded-guard finite domains.** For each bound variable of `quant`,
+    /// return `Some(literals)` when the quantifier body has the guarded shape
+    /// `∀x̄. (guard ⇒ φ)` and `guard` pins that variable to a CONCRETE integer
+    /// range `lo ≤ x ≤ hi` — `literals` is then exactly the ground terms
+    /// `mk_int(lo), …, mk_int(hi)`. `None` for a variable with no such finite
+    /// range (the engine then enumerates it over the full ground index, as
+    /// before).
+    ///
+    /// Restricting enumeration to this finite set is SOUND and loses no
+    /// completeness: for `x ∉ [lo,hi]` the guard is false so the instance is
+    /// vacuous, and `∀x∈ℤ. (lo≤x≤hi ⇒ φ)` is exactly `⋀_{v=lo}^{hi} φ(v)`; a
+    /// term instance `φ(t)` whose model value lands in `[lo,hi]` follows from the
+    /// corresponding literal instance by congruence. It defuses the classic
+    /// guarded-quantifier matching loop (a `∀m,n` over `Int` instantiated across
+    /// every ground `Int` term — including the function's own applications —
+    /// explodes; the guard says only finitely many tuples matter).
+    ///
+    /// Default: `Vec::new()` (no host support ⇒ no restriction anywhere). The
+    /// returned vector, when non-empty, is aligned with the quantifier's bound
+    /// variable list.
+    fn bounded_var_domains(
+        &mut self,
+        _quant: <Self::Sig as Sig>::Term,
+    ) -> Vec<Option<Vec<<Self::Sig as Sig>::Term>>> {
+        Vec::new()
+    }
 }
 
 /// A capture-free substitution: bound-variable name → ground replacement.

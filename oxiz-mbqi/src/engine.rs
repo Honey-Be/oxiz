@@ -102,6 +102,7 @@ impl<S: Sig> Engine<S> {
                     triggers,
                     body,
                     universal: forall,
+                    var_domains: None, // computed lazily on first enumeration
                 });
                 self.scanned.push(0); // new quantifier: scan the whole index once
             }
@@ -213,6 +214,28 @@ impl<S: Sig> Engine<S> {
         // synthetic witnesses never cross into the engine → nothing fabricated.
         for q in &self.quants {
             if q.triggers.is_empty() && model.is_active(lang, q.term) {
+                // Bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`): every
+                // bound var has a finite literal domain whose product fits the
+                // per-quant enumeration cap, so ALL its non-vacuous instances were
+                // emitted (saturation ⇒ none new this round ⇒ all in `seen`) and
+                // the model satisfies them (Saturated ⇒ the ground solve is
+                // consistent); everything outside the guard is vacuous. Hence the
+                // quantifier holds — no model-completion needed, sound by finite
+                // exhaustion. (The cap guard is essential: if the product exceeded
+                // the cap, enumeration would truncate and "saturate" without
+                // covering the tail, so we must NOT claim satisfaction then.)
+                let finitely_exhausted = q.var_domains.as_ref().is_some_and(|vds| {
+                    !vds.is_empty()
+                        && vds.iter().all(|d| d.is_some())
+                        && vds
+                            .iter()
+                            .map(|d| d.as_ref().map_or(0, Vec::len))
+                            .fold(1usize, usize::saturating_mul)
+                            <= self.cfg.max_tuples_per_quant
+                });
+                if finitely_exhausted {
+                    continue;
+                }
                 match model.eval_forall(lang, q.term) {
                     Some(true) => {}
                     Some(false) | None => return Verdict::Inconclusive,
@@ -262,9 +285,25 @@ impl<S: Sig> Engine<S> {
         qi: usize,
         out: &mut Vec<S::Term>,
     ) {
+        // Lazily compute the per-variable bounded-guard finite domains (the host
+        // parses the `∀x̄. (lo≤x≤hi ⇒ φ)` guard once); cache on the quantifier.
+        if self.quants[qi].var_domains.is_none() {
+            let vd = lang.bounded_var_domains(self.quants[qi].term);
+            self.quants[qi].var_domains = Some(vd);
+        }
         let sorts: Vec<S::Sort> = self.quants[qi].vars.iter().map(|(_, s)| *s).collect();
-        let domains: Vec<Vec<S::Term>> =
-            sorts.iter().map(|s| self.ground.of_sort(*s).to_vec()).collect();
+        // Cloned to release the `self.quants` borrow before touching `self.ground`.
+        let vd = self.quants[qi].var_domains.clone().unwrap_or_default();
+        let domains: Vec<Vec<S::Term>> = sorts
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match vd.get(i).and_then(|o| o.as_ref()) {
+                // Bounded-int guard → only the finite literal set matters.
+                Some(finite) => finite.clone(),
+                // Otherwise enumerate over the real ground index (unchanged).
+                None => self.ground.of_sort(*s).to_vec(),
+            })
+            .collect();
         if domains.iter().any(|d| d.is_empty()) {
             return; // no real candidate of some sort → emit nothing (no fabrication)
         }

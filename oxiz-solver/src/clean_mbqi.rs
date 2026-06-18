@@ -32,6 +32,7 @@ use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_core::sort::SortId;
 use oxiz_mbqi::{Binding, ModelEval, Sig, TermLang, TermView};
+use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 // Reserved syms for structured connectives/operators. A `Spur` is a
@@ -198,6 +199,123 @@ impl<'a> TermLang for OxizHost<'a> {
 
     fn mk_implies(&mut self, a: TermId, b: TermId) -> TermId {
         self.tm.mk_implies(a, b)
+    }
+
+    fn bounded_var_domains(&mut self, quant: TermId) -> Vec<Option<Vec<TermId>>> {
+        // Bound variables + matrix of the (universal) quantifier.
+        let (bound, body) = match self.m().get(quant).map(|t| &t.kind) {
+            Some(TermKind::Forall { vars, body, .. }) => {
+                (vars.iter().map(|(n, _)| *n).collect::<Vec<Spur>>(), *body)
+            }
+            _ => return Vec::new(),
+        };
+        // Only the guarded shape `(=> guard φ)` carries a concrete range.
+        let guard = match self.m().get(body).map(|t| &t.kind) {
+            Some(TermKind::Implies(g, _)) => *g,
+            _ => return Vec::new(),
+        };
+        // Tightest concrete (lower, upper) integer bound per bound var.
+        let mut lo: FxHashMap<Spur, i128> = FxHashMap::default();
+        let mut hi: FxHashMap<Spur, i128> = FxHashMap::default();
+        collect_int_bounds(self.m(), guard, &bound, &mut lo, &mut hi);
+        // Finite literal domain for each fully + tightly bounded var; a huge or
+        // half-open range falls back to `None` (enumerate over the ground index).
+        const MAX_RANGE: i128 = 1024;
+        bound
+            .iter()
+            .map(|name| match (lo.get(name).copied(), hi.get(name).copied()) {
+                (Some(l), Some(u)) if l <= u && u - l < MAX_RANGE => {
+                    Some((l..=u).map(|v| self.tm.mk_int(v)).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// One comparison's contribution to a bound variable's integer range.
+enum Cmp {
+    Ge,
+    Le,
+    Gt,
+    Lt,
+    Eq,
+}
+
+#[inline]
+fn update_lo(lo: &mut FxHashMap<Spur, i128>, x: Spur, v: i128) {
+    lo.entry(x).and_modify(|e| *e = (*e).max(v)).or_insert(v);
+}
+#[inline]
+fn update_hi(hi: &mut FxHashMap<Spur, i128>, x: Spur, v: i128) {
+    hi.entry(x).and_modify(|e| *e = (*e).min(v)).or_insert(v);
+}
+
+fn as_bound_var(m: &TermManager, t: TermId, bound: &[Spur]) -> Option<Spur> {
+    match m.get(t).map(|x| &x.kind) {
+        Some(TermKind::Var(s)) if bound.contains(s) => Some(*s),
+        _ => None,
+    }
+}
+fn as_int_const(m: &TermManager, t: TermId) -> Option<i128> {
+    match m.get(t).map(|x| &x.kind) {
+        Some(TermKind::IntConst(b)) => b.to_i128(),
+        _ => None,
+    }
+}
+
+/// Walk a guard (a conjunction of comparisons) and record, per bound variable,
+/// the concrete integer lower/upper bounds it pins. Only `And` of simple
+/// `var ⋈ const` / `const ⋈ var` comparisons contributes; `Or`/`Not`/anything
+/// else is conservatively ignored (no bound ⇒ that var stays unrestricted).
+fn collect_int_bounds(
+    m: &TermManager,
+    t: TermId,
+    bound: &[Spur],
+    lo: &mut FxHashMap<Spur, i128>,
+    hi: &mut FxHashMap<Spur, i128>,
+) {
+    let Some(term) = m.get(t) else { return };
+    let (a, b, cmp) = match &term.kind {
+        TermKind::And(args) => {
+            for &c in args.iter() {
+                collect_int_bounds(m, c, bound, lo, hi);
+            }
+            return;
+        }
+        TermKind::Ge(a, b) => (*a, *b, Cmp::Ge),
+        TermKind::Le(a, b) => (*a, *b, Cmp::Le),
+        TermKind::Gt(a, b) => (*a, *b, Cmp::Gt),
+        TermKind::Lt(a, b) => (*a, *b, Cmp::Lt),
+        TermKind::Eq(a, b) => (*a, *b, Cmp::Eq),
+        _ => return,
+    };
+    // `var ⋈ const`
+    if let (Some(x), Some(k)) = (as_bound_var(m, a, bound), as_int_const(m, b)) {
+        match cmp {
+            Cmp::Ge => update_lo(lo, x, k),
+            Cmp::Le => update_hi(hi, x, k),
+            Cmp::Gt => update_lo(lo, x, k + 1),
+            Cmp::Lt => update_hi(hi, x, k - 1),
+            Cmp::Eq => {
+                update_lo(lo, x, k);
+                update_hi(hi, x, k);
+            }
+        }
+        return;
+    }
+    // `const ⋈ var` (flip the relation)
+    if let (Some(k), Some(x)) = (as_int_const(m, a), as_bound_var(m, b, bound)) {
+        match cmp {
+            Cmp::Ge => update_hi(hi, x, k),       // k ≥ x ⟺ x ≤ k
+            Cmp::Le => update_lo(lo, x, k),       // k ≤ x ⟺ x ≥ k
+            Cmp::Gt => update_hi(hi, x, k - 1),   // k > x ⟺ x ≤ k-1
+            Cmp::Lt => update_lo(lo, x, k + 1),   // k < x ⟺ x ≥ k+1
+            Cmp::Eq => {
+                update_lo(lo, x, k);
+                update_hi(hi, x, k);
+            }
+        }
     }
 }
 

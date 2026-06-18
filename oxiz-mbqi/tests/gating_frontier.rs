@@ -17,13 +17,19 @@ const EQ: u32 = 12;
 /// `Q` is false (inactive) vs true.
 struct Gated {
     active: bool,
+    /// Whether the model can VERIFY a reached trigger-free quantifier
+    /// (`eval_forall` ⇒ `Some(true)`). When it can, the engine's M3
+    /// model-completion short-circuit skips enumeration entirely (the quantifier
+    /// needs no ground instances); when it cannot (`None`), the engine falls back
+    /// to enumerating at the real ground terms.
+    verifies: bool,
 }
 impl ModelEval<Toy> for Gated {
     fn eval_bool(&self, _l: &Toy, _t: Tid) -> Option<bool> {
         None
     }
     fn eval_forall(&self, _l: &Toy, _q: Tid) -> Option<bool> {
-        Some(true) // when active & reached, the model verifies it
+        if self.verifies { Some(true) } else { None }
     }
     fn is_active(&self, _l: &Toy, _q: Tid) -> bool {
         self.active
@@ -65,24 +71,43 @@ fn guarded_quantifier_when_inactive_is_skipped_entirely() {
     let mut e = Engine::new(Config::default());
     e.assert(&t, fbd_c);
     e.assert(&t, q);
-    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: false });
+    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: false, verifies: true });
     assert_eq!(verdict, "Sat");
     assert_eq!(lemmas, 0, "inactive quantifier emits nothing");
     assert_eq!(e.rejected(), 0);
 }
 
 #[test]
-fn guarded_quantifier_when_active_instantiates_then_verifies() {
-    // Guard true ⇒ active. The trigger-free quant enumerates at the real
-    // ground FuelId c (sound, no fabrication), then the model verifies it →
-    // Sat. (At least the c instance is emitted.)
+fn guarded_quantifier_when_active_and_verified_skips_instantiation() {
+    // Guard true ⇒ active, and the model verifies it (`eval_forall ⇒
+    // Some(true)`). The M3 model-completion short-circuit then needs NO ground
+    // instances — Sat with zero lemmas (no fabrication, no unnecessary
+    // enumeration). The completion's witness never crosses into the engine.
     let mut t = Toy::new();
     let (q, fbd_c) = fuel_quant(&mut t);
     let mut e = Engine::new(Config::default());
     e.assert(&t, fbd_c);
     e.assert(&t, q);
-    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true });
+    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: true });
     assert_eq!(verdict, "Sat");
-    assert!(lemmas >= 1, "active: instantiated at the real ground FuelId");
+    assert_eq!(lemmas, 0, "verified ⇒ short-circuited, no instances needed");
+    assert_eq!(e.rejected(), 0);
+}
+
+#[test]
+fn guarded_quantifier_when_active_but_unverified_enumerates_real_ground() {
+    // Guard true ⇒ active, but the model CANNOT verify it (`eval_forall ⇒
+    // None`). The engine then enumerates at the REAL ground FuelId `c` (sound,
+    // no fabrication — at least the `c` instance is emitted), and since the
+    // quantifier stays unverified the sound verdict is `Unknown` (never a
+    // guessed Sat, never a fabricated Unsat).
+    let mut t = Toy::new();
+    let (q, fbd_c) = fuel_quant(&mut t);
+    let mut e = Engine::new(Config::default());
+    e.assert(&t, fbd_c);
+    e.assert(&t, q);
+    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: false });
+    assert!(lemmas >= 1, "active+unverified: instantiated at the real ground FuelId");
+    assert_eq!(verdict, "Unknown", "unverified trigger-free quant ⇒ sound Unknown");
     assert_eq!(e.rejected(), 0);
 }
