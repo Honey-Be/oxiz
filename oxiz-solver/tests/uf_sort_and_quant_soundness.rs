@@ -210,18 +210,13 @@ fn cdqi_no_false_conflict_when_existing_terms_are_consistent() {
     // conflicting instance over the existing terms, so the model stands.
     // (z3: sat.)
     //
-    // The clean-room MBQI is conservative here: with no conflicting instance it
-    // reports the SOUND `Unknown` rather than guessing `Sat`. The
-    // function-completion fragment that WOULD discharge this (`f` ≡ a positive
-    // constant off the consistent ground point f(7)=5) is recognised by
-    // `eval_forall` (Condition C), but cannot fire yet: the body is ARITHMETIC
-    // (`f(a)>0`), and the clean model oracle does not fold `>` over concrete
-    // values, so a model-falsified existing ground instance is detected only by
-    // asserting the enumerated instance — and that enumeration loops on the
-    // `f`-tower (`a := f(7)` ⇒ `f(f(7))` ⇒ …) to the iteration cap before
-    // saturating. Reaching the completion soundly needs an arithmetic-aware
-    // oracle + a verify-existing-ground-instances gate (#260). Both `Sat` and
-    // `Unknown` are sound, so assert only the non-`unsat` property. (z3: sat.)
+    // M3 arithmetic function completion (#260) discharges this: `∀a. f(a)>0` is
+    // `f`'s sole universal constraint, the bound var feeds only `f`, the
+    // arithmetic-aware oracle confirms the ONE existing ground point f(7)=5
+    // satisfies `>0`, and `(> (f a) 0)` is satisfiable for some value — so `f`
+    // is completed to a positive constant off that consistent point. The engine
+    // skips enumerating it (avoiding the divergent `f`-tower); the completion's
+    // witness never crosses into the engine. (z3: sat.)
     let r = solve_streamed(&[
         "(declare-fun f (Int) Int)",
         "(declare-const c Int)",
@@ -230,12 +225,11 @@ fn cdqi_no_false_conflict_when_existing_terms_are_consistent() {
         "(assert (= c 5))",
         "(check-sat)",
     ]);
-    assert_ne!(
+    assert_eq!(
         r,
-        SolverResult::Unsat,
-        "f(7)=5 is consistent with ∀a.f(a)>0 — must NOT be a spurious unsat \
-         (clean MBQI reports the sound Unknown; full Sat is M3 arithmetic \
-         function completion, #260)"
+        SolverResult::Sat,
+        "f(7)=5 is consistent with ∀a.f(a)>0 — M3 arithmetic function completion \
+         (f ≡ positive constant, existing point verified) makes it Sat"
     );
 }
 
@@ -317,6 +311,29 @@ fn trigger_free_partial_order_axioms_are_sat() {
         SolverResult::Sat,
         "reflexivity (pure-positive po ≡ true) + strict-order definition (fresh \
          lt) over an uninterpreted sort — M3 model completion makes it Sat"
+    );
+}
+
+#[test]
+fn function_completion_respects_a_second_violating_ground_point() {
+    // M3 #260 soundness: `∀a. f(a)>0` with f(7)=5 (ok) AND f(8)=-1 (violates).
+    // The arithmetic function-completion recognizer scans EVERY existing
+    // `f`-application in the model and arith-folds the body; f(8)=-1 fails `>0`,
+    // so it must NOT certify the axiom — enumeration then asserts f(8)>0 and the
+    // arithmetic theory refutes it. A spurious `Sat` would mean the verify only
+    // checked some points (e.g. relied on CDQI's tuple budget).
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((a Int)) (> (f a) 0)))",
+        "(assert (= (f 7) 5))",
+        "(assert (= (f 8) (- 1)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "f(8)=-1 violates ∀a.f(a)>0 — the completion verify must scan ALL pinned \
+         f-points, not skip the axiom"
     );
 }
 

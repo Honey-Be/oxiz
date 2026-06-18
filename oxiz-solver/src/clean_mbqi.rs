@@ -249,6 +249,25 @@ impl SolverModel {
     fn value(&self, t: TermId) -> TermId {
         self.assign.get(&t).copied().unwrap_or(t)
     }
+
+    /// Resolve `t` to a CONCRETE integer under the model, following the
+    /// `term → value` chain to an `IntConst` (bounded, so a cyclic/length model
+    /// cannot loop). `None` if it does not bottom out at a literal integer —
+    /// the arithmetic fold then stays the sound `undetermined`.
+    fn int_of(&self, lang: &OxizHost<'_>, t: TermId) -> Option<num_bigint::BigInt> {
+        let mut cur = t;
+        for _ in 0..8 {
+            if let Some(TermKind::IntConst(b)) = lang.m().get(cur).map(|x| &x.kind) {
+                return Some(b.clone());
+            }
+            let next = self.value(cur);
+            if next == cur {
+                return None;
+            }
+            cur = next;
+        }
+        None
+    }
 }
 
 /// Model-independent facts about the whole asserted formula, used by the
@@ -522,8 +541,27 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
                         let (va, vb) = (self.value(args[0]), self.value(args[1]));
                         if va == vb {
                             Some(true)
+                        } else if let (Some(x), Some(y)) =
+                            (self.int_of(lang, args[0]), self.int_of(lang, args[1]))
+                        {
+                            // Both sides resolve to concrete integers ⇒ decide.
+                            Some(x == y)
                         } else {
-                            None // distinct values may still be model-equal; stay safe
+                            None // distinct (non-numeric) values may still be model-equal; stay safe
+                        }
+                    }
+                    // Arithmetic comparisons: fold when BOTH operands resolve to
+                    // concrete integers under the model (the M3 oracle, #260).
+                    // Undetermined otherwise — never a guess.
+                    OP_LT | OP_LE | OP_GT | OP_GE => {
+                        match (self.int_of(lang, args[0]), self.int_of(lang, args[1])) {
+                            (Some(x), Some(y)) => Some(match sym {
+                                OP_LT => x < y,
+                                OP_LE => x <= y,
+                                OP_GT => x > y,
+                                _ => x >= y, // OP_GE
+                            }),
+                            _ => None,
                         }
                     }
                     // An uninterpreted boolean atom not in the assignment, or
@@ -758,7 +796,44 @@ impl SolverModel {
         }
         // `f` must be this axiom's SOLE universal constraint (no cross-quantifier
         // requirement that a single constant completion could violate).
-        facts.quant_count.get(&fsym).copied() == Some(1)
+        if facts.quant_count.get(&fsym).copied() != Some(1) {
+            return false;
+        }
+        // VERIFY (the #260 soundness gate). The constant completion is valid only
+        // if every EXISTING ground `f`-application already satisfies the
+        // comparison in the model — otherwise asserting that instance would
+        // refute (an `unsat` we must never hide behind a `Some(true)`). Scan the
+        // model's `f`-applications and arith-fold `cmp(·, g)`; bail (do not
+        // certify) on any FALSE or any value we cannot resolve. The
+        // yet-to-be-generated `f`-tower terms are not in the model, so they
+        // impose no obligation — exactly why completing `f` to a constant is
+        // sound. This is independent of CDQI's tuple budget, so it cannot miss a
+        // pinned conflict.
+        let g = if app_side == l { r } else { l };
+        let app_is_left = app_side == l;
+        let Some(gv) = self.int_of(lang, g) else {
+            return false; // ground operand not concrete ⇒ cannot verify
+        };
+        for &k in self.assign.keys() {
+            if !matches!(lang.view(k), TermView::App { sym: s } if s == fsym) {
+                continue;
+            }
+            let Some(av) = self.int_of(lang, k) else {
+                return false; // a pinned `f`-point we cannot evaluate ⇒ conservative
+            };
+            let (lo, hi) = if app_is_left { (av, gv.clone()) } else { (gv.clone(), av) };
+            let holds = match sym {
+                OP_LT => lo < hi,
+                OP_LE => lo <= hi,
+                OP_GT => lo > hi,
+                OP_GE => lo >= hi,
+                _ => lo == hi, // OP_EQ
+            };
+            if !holds {
+                return false;
+            }
+        }
+        true
     }
 
     /// Does `t` mention any of the `bound` variable names? Depth-bounded;

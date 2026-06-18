@@ -169,26 +169,29 @@ impl<S: Sig> Engine<S> {
                 continue;
             }
 
+            // 2.5. Model-completion short-circuit (M3, #260). If the host can
+            //    verify this trigger-free quantifier in a COMPLETED model, it
+            //    needs no ground instances — and enumerating it could DIVERGE: a
+            //    body like `∀a. f(a) > 0` instantiates `a := f(t)` (an `Int`
+            //    ground term), yielding `f(f(t))`, a fresh ground term enumerated
+            //    next round → an unbounded `f`-tower that never saturates (so the
+            //    saturation check below never runs). The host's `eval_forall`
+            //    returns `Some(true)` only via a recognizer that has VERIFIED the
+            //    existing pinned ground points (definitional / pure-polarity need
+            //    none; the arithmetic function-completion recognizer scans the
+            //    model's `f`-applications and arith-folds the body). So a
+            //    model-falsified existing instance (e.g. `f(7) = -3`) is NOT
+            //    certified — it falls through to enumeration, where the
+            //    arithmetic theory refutes it. Skipping here is therefore sound:
+            //    the completion's witness never crosses into the engine.
+            if model.eval_forall(lang, self.quants[qi].term) == Some(true) {
+                continue;
+            }
+
             // 3. Enumeration — trigger-free, REAL ground index only (no
             //    fabricated witness ⇒ D bug impossible). Completeness over the
             //    ground universe; the model-based check below decides Sat vs
             //    Unknown once it saturates.
-            //
-            // NOTE (M3, #260): a pre-enumeration model-completion short-circuit
-            // (`eval_forall == Some(true)` ⇒ skip) is NOT sound for an
-            // ARITHMETIC body like `∀a. f(a) > 0`: the clean model oracle does
-            // not fold `>` over concrete values, so a model-falsified existing
-            // ground instance (e.g. `f(7) = -3`) is detected ONLY by asserting
-            // the enumerated instance and letting the arithmetic theory refute
-            // it — exactly the enumeration step. Skipping it would hide that
-            // `unsat`. Reaching the completion verdict soundly for such bodies
-            // needs an arithmetic-aware oracle + a "verify existing ground
-            // instances" gate (#260). Until then the arithmetic
-            // function-completion case stays the sound `Unknown` (the `f`-tower
-            // enumeration runs to the iteration cap). The
-            // definitional / pure-polarity recognizers in `eval_forall` (which
-            // need no ground instances and cannot loop) DO fire here once
-            // enumeration saturates.
             self.enumerate(lang, qi, &mut lemmas);
         }
         // Advance the frontier watermark for every quantifier scanned this
