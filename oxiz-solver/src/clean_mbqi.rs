@@ -1802,6 +1802,97 @@ fn try_monotone_extension(m: &TermManager, facts: &CompletionFacts, body: TermId
     true
 }
 
+// ───────────────────────── idempotent axiom `f∘f = f` ──────────────────────
+//
+// `∀x. f(f(x)) = f(x)` over an uninterpreted `f` is satisfiable together with
+// its ground facts iff those facts are IDEMPOTENCY-CONSISTENT: instantiating the
+// axiom at a pinned point `f(t)=v` forces `f(v)=f(f(t))=f(t)=v`, so every pinned
+// value must itself be a fixed point. When that holds, an idempotent total
+// model exists (identity off the pinned points, which already map into their own
+// fixed points), so the axiom is sound to report `Sat`.
+
+/// If `ffx`/`fx` are `(f (f x))`/`(f x)` for the SAME uninterpreted unary `f`
+/// over the bound var `x`, return `f`'s symbol.
+fn idempotent_sides(m: &TermManager, ffx: TermId, fx: TermId, x: Spur) -> Option<u64> {
+    let TermKind::Apply { func: f1, args: a1 } = m.get(ffx)?.kind.clone() else {
+        return None;
+    };
+    if a1.len() != 1 || a1[0] != fx {
+        return None;
+    }
+    let TermKind::Apply { func: f2, args: a2 } = m.get(fx)?.kind.clone() else {
+        return None;
+    };
+    if f1 != f2 || a2.len() != 1 {
+        return None;
+    }
+    let TermKind::Var(s) = m.get(a2[0])?.kind else {
+        return None;
+    };
+    if s != x {
+        return None;
+    }
+    Some(spur_sym(f1))
+}
+
+/// Recognise a satisfiable idempotent axiom `∀x. f(f(x)) = f(x)` by checking the
+/// ground `f`-points are idempotency-consistent. Sound — declines (→ `false`)
+/// unless `f` is confined to this axiom + eq-pinned ground points.
+fn try_idempotent(m: &TermManager, facts: &CompletionFacts, body: TermId, bound: &[Spur]) -> bool {
+    if bound.len() != 1 {
+        return false;
+    }
+    let x = bound[0];
+    let TermKind::Eq(o1, o2) = (match m.get(body) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let Some(fsym) = idempotent_sides(m, o1, o2, x).or_else(|| idempotent_sides(m, o2, o1, x))
+    else {
+        return false;
+    };
+    // `f` must occur in no OTHER quantifier (this axiom contributes 1).
+    if facts.quant_count.get(&fsym).copied().unwrap_or(0) > 1 {
+        return false;
+    }
+    let Some(apps) = facts.ground_apps.get(&fsym) else {
+        return true; // no ground points → identity is an idempotent model
+    };
+    // Map each pinned application's ARGUMENT term → its pinned VALUE term. Every
+    // ground application must be eq-pinned (an unpinned one — e.g. in an
+    // inequality — could break idempotency, so we cannot certify).
+    let mut argval: FxHashMap<TermId, TermId> = FxHashMap::default();
+    for &app in apps {
+        let TermKind::Apply { args, .. } = (match m.get(app) {
+            Some(t) => t.kind.clone(),
+            None => return false,
+        }) else {
+            return false;
+        };
+        if args.len() != 1 {
+            return false;
+        }
+        match facts.eq_pins.get(&app).and_then(|v| v.first()) {
+            Some(&val) => {
+                argval.insert(args[0], val);
+            }
+            None => return false, // unpinned ground application
+        }
+    }
+    // Idempotency-consistency: for each `f(arg)=val`, if `val` is itself the
+    // argument of a pinned application, that application must map `val → val`.
+    for (_arg, &val) in &argval {
+        if let Some(&w) = argval.get(&val) {
+            if w != val {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Walk the boolean skeleton of `t` recording each uninterpreted PREDICATE
 /// symbol's polarity (`pos`/`neg`); a symbol reached in a non-monotone context
 /// (Eq/Xor/Ite/Distinct/arith comparison) or in term (argument) position is
@@ -2005,6 +2096,11 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // the ground `f`-points admit a monotone extension (order-extension
         // theorem). Sound — declines unless every `f`-constraint is accounted for.
         if try_monotone_extension(lang.m(), facts, body) {
+            return Some(true);
+        }
+        // (6) Idempotent axiom `∀x. f(f(x)) = f(x)`: satisfiable when the ground
+        // f-points are idempotency-consistent (each `f(t)=v` needs `f(v)=v`).
+        if try_idempotent(lang.m(), facts, body, &bound) {
             return Some(true);
         }
         None

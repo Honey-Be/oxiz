@@ -962,3 +962,38 @@ fn monotone_with_unaccounted_constraint_is_not_certified_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "an unaccounted f-constraint must block the order-extension sat");
 }
+
+#[test]
+fn idempotent_with_consistent_fixed_points_is_sat() {
+    // `∀x. f(f(x)) = f(x)` with idempotency-consistent ground facts: every pinned
+    // value is its own fixed point (`f(0)=5` and `f(5)=5`; `f(3)=3`). An
+    // idempotent total model exists (identity off these points), so it is sat.
+    // (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int)) (= (f (f x)) (f x))))",
+        "(assert (= (f 0) 5))",
+        "(assert (= (f 5) 5))",
+        "(assert (= (f 3) 3))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "an idempotency-consistent partial f extends to an idempotent total f");
+}
+
+#[test]
+fn idempotent_violated_is_unsat() {
+    // Soundness: `f(0)=5` with `f(5)=7` violates idempotency
+    // (`f(f(0)) = f(5) = 7 ≠ 5 = f(0)`). The recognizer must decline; the engine
+    // instantiates the axiom at 0 → `f(5)=f(0)=5` → conflicts with `f(5)=7` →
+    // unsat. Never a spurious sat. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int)) (= (f (f x)) (f x))))",
+        "(assert (= (f 0) 5))",
+        "(assert (= (f 5) 7))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "an idempotency-violating ground point is unsat");
+}
