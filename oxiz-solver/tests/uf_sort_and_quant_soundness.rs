@@ -866,3 +866,44 @@ fn skolemized_forall_exists_unsat_is_never_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "an unsat ∀∃ must not be Skolemized into a spurious sat");
 }
+
+#[test]
+fn monotone_affine_implication_is_valid_sat() {
+    // `∀x,y. x≤y ⇒ (2x+1) ≤ (2y+1)` is VALID in every interpretation because
+    // `2x+1` is monotone increasing — the monotonicity KB certifies the affine
+    // form (scale by +2, add a constant), so the engine reports sat without any
+    // model search. (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(assert (forall ((x Real) (y Real)) \
+            (=> (<= x y) (<= (+ (* 2.0 x) 1.0) (+ (* 2.0 y) 1.0)))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "an affine-monotone implication is a valid tautology → sat");
+}
+
+#[test]
+fn anti_monotone_implication_is_not_certified_sat() {
+    // Soundness: `∀x,y. x≤y ⇒ -x ≤ -y` is NOT valid (`-x` is DECREASING). The
+    // certifier must NOT certify it — the only sound verdicts are unsat or
+    // Unknown, never a spurious sat from a wrong-direction monotonicity claim.
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(assert (forall ((x Int) (y Int)) (=> (<= x y) (<= (- 0 x) (- 0 y)))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "a wrong-direction monotonicity claim must not be certified sat");
+}
+
+#[test]
+fn nonlinear_square_implication_is_not_certified_sat() {
+    // Soundness: `∀x,y. x≤y ⇒ x² ≤ y²` is NOT valid (false for x=-2,y=1). The
+    // certifier returns None for `x*x` (two var factors), so it is never
+    // certified — sound Unknown/unsat, never spurious sat.
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(assert (forall ((x Int) (y Int)) (=> (<= x y) (<= (* x x) (* y y)))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "a non-monotone square must not be certified sat");
+}

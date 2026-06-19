@@ -1177,6 +1177,251 @@ fn definitional_ground_consistent(
     true
 }
 
+// ───────────────────────── monotonicity knowledge base ─────────────────────
+//
+// A SOUND, structural certifier for the monotonicity of an arithmetic expression
+// as a function of one variable — the "monotonicity KB". Every rule is a
+// theorem, so a positive certificate is sound to feed a VALIDITY judgement: an
+// implication `(x ⊴ y) ⇒ (E[x] ⊴ E[y])` is valid in EVERY interpretation when
+// `E` is monotone in the matching direction (no model needed). Used by
+// [`SolverModel::body_is_valid`] via [`is_monotone_implication`].
+
+/// Monotonicity direction of an expression in one variable (`Const` = does not
+/// depend on it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MonoDir {
+    Inc,
+    Dec,
+    Const,
+}
+
+/// `(direction, strict)`. `strict` = `<`-monotone (injective ⇒ invertible),
+/// vs merely `≤`-monotone; `Const` is never strict.
+type Mono = (MonoDir, bool);
+
+#[inline]
+fn mono_flip((d, s): Mono) -> Mono {
+    match d {
+        MonoDir::Inc => (MonoDir::Dec, s),
+        MonoDir::Dec => (MonoDir::Inc, s),
+        MonoDir::Const => (MonoDir::Const, false),
+    }
+}
+
+/// Scale by a scalar of the given sign: `>0` preserves, `<0` flips, `0` ⇒ `Const`.
+fn mono_scale(sign: i32, inner: Mono) -> Mono {
+    match sign.cmp(&0) {
+        std::cmp::Ordering::Greater => inner,
+        std::cmp::Ordering::Less => mono_flip(inner),
+        std::cmp::Ordering::Equal => (MonoDir::Const, false),
+    }
+}
+
+/// Combine the addends of a sum: `↑+↑=↑`, `↓+↓=↓`, `Const` is the identity, a
+/// mix of `↑` and `↓` is undetermined (`None`). Strict if any same-direction
+/// addend is strict.
+fn mono_sum(parts: &[Mono]) -> Option<Mono> {
+    let mut dir = MonoDir::Const;
+    let mut strict = false;
+    for &(d, s) in parts {
+        match (dir, d) {
+            (_, MonoDir::Const) => {}
+            (MonoDir::Const, _) => {
+                dir = d;
+                strict = s;
+            }
+            (a, b) if a == b => strict |= s,
+            _ => return None,
+        }
+    }
+    Some((dir, strict))
+}
+
+/// Sign of a literal constant term (`+1`/`-1`/`0`), or `None` if not a literal.
+fn literal_sign(m: &TermManager, t: TermId) -> Option<i32> {
+    match m.get(t).map(|x| &x.kind)? {
+        TermKind::IntConst(b) => Some(match b.sign() {
+            num_bigint::Sign::Plus => 1,
+            num_bigint::Sign::Minus => -1,
+            num_bigint::Sign::NoSign => 0,
+        }),
+        TermKind::RealConst(r) => Some((r.numer().signum()) as i32),
+        TermKind::Neg(a) => literal_sign(m, *a).map(|s| -s),
+        _ => None,
+    }
+}
+
+/// Does the subtree of `t` mention the variable `var`?
+fn term_mentions_var(m: &TermManager, t: TermId, var: Spur) -> bool {
+    match m.get(t).map(|x| &x.kind) {
+        Some(TermKind::Var(s)) => *s == var,
+        Some(_) => subterms(m, t).iter().any(|&c| term_mentions_var(m, c, var)),
+        None => false,
+    }
+}
+
+/// Certify the monotonicity of arithmetic expression `e` in `var` using only
+/// sound structural rules. `None` when no rule applies (caller stays
+/// conservative). `depth`-bounded against pathological nesting.
+fn monotonicity(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mono> {
+    if depth == 0 {
+        return None;
+    }
+    if !term_mentions_var(m, e, var) {
+        return Some((MonoDir::Const, false));
+    }
+    match m.get(e).map(|x| x.kind.clone())? {
+        TermKind::Var(s) => Some(if s == var {
+            (MonoDir::Inc, true)
+        } else {
+            (MonoDir::Const, false)
+        }),
+        TermKind::Neg(a) => Some(mono_flip(monotonicity(m, a, var, depth - 1)?)),
+        TermKind::Add(args) => {
+            let parts: Option<Vec<Mono>> = args
+                .iter()
+                .map(|&a| monotonicity(m, a, var, depth - 1))
+                .collect();
+            mono_sum(&parts?)
+        }
+        TermKind::Sub(a, b) => {
+            let ma = monotonicity(m, a, var, depth - 1)?;
+            let mb = mono_flip(monotonicity(m, b, var, depth - 1)?);
+            mono_sum(&[ma, mb])
+        }
+        TermKind::Mul(args) => {
+            // At most one factor may mention `var`; the rest must be literal
+            // constants whose sign product is the scaling.
+            let mut var_factor: Option<TermId> = None;
+            let mut sign = 1i32;
+            for &a in args.iter() {
+                if term_mentions_var(m, a, var) {
+                    if var_factor.is_some() {
+                        return None; // x·x and the like — not handled soundly here
+                    }
+                    var_factor = Some(a);
+                } else {
+                    sign *= literal_sign(m, a)?;
+                }
+            }
+            Some(mono_scale(sign, monotonicity(m, var_factor?, var, depth - 1)?))
+        }
+        TermKind::Div(a, b) => {
+            // `a / c` for a nonzero literal `c` = scale by sign(c).
+            if term_mentions_var(m, b, var) {
+                return None;
+            }
+            let sign = literal_sign(m, b)?;
+            if sign == 0 {
+                return None;
+            }
+            Some(mono_scale(sign, monotonicity(m, a, var, depth - 1)?))
+        }
+        _ => None,
+    }
+}
+
+/// Is `l == E[x]` and `r == E[y]` for a common one-hole context `E` whose hole
+/// is exactly the variable `x` (resp. `y`)? Commutative `Add`/`Mul` children are
+/// matched up to permutation (the `TermManager` canonicalises operand order by
+/// `TermId`, so `E[x]` and `E[y]` can list their operands differently).
+fn anti_unify_hole(m: &TermManager, l: TermId, r: TermId, x: Spur, y: Spur, depth: u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    if l == r {
+        // Identical subtree: a hole-free constant part — sound only if it does
+        // not itself mention the hole var (else it would have had to change).
+        return !term_mentions_var(m, l, x);
+    }
+    let (lk, rk) = match (m.get(l), m.get(r)) {
+        (Some(a), Some(b)) => (&a.kind, &b.kind),
+        _ => return false,
+    };
+    // The hole: `Var(x)` on the left aligns with `Var(y)` on the right.
+    if let (TermKind::Var(a), TermKind::Var(b)) = (lk, rk) {
+        return *a == x && *b == y;
+    }
+    // Same operator: an application needs the SAME function head.
+    if let (TermKind::Apply { func: f1, .. }, TermKind::Apply { func: f2, .. }) = (lk, rk) {
+        if f1 != f2 {
+            return false;
+        }
+    } else if std::mem::discriminant(lk) != std::mem::discriminant(rk) {
+        return false;
+    }
+    let lc = subterms(m, l);
+    let rc = subterms(m, r);
+    if lc.len() != rc.len() {
+        return false;
+    }
+    // Two DISTINCT leaves (`l != r`, established above) with no children — e.g.
+    // the constants `5` and `7`, or two unrelated vars — are NOT a common
+    // context: they differ but neither is the hole. (Without this, `(+ x 7)` and
+    // `(+ y 5)` would vacuously "anti-unify", certifying the INVALID
+    // `x≤y ⇒ x+7 ≤ y+5` — a spurious sat.)
+    if lc.is_empty() {
+        return false;
+    }
+    // Match children up to permutation (greedy bijection): every left child must
+    // anti-unify with a distinct right child.
+    let mut used = vec![false; rc.len()];
+    for &lci in &lc {
+        let mut matched = false;
+        for (j, &rcj) in rc.iter().enumerate() {
+            if !used[j] && anti_unify_hole(m, lci, rcj, x, y, depth - 1) {
+                used[j] = true;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recognise a VALID monotonicity implication `(x ⊴ y) ⇒ (E[x] ⊵ E[y])`: the
+/// guard orders two distinct bound vars, the consequent compares `E` at those
+/// vars, and `E` is certifiably monotone in the matching direction. Valid in
+/// every interpretation, so sound to treat the universal closure as `Sat`.
+fn is_monotone_implication(m: &TermManager, guard: TermId, conseq: TermId) -> bool {
+    // guard: `(≤ x y)` / `(< x y)` over two distinct bound vars (the order).
+    let (gx, gy, guard_strict) = match m.get(guard).map(|t| &t.kind) {
+        Some(TermKind::Le(a, b)) => (*a, *b, false),
+        Some(TermKind::Lt(a, b)) => (*a, *b, true),
+        _ => return false,
+    };
+    let (x, y) = match (m.get(gx).map(|t| &t.kind), m.get(gy).map(|t| &t.kind)) {
+        (Some(TermKind::Var(a)), Some(TermKind::Var(b))) if a != b => (*a, *b),
+        _ => return false,
+    };
+    // consequent: `(⊴ L R)` with `L = E[x]`, `R = E[y]`. Direction + strictness.
+    let (l, r, conseq_strict, need_dir) = match m.get(conseq).map(|t| &t.kind) {
+        Some(TermKind::Le(l, r)) => (*l, *r, false, MonoDir::Inc),
+        Some(TermKind::Lt(l, r)) => (*l, *r, true, MonoDir::Inc),
+        Some(TermKind::Ge(l, r)) => (*l, *r, false, MonoDir::Dec),
+        Some(TermKind::Gt(l, r)) => (*l, *r, true, MonoDir::Dec),
+        _ => return false,
+    };
+    if !anti_unify_hole(m, l, r, x, y, 64) {
+        return false;
+    }
+    let Some((dir, strict)) = monotonicity(m, l, x, 64) else {
+        return false;
+    };
+    if conseq_strict {
+        // `E[x] < E[y]` from `x ⊴ y` needs a STRICT antecedent (`x < y`, else
+        // `x = y` gives `E[x] = E[y]`) AND strictly-monotone `E` in `need_dir`.
+        guard_strict && strict && dir == need_dir
+    } else {
+        // `E[x] ≤ E[y]`: weak monotone in `need_dir`, or a constant `E`
+        // (`E[x] = E[y]`, reflexively `≤`).
+        dir == need_dir || dir == MonoDir::Const
+    }
+}
+
 /// Walk the boolean skeleton of `t` recording each uninterpreted PREDICATE
 /// symbol's polarity (`pos`/`neg`); a symbol reached in a non-monotone context
 /// (Eq/Xor/Ite/Distinct/arith comparison) or in term (argument) position is
@@ -1423,6 +1668,7 @@ impl SolverModel {
                             || self.body_is_unsat(lang, args[0], depth - 1)
                             || self.is_congruence_axiom(lang, args[0], args[1])
                             || self.is_order_transitivity(lang, args[0], args[1])
+                            || is_monotone_implication(lang.m(), args[0], args[1])
                     }
                     // `ite(c, t, e)` is valid when both branches are valid.
                     OP_ITE if args.len() == 3 => {
