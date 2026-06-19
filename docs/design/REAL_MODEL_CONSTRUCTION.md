@@ -167,11 +167,11 @@ deliberate soundness control (a near-miss that must stay `Unknown`/`Unsat`, neve
 
 ## 5. Remaining real/quantifier frontier
 
-`real_fixed_point` (§5.1) and `nested_quantifiers` (§5.2) are now handled. One
-`z3=Sat` case stays the sound `Unknown`:
-
-- **`array_sorted`** — a cross-variable triangular guard `i≤j` (not an axis-aligned
-  box), beyond the current bounded-domain machinery.
+`real_fixed_point` (§5.1), `nested_quantifiers` (§5.2), and `array_sorted` (§5.3)
+are all handled. **The z3-parity corpus completeness frontier is closed**: every
+`z3=Sat` case now agrees (corpus 166 agree / 168), the lone non-agreement being
+`forall_exists_unsat` (z3=Unsat → the sound `Unknown` clean MBQI cannot conclude),
+0 spurious.
 
 ### 5.1 Done — `real_fixed_point` (guard-aware range + Skolem fixed-point)
 
@@ -200,3 +200,16 @@ shape (fresh-skolem lower threshold on a bound var, feasible single-`f` range
 consequent with the threshold var as an `f`-arg, `f` single-quantifier) and
 certifies. An infeasible consequent makes the axiom `∀z. z<sk` — unsat — so it
 declines.
+
+### 5.3 Done — `array_sorted` (transitive cross-variable bound propagation)
+
+`∀i,j. (0≤i ∧ i≤j ∧ j<n) ⇒ a[i]≤a[j]` (n=4). The cross-variable `i≤j` pinned no
+per-variable constant bound, so `bounded_var_domains` could not form a box.
+`collect_int_bounds` now also records `var ⋈ var` relations, and
+`bounded_var_domains` propagates them transitively to a fixpoint: `i≤j` + `j≤3` ⇒
+`i≤3`, `0≤i` + `i≤j` ⇒ `j≥0`, giving the box `[0,3]²`. Every derived bound is
+IMPLIED by the guard, so the box is a SUPERSET of the guard region — the bounded
+enumeration is EXACT (out-of-region tuples are vacuous), and the #280
+logic-carrying re-solve confirms `Sat`. The unsorted control (`a[0]=5 > a[1]=3`)
+checks the box covers the `(0,1)` tuple: the engine refutes ⇒ Unsat, never
+spurious sat.
