@@ -820,6 +820,20 @@ struct CompletionFacts {
     /// `f`-application (its own `assign` entry is a poisoned default when it is
     /// merely inequality-constrained). Keyed by the pinned term's `TermId`.
     eq_pins: FxHashMap<TermId, Vec<TermId>>,
+    /// Global occurrence count of every uninterpreted `Apply` head (Pass 0).
+    /// The monotone order-extension uses it as an accounting guard: a function is
+    /// safe to model only if EVERY one of its applications is accounted for by
+    /// the axiom itself plus the handled ground bounds below.
+    global_occ: FxHashMap<u64, u32>,
+    /// Tightest numeric lower / upper bound on a ground function application,
+    /// from the WEAK shapes `(= app c)` / `(>= app c)` / `(<= app c)` only.
+    mono_lo: FxHashMap<TermId, num_rational::BigRational>,
+    mono_hi: FxHashMap<TermId, num_rational::BigRational>,
+    /// Relational `(<= app1 app2)` between two ground applications.
+    mono_rels: Vec<(TermId, TermId)>,
+    /// Count of `Apply` heads that appear inside a HANDLED ground bound/relation
+    /// above (so the accounting guard can confirm nothing else constrains `f`).
+    mono_handled_occ: FxHashMap<u64, u32>,
 }
 
 impl CompletionFacts {
@@ -832,6 +846,7 @@ impl CompletionFacts {
         for &a in assertions {
             count_syms(m, a, &mut global_occ);
         }
+        f.global_occ = global_occ.clone();
 
         // Pass 1: identify definitional axioms `∀x̄. (= (f x̄) rhs)` with `f`
         // occurring exactly once globally (so only as this defining head).
@@ -916,6 +931,18 @@ impl CompletionFacts {
                     f.definitional_quants.insert(a);
                 }
             }
+        }
+
+        // Pass 6: ground numeric bounds + relations on function applications, for
+        // the monotone order-extension recognizer. Only the WEAK shapes `(= app
+        // c)`/`(>= app c)`/`(<= app c)` (numeric `c`) and `(<= app1 app2)` are
+        // recorded; every `Apply` head they touch is tallied in `mono_handled_occ`
+        // so the recognizer can verify (via `global_occ`) that NOTHING ELSE
+        // constrains the function — a strict bound or an `f`-app in any other
+        // context is simply not tallied, so the accounting check fails and the
+        // recognizer conservatively declines.
+        for &a in assertions {
+            collect_mono_facts(m, a, &mut f);
         }
         f
     }
@@ -1422,6 +1449,300 @@ fn is_monotone_implication(m: &TermManager, guard: TermId, conseq: TermId) -> bo
     }
 }
 
+// ─────────────────── monotone order-extension (uninterpreted f) ─────────────
+//
+// A bare monotonicity axiom `∀x,y. (x⊴y) ⇒ (f(x)⊵f(y))` over an UNINTERPRETED
+// `f` is satisfiable together with the ground facts about `f` iff those facts
+// admit a MONOTONE total extension — a standard order-extension theorem. The
+// recognizer collects the ground `f`-points' numeric bounds (Pass 6) and greedily
+// checks a monotone selection exists; if so the axiom is sound to report `Sat`
+// (a model exists). It declines (→ `None`) whenever any `f`-constraint is outside
+// the handled WEAK shapes (accounting guard) — sound: an unmodeled constraint
+// could forbid the extension, so a guessed `Sat` is never emitted.
+
+/// A constant term as an exact rational, or `None` if not a literal.
+fn term_to_rational(m: &TermManager, t: TermId) -> Option<num_rational::BigRational> {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+    match m.get(t).map(|x| &x.kind)? {
+        TermKind::IntConst(b) => Some(BigRational::from_integer(b.clone())),
+        TermKind::RealConst(r) => {
+            Some(BigRational::new(BigInt::from(*r.numer()), BigInt::from(*r.denom())))
+        }
+        TermKind::Neg(a) => term_to_rational(m, *a).map(|v| -v),
+        _ => None,
+    }
+}
+
+#[inline]
+fn is_apply(m: &TermManager, t: TermId) -> bool {
+    matches!(m.get(t).map(|x| &x.kind), Some(TermKind::Apply { .. }))
+}
+
+/// Record a tightest lower / upper bound on the ground application `app`, and
+/// tally its `Apply` head into `mono_handled_occ`.
+fn mono_record_bound(
+    m: &TermManager,
+    app: TermId,
+    lo: Option<num_rational::BigRational>,
+    hi: Option<num_rational::BigRational>,
+    f: &mut CompletionFacts,
+) {
+    if let Some(TermKind::Apply { func, .. }) = m.get(app).map(|x| &x.kind) {
+        *f.mono_handled_occ.entry(spur_sym(*func)).or_insert(0) += 1;
+    }
+    if let Some(l) = lo {
+        f.mono_lo
+            .entry(app)
+            .and_modify(|e| {
+                if l > *e {
+                    *e = l.clone();
+                }
+            })
+            .or_insert(l);
+    }
+    if let Some(h) = hi {
+        f.mono_hi
+            .entry(app)
+            .and_modify(|e| {
+                if h < *e {
+                    *e = h.clone();
+                }
+            })
+            .or_insert(h);
+    }
+}
+
+/// Pass 6 worker: record ground numeric bounds / relations on `Apply`s through
+/// the top-level conjunction. Only `(= app c)`, `(>= app c)`, `(<= app c)` (with
+/// numeric `c`) and `(<= app1 app2)` are handled — every other shape is left
+/// untallied so the recognizer's accounting guard rejects the function.
+fn collect_mono_facts(m: &TermManager, t: TermId, f: &mut CompletionFacts) {
+    match m.get(t).map(|x| x.kind.clone()) {
+        Some(TermKind::And(args)) => {
+            for c in args.iter() {
+                collect_mono_facts(m, *c, f);
+            }
+        }
+        Some(TermKind::Eq(a, b)) => {
+            // `app = c` (either order) ⇒ lo = hi = c.
+            if is_apply(m, a) {
+                if let Some(v) = term_to_rational(m, b) {
+                    mono_record_bound(m, a, Some(v.clone()), Some(v), f);
+                }
+            } else if is_apply(m, b) {
+                if let Some(v) = term_to_rational(m, a) {
+                    mono_record_bound(m, b, Some(v.clone()), Some(v), f);
+                }
+            }
+        }
+        Some(TermKind::Le(a, b)) => {
+            // a ≤ b.
+            if is_apply(m, a) && is_apply(m, b) {
+                if let (Some(TermKind::Apply { func: fa, .. }), Some(TermKind::Apply { func: fb, .. })) =
+                    (m.get(a).map(|x| &x.kind), m.get(b).map(|x| &x.kind))
+                {
+                    *f.mono_handled_occ.entry(spur_sym(*fa)).or_insert(0) += 1;
+                    *f.mono_handled_occ.entry(spur_sym(*fb)).or_insert(0) += 1;
+                }
+                f.mono_rels.push((a, b));
+            } else if is_apply(m, a) {
+                if let Some(v) = term_to_rational(m, b) {
+                    mono_record_bound(m, a, None, Some(v), f); // app ≤ c
+                }
+            } else if is_apply(m, b) {
+                if let Some(v) = term_to_rational(m, a) {
+                    mono_record_bound(m, b, Some(v), None, f); // c ≤ app
+                }
+            }
+        }
+        Some(TermKind::Ge(a, b)) => {
+            // a ≥ b  ⟺  b ≤ a.
+            if is_apply(m, a) && is_apply(m, b) {
+                if let (Some(TermKind::Apply { func: fa, .. }), Some(TermKind::Apply { func: fb, .. })) =
+                    (m.get(a).map(|x| &x.kind), m.get(b).map(|x| &x.kind))
+                {
+                    *f.mono_handled_occ.entry(spur_sym(*fa)).or_insert(0) += 1;
+                    *f.mono_handled_occ.entry(spur_sym(*fb)).or_insert(0) += 1;
+                }
+                f.mono_rels.push((b, a));
+            } else if is_apply(m, a) {
+                if let Some(v) = term_to_rational(m, b) {
+                    mono_record_bound(m, a, Some(v), None, f); // app ≥ c
+                }
+            } else if is_apply(m, b) {
+                if let Some(v) = term_to_rational(m, a) {
+                    mono_record_bound(m, b, None, Some(v), f); // c ≥ app
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recognise a satisfiable bare monotonicity axiom `∀x,y. (x⊴y) ⇒ (f(x)⊵f(y))`
+/// over an uninterpreted unary `f` by checking the ground `f`-points admit a
+/// monotone extension. Returns `true` (⇒ `Sat`) only when sound.
+fn try_monotone_extension(m: &TermManager, facts: &CompletionFacts, body: TermId) -> bool {
+    use num_rational::BigRational;
+    // body = `(=> (⊴ x y) conseq)`.
+    let (guard, conseq) = match m.get(body).map(|t| &t.kind) {
+        Some(TermKind::Implies(g, c)) => (*g, *c),
+        _ => return false,
+    };
+    let (gx, gy) = match m.get(guard).map(|t| &t.kind) {
+        Some(TermKind::Le(a, b)) | Some(TermKind::Lt(a, b)) => (*a, *b),
+        _ => return false,
+    };
+    if !matches!(m.get(gx).map(|t| &t.kind), Some(TermKind::Var(_)))
+        || !matches!(m.get(gy).map(|t| &t.kind), Some(TermKind::Var(_)))
+        || gx == gy
+    {
+        return false;
+    }
+    // conseq = `(⊴ f(·) f(·))`. Extract the two applications + the comparison's
+    // increasing/decreasing sense.
+    let (cl, cr, conseq_inc) = match m.get(conseq).map(|t| &t.kind) {
+        Some(TermKind::Le(l, r)) => (*l, *r, true),
+        Some(TermKind::Ge(l, r)) => (*l, *r, false),
+        _ => return false,
+    };
+    // Both sides must be `f(var)` for the SAME uninterpreted unary `f`, one over
+    // `gx` and the other over `gy`.
+    let (fsym, increasing) = match (m.get(cl).map(|t| &t.kind), m.get(cr).map(|t| &t.kind)) {
+        (
+            Some(TermKind::Apply { func: f1, args: a1 }),
+            Some(TermKind::Apply { func: f2, args: a2 }),
+        ) if f1 == f2 && a1.len() == 1 && a2.len() == 1 => {
+            let (l_over_x, l_over_y) = (a1[0] == gx, a1[0] == gy);
+            let (r_over_x, r_over_y) = (a2[0] == gx, a2[0] == gy);
+            // `f(gx)`/`f(gy)` must appear once each across the two sides.
+            if !((l_over_x && r_over_y) || (l_over_y && r_over_x)) {
+                return false;
+            }
+            // `conseq_inc` = the consequent is `(<= cl cr)`. With the guard `gx≤gy`,
+            // `f(gx) ≤ f(gy)` (lhs over `gx`) is INCREASING; lhs over `gy` flips it.
+            let increasing = if l_over_x { conseq_inc } else { !conseq_inc };
+            (spur_sym(*f1), increasing)
+        }
+        _ => return false,
+    };
+
+    // Accounting guard: every `f`-application must be in the axiom (2) or the
+    // handled ground bounds — otherwise some unmodeled constraint exists.
+    let axiom_occ = 2u32; // f(x), f(y)
+    let handled = facts.mono_handled_occ.get(&fsym).copied().unwrap_or(0);
+    if facts.global_occ.get(&fsym).copied().unwrap_or(0) != axiom_occ + handled {
+        return false;
+    }
+    let Some(apps) = facts.ground_apps.get(&fsym) else {
+        return true; // no ground points: the empty partial function is monotone
+    };
+
+    // Build (arg → merged [lo, hi]) for the ground points; bail on a non-literal
+    // argument (cannot place it on the order).
+    let mut points: std::collections::BTreeMap<BigRational, (Option<BigRational>, Option<BigRational>)> =
+        std::collections::BTreeMap::new();
+    for &app in apps {
+        let Some(TermKind::Apply { args, .. }) = m.get(app).map(|t| &t.kind) else {
+            return false;
+        };
+        if args.len() != 1 {
+            return false;
+        }
+        let Some(arg) = term_to_rational(m, args[0]) else {
+            return false;
+        };
+        let lo = facts.mono_lo.get(&app).cloned();
+        let hi = facts.mono_hi.get(&app).cloned();
+        let entry = points.entry(arg).or_insert((None, None));
+        // Merge (intersect) bounds for the same argument (congruence).
+        if let Some(l) = lo {
+            entry.0 = Some(match &entry.0 {
+                Some(e) if *e > l => e.clone(),
+                _ => l,
+            });
+        }
+        if let Some(h) = hi {
+            entry.1 = Some(match &entry.1 {
+                Some(e) if *e < h => e.clone(),
+                _ => h,
+            });
+        }
+    }
+
+    // Relations `(<= p q)` between two `f`-apps must be IMPLIED by monotonicity
+    // (so they add nothing); a non-implied relation could forbid the extension.
+    for &(p, q) in &facts.mono_rels {
+        let (hp, hq) = (
+            m.get(p).and_then(|t| if let TermKind::Apply { func, .. } = &t.kind { Some(spur_sym(*func)) } else { None }),
+            m.get(q).and_then(|t| if let TermKind::Apply { func, .. } = &t.kind { Some(spur_sym(*func)) } else { None }),
+        );
+        if hp != Some(fsym) || hq != Some(fsym) {
+            continue;
+        }
+        let (ap, aq) = match (
+            m.get(p).map(|t| t.kind.clone()),
+            m.get(q).map(|t| t.kind.clone()),
+        ) {
+            (Some(TermKind::Apply { args: a1, .. }), Some(TermKind::Apply { args: a2, .. }))
+                if a1.len() == 1 && a2.len() == 1 =>
+            {
+                match (term_to_rational(m, a1[0]), term_to_rational(m, a2[0])) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        // `f(ap) ≤ f(aq)` implied by INC iff ap ≤ aq; by DEC iff ap ≥ aq.
+        let implied = if increasing { ap <= aq } else { ap >= aq };
+        if !implied {
+            return false;
+        }
+    }
+
+    // Greedy feasibility over the sorted points.
+    if increasing {
+        let mut prev: Option<BigRational> = None; // −∞
+        for (_arg, (lo, hi)) in points.iter() {
+            let v: Option<BigRational> = match (lo, &prev) {
+                (Some(l), Some(p)) => Some(if l > p { l.clone() } else { p.clone() }),
+                (Some(l), None) => Some(l.clone()),
+                (None, Some(p)) => Some(p.clone()),
+                (None, None) => None,
+            };
+            if let (Some(vv), Some(h)) = (&v, hi) {
+                if vv > h {
+                    return false;
+                }
+            }
+            if v.is_some() {
+                prev = v;
+            }
+        }
+    } else {
+        let mut prev: Option<BigRational> = None; // +∞
+        for (_arg, (lo, hi)) in points.iter() {
+            let v: Option<BigRational> = match (hi, &prev) {
+                (Some(h), Some(p)) => Some(if h < p { h.clone() } else { p.clone() }),
+                (Some(h), None) => Some(h.clone()),
+                (None, Some(p)) => Some(p.clone()),
+                (None, None) => None,
+            };
+            if let (Some(vv), Some(l)) = (&v, lo) {
+                if vv < l {
+                    return false;
+                }
+            }
+            if v.is_some() {
+                prev = v;
+            }
+        }
+    }
+    true
+}
+
 /// Walk the boolean skeleton of `t` recording each uninterpreted PREDICATE
 /// symbol's polarity (`pos`/`neg`); a symbol reached in a non-monotone context
 /// (Eq/Xor/Ite/Distinct/arith comparison) or in term (argument) position is
@@ -1619,6 +1940,12 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // `f`'s result ⇒ complete `f` to that constant off the (already
         // consistent) ground points.
         if self.try_function_completion(lang, body, &bound, facts) {
+            return Some(true);
+        }
+        // (5) Bare monotonicity axiom over an uninterpreted `f`: satisfiable when
+        // the ground `f`-points admit a monotone extension (order-extension
+        // theorem). Sound — declines unless every `f`-constraint is accounted for.
+        if try_monotone_extension(lang.m(), facts, body) {
             return Some(true);
         }
         None

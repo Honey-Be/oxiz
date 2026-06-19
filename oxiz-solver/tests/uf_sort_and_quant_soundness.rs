@@ -907,3 +907,58 @@ fn nonlinear_square_implication_is_not_certified_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "a non-monotone square must not be certified sat");
 }
+
+#[test]
+fn monotone_uninterpreted_with_consistent_points_is_sat() {
+    // `∀x,y. x≤y ⇒ f(x)≤f(y)` over an UNINTERPRETED f, with ground points (and an
+    // interval `30 ≤ f(5) ≤ 70`) that admit a monotone extension. The
+    // order-extension recognizer checks the points are monotone-feasible (a
+    // monotone total f exists), so the engine reports sat without a model search.
+    // (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int) (y Int)) (=> (<= x y) (<= (f x) (f y)))))",
+        "(assert (= (f 0) 0))",
+        "(assert (= (f 10) 100))",
+        "(assert (>= (f 5) 30))",
+        "(assert (<= (f 5) 70))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "a monotone-feasible partial f extends to a monotone total f");
+}
+
+#[test]
+fn monotone_violated_by_ground_points_is_unsat() {
+    // Soundness: `∀x,y. x≤y ⇒ f(x)≤f(y)` with `f(0)=5`, `f(10)=3` — 0≤10 but 5>3,
+    // so NO monotone extension exists. The recognizer must decline (the points
+    // are infeasible); the engine then instantiates the axiom at 0,10 →
+    // `f(0)≤f(10)` → `5≤3` → unsat. Never a spurious sat. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int) (y Int)) (=> (<= x y) (<= (f x) (f y)))))",
+        "(assert (= (f 0) 5))",
+        "(assert (= (f 10) 3))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "monotone-violating ground points are unsat");
+}
+
+#[test]
+fn monotone_with_unaccounted_constraint_is_not_certified_sat() {
+    // Soundness (the accounting guard): the same monotone axiom, but `f(5)` is
+    // ALSO constrained inside an arithmetic term `(* 2 (f 5)) = 60` the
+    // order-extension cannot model. The guard (every f-application must be the
+    // axiom or a handled bound) fails, so the recognizer declines → the sound
+    // Unknown, never a guessed sat from an incompletely-modeled `f`.
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int) (y Int)) (=> (<= x y) (<= (f x) (f y)))))",
+        "(assert (= (f 0) 0))",
+        "(assert (= (* 2 (f 5)) 60))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an unaccounted f-constraint must block the order-extension sat");
+}
