@@ -98,7 +98,7 @@ the single-comparison `try_function_completion` (recognizer 4) to (a) `Real`
 rationals and (b) a two-sided range. Lives in `try_range_completion`
 (recognizer 4b). *Status: implemented; `real_bounds` → `Sat`.*
 
-### 3.2 Bounded oscillation — `real_lipschitz` *(designed)*
+### 3.2 Bounded oscillation — `real_lipschitz` *(implemented)*
 
 Body `∀x,y∈G. f(x)−f(y) ≤ B ∧ f(y)−f(x) ≤ B` (`|f(x)−f(y)| ≤ B` on a guard
 region `G`). The `else` value is again a constant `δ ≡ k`: between two non-pinned
@@ -120,10 +120,11 @@ the guard interval, which for an affine `τ` is attained at an endpoint and is a
 cheap LRA evaluation. Verification: the chosen `δ` satisfies `cmp(δ, τ(r))` for
 all `r ∈ [lo, hi]` (an endpoint check for affine `τ`) and the pinned points
 satisfy the body. This is where cvc5's `--fmf-bound` "reason over the guard
-interval" idea enters. *Status: designed; needs guard extraction + endpoint
-evaluation.*
+interval" idea enters. *Status: implemented (`try_var_relative_bound`, 4d) for
+the NON-STRICT case via the reflexive identity default `f(r) := r` — guard-free
+and constant-free; strict `>`/`<` (needing the guard sup/inf) deferred.*
 
-### 3.4 `f ≡ g` identity collapse — `real_composition` *(designed)*
+### 3.4 `f ≡ g` identity collapse — `real_composition` *(implemented)*
 
 Body `∀x∈G. f(g(x)) = g(f(x))`. The default is *relational*: set `f ≡ g` (the
 same graph). Then `f(g(x)) = g(g(x)) = g(f(x))` holds definitionally. This is
@@ -131,32 +132,50 @@ sound when (a) `f` and `g` agree on every point where both are pinned
 (`f(p) = g(p)` for all shared pinned `p`), and (b) neither is otherwise
 universally constrained (the single-quantifier gate, applied to both). The model
 identifies the two functions' graphs and takes a common default. Verification is
-a pinned-points agreement scan. *Status: designed; needs a two-function variant
-of the accounting gate.*
+a pinned-points agreement scan. *Status: implemented (`try_commuting_functions`,
+4e), with the agreement scan + the accounting gate applied to BOTH functions.*
 
-### 3.5 Multi-axiom completion — `real_interp` *(designed)*
+### 3.5 Multi-axiom completion — `real_interp` *(implemented)*
 
 Three interacting universals: a definitional `g(x) = 2x+1` on a guard, a relation
-`f(x) ≤ g(x)`, and a sign bound `f(x) ≥ 0`. Handled compositionally:
-`g` is fixed by the existing definitional recognizer (recognizer 2) extended to a
-guarded affine definition; `f` is then bounded *between* `0` and the now-known
-`g`, i.e. a range completion (§3.1) whose upper bound is the *term* `g(x)`
-evaluated through `g`'s definition rather than a constant. The default for `f`
-is `δ ≡ 0` (the lower bound), which trivially satisfies `0 ≤ f ≤ g` whenever
-`g ≥ 0` on the guard — itself an LRA check on `g`'s affine form. This requires
-recognizers to *compose* (one axiom's certified model feeding another's
-verification), the natural next structural step. *Status: designed; the largest
-piece, gated on §3.1 + the guarded-definitional extension.*
+`f(x) ≤ g(x)`, and a sign bound `f(x) ≥ 0`. No single-quantifier recognizer can
+fire (`f` lives in two universals), so the firewall is relaxed CAREFULLY: a
+dedicated pass (`collect_layered_bounds`, Pass 7) classifies the group, verifies
+the canonical model `f ≡ L` (max constant lower bound), `g ≡ affine` once, and
+marks each member in `layered_ok`; `eval_forall` certifies each by membership
+(2b). The verification: `g`'s affine is unique and covers the `f≤g` region;
+`L ≤ min(affine)` over that region (compatible layers — a dipping affine such as
+`g=2x−15` is rejected); ground `g`-points equal the affine, ground `f`-points lie
+in the band and `≤ affine`; and the accounting gate confirms `f`,`g` are local to
+the group. *Status: implemented — the largest piece, the only recognizer that
+relaxes the single-quantifier gate, hence the most validation-heavy.*
 
-## 4. Implementation order
+## 4. Implementation order — DONE
 
-1. **§3.1 constant range completion** — done (`try_range_completion`, 4b).
-2. **§3.2 bounded oscillation** — small, self-contained, one more corpus case.
-3. **§3.3 guarded variable-relative** — introduces guard extraction, reused by
-   §3.5.
-4. **§3.4 identity collapse** — introduces the two-function accounting gate.
-5. **§3.5 multi-axiom** — composition of the above; the structural capstone.
+All five recognizers are implemented and corpus-validated (agree 157 → 163 across
+§3.2–§3.5, 0 spurious throughout):
 
-Each step keeps the two soundness gates of §2 and adds a regression case plus a
+1. **§3.1 constant range completion** — `try_range_completion` (4b); `real_bounds`.
+2. **§3.2 bounded oscillation** — `try_bounded_oscillation` (4c); `real_lipschitz`.
+3. **§3.3 variable-relative bound** — `try_var_relative_bound` (4d); `real_archimedean`.
+4. **§3.4 identity collapse** — `try_commuting_functions` (4e); `real_composition`.
+5. **§3.5 layered bounds** — `collect_layered_bounds` + `layered_ok` (2b); `real_interp`.
+
+Each keeps the two soundness gates of §2 and ships a regression case plus a
 deliberate soundness control (a near-miss that must stay `Unknown`/`Unsat`, never
 `Sat`), validated by the `clean_mbqi_corpus` z3-parity gate.
+
+## 5. Remaining real/quantifier frontier
+
+Three `z3=Sat` cases stay the sound `Unknown`, each needing machinery beyond this
+note's single-/multi-axiom completions:
+
+- **`real_fixed_point`** — `∀x∈[0,1]. 0≤f(x)≤1` **plus** `∃x∈[0,1]. f(x)=x`. The
+  ∀ is a guarded range completion, but the witness lives in a bounded-REAL ∃ (the
+  bounded-∃ disjunction is integer-domain only) and the skolemized witness `f(sk)`
+  is a symbolic point the accounting gate rejects. Needs real-domain ∃ handling
+  (or a ground-witness recognizer: `f(0.5)=0.5` already witnesses it).
+- **`nested_quantifiers`** — triple-nested `∀x.∃y.∀z. (z≥y ⇒ f(x,z)≥0)`. Needs
+  Skolem-function reasoning under an inner ∀.
+- **`array_sorted`** — a cross-variable triangular guard `i≤j` (not an axis-aligned
+  box), beyond the current bounded-domain machinery.
