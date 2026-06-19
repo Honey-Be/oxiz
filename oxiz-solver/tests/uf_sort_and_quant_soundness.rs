@@ -1308,3 +1308,35 @@ fn layered_bounds_infeasible_negative_affine_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "infeasible negative-affine layering must not be spurious sat");
 }
+
+#[test]
+fn real_fixed_point_skolem_witness_is_sat() {
+    // `∀x∈[0,1]. 0≤f(x)≤1` (guarded range) + `∃x∈[0,1]. f(x)=x` + f(0.5)=0.5.
+    // The ∃ skolemizes to f(sk)=sk, sk∈[0,1] — an IN-RANGE fixed-point point that
+    // the guard-aware range completion now tolerates. (z3: sat; corpus
+    // `real_fixed_point.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((x Real)) (=> (and (>= x 0.0) (<= x 1.0)) (and (>= (f x) 0.0) (<= (f x) 1.0)))))",
+        "(assert (exists ((x Real)) (and (>= x 0.0) (<= x 1.0) (= (f x) x))))",
+        "(assert (= (f 0.5) 0.5))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "bounded range + in-range fixed-point ∃ is sat");
+}
+
+#[test]
+fn skolem_fixed_point_out_of_range_is_not_spurious_sat() {
+    // Soundness control: UNGUARDED `∀x. 0≤f(x)≤1` so f maps ALL reals into [0,1],
+    // plus `∃x≥2. f(x)=x` → f(sk)=sk≥2 but f(sk)≤1 — UNSAT. The fixed-point fold
+    // [0,1]∩[2,∞)=∅ makes range completion DECLINE; the engine refutes.
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((x Real)) (and (>= (f x) 0.0) (<= (f x) 1.0))))",
+        "(assert (exists ((x Real)) (and (>= x 2.0) (= (f x) x))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an out-of-range fixed-point witness must not be spurious sat");
+}

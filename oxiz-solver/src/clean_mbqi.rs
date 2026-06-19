@@ -841,6 +841,18 @@ struct CompletionFacts {
     /// group spans MULTIPLE quantifiers, so the single-quantifier per-recognizer
     /// gate cannot see it; `eval_forall` certifies each member by membership.
     layered_ok: FxHashSet<TermId>,
+    /// Fresh-Skolem self-fixed-point applications, per function: a conjunct
+    /// `(= (f sk) sk)` where `sk` is a fresh Skolem constant (from skolemizing a
+    /// positive `∃x. … ∧ f(x)=x`, e.g. `real_fixed_point`), with `sk`'s sibling
+    /// `[lo, hi]` bounds. The range completion treats such an `f(sk)` as in-range:
+    /// `f(sk)=sk` and `sk` bounded ⇒ the value stays inside the range, so the
+    /// symbolic point does not block the constant completion (one entry per
+    /// occurrence, so the accounting count matches).
+    #[allow(clippy::type_complexity)]
+    skolem_fp: FxHashMap<
+        u64,
+        Vec<(Option<num_rational::BigRational>, Option<num_rational::BigRational>)>,
+    >,
 }
 
 impl CompletionFacts {
@@ -956,6 +968,12 @@ impl CompletionFacts {
         // several universals by an affine-defined function) and mark every member
         // quantifier whose canonical model is jointly consistent.
         collect_layered_bounds(m, assertions, &mut f);
+
+        // Pass 8 (fixed-point): collect fresh-Skolem self-fixed-points `f(sk)=sk`
+        // so the range completion can treat them as in-range symbolic points.
+        for &a in assertions {
+            collect_skolem_fixedpoints(m, a, &mut f);
+        }
         f
     }
 
@@ -2211,10 +2229,19 @@ fn try_range_completion(
         return false;
     }
     let want: FxHashSet<Spur> = bound.iter().copied().collect();
+    // Peel an optional guard (`∀x̄. guard ⇒ ⋀cmp`): out-of-guard arguments are
+    // vacuous, so the constant completion need only meet the bounds ON the guard
+    // region — and a single `k ∈ [lo,hi]` does so everywhere. The guard carries no
+    // `f`-app, so it does not perturb the accounting count below.
+    let matrix = match m.get(body).map(|t| t.kind.clone()) {
+        Some(TermKind::Implies(_, c)) => c,
+        Some(_) => body,
+        None => return false,
+    };
     // Top-level conjunction (a single atom is a one-conjunct body).
-    let conjuncts: Vec<TermId> = match m.get(body).map(|t| &t.kind) {
+    let conjuncts: Vec<TermId> = match m.get(matrix).map(|t| &t.kind) {
         Some(TermKind::And(a)) => a.to_vec(),
-        Some(_) => vec![body],
+        Some(_) => vec![matrix],
         None => return false,
     };
     if conjuncts.is_empty() {
@@ -2259,14 +2286,34 @@ fn try_range_completion(
     // unaccounted symbolic application ⇒ decline to the sound `Unknown`.
     let mut body_occ: FxHashMap<u64, u32> = FxHashMap::default();
     count_syms(m, body, &mut body_occ);
-    let accounted =
-        body_occ.get(&fsym).copied().unwrap_or(0) + facts.ground_apps.get(&fsym).map_or(0, |p| p.len() as u32);
+    // Fresh-Skolem self-fixed-points `f(sk)=sk` (sk bounded) are IN-RANGE symbolic
+    // points (the value equals the bounded `sk`), so they are accounted for here
+    // and folded into the feasible interval below — see `skolem_fp`.
+    let skfp = facts.skolem_fp.get(&fsym);
+    let skfp_occ = skfp.map_or(0, |v| v.len() as u32);
+    let accounted = body_occ.get(&fsym).copied().unwrap_or(0)
+        + facts.ground_apps.get(&fsym).map_or(0, |p| p.len() as u32)
+        + skfp_occ;
     if facts.global_occ.get(&fsym).copied().unwrap_or(0) != accounted {
         return false;
     }
-    // A nonempty interval is required: an empty one means `∀x̄. body` is itself
-    // unsatisfiable, which we must not certify as `Sat`.
-    if !interval_nonempty(&lo, &hi) {
+    // The constant default `k` must lie in `[lo, hi]` AND, for every fixed-point
+    // `f(sk)=sk` (which forces `sk = k`), inside `sk`'s bounds — so fold those into
+    // a feasible interval. A nonempty result is required: an empty `[lo, hi]` means
+    // `∀x̄. body` is itself unsatisfiable, and an empty fold means no constant can
+    // simultaneously satisfy the range and every fixed-point witness.
+    let (mut flo, mut fhi) = (lo.clone(), hi.clone());
+    if let Some(fps) = skfp {
+        for (sk_lo, sk_hi) in fps {
+            if let Some(l) = sk_lo {
+                tighten_lo(&mut flo, l.clone(), false);
+            }
+            if let Some(h) = sk_hi {
+                tighten_hi(&mut fhi, h.clone(), false);
+            }
+        }
+    }
+    if !interval_nonempty(&flo, &fhi) {
         return false;
     }
     // VERIFY the ground `f`-points (the #260 gate): each must be eq-pinned to a
@@ -2988,6 +3035,53 @@ fn group_accounted(
     }
     let ground = facts.ground_apps.get(&sym).map_or(0, |p| p.len() as u32);
     facts.global_occ.get(&sym).copied().unwrap_or(0) == body_total + ground
+}
+
+/// `(f, sk_var_term)` if `c` is `(= (f sk) sk)` with `sk` a FRESH Skolem
+/// constant (name `sk!…`) and `f` uninterpreted — the self-fixed-point a
+/// skolemized `∃x. … ∧ f(x)=x` leaves behind.
+fn skolem_self_eq(m: &TermManager, c: TermId) -> Option<(u64, TermId)> {
+    let TermKind::Eq(o1, o2) = m.get(c)?.kind.clone() else {
+        return None;
+    };
+    for (app_side, var_side) in [(o1, o2), (o2, o1)] {
+        let TermKind::Apply { func, args } = m.get(app_side)?.kind.clone() else {
+            continue;
+        };
+        let fsym = spur_sym(func);
+        if fsym & OP != 0 || args.len() != 1 || args[0] != var_side {
+            continue; // not `f(t)` self-equated to its own argument `t`
+        }
+        if let Some(TermKind::Var(s)) = m.get(var_side).map(|t| &t.kind) {
+            if m.resolve_str(*s).starts_with("sk!") {
+                return Some((fsym, var_side));
+            }
+        }
+    }
+    None
+}
+
+/// Pass 8: collect fresh-Skolem self-fixed-points `(= (f sk) sk)` reached through
+/// top-level conjunctions, recording each with `sk`'s sibling `[lo, hi]` bounds.
+fn collect_skolem_fixedpoints(m: &TermManager, t: TermId, facts: &mut CompletionFacts) {
+    let TermKind::And(parts) = (match m.get(t) {
+        Some(x) => x.kind.clone(),
+        None => return,
+    }) else {
+        return;
+    };
+    for &c in parts.iter() {
+        if let Some((fsym, sk_var)) = skolem_self_eq(m, c) {
+            // `sk`'s bounds come from the sibling conjuncts of this same `and`.
+            let Some(TermKind::Var(s)) = m.get(sk_var).map(|t| &t.kind).cloned() else {
+                continue;
+            };
+            let (mut lo, mut hi) = (None, None);
+            guard_bounds(m, t, s, 32, &mut lo, &mut hi);
+            facts.skolem_fp.entry(fsym).or_default().push((lo, hi));
+        }
+        collect_skolem_fixedpoints(m, c, facts); // nested conjunctions
+    }
 }
 
 // ─────────────────────────── array axiom recognizers ───────────────────────
