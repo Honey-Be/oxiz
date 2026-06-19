@@ -1375,3 +1375,45 @@ fn nested_threshold_infeasible_consequent_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "an infeasible threshold consequent must not be spurious sat");
 }
+
+#[test]
+fn array_sorted_triangular_guard_is_sat() {
+    // `∀i,j. (0≤i ∧ i≤j ∧ j<n) ⇒ a[i]≤a[j]` (cross-variable triangular guard),
+    // n=4, sorted ground values. Transitive bound propagation (i≤j<4⇒i≤3,
+    // 0≤i≤j⇒j≥0) yields the covering box [0,3]²; the guard filters the upper
+    // triangle. (z3: sat; corpus `array_sorted.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic AUFLIA)",
+        "(declare-const a (Array Int Int))",
+        "(declare-const n Int)",
+        "(assert (= n 4))",
+        "(assert (forall ((i Int) (j Int))
+           (=> (and (>= i 0) (<= i j) (< j n)) (<= (select a i) (select a j)))))",
+        "(assert (= (select a 0) 1))",
+        "(assert (= (select a 1) 3))",
+        "(assert (= (select a 2) 5))",
+        "(assert (= (select a 3) 7))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "sorted array with a triangular guard is sat");
+}
+
+#[test]
+fn array_unsorted_triangular_guard_is_not_spurious_sat() {
+    // Soundness control: the SAME triangular sortedness axiom but a[0]=5 > a[1]=3.
+    // The covering box [0,3]² MUST include the (i,j)=(0,1) tuple (guard true), so
+    // the engine instantiates `a[0]≤a[1]` → 5≤3 → UNSAT. Never spurious sat — a
+    // proof the derived box covers the guard region.
+    let r = solve_streamed(&[
+        "(set-logic AUFLIA)",
+        "(declare-const a (Array Int Int))",
+        "(declare-const n Int)",
+        "(assert (= n 4))",
+        "(assert (forall ((i Int) (j Int))
+           (=> (and (>= i 0) (<= i j) (< j n)) (<= (select a i) (select a j)))))",
+        "(assert (= (select a 0) 5))",
+        "(assert (= (select a 1) 3))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an unsorted array under the sortedness axiom must not be spurious sat");
+}

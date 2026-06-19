@@ -607,10 +607,73 @@ impl<'a> TermLang for OxizHost<'a> {
             let consts = self.int_consts.clone();
             self.tm.substitute(guard, &consts)
         };
-        // Tightest concrete (lower, upper) integer bound per bound var.
+        // Tightest concrete (lower, upper) integer bound per bound var, plus the
+        // CROSS-variable relations (`i ≤ j` etc.) that pin no constant directly.
         let mut lo: FxHashMap<Spur, i128> = FxHashMap::default();
         let mut hi: FxHashMap<Spur, i128> = FxHashMap::default();
-        collect_int_bounds(self.m(), guard, &bound, &mut lo, &mut hi);
+        let mut rels: Vec<(Spur, Spur, Cmp)> = Vec::new();
+        collect_int_bounds(self.m(), guard, &bound, &mut lo, &mut hi, &mut rels);
+        // Transitively propagate cross-variable relations to a fixpoint so a
+        // TRIANGULAR guard `0≤i≤j<n` yields a covering box: `i≤j` + `j≤n-1` ⇒
+        // `i≤n-1`, and `0≤i` + `i≤j` ⇒ `0≤j`. Each derived bound is IMPLIED by the
+        // guard, so the box is a SUPERSET of the guard region — every tuple where
+        // the guard could hold is enumerated, the rest are vacuous (guard false).
+        // The relation graph is finite; `|rels|+1` passes reach the fixpoint.
+        if !rels.is_empty() {
+            for _ in 0..=rels.len() {
+                let mut changed = false;
+                for &(x, y, cmp) in &rels {
+                    // Normalize each relation to the two directed `≤`-style bounds
+                    // `x ≤ y + δ_hi` (tightens `hi[x]` from `hi[y]`) and
+                    // `y ≥ x + δ_lo` (tightens `lo[y]` from `lo[x]`).
+                    let (xy_hi, yx_lo) = match cmp {
+                        Cmp::Le => (Some(0), Some(0)),  // x ≤ y
+                        Cmp::Lt => (Some(-1), Some(1)), // x < y  ⇒ x ≤ y-1, y ≥ x+1
+                        Cmp::Ge => (None, None),        // x ≥ y handled by the (y,x) view below
+                        Cmp::Gt => (None, None),
+                        Cmp::Eq => (Some(0), Some(0)),
+                    };
+                    // Also fold the reverse direction so `≥`/`>`/`=` propagate.
+                    let (yx_hi, xy_lo) = match cmp {
+                        Cmp::Ge => (Some(0), Some(0)),  // x ≥ y ⇒ y ≤ x, x ≥ y
+                        Cmp::Gt => (Some(-1), Some(1)),
+                        Cmp::Eq => (Some(0), Some(0)),
+                        _ => (None, None),
+                    };
+                    // x ≤ y + δ : hi[x] ≤ hi[y] + δ
+                    if let (Some(d), Some(&hy)) = (xy_hi, hi.get(&y)) {
+                        if hi.get(&x).is_none_or(|&h| hy + d < h) {
+                            hi.insert(x, hy + d);
+                            changed = true;
+                        }
+                    }
+                    // y ≥ x + δ : lo[y] ≥ lo[x] + δ
+                    if let (Some(d), Some(&lx)) = (yx_lo, lo.get(&x)) {
+                        if lo.get(&y).is_none_or(|&l| lx + d > l) {
+                            lo.insert(y, lx + d);
+                            changed = true;
+                        }
+                    }
+                    // Reverse: y ≤ x + δ : hi[y] ≤ hi[x] + δ
+                    if let (Some(d), Some(&hx)) = (yx_hi, hi.get(&x)) {
+                        if hi.get(&y).is_none_or(|&h| hx + d < h) {
+                            hi.insert(y, hx + d);
+                            changed = true;
+                        }
+                    }
+                    // Reverse: x ≥ y + δ : lo[x] ≥ lo[y] + δ
+                    if let (Some(d), Some(&ly)) = (xy_lo, lo.get(&y)) {
+                        if lo.get(&x).is_none_or(|&l| ly + d > l) {
+                            lo.insert(x, ly + d);
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
         // Finite literal domain for each fully + tightly bounded var; a huge or
         // half-open range falls back to `None` (enumerate over the ground index).
         const MAX_RANGE: i128 = 1024;
@@ -627,6 +690,7 @@ impl<'a> TermLang for OxizHost<'a> {
 }
 
 /// One comparison's contribution to a bound variable's integer range.
+#[derive(Clone, Copy)]
 enum Cmp {
     Ge,
     Le,
@@ -667,12 +731,13 @@ fn collect_int_bounds(
     bound: &[Spur],
     lo: &mut FxHashMap<Spur, i128>,
     hi: &mut FxHashMap<Spur, i128>,
+    rels: &mut Vec<(Spur, Spur, Cmp)>,
 ) {
     let Some(term) = m.get(t) else { return };
     let (a, b, cmp) = match &term.kind {
         TermKind::And(args) => {
             for &c in args.iter() {
-                collect_int_bounds(m, c, bound, lo, hi);
+                collect_int_bounds(m, c, bound, lo, hi, rels);
             }
             return;
         }
@@ -709,6 +774,14 @@ fn collect_int_bounds(
                 update_hi(hi, x, k);
             }
         }
+        return;
+    }
+    // `var ⋈ var` — a CROSS-variable relation (e.g. the `i ≤ j` of a triangular
+    // `0≤i≤j<n` guard). It pins no constant bound directly, but combined with the
+    // others it does transitively (`i≤j<4 ⇒ i≤3`); recorded for the fixpoint in
+    // [`OxizHost::bounded_var_domains`].
+    if let (Some(x), Some(y)) = (as_bound_var(m, a, bound), as_bound_var(m, b, bound)) {
+        rels.push((x, y, cmp));
     }
 }
 
