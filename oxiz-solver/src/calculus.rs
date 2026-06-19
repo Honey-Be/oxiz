@@ -57,6 +57,26 @@ pub enum Expr {
     Cos(Box<Expr>),
     /// `tan g` (`d tan g = (1 + tan² g) · g'`).
     Tan(Box<Expr>),
+    /// `sinh g` (`d = cosh g · g'`); odd, strictly increasing.
+    Sinh(Box<Expr>),
+    /// `cosh g` (`d = sinh g · g'`); even, `≥ 1`.
+    Cosh(Box<Expr>),
+    /// `tanh g` (`d = g' / cosh² g`); odd, strictly increasing, bounded `(−1,1)`.
+    Tanh(Box<Expr>),
+    /// `atan g` (`d = g' / (1 + g²)`); odd, strictly increasing, bounded.
+    Atan(Box<Expr>),
+    /// `|g|`; even, `≥ 0`. NON-differentiable at `g = 0` ⇒ `diff` is `Undefined`.
+    Abs(Box<Expr>),
+    /// `⌊g⌋`; NON-differentiable, but weakly increasing.
+    Floor(Box<Expr>),
+    /// `⌈g⌉`; NON-differentiable, but weakly increasing.
+    Ceil(Box<Expr>),
+    /// `round(g)`; NON-differentiable, but weakly increasing.
+    Round(Box<Expr>),
+    /// The derivative of a non-differentiable node — its sign is `Unknown`, so
+    /// the first-derivative test never certifies a monotonicity through it (those
+    /// functions carry a DECLARED monotonicity instead).
+    Undefined,
 }
 
 use Expr::*;
@@ -226,6 +246,20 @@ pub fn diff(e: &Expr) -> Expr {
             let sec2 = Add(vec![Expr::c(1), Pow(Box::new(Tan(g.clone())), rat(2))]);
             Mul(vec![sec2, diff(g)])
         }
+        Sinh(g) => Mul(vec![Cosh(g.clone()), diff(g)]),
+        Cosh(g) => Mul(vec![Sinh(g.clone()), diff(g)]),
+        Tanh(g) => {
+            // d(tanh g) = g' / cosh² g = g' · (cosh g)^{-2}  (> 0).
+            Mul(vec![diff(g), Pow(Box::new(Cosh(g.clone())), rat(-2))])
+        }
+        Atan(g) => {
+            // d(atan g) = g' / (1 + g²) = g' · (1 + g²)^{-1}  (> 0).
+            let one_plus_sq = Add(vec![Expr::c(1), Pow(g.clone(), rat(2))]);
+            Mul(vec![diff(g), Pow(Box::new(one_plus_sq), -BigRational::one())])
+        }
+        // Non-differentiable nodes: their monotonicity is DECLARED in the KB, not
+        // derived; their formal derivative is `Undefined` (sign `Unknown`).
+        Abs(_) | Floor(_) | Ceil(_) | Round(_) | Undefined => Undefined,
     }
 }
 
@@ -277,6 +311,14 @@ impl Expr {
             },
             // Oscillating — sign is not constant over any nondegenerate interval.
             Sin(_) | Cos(_) | Tan(_) => Sign::Unknown,
+            // `cosh ≥ 1 > 0` always.
+            Cosh(_) => Sign::Pos,
+            // Odd, strictly-increasing-through-0 ⇒ same sign as the argument.
+            Sinh(g) | Tanh(g) | Atan(g) => g.sign_on(dom),
+            // `|g| ≥ 0`.
+            Abs(_) => Sign::NonNeg,
+            // Step functions / the undefined derivative: no constant sign known.
+            Floor(_) | Ceil(_) | Round(_) | Undefined => Sign::Unknown,
         }
     }
 
@@ -302,65 +344,70 @@ pub enum MonoDir {
 
 /// A primitive (level-0) function in the KB: its symbol, its body as an `Expr`
 /// of `x`, its domain, and the monotonicity the level-1 derivation must confirm.
+/// `differentiable = false` marks a function (step/abs) whose monotonicity is
+/// AXIOMATIC — the first-derivative test does not apply, so `expected` is taken
+/// on faith rather than verified.
 pub struct Primitive {
     pub name: &'static str,
     pub body: Expr,
     pub domain: Domain,
     pub expected: Option<MonoDir>,
+    pub differentiable: bool,
 }
 
 /// The level-0 catalogue: the primitive functions whose derivative-sign test the
 /// engine runs first to self-verify the KB.
 pub fn level0_primitives() -> Vec<Primitive> {
+    let diff_prim = |name, body, domain, expected| Primitive {
+        name,
+        body,
+        domain,
+        expected: Some(expected),
+        differentiable: true,
+    };
+    let axiom_prim = |name, body, domain, expected| Primitive {
+        name,
+        body,
+        domain,
+        expected: Some(expected),
+        differentiable: false,
+    };
     vec![
-        Primitive { name: "id", body: X, domain: Domain::all(), expected: Some(MonoDir::Inc) },
-        Primitive {
-            name: "neg",
-            body: Neg(Box::new(X)),
-            domain: Domain::all(),
-            expected: Some(MonoDir::Dec),
-        },
-        Primitive {
-            name: "affine_2x+1",
-            body: Add(vec![Expr::mul(Expr::c(2), X), Expr::c(1)]),
-            domain: Domain::all(),
-            expected: Some(MonoDir::Inc),
-        },
-        Primitive {
-            // x² is increasing on x ≥ 0 (the derivative 2x ≥ 0 there).
-            name: "x^2_on_nonneg",
-            body: Pow(Box::new(X), rat(2)),
-            domain: Domain::non_negative(),
-            expected: Some(MonoDir::Inc),
-        },
-        Primitive {
-            // x² is decreasing on x ≤ 0.
-            name: "x^2_on_nonpos",
-            body: Pow(Box::new(X), rat(2)),
-            domain: Domain::non_positive(),
-            expected: Some(MonoDir::Dec),
-        },
-        Primitive {
-            // a^x for a = 2 (>1) is strictly increasing: d = 2^x·ln2 > 0.
-            name: "exp_base2",
-            body: ExpBase(rat(2), Box::new(X)),
-            domain: Domain::all(),
-            expected: Some(MonoDir::Inc),
-        },
-        Primitive {
-            // (1/2)^x is decreasing: d = (1/2)^x·ln(1/2) < 0.
-            name: "exp_base_half",
-            body: ExpBase(BigRational::new(BigInt::one(), BigInt::from(2)), Box::new(X)),
-            domain: Domain::all(),
-            expected: Some(MonoDir::Dec),
-        },
-        Primitive {
-            // ln x is increasing on its domain x > 0: d = 1/x > 0.
-            name: "ln_on_positive",
-            body: Ln(Box::new(X)),
-            domain: Domain::positive(),
-            expected: Some(MonoDir::Inc),
-        },
+        diff_prim("id", X, Domain::all(), MonoDir::Inc),
+        diff_prim("neg", Neg(Box::new(X)), Domain::all(), MonoDir::Dec),
+        diff_prim(
+            "affine_2x+1",
+            Add(vec![Expr::mul(Expr::c(2), X), Expr::c(1)]),
+            Domain::all(),
+            MonoDir::Inc,
+        ),
+        // x² is increasing on x ≥ 0 (derivative 2x ≥ 0), decreasing on x ≤ 0.
+        diff_prim("x^2_on_nonneg", Pow(Box::new(X), rat(2)), Domain::non_negative(), MonoDir::Inc),
+        diff_prim("x^2_on_nonpos", Pow(Box::new(X), rat(2)), Domain::non_positive(), MonoDir::Dec),
+        // a^x: base > 1 strictly increasing (d = a^x·ln a > 0); base < 1 decreasing.
+        diff_prim("exp_base2", ExpBase(rat(2), Box::new(X)), Domain::all(), MonoDir::Inc),
+        diff_prim(
+            "exp_base_half",
+            ExpBase(BigRational::new(BigInt::one(), BigInt::from(2)), Box::new(X)),
+            Domain::all(),
+            MonoDir::Dec,
+        ),
+        // ln x increasing on its domain x > 0 (d = 1/x > 0).
+        diff_prim("ln_on_positive", Ln(Box::new(X)), Domain::positive(), MonoDir::Inc),
+        // Hyperbolics + arctan (all derivative-verified).
+        diff_prim("sinh", Sinh(Box::new(X)), Domain::all(), MonoDir::Inc),
+        diff_prim("cosh_on_nonneg", Cosh(Box::new(X)), Domain::non_negative(), MonoDir::Inc),
+        diff_prim("cosh_on_nonpos", Cosh(Box::new(X)), Domain::non_positive(), MonoDir::Dec),
+        diff_prim("tanh", Tanh(Box::new(X)), Domain::all(), MonoDir::Inc),
+        diff_prim("atan", Atan(Box::new(X)), Domain::all(), MonoDir::Inc),
+        // Non-differentiable, AXIOMATICALLY monotone (the derivative test cannot
+        // verify these — abs is non-smooth at 0, the step functions are
+        // discontinuous — so their monotonicity is declared, not derived).
+        axiom_prim("abs_on_nonneg", Abs(Box::new(X)), Domain::non_negative(), MonoDir::Inc),
+        axiom_prim("abs_on_nonpos", Abs(Box::new(X)), Domain::non_positive(), MonoDir::Dec),
+        axiom_prim("floor", Floor(Box::new(X)), Domain::all(), MonoDir::Inc),
+        axiom_prim("ceil", Ceil(Box::new(X)), Domain::all(), MonoDir::Inc),
+        axiom_prim("round", Round(Box::new(X)), Domain::all(), MonoDir::Inc),
     ]
 }
 
@@ -390,19 +437,25 @@ impl Kb {
             }
         }
         kb.levels.push(l0);
-        // Level 1: derive monotonicity by the first-derivative test, count
-        // disagreements with the declared expectation.
+        // Level 1: derive monotonicity by the first-derivative test for the
+        // DIFFERENTIABLE primitives, counting disagreements with the declared
+        // expectation. Non-differentiable primitives (step/abs) carry their
+        // axiomatic declaration forward unverified.
         let mut l1 = HashMap::new();
         let mut mismatches = 0usize;
         for p in &prims {
-            let derived = p.body.monotonicity(&p.domain);
-            if let (Some(exp), Some(got)) = (p.expected, derived) {
-                if exp != got {
-                    mismatches += 1;
+            if p.differentiable {
+                let derived = p.body.monotonicity(&p.domain);
+                if let (Some(exp), Some(got)) = (p.expected, derived) {
+                    if exp != got {
+                        mismatches += 1;
+                    }
                 }
-            }
-            if let Some(got) = derived {
-                l1.insert(p.name.to_string(), got);
+                if let Some(got) = derived {
+                    l1.insert(p.name.to_string(), got);
+                }
+            } else if let Some(d) = p.expected {
+                l1.insert(p.name.to_string(), d);
             }
         }
         kb.levels.push(l1);
@@ -442,14 +495,21 @@ mod tests {
     }
 
     #[test]
-    fn derivative_sign_test_matches_each_primitive() {
+    fn derivative_sign_test_matches_each_differentiable_primitive() {
         for p in level0_primitives() {
             let got = p.body.monotonicity(&p.domain);
-            assert_eq!(
-                got, p.expected,
-                "first-derivative test disagreed for `{}`: got {:?}, expected {:?}",
-                p.name, got, p.expected
-            );
+            if p.differentiable {
+                assert_eq!(
+                    got, p.expected,
+                    "first-derivative test disagreed for `{}`: got {:?}, expected {:?}",
+                    p.name, got, p.expected
+                );
+            } else {
+                // Non-differentiable: the derivative test cannot certify it (the
+                // formal derivative is `Undefined`), so it must yield `None` — the
+                // monotonicity is the axiomatic declaration, never a wrong guess.
+                assert_eq!(got, None, "non-differentiable `{}` must not be certified by the derivative test", p.name);
+            }
         }
     }
 
@@ -476,6 +536,31 @@ mod tests {
         // sin/cos have no constant-sign derivative over an unrestricted domain.
         assert_eq!(Sin(Box::new(X)).monotonicity(&Domain::all()), None);
         assert_eq!(Cos(Box::new(X)).monotonicity(&Domain::all()), None);
+    }
+
+    #[test]
+    fn hyperbolics_and_atan_certified_by_derivative() {
+        assert_eq!(Sinh(Box::new(X)).monotonicity(&Domain::all()), Some(MonoDir::Inc));
+        assert_eq!(Tanh(Box::new(X)).monotonicity(&Domain::all()), Some(MonoDir::Inc));
+        assert_eq!(Atan(Box::new(X)).monotonicity(&Domain::all()), Some(MonoDir::Inc));
+        // cosh: even, derivative sinh flips sign at 0.
+        assert_eq!(Cosh(Box::new(X)).monotonicity(&Domain::non_negative()), Some(MonoDir::Inc));
+        assert_eq!(Cosh(Box::new(X)).monotonicity(&Domain::non_positive()), Some(MonoDir::Dec));
+        assert_eq!(Cosh(Box::new(X)).monotonicity(&Domain::all()), None);
+    }
+
+    #[test]
+    fn nondifferentiable_monotone_facts_are_in_the_kb() {
+        // floor/ceil/round/abs cannot be derivative-certified but are declared
+        // monotone — they reach the KB as axiomatic facts.
+        let (kb, _) = Kb::build_and_verify();
+        assert_eq!(kb.monotonicity_of("floor"), Some(MonoDir::Inc));
+        assert_eq!(kb.monotonicity_of("ceil"), Some(MonoDir::Inc));
+        assert_eq!(kb.monotonicity_of("round"), Some(MonoDir::Inc));
+        assert_eq!(kb.monotonicity_of("abs_on_nonneg"), Some(MonoDir::Inc));
+        assert_eq!(kb.monotonicity_of("abs_on_nonpos"), Some(MonoDir::Dec));
+        // …and the derivative test refuses to certify a step function directly.
+        assert_eq!(Floor(Box::new(X)).monotonicity(&Domain::all()), None);
     }
 
     #[test]
