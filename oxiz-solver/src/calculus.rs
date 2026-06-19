@@ -325,12 +325,33 @@ impl Expr {
     /// Monotonicity of this expression on `dom`, by the first-derivative sign
     /// test. `Some(Inc/Dec/Const)` is sound; `None` = the test is inconclusive.
     pub fn monotonicity(&self, dom: &Domain) -> Option<MonoDir> {
+        self.monotonicity_strict(dom).map(|(d, _)| d)
+    }
+
+    /// As [`Self::monotonicity`], but also reporting STRICTNESS: a strictly
+    /// positive derivative (`f' > 0`) gives STRICT increase (`strict = true`);
+    /// a merely non-negative derivative (`f' ≥ 0`, e.g. `f' = 0` at a point)
+    /// gives weak increase. Strict monotonicity ⇒ injective ⇒ invertible.
+    pub fn monotonicity_strict(&self, dom: &Domain) -> Option<(MonoDir, bool)> {
         match diff(self).sign_on(dom) {
-            Sign::Pos | Sign::NonNeg => Some(MonoDir::Inc),
-            Sign::Neg | Sign::NonPos => Some(MonoDir::Dec),
-            Sign::Zero => Some(MonoDir::Const),
+            Sign::Pos => Some((MonoDir::Inc, true)),
+            Sign::NonNeg => Some((MonoDir::Inc, false)),
+            Sign::Neg => Some((MonoDir::Dec, true)),
+            Sign::NonPos => Some((MonoDir::Dec, false)),
+            Sign::Zero => Some((MonoDir::Const, false)),
             Sign::Unknown => None,
         }
+    }
+}
+
+/// The inverse of a STRICTLY monotone function exists (it is injective) and has
+/// the same direction and strictness; a weakly-monotone (or constant) function
+/// is not necessarily injective, so it has no inverse. `None` = no inverse.
+pub fn inverse_dir(dir: MonoDir, strict: bool) -> Option<(MonoDir, bool)> {
+    if strict && dir != MonoDir::Const {
+        Some((dir, true))
+    } else {
+        None
     }
 }
 
@@ -385,7 +406,79 @@ impl Parity {
     }
 }
 
+/// Function periodicity — the third lattice attribute. The trig periods are
+/// rational multiples of `π` (which is irrational, so it is kept symbolic);
+/// `Constant` is periodic with EVERY period, `Aperiodic` with none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Period {
+    /// Period `k · π`.
+    Pi(BigRational),
+    /// A rational period.
+    Rat(BigRational),
+    /// A constant function — periodic with every period.
+    Constant,
+    /// Not (non-trivially) periodic.
+    Aperiodic,
+}
+
+impl Period {
+    /// Combine two periods that must AGREE (sum/product of periodic functions):
+    /// `Constant` is the identity; equal periods survive; otherwise the result
+    /// is conservatively `Aperiodic` (a common period may exist but we do not
+    /// compute the lcm).
+    fn combine(&self, o: &Period) -> Period {
+        match (self, o) {
+            (Period::Constant, x) | (x, Period::Constant) => x.clone(),
+            (Period::Aperiodic, _) | (_, Period::Aperiodic) => Period::Aperiodic,
+            (a, b) if a == b => a.clone(),
+            _ => Period::Aperiodic,
+        }
+    }
+    fn is_periodic(&self) -> bool {
+        !matches!(self, Period::Aperiodic)
+    }
+}
+
 impl Expr {
+    /// The periodicity of this expression. Conservative — `Aperiodic` is sound.
+    /// Differentiation PRESERVES the period (the user's KB rule), which the
+    /// engine self-verifies.
+    pub fn period(&self) -> Period {
+        match self {
+            Const(_) => Period::Constant,
+            // Fundamental trig periods (over the bare variable): `sin`/`cos` are
+            // `2π`-periodic, `tan` is `π`-periodic.
+            Sin(g) | Cos(g) if **g == X => Period::Pi(rat(2)),
+            Tan(g) if **g == X => Period::Pi(rat(1)),
+            // A trig of a PERIODIC inner is periodic with the inner's period
+            // (`f(g(x+p)) = f(g(x))`); of an aperiodic inner, conservatively not.
+            Sin(g) | Cos(g) | Tan(g) => {
+                let pg = g.period();
+                if pg.is_periodic() {
+                    pg
+                } else {
+                    Period::Aperiodic
+                }
+            }
+            Neg(a) => a.period(),
+            Add(xs) => xs.iter().fold(Period::Constant, |acc, x| acc.combine(&x.period())),
+            Mul(xs) => xs.iter().fold(Period::Constant, |acc, x| acc.combine(&x.period())),
+            Pow(b, _) => {
+                // A power of a periodic function keeps that period (`tan² x` is
+                // still `π`-periodic); of a constant, constant.
+                let pb = b.period();
+                if pb.is_periodic() {
+                    pb
+                } else {
+                    Period::Aperiodic
+                }
+            }
+            // Everything else (`x`, `exp`, `ln`, hyperbolics, atan, step/abs) is
+            // not periodic.
+            _ => Period::Aperiodic,
+        }
+    }
+
     /// The parity of this expression (as a function over a symmetric domain).
     /// Conservative — `Neither` is always sound.
     pub fn parity(&self) -> Parity {
@@ -682,6 +775,39 @@ mod tests {
         // sin/cos have no constant-sign derivative over an unrestricted domain.
         assert_eq!(Sin(Box::new(X)).monotonicity(&Domain::all()), None);
         assert_eq!(Cos(Box::new(X)).monotonicity(&Domain::all()), None);
+    }
+
+    #[test]
+    fn strictness_and_inverse() {
+        // 2x+1: derivative is the constant 2 > 0 ⇒ STRICTLY increasing ⇒ invertible.
+        let affine = Add(vec![Expr::mul(Expr::c(2), X), Expr::c(1)]);
+        assert_eq!(affine.monotonicity_strict(&Domain::all()), Some((MonoDir::Inc, true)));
+        assert_eq!(inverse_dir(MonoDir::Inc, true), Some((MonoDir::Inc, true)));
+        // A weak / constant monotone is NOT invertible.
+        assert_eq!(inverse_dir(MonoDir::Inc, false), None);
+        assert_eq!(inverse_dir(MonoDir::Const, true), None);
+        // tanh: derivative 1/cosh² is strictly positive (cosh² > 0) ⇒ STRICTLY
+        // increasing ⇒ invertible (its inverse `artanh` exists).
+        assert_eq!(Tanh(Box::new(X)).monotonicity_strict(&Domain::all()), Some((MonoDir::Inc, true)));
+        assert_eq!(inverse_dir(MonoDir::Inc, true), Some((MonoDir::Inc, true)));
+        // x² on x ≥ 0: derivative 2x is ≥ 0 (=0 at the endpoint) ⇒ WEAK ⇒ the
+        // strictness-gated inverse rule declines.
+        let sq = Pow(Box::new(X), rat(2));
+        assert_eq!(sq.monotonicity_strict(&Domain::non_negative()), Some((MonoDir::Inc, false)));
+    }
+
+    #[test]
+    fn periodicity_and_its_preservation_under_diff() {
+        assert_eq!(Sin(Box::new(X)).period(), Period::Pi(rat(2)));
+        assert_eq!(Cos(Box::new(X)).period(), Period::Pi(rat(2)));
+        assert_eq!(Tan(Box::new(X)).period(), Period::Pi(rat(1)));
+        assert_eq!(X.period(), Period::Aperiodic);
+        assert_eq!(ExpBase(rat(2), Box::new(X)).period(), Period::Aperiodic);
+        // The user's KB rule: differentiation PRESERVES the period.
+        for body in [Sin(Box::new(X)), Cos(Box::new(X)), Tan(Box::new(X))] {
+            let p = body.period();
+            assert_eq!(diff(&body).period(), p, "d/dx must preserve the period of {body:?}");
+        }
     }
 
     #[test]
