@@ -1195,3 +1195,36 @@ fn bounded_oscillation_violated_spread_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "an oscillation-violating pinned pair must not be spurious sat");
 }
+
+#[test]
+fn archimedean_var_relative_bound_is_sat() {
+    // `∀r∈[0,10]. ceil(r) ≥ r` with ceil(3.7)=4, ceil(0)=0. The identity default
+    // ceil(r):=r satisfies r≥r; pinned points verified (4≥3.7, 0≥0). (z3: sat;
+    // corpus `real_archimedean.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun ceil (Real) Real)",
+        "(assert (forall ((r Real))
+           (=> (and (>= r 0.0) (<= r 10.0)) (>= (ceil r) r))))",
+        "(assert (= (ceil 3.7) 4.0))",
+        "(assert (= (ceil 0.0) 0.0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "∀r∈[0,10].ceil(r)≥r with consistent pins is sat");
+}
+
+#[test]
+fn var_relative_bound_violated_pin_is_not_spurious_sat() {
+    // Soundness control: `∀r∈[0,10]. f(r) ≥ r` but f(5)=3 — at r=5, 3≥5 is false,
+    // UNSAT. The recognizer verifies the pin (3≥5 fails) and DECLINES; the engine
+    // instantiates at 5 and refutes. Never spurious sat.
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((r Real))
+           (=> (and (>= r 0.0) (<= r 10.0)) (>= (f r) r))))",
+        "(assert (= (f 5.0) 3.0))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "a pin below the identity bound must not be spurious sat");
+}

@@ -2409,6 +2409,94 @@ fn try_bounded_oscillation(
     }
 }
 
+// ────────────────── variable-relative bound recognizer (§3.3) ───────────────
+//
+// A bound that compares `f` to the VARIABLE itself: `∀r[∈G]. f(r) ⋛ r` (e.g. the
+// Archimedean `ceil(r) ≥ r`). A constant default cannot dominate an unbounded
+// `r`, but for the NON-STRICT relations the IDENTITY default `f(r) := r` makes
+// the body reflexively true (`r ≥ r` / `r ≤ r`) everywhere — so the guard is
+// irrelevant and no constant is needed. The pinned points keep their values and
+// are verified against the relation directly. (Strict `>`/`<` would need the
+// guard's sup/inf as the default; deferred until a case needs it.)
+
+/// **M3 recognizer — variable-relative bound** (§3.3). Body `∀r. [guard ⇒]
+/// (f(r) rel r)` with `rel ∈ {≥, ≤}` and the non-`f` side exactly the bound
+/// variable. The identity completion `f(r) := r` satisfies the body on every
+/// non-pinned `r`; the pinned points `f(p)=v` are verified to satisfy `rel(v, p)`
+/// (each `p` a literal, `v` eq-pinned). Same single-quantifier + accounting gates.
+fn try_var_relative_bound(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    body: TermId,
+    bound: &[Spur],
+) -> bool {
+    if bound.len() != 1 {
+        return false;
+    }
+    let r = bound[0];
+    let want: FxHashSet<Spur> = [r].into_iter().collect();
+    let matrix = match m.get(body).map(|t| t.kind.clone()) {
+        Some(TermKind::Implies(_, c)) => c,
+        Some(_) => body,
+        None => return false,
+    };
+    let (sym, l, rr) = match m.get(matrix).map(|t| t.kind.clone()) {
+        Some(TermKind::Ge(a, b)) => (OP_GE, a, b),
+        Some(TermKind::Le(a, b)) => (OP_LE, a, b),
+        _ => return false,
+    };
+    // One side is `(f r)`, the other exactly the bound variable `r`. Normalize to
+    // `f(r) rel r`.
+    let (fsym, rel) = match (fapp_of_var(m, l, &want), fapp_of_var(m, rr, &want)) {
+        (Some((f, _)), None) if is_var_term(m, rr, r) => (f, sym),
+        (None, Some((f, _))) if is_var_term(m, l, r) => (f, flip_rel(sym)),
+        _ => return false,
+    };
+    if !matches!(rel, OP_GE | OP_LE) {
+        return false;
+    }
+    if facts.quant_count.get(&fsym).copied() != Some(1) {
+        return false;
+    }
+    // ACCOUNTING GUARD (as in `try_range_completion`).
+    let mut body_occ: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(m, body, &mut body_occ);
+    let accounted = body_occ.get(&fsym).copied().unwrap_or(0)
+        + facts.ground_apps.get(&fsym).map_or(0, |p| p.len() as u32);
+    if facts.global_occ.get(&fsym).copied().unwrap_or(0) != accounted {
+        return false;
+    }
+    // VERIFY each pinned point `f(p)=v` against `rel(v, p)` (`p` a literal, `v`
+    // eq-pinned); the identity default covers every non-pinned `r`.
+    if let Some(points) = facts.ground_apps.get(&fsym) {
+        for &k in points {
+            let TermKind::Apply { args, .. } = (match m.get(k) {
+                Some(t) => t.kind.clone(),
+                None => return false,
+            }) else {
+                return false;
+            };
+            if args.len() != 1 {
+                return false;
+            }
+            let (Some(p), Some(v)) = (
+                term_to_rational(m, args[0]),
+                resolve_eq_rational(m, k, &facts.eq_pins, 16),
+            ) else {
+                return false;
+            };
+            let ok = match rel {
+                OP_GE => v >= p,
+                _ => v <= p, // OP_LE
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -2723,6 +2811,11 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // (4c) Bounded oscillation (§3.2): a Lipschitz-style `∀x,y∈G. |f(x)−f(y)|
         // ≤ B` — complete `f` to a constant when the pinned values span ≤ B.
         if try_bounded_oscillation(lang.m(), facts, body, &bound) {
+            return Some(true);
+        }
+        // (4d) Variable-relative bound (§3.3): `∀r. f(r) ⋛ r` (e.g. `ceil(r)≥r`)
+        // — the identity completion `f(r):=r` makes the body reflexively true.
+        if try_var_relative_bound(lang.m(), facts, body, &bound) {
             return Some(true);
         }
         // (5) Bare monotonicity axiom over an uninterpreted `f`: satisfiable when
