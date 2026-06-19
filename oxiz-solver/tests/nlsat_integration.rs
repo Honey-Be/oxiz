@@ -513,3 +513,66 @@ fn test_qf_nia_z3_parity_fixtures() {
         failures.join("\n")
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QF_NIRA mixed int+real — soundness regression (#278 Bug Y)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn nira_mixed_int_nonlinear_and_real_linear_is_sat() {
+    // `(* x x) = 4` (Int x) ∧ `1.0 < y < 2.0` (Real y). Each conjunct is SAT
+    // alone (x=2; y=1.5) and they share no variable, so the system is SAT.
+    // BUG (#278): `QF_NIRA` was routed through the INTEGER nlsat
+    // (`is_nia = NIA || (NIRA && !NRA)`), which INTEGERIZES the real `y` —
+    // `1.0 < y < 2.0` then has no integer solution → a spurious `unsat`. The
+    // fix declines the integer dispatch when the NIRA problem has any
+    // real-sorted term, falling through to CDCL(T). (z3: sat.)
+    let mut ctx = Context::new();
+    ctx.set_clean_mbqi(true);
+    let out = ctx
+        .execute_script(
+            "(set-logic QF_NIRA)\
+             (declare-const x Int)\
+             (declare-const y Real)\
+             (assert (= (* x x) 4))\
+             (assert (> y 1.0))\
+             (assert (< y 2.0))\
+             (check-sat)",
+        )
+        .expect("script runs");
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_eq!(
+        verdict,
+        Some("sat"),
+        "mixed NIRA must NOT integerize the real variable into a spurious Unsat, got {out:?}"
+    );
+}
+
+#[test]
+fn nira_pure_integer_nonlinear_unsat_still_caught() {
+    // Guard: the NIRA→NIA dispatch must still fire for a PURE-integer NIRA
+    // problem (no real term). `(* x x) = 3` (Int) is UNSAT (3 not a perfect
+    // square) and must stay UNSAT after the real-sort gate. (z3: unsat.)
+    let mut ctx = Context::new();
+    ctx.set_clean_mbqi(true);
+    let out = ctx
+        .execute_script(
+            "(set-logic QF_NIRA)\
+             (declare-const x Int)\
+             (assert (= (* x x) 3))\
+             (check-sat)",
+        )
+        .expect("script runs");
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_eq!(verdict, Some("unsat"), "pure-int NIRA x*x=3 must stay Unsat, got {out:?}");
+}

@@ -69,7 +69,24 @@ impl Solver {
     pub(super) fn dispatch_nl_solver(&self, manager: &TermManager) -> Option<SolverResult> {
         let logic = self.logic.as_deref()?;
 
-        let is_nia = logic.contains("NIA") || (logic.contains("NIRA") && !logic.contains("NRA"));
+        let mut is_nia = logic.contains("NIA") || (logic.contains("NIRA") && !logic.contains("NRA"));
+        // `NIRA` is MIXED integer+real. Routing it through the INTEGER nlsat
+        // (`dispatch_nia_constraints(.., true)`) INTEGERIZES every variable,
+        // including the real-sorted ones — so an independent real constraint
+        // with no integer solution (e.g. `1.0 < y < 2.0`) is reported as a
+        // SPURIOUS `unsat`. Only treat `NIRA` as pure-integer NIA when the
+        // problem has NO real-sorted term; otherwise fall through to CDCL(T)
+        // (sound: the linear-real part is handled there and the nonlinear part
+        // yields the sound `Unknown`).
+        if is_nia
+            && logic.contains("NIRA")
+            && self
+                .assertions
+                .iter()
+                .any(|&a| term_mentions_real_sort(manager, a, 64))
+        {
+            is_nia = false;
+        }
         let is_nra = logic.contains("NRA") && !is_nia;
 
         if is_nia {
@@ -636,6 +653,41 @@ fn is_perfect_square(n: u64) -> bool {
     let r = (n as f64).sqrt() as u64;
     // Check r and r+1 in case of floating-point rounding
     (r * r == n) || ((r + 1) * (r + 1) == n)
+}
+
+/// Does `t` (or any sub-term) carry the `Real` sort? Used to detect a MIXED
+/// `NIRA` problem so the integer nlsat is not handed real variables (which it
+/// would integerize, turning e.g. `1.0 < y < 2.0` into a spurious `unsat`).
+/// Depth-bounded; conservative (`false` only when no real sort is reached).
+fn term_mentions_real_sort(manager: &TermManager, t: TermId, depth: u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Some(term) = manager.get(t) else {
+        return false;
+    };
+    if term.sort == manager.sorts.real_sort {
+        return true;
+    }
+    let any = |xs: &[TermId]| xs.iter().any(|&c| term_mentions_real_sort(manager, c, depth - 1));
+    match &term.kind {
+        TermKind::Not(a) | TermKind::Neg(a) => term_mentions_real_sort(manager, *a, depth - 1),
+        TermKind::And(a) | TermKind::Or(a) | TermKind::Add(a) | TermKind::Mul(a)
+        | TermKind::Distinct(a) => any(a),
+        TermKind::Xor(a, b)
+        | TermKind::Implies(a, b)
+        | TermKind::Eq(a, b)
+        | TermKind::Sub(a, b)
+        | TermKind::Div(a, b)
+        | TermKind::Mod(a, b)
+        | TermKind::Lt(a, b)
+        | TermKind::Le(a, b)
+        | TermKind::Gt(a, b)
+        | TermKind::Ge(a, b) => any(&[*a, *b]),
+        TermKind::Ite(a, b, c) => any(&[*a, *b, *c]),
+        TermKind::Apply { args, .. } => any(args),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
