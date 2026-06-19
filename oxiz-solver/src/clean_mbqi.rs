@@ -2012,6 +2012,267 @@ fn skolem_witness_side(
     })
 }
 
+// ───────────────────── constant range-completion recognizer ─────────────────
+//
+// The DENSE-ORDER (Real / Int) analog of the single-comparison function
+// completion (recognizer 4). A universal `∀x̄. ⋀ᵢ cmpᵢ(f(x̄), cᵢ)` bounding ONE
+// uninterpreted `f` against ground constants intersects to an interval `[lo,hi]`;
+// when it is nonempty (a dense order always has an interior point) and `f` is
+// constrained by no other quantifier, completing `f` to any constant in `[lo,hi]`
+// on every non-ground argument satisfies the body — a CONSERVATIVE EXTENSION over
+// `f` (the ground points keep their verified-in-range values, the completed
+// points appear in no other constraint).  This is exactly how a model-based
+// solver assigns an uninterpreted `f` a finite graph plus an `else` (default)
+// value (cf. z3's `as-array` / `else` model representation).
+
+/// Resolve `t` to an exact rational by following top-level equality pins
+/// (`(= t k)`), the rational analog of [`resolve_eq_concrete`].  `None` for
+/// anything not pinned to a concrete literal (an inequality- or
+/// unconstrained point ⇒ the caller bails conservatively).
+fn resolve_eq_rational(
+    m: &TermManager,
+    t: TermId,
+    eq_pins: &FxHashMap<TermId, Vec<TermId>>,
+    depth: u32,
+) -> Option<num_rational::BigRational> {
+    if depth == 0 {
+        return None;
+    }
+    if let Some(v) = term_to_rational(m, t) {
+        return Some(v);
+    }
+    eq_pins
+        .get(&t)?
+        .iter()
+        .find_map(|&p| resolve_eq_rational(m, p, eq_pins, depth - 1))
+}
+
+/// One side of an interval: `(value, strict)` where `strict` is `<`/`>` (vs
+/// `≤`/`≥`).  `None` = unbounded on that side.
+type IntervalBound = Option<(num_rational::BigRational, bool)>;
+
+/// Tighten a LOWER bound with `value` (keep the larger; a tie keeps strict if
+/// either is strict).
+fn tighten_lo(cur: &mut IntervalBound, value: num_rational::BigRational, strict: bool) {
+    match cur {
+        None => *cur = Some((value, strict)),
+        Some((v, s)) => {
+            if value > *v {
+                *v = value;
+                *s = strict;
+            } else if value == *v {
+                *s = *s || strict;
+            }
+        }
+    }
+}
+
+/// Tighten an UPPER bound with `value` (keep the smaller; strict-on-tie).
+fn tighten_hi(cur: &mut IntervalBound, value: num_rational::BigRational, strict: bool) {
+    match cur {
+        None => *cur = Some((value, strict)),
+        Some((v, s)) => {
+            if value < *v {
+                *v = value;
+                *s = strict;
+            } else if value == *v {
+                *s = *s || strict;
+            }
+        }
+    }
+}
+
+/// Is `[lo, hi]` nonempty over a DENSE order?  Empty iff `lo > hi`, or `lo == hi`
+/// with either side strict (an unbounded side is always nonempty).
+fn interval_nonempty(lo: &IntervalBound, hi: &IntervalBound) -> bool {
+    match (lo, hi) {
+        (Some((l, ls)), Some((h, hs))) => l < h || (l == h && !ls && !hs),
+        _ => true,
+    }
+}
+
+/// Does `v` satisfy `[lo, hi]` (per-side strictness)?
+fn in_interval(v: &num_rational::BigRational, lo: &IntervalBound, hi: &IntervalBound) -> bool {
+    if let Some((l, s)) = lo {
+        if (*s && v <= l) || (!*s && v < l) {
+            return false;
+        }
+    }
+    if let Some((h, s)) = hi {
+        if (*s && v >= h) || (!*s && v > h) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `flip` a comparison op (so a `c <rel> f(x̄)` atom can be read as `f(x̄) <rel'> c`).
+fn flip_rel(sym: u64) -> u64 {
+    match sym {
+        OP_LE => OP_GE,
+        OP_GE => OP_LE,
+        OP_LT => OP_GT,
+        OP_GT => OP_LT,
+        other => other, // OP_EQ
+    }
+}
+
+/// `f`'s `view`-symbol if `t` is a bare application of an uninterpreted `f` that
+/// mentions at least one bound (`want`) variable; else `None`.
+fn app_over_bound(m: &TermManager, t: TermId, want: &FxHashSet<Spur>) -> Option<u64> {
+    let TermKind::Apply { func, .. } = m.get(t)?.kind.clone() else {
+        return None;
+    };
+    let fsym = spur_sym(func);
+    if fsym & OP != 0 {
+        return None;
+    }
+    let fv = free_var_spurs(m, t);
+    want.iter().any(|s| fv.contains(s)).then_some(fsym)
+}
+
+/// `t` as a concrete rational, but ONLY if it is ground w.r.t. the bound vars
+/// (mentions no `want` variable).
+fn ground_rational(
+    m: &TermManager,
+    t: TermId,
+    want: &FxHashSet<Spur>,
+) -> Option<num_rational::BigRational> {
+    let fv = free_var_spurs(m, t);
+    if want.iter().any(|s| fv.contains(s)) {
+        return None;
+    }
+    term_to_rational(m, t)
+}
+
+/// Parse one comparison atom of a range body — `cmp(f(x̄), c)` or `cmp(c, f(x̄))`
+/// with one side a bare uninterpreted application mentioning a bound var and the
+/// other a ground concrete rational.  Returns `(f-symbol, lo-update, hi-update)`
+/// reading the relation as `f <rel> c`.
+fn range_atom(
+    m: &TermManager,
+    atom: TermId,
+    want: &FxHashSet<Spur>,
+) -> Option<(u64, IntervalBound, IntervalBound)> {
+    let (sym, l, r) = match m.get(atom).map(|t| &t.kind)? {
+        TermKind::Le(a, b) => (OP_LE, *a, *b),
+        TermKind::Lt(a, b) => (OP_LT, *a, *b),
+        TermKind::Ge(a, b) => (OP_GE, *a, *b),
+        TermKind::Gt(a, b) => (OP_GT, *a, *b),
+        TermKind::Eq(a, b) => (OP_EQ, *a, *b),
+        _ => return None,
+    };
+    let (fsym, c, f_on_left) = match (app_over_bound(m, l, want), app_over_bound(m, r, want)) {
+        (Some(f), None) => (f, ground_rational(m, r, want)?, true),
+        (None, Some(f)) => (f, ground_rational(m, l, want)?, false),
+        _ => return None, // not exactly one `f(x̄)` side over a ground constant
+    };
+    let rel = if f_on_left { sym } else { flip_rel(sym) };
+    let (lo, hi) = match rel {
+        OP_LE => (None, Some((c, false))),
+        OP_LT => (None, Some((c, true))),
+        OP_GE => (Some((c, false)), None),
+        OP_GT => (Some((c, true)), None),
+        OP_EQ => (Some((c.clone(), false)), Some((c, false))),
+        _ => return None,
+    };
+    Some((fsym, lo, hi))
+}
+
+/// **M3 recognizer — constant range completion** (dense Real / Int).  Body
+/// `∀x̄. ⋀ᵢ cmpᵢ(f(x̄), cᵢ)`: a conjunction of comparison atoms each bounding ONE
+/// uninterpreted `f` (applied to the bound vars) against a ground concrete
+/// constant — e.g. `∀x. (and (>= (f x) 0.0) (<= (f x) 1.0))`.  The atoms
+/// intersect to an interval `[lo, hi]`; when it is nonempty and `f` is this
+/// axiom's SOLE universal constraint (`quant_count[f]==1`), complete `f` to any
+/// constant in `[lo, hi]` on every non-ground argument.  Verified against the
+/// ground `f`-points (each eq-pinned, in range — the #260 gate), this is a
+/// CONSERVATIVE EXTENSION over `f`, hence sound `Sat`.  An empty interval means
+/// the universal is itself unsatisfiable, so we decline to the sound `Unknown`.
+fn try_range_completion(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    body: TermId,
+    bound: &[Spur],
+) -> bool {
+    if bound.is_empty() {
+        return false;
+    }
+    let want: FxHashSet<Spur> = bound.iter().copied().collect();
+    // Top-level conjunction (a single atom is a one-conjunct body).
+    let conjuncts: Vec<TermId> = match m.get(body).map(|t| &t.kind) {
+        Some(TermKind::And(a)) => a.to_vec(),
+        Some(_) => vec![body],
+        None => return false,
+    };
+    if conjuncts.is_empty() {
+        return false;
+    }
+    let mut fsym: Option<u64> = None;
+    let mut lo: IntervalBound = None;
+    let mut hi: IntervalBound = None;
+    for &atom in &conjuncts {
+        let Some((f, lo_u, hi_u)) = range_atom(m, atom, &want) else {
+            return false; // a conjunct we cannot read as a single-`f` bound
+        };
+        match fsym {
+            None => fsym = Some(f),
+            Some(p) if p != f => return false, // a second function ⇒ not a single-`f` range
+            _ => {}
+        }
+        if let Some((v, s)) = lo_u {
+            tighten_lo(&mut lo, v, s);
+        }
+        if let Some((v, s)) = hi_u {
+            tighten_hi(&mut hi, v, s);
+        }
+    }
+    let Some(fsym) = fsym else {
+        return false;
+    };
+    // `f` must be this axiom's SOLE universal constraint (no other quantifier
+    // could forbid the constant completion).
+    if facts.quant_count.get(&fsym).copied().unwrap_or(0) != 1 {
+        return false;
+    }
+    // ACCOUNTING GUARD. The constant completion is sound only if EVERY `f`
+    // application is either inside THIS body (a `f(x̄)`, handled by the
+    // completion) or a LITERAL ground point we verify below. A `f`-application at
+    // a SYMBOLIC argument — e.g. `f(c)` for a free constant `c` (`real_unsat`:
+    // `∀x.f(x)≤1` with `f(c)>1`) — is NOT recorded as a ground point (its arg is
+    // a variable, not a literal), so the verify loop would miss the constraint it
+    // carries and the completion could violate it. `range_atom` guarantees the
+    // body's only `f`-apps are the bound-var `f(x̄)`, so the body's count plus the
+    // literal ground points must exhaust every occurrence; any shortfall is an
+    // unaccounted symbolic application ⇒ decline to the sound `Unknown`.
+    let mut body_occ: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(m, body, &mut body_occ);
+    let accounted =
+        body_occ.get(&fsym).copied().unwrap_or(0) + facts.ground_apps.get(&fsym).map_or(0, |p| p.len() as u32);
+    if facts.global_occ.get(&fsym).copied().unwrap_or(0) != accounted {
+        return false;
+    }
+    // A nonempty interval is required: an empty one means `∀x̄. body` is itself
+    // unsatisfiable, which we must not certify as `Sat`.
+    if !interval_nonempty(&lo, &hi) {
+        return false;
+    }
+    // VERIFY the ground `f`-points (the #260 gate): each must be eq-pinned to a
+    // concrete rational that lies in `[lo, hi]`, else asserting the universal at
+    // that argument would refute — an `unsat` we must never hide behind `Sat`.
+    if let Some(points) = facts.ground_apps.get(&fsym) {
+        for &k in points {
+            let Some(v) = resolve_eq_rational(m, k, &facts.eq_pins, 16) else {
+                return false; // value not faithfully known ⇒ conservative bail
+            };
+            if !in_interval(&v, &lo, &hi) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -2314,6 +2575,13 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // `f`'s result ⇒ complete `f` to that constant off the (already
         // consistent) ground points.
         if self.try_function_completion(lang, body, &bound, facts) {
+            return Some(true);
+        }
+        // (4b) Constant RANGE completion (dense Real/Int): a conjunction of
+        // comparison atoms bounding one uninterpreted `f` against ground
+        // constants `∀x̄. ⋀ cmp(f(x̄), cᵢ)` — complete `f` to a constant in the
+        // intersected interval (e.g. `∀x. 0 ≤ f(x) ≤ 1`).
+        if try_range_completion(lang.m(), facts, body, &bound) {
             return Some(true);
         }
         // (5) Bare monotonicity axiom over an uninterpreted `f`: satisfiable when
@@ -2630,6 +2898,21 @@ impl SolverModel {
         // `f` must be this axiom's SOLE universal constraint (no cross-quantifier
         // requirement that a single constant completion could violate).
         if facts.quant_count.get(&fsym).copied() != Some(1) {
+            return false;
+        }
+        // ACCOUNTING GUARD (the symbolic-point companion to the #260 ground gate
+        // below). The `ground_apps` verify covers only LITERAL ground points; a
+        // `f`-application at a SYMBOLIC argument — `f(c)` for a free constant `c`
+        // (`∀x.f(x)≤1` with `f(c)>1`) — has a variable argument, so it is NOT
+        // recorded as a ground point and its constraint would be missed, letting
+        // the constant completion violate it. The body's single `f(x̄)` plus the
+        // literal ground points must exhaust every `f`-occurrence; any shortfall
+        // is an unaccounted symbolic application ⇒ decline to the sound `Unknown`.
+        let mut body_occ: FxHashMap<u64, u32> = FxHashMap::default();
+        count_syms(lang.m(), body, &mut body_occ);
+        let accounted = body_occ.get(&fsym).copied().unwrap_or(0)
+            + facts.ground_apps.get(&fsym).map_or(0, |p| p.len() as u32);
+        if facts.global_occ.get(&fsym).copied().unwrap_or(0) != accounted {
             return false;
         }
         // VERIFY (the #260 soundness gate). The constant completion is valid only

@@ -1093,3 +1093,68 @@ fn skolem_witness_blocked_by_universal_f_bound_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "f universally bounded below the witness must not be spurious sat");
 }
+
+#[test]
+fn real_bounded_function_unit_interval_is_sat() {
+    // `∀x. 0 ≤ f(x) ≤ 1` with ground points all inside [0,1]. The constant
+    // range-completion recognizer completes `f` to a constant in [0,1] off the
+    // ground points. (z3: sat; corpus `real_bounds.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((x Real)) (and (>= (f x) 0.0) (<= (f x) 1.0))))",
+        "(assert (= (f 0.0) 0.5))",
+        "(assert (= (f 1.0) 0.75))",
+        "(assert (= (f (- 1.0)) 0.25))",
+        "(assert (<= (+ (f 0.0) (+ (f 1.0) (f (- 1.0)))) 3.0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "∀x.0≤f(x)≤1 with in-range ground points is sat");
+}
+
+#[test]
+fn real_range_completion_with_out_of_range_ground_point_is_not_spurious_sat() {
+    // Soundness control: `∀x. 0 ≤ f(x) ≤ 1` but `f(0)=5` — the universal at x=0
+    // demands 5 ≤ 1, UNSAT. The recognizer VERIFIES the ground point (5 ∉ [0,1])
+    // and declines; the engine instantiates at 0 and refutes. Never spurious sat.
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((x Real)) (and (>= (f x) 0.0) (<= (f x) 1.0))))",
+        "(assert (= (f 0.0) 5.0))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an out-of-range ground point must not be spurious sat");
+}
+
+#[test]
+fn int_range_completion_two_sided_bound_is_sat() {
+    // The same range completion over Int: `∀x. 1 ≤ f(x) ≤ 3`, in-range ground.
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int)) (and (>= (f x) 1) (<= (f x) 3))))",
+        "(assert (= (f 0) 2))",
+        "(assert (= (f 7) 3))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "∀x.1≤f(x)≤3 with in-range ground points is sat");
+}
+
+#[test]
+fn int_function_completion_with_symbolic_point_is_not_spurious_sat() {
+    // Soundness control (the Int analog of `real_unsat`): `∀x. f(x) ≤ 1` with a
+    // SYMBOLIC application `f(c) > 1` for a free constant `c`. The universal at
+    // x=c forces f(c) ≤ 1, contradicting f(c) > 1 — UNSAT. `f(c)` is not a
+    // literal ground point, so the single-function completion's accounting guard
+    // (body f(x̄) + literal points ≠ all occurrences) DECLINES. Never spurious sat.
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(declare-const c Int)",
+        "(assert (forall ((x Int)) (<= (f x) 1)))",
+        "(assert (> (f c) 1))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "a symbolic out-of-bound f-application must not be spurious sat");
+}
