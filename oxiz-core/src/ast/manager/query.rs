@@ -2,6 +2,8 @@
 
 use super::super::term::{TermId, TermKind};
 use super::super::traversal::get_children;
+use crate::interner::Spur;
+use crate::sort::SortId;
 #[allow(unused_imports)]
 use crate::prelude::*;
 use num_bigint::BigInt;
@@ -506,16 +508,83 @@ impl TermManager {
                     self.mk_mod(na, nb)
                 }
             }
-            // For the remaining (BV/string/quantifier/…) kinds, return as-is.
-            // NOTE: this is still a substitution gap for those theories — the
-            // FO/UF/LIA fragment above is complete, which covers the clean
-            // quantifier engine's instantiation needs; broadening the rest is a
-            // follow-up.
+            // Quantifiers: substitute into the body for the FREE variables only.
+            // Omitting this silently left `(∀z. … x …)[x↦t]` unchanged — so a
+            // nested-quantifier instantiation kept the bound variable, and
+            // skolemizing `∀x.∃y.∀z. φ` leaked `y` into the inner `∀z` (the
+            // `nested_quantifiers` Unknown). `subst_under_binder` drops shadowed
+            // keys and BAILS (leaves the body untouched) on capture, so it is
+            // never unsound; patterns are preserved (triggers are advisory).
+            Some(TermKind::Forall { vars, body, patterns }) => {
+                let nb = self.subst_under_binder(&vars, body, subst);
+                if nb == body {
+                    id
+                } else {
+                    self.intern(
+                        TermKind::Forall { vars, body: nb, patterns },
+                        self.sorts.bool_sort,
+                    )
+                }
+            }
+            Some(TermKind::Exists { vars, body, patterns }) => {
+                let nb = self.subst_under_binder(&vars, body, subst);
+                if nb == body {
+                    id
+                } else {
+                    self.intern(
+                        TermKind::Exists { vars, body: nb, patterns },
+                        self.sorts.bool_sort,
+                    )
+                }
+            }
+            // For the remaining (BV/string/let/…) kinds, return as-is. NOTE: this
+            // is still a substitution gap for those theories — the FO/UF/LIA +
+            // quantifier fragment above covers the clean engine's needs;
+            // broadening the rest is a follow-up.
             Some(_) => id,
         };
 
         cache.insert(id, result);
         result
+    }
+
+    /// Substitute into a quantifier `body` whose own bound variables are `vars`.
+    /// Shadowed substitution keys (a `vars` variable) are dropped, and the whole
+    /// substitution is ABORTED (body returned unchanged) if any live replacement
+    /// would be captured by a bound variable — so the result is always
+    /// capture-free. Uses a fresh cache because the effective substitution
+    /// (after shadow-filtering) differs from the caller's.
+    fn subst_under_binder(
+        &mut self,
+        vars: &[(Spur, SortId)],
+        body: TermId,
+        subst: &FxHashMap<TermId, TermId>,
+    ) -> TermId {
+        let bound: FxHashSet<Spur> = vars.iter().map(|(n, _)| *n).collect();
+        let mentions_bound = |me: &Self, t: TermId| -> bool {
+            me.free_vars(t).into_iter().any(|fv| {
+                matches!(me.get(fv).map(|x| &x.kind), Some(TermKind::Var(s)) if bound.contains(s))
+            })
+        };
+        let mut filtered: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for (&k, &v) in subst {
+            // Drop a key shadowed by this quantifier's own binder.
+            if let Some(TermKind::Var(s)) = self.get(k).map(|t| &t.kind) {
+                if bound.contains(s) {
+                    continue;
+                }
+            }
+            // Capture: a live replacement names a bound variable ⇒ leave the body
+            // untouched rather than risk an unsound capture.
+            if mentions_bound(self, v) {
+                return body;
+            }
+            filtered.insert(k, v);
+        }
+        if filtered.is_empty() {
+            return body;
+        }
+        self.substitute_cached(body, &filtered, &mut FxHashMap::default())
     }
 
     /// Simplify a term by applying rewrite rules

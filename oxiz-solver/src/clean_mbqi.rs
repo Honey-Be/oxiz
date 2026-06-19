@@ -3084,6 +3084,130 @@ fn collect_skolem_fixedpoints(m: &TermManager, t: TermId, facts: &mut Completion
     }
 }
 
+// ───────────────── fresh-Skolem threshold-guard recognizer ──────────────────
+//
+// The triple-nested `∀x.∃y.∀z. (z≥y ⇒ f(x,z)≥0)` (`nested_quantifiers`), which
+// skolemizes the `∃y` to a fresh threshold function `sk(x)`, leaving the NESTED
+// `∀x.∀z. (z ≥ sk(x) ⇒ f(x,z) ≥ 0)`. Because `sk` is fresh, the threshold can be
+// pushed ABOVE every (finitely many) ground point of `f`: then every pinned
+// `f(x,z')` sits in the EXCLUDED region `z' < sk(x)` (guard false ⇒ vacuous), and
+// the constrained region `z ≥ sk(x)` holds only fresh points where `f` is free to
+// meet the (feasible) consequent. So the axiom is satisfiable WITHOUT touching any
+// ground fact — a conservative extension over `f` and `sk` ⇒ sound `Sat`.
+
+/// Peel a chain of nested universals `∀x.∀z.…`, returning the full bound-var list
+/// and the innermost non-`∀` body.
+fn flatten_foralls(m: &TermManager, quant: TermId) -> (Vec<Spur>, TermId) {
+    let mut vars = Vec::new();
+    let mut t = quant;
+    while let Some(TermKind::Forall { vars: vs, body, .. }) = m.get(t).map(|x| x.kind.clone()) {
+        vars.extend(vs.iter().map(|(n, _)| *n));
+        t = body;
+    }
+    (vars, t)
+}
+
+/// If `g` lower-bounds a bound variable `z` by a FRESH Skolem application
+/// (`z ≥ sk(…)` / `z > sk(…)` / `sk(…) ≤ z` / `sk(…) < z`) where `sk` is fresh
+/// (name `sk!…`, single-quantifier) and does NOT take `z` as an argument, return
+/// that threshold variable `z`. Scans through conjunctions.
+fn fresh_threshold_var(
+    m: &TermManager,
+    g: TermId,
+    bound: &[Spur],
+    facts: &CompletionFacts,
+) -> Option<Spur> {
+    // `z` (a bound var) lower-bounded by a fresh skolem app that omits `z`.
+    let check = |zside: TermId, skside: TermId| -> Option<Spur> {
+        let z = as_bound_var(m, zside, bound)?;
+        let sksym = fresh_skolem_head(m, skside)?;
+        if facts.quant_count.get(&sksym).copied() != Some(1)
+            || free_var_spurs(m, skside).contains(&z)
+        {
+            return None;
+        }
+        Some(z)
+    };
+    match m.get(g).map(|t| t.kind.clone()) {
+        Some(TermKind::And(parts)) => {
+            parts.iter().find_map(|&p| fresh_threshold_var(m, p, bound, facts))
+        }
+        Some(TermKind::Ge(a, b)) | Some(TermKind::Gt(a, b)) => check(a, b), // z ≥/> sk
+        Some(TermKind::Le(a, b)) | Some(TermKind::Lt(a, b)) => check(b, a), // sk ≤/< z
+        _ => None,
+    }
+}
+
+/// **M3 recognizer — fresh-Skolem threshold guard** (nested `∀∃∀`). After
+/// skolemization the body is `∀x̄. (z ≥ sk(…) ⇒ ψ)` with `sk` fresh and `ψ` a
+/// feasible bound on a single uninterpreted `f` over the bound vars, `z` among
+/// `f`'s arguments. Pushing the fresh threshold above all ground points makes the
+/// axiom vacuous there and free above ⇒ satisfiable. Sound when `sk` is fresh, `f`
+/// single-quantifier, and `ψ` feasible.
+fn try_threshold_guard(m: &TermManager, facts: &CompletionFacts, quant: TermId) -> bool {
+    let (bound, body) = flatten_foralls(m, quant);
+    if bound.is_empty() {
+        return false;
+    }
+    let TermKind::Implies(guard, psi) = (match m.get(body) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let Some(zvar) = fresh_threshold_var(m, guard, &bound, facts) else {
+        return false;
+    };
+    let want: FxHashSet<Spur> = bound.iter().copied().collect();
+    // ψ = a feasible range on ONE uninterpreted `f`, EVERY conjunct of which has
+    // the threshold variable `z` as an argument (so the threshold genuinely
+    // excludes `f`'s ground points — a conjunct over `f(x)` alone would force a
+    // value regardless of the threshold).
+    let conjuncts: Vec<TermId> = match m.get(psi).map(|t| &t.kind) {
+        Some(TermKind::And(a)) => a.to_vec(),
+        Some(_) => vec![psi],
+        None => return false,
+    };
+    if conjuncts.is_empty() {
+        return false;
+    }
+    let mut fsym: Option<u64> = None;
+    let (mut lo, mut hi): (IntervalBound, IntervalBound) = (None, None);
+    for &atom in &conjuncts {
+        let Some((f, lo_u, hi_u)) = range_atom(m, atom, &want) else {
+            return false;
+        };
+        // `range_atom` requires the non-`f` side ground, so if `z` occurs in the
+        // atom it must be inside `f`'s application — exactly what we need.
+        if !free_var_spurs(m, atom).contains(&zvar) {
+            return false;
+        }
+        match fsym {
+            None => fsym = Some(f),
+            Some(p) if p != f => return false,
+            _ => {}
+        }
+        if let Some((v, s)) = lo_u {
+            tighten_lo(&mut lo, v, s);
+        }
+        if let Some((v, s)) = hi_u {
+            tighten_hi(&mut hi, v, s);
+        }
+    }
+    if fsym.is_none() {
+        return false;
+    }
+    // `f` constrained by no OTHER quantifier (its ground points are all excludable
+    // by the fresh threshold; a second universal could force a value at a point
+    // the threshold cannot exclude).
+    if facts.quant_count.get(&fsym.unwrap()).copied() != Some(1) {
+        return false;
+    }
+    // `ψ` must be feasible: an empty interval makes `z≥sk ⇒ ψ` ≡ `z < sk(x)`, i.e.
+    // `∀z. z < sk(x)` — false for large `z` ⇒ the axiom is unsatisfiable.
+    interval_nonempty(&lo, &hi)
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -3377,6 +3501,13 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // `g ≡ affine` (verified jointly in Pass 7 across all group members)
         // satisfies this universal.
         if facts.layered_ok.contains(&quant) {
+            return Some(true);
+        }
+        // (2c) Fresh-Skolem threshold guard (nested `∀∃∀`): a skolemized
+        // `∀x̄. (z ≥ sk(…) ⇒ f(…z…) ⋛ c)` — the fresh threshold excludes every
+        // ground point, leaving the constrained region free. Operates on the
+        // (possibly nested) `quant` directly, flattening the universal chain.
+        if try_threshold_guard(lang.m(), facts, quant) {
             return Some(true);
         }
         // (3) Pure-polarity predicate: a single-literal body whose uninterpreted

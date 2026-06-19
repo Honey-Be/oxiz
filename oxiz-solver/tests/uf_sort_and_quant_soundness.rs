@@ -1340,3 +1340,38 @@ fn skolem_fixed_point_out_of_range_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "an out-of-range fixed-point witness must not be spurious sat");
 }
+
+#[test]
+fn nested_forall_exists_forall_threshold_is_sat() {
+    // `∀x.∃y.∀z. (z≥y ⇒ f(x,z)≥0)` (triple-nested). Skolemizes the ∃y to a fresh
+    // threshold sk(x), leaving `∀x,z. (z≥sk(x) ⇒ f(x,z)≥0)`. The fresh threshold
+    // can be pushed above all ground points (incl. f(0,0)=-1), so the axiom is
+    // vacuous there and free above. (z3: sat; corpus `nested_quantifiers.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int Int) Int)",
+        "(assert (forall ((x Int)) (exists ((y Int)) (forall ((z Int))
+           (=> (>= z y) (>= (f x z) 0))))))",
+        "(assert (= (f 0 0) (- 1)))",
+        "(assert (= (f 0 5) 10))",
+        "(assert (= (f 0 6) 12))",
+        "(assert (= (f 1 3) 7))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "nested ∀∃∀ threshold guard with a negative low point is sat");
+}
+
+#[test]
+fn nested_threshold_infeasible_consequent_is_not_spurious_sat() {
+    // Soundness control: the consequent `f(x,z)≥0 ∧ f(x,z)≤-1` is infeasible, so
+    // `z≥y ⇒ ψ` collapses to `z<y` and `∀z. z<y` is false — UNSAT. The recognizer
+    // sees the empty ψ-interval and DECLINES (never spurious sat).
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int Int) Int)",
+        "(assert (forall ((x Int)) (exists ((y Int)) (forall ((z Int))
+           (=> (>= z y) (and (>= (f x z) 0) (<= (f x z) (- 1))))))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an infeasible threshold consequent must not be spurious sat");
+}
