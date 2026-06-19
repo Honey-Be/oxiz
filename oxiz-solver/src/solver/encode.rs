@@ -513,6 +513,24 @@ impl Solver {
     /// Assert a term
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
         let index = self.assertions.len();
+        // Clean-MBQI quantifier preprocessing (equisatisfiable, polarity-safe):
+        //  1. Fold any quantifier whose matrix is a recognized tautology to
+        //     `true`, regardless of polarity — so a negated valid `∀`
+        //     (`(not (forall x. x=x))`) collapses to `(not true)` = `false` =
+        //     the sound `unsat`, instead of the spurious `sat` it gave when the
+        //     validity was only checked on the positive (active-quantifier)
+        //     path. See `clean_mbqi::fold_valid_quantifiers`.
+        //  2. Skolemize a top-level positive *unbounded* `∃` into a fresh ground
+        //     constant, so the engine (which never fabricates witnesses) can
+        //     discharge surjectivity-style goals (`∃y. f(y) = 0`) it would
+        //     otherwise leave `Unknown`. Bounded `∃` is left for the engine's
+        //     finite disjunction (#279). See `skolemize_unbounded_existentials`.
+        let term = if self.config.clean_mbqi {
+            let t = crate::clean_mbqi::fold_valid_quantifiers(manager, term);
+            crate::clean_mbqi::skolemize_unbounded_existentials(manager, t, &index.to_string())
+        } else {
+            term
+        };
         self.assertions.push(term);
         self.trail.push(TrailOp::AssertionAdded { index });
         self.invalidate_fp_cache();

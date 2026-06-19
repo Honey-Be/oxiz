@@ -719,3 +719,67 @@ fn trigger_free_quant_over_uninterpreted_sort_is_not_enumerated_into_unsat() {
          enumerated over fabricated witnesses into a spurious unsat"
     );
 }
+
+#[test]
+fn surjective_unbounded_existential_is_skolemized_to_sat() {
+    // Surjectivity-style obligation: a top-level POSITIVE *unbounded* `∃`
+    // (`∃y. f(y)=k`) plus a bounded `∀` on `f`'s range. The clean engine never
+    // fabricates witnesses, so it would leave the existential `Unknown`;
+    // assert-time skolemization replaces each `∃y. φ(y)` with `φ(sk)` for a
+    // fresh constant `sk` (equisatisfiable), which IS satisfiable. (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (exists ((y1 Int)) (= (f y1) 0)))",
+        "(assert (exists ((y2 Int)) (= (f y2) 1)))",
+        "(assert (exists ((y3 Int)) (= (f y3) 2)))",
+        "(assert (forall ((x Int)) \
+            (=> (and (>= x 0) (<= x 10)) (and (>= (f x) 0) (<= (f x) 5)))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "an unbounded positive ∃ must be skolemized to a witnessable ground fact"
+    );
+}
+
+#[test]
+fn negated_valid_forall_folds_to_unsat() {
+    // `(not (forall x. x = x))`. The matrix `x = x` is a reflexivity tautology,
+    // so the `∀` is valid — and its negation is therefore unsat. Pre-fix this
+    // returned a spurious `sat`: the validity recognizer only ran on the
+    // POSITIVE path (the `eval_forall` verdict for an *active* quantifier), and
+    // under the `not` the quantifier is asserted false → inactive → never
+    // verified. Folding the valid quantifier to `true` up front makes this
+    // `(not true)` → `false` → the sound `unsat`. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(assert (not (forall ((x Int)) (= x x))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "the negation of a valid (reflexive) ∀ must be unsat, not spurious sat"
+    );
+}
+
+#[test]
+fn negated_congruence_valid_forall_folds_to_unsat() {
+    // `(not (forall x. f(x) = f(x)))` — the matrix is reflexivity over an
+    // uninterpreted application, still a tautology, so the `∀` is valid and its
+    // negation unsat. Exercises the fold through an uninterpreted-function term
+    // (same polarity-independent path as the bare-variable case). (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (not (forall ((x Int)) (= (f x) (f x)))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "the negation of a valid ∀ over an uninterpreted application must be unsat"
+    );
+}

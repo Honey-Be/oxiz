@@ -141,6 +141,143 @@ fn collect_const_eqs(m: &TermManager, t: TermId, out: &mut FxHashMap<TermId, Ter
     }
 }
 
+/// Constant-fold a quantifier whose matrix is a recognized *tautology* to the
+/// literal `true` — POLARITY-INDEPENDENTLY, anywhere it appears in the boolean
+/// structure of an assertion. A valid body makes the whole quantifier valid:
+/// `∀x̄. φ` with `φ` valid is true, and `∃x̄. φ` with `φ` valid is true as well
+/// (SMT sorts are non-empty, so a witness always exists). Replacing such a node
+/// with `true` is therefore meaning-preserving in *every* context.
+///
+/// Why a rewrite and not just the model check. The clean engine already
+/// recognizes these tautologies via [`SolverModel::body_is_valid`] — but only
+/// on the POSITIVE path, as the `eval_forall` verdict for an *active*
+/// quantifier. Under a negation the quantifier node is asserted false, so the
+/// SAT core marks it inactive, `eval_forall` is never consulted, and the
+/// validity goes unnoticed: `(not (forall ((x Int)) (= x x)))` wrongly comes
+/// back `sat` instead of `unsat`. Folding the valid quantifier to `true` up
+/// front closes that gap — `(not (forall x. x=x))` becomes `(not true)` →
+/// `false` → the sound `unsat` — and as a bonus removes the quantifier from the
+/// SAT core entirely on the positive path too.
+///
+/// Recurses only through the boolean connectives (`not`/`and`/`or`/`=>`/`ite`),
+/// since a quantifier (being `Bool`-sorted) can nest only there. Reuses the
+/// SAME validity recognizer the positive path trusts, so it inherits its
+/// corpus-validated exactness — a false positive here would be a spurious
+/// `unsat` (via `not(true)=false`), exactly the bar `body_is_valid` already
+/// meets. Covers the *tautology* subset only; a negated CONTINGENT quantifier
+/// (`(not (exists y. (= (f y) 0)))` with `(= (f 5) 0)` asserted, unsat only
+/// because of the ground fact) is NOT a validity question and still needs
+/// polarity-aware instantiation.
+pub fn fold_valid_quantifiers(m: &mut TermManager, t: TermId) -> TermId {
+    let kind = match m.get(t) {
+        Some(x) => x.kind.clone(),
+        None => return t,
+    };
+    match kind {
+        TermKind::Forall { body, .. } | TermKind::Exists { body, .. } => {
+            let true_id = m.mk_bool(true);
+            let false_id = m.mk_bool(false);
+            let valid = {
+                let model = SolverModel::new(FxHashMap::default(), true_id, false_id);
+                let host = OxizHost::new(m);
+                model.body_is_valid(&host, body, 64)
+            };
+            if valid { true_id } else { t }
+        }
+        TermKind::Not(a) => {
+            let a2 = fold_valid_quantifiers(m, a);
+            m.mk_not(a2)
+        }
+        TermKind::And(args) => {
+            let v: Vec<TermId> = args.iter().map(|&a| fold_valid_quantifiers(m, a)).collect();
+            m.mk_and(v)
+        }
+        TermKind::Or(args) => {
+            let v: Vec<TermId> = args.iter().map(|&a| fold_valid_quantifiers(m, a)).collect();
+            m.mk_or(v)
+        }
+        TermKind::Implies(a, b) => {
+            let a2 = fold_valid_quantifiers(m, a);
+            let b2 = fold_valid_quantifiers(m, b);
+            m.mk_implies(a2, b2)
+        }
+        TermKind::Ite(c, a, b) => {
+            let c2 = fold_valid_quantifiers(m, c);
+            let a2 = fold_valid_quantifiers(m, a);
+            let b2 = fold_valid_quantifiers(m, b);
+            m.mk_ite(c2, a2, b2)
+        }
+        _ => t,
+    }
+}
+
+/// Skolemize a top-level POSITIVE unbounded existential. Replacing `∃x.φ(x)`
+/// with `φ(c)` for a fresh constant `c` is *equisatisfiable* — a model of the
+/// skolemized form extends to a model of the original by reading the witness off
+/// `c`, and vice versa — so doing it to an asserted formula never changes the
+/// answer. It does, however, turn a surjectivity-style obligation
+/// (`∃y. f(y) = 0`) into a ground constraint the solver can actually witness;
+/// the clean MBQI engine, which never fabricates witnesses, would otherwise
+/// report `Unknown` on it.
+///
+/// Fires only on a *positive* top-level occurrence: a bare `∃`, or one reached
+/// through `and`/`or` (both polarity-preserving). A `∃` under `not`/`=>`/`ite`
+/// — anywhere polarity could flip — is left untouched, since skolemizing a
+/// negative `∃` (an effective `∀`) would be unsound. A BOUNDED `∃` (finite
+/// integer domain) is also left untouched: the engine discharges it precisely
+/// via its finite disjunction ([`Engine::emit_existential_disjunction`], #279),
+/// which is complete and needs no fresh symbol. Leaving an existential for the
+/// engine is always sound — at worst it yields `Unknown`, never a wrong verdict.
+///
+/// `tag` makes the minted skolem names unique across assertions.
+pub fn skolemize_unbounded_existentials(m: &mut TermManager, t: TermId, tag: &str) -> TermId {
+    let kind = match m.get(t) {
+        Some(x) => x.kind.clone(),
+        None => return t,
+    };
+    match kind {
+        TermKind::Exists { vars, body, .. } => {
+            // Bounded ∃ → leave it for the engine's finite disjunction (#279).
+            let bounded = {
+                let mut host = OxizHost::new(m);
+                let doms = host.bounded_var_domains(t);
+                !doms.is_empty() && doms.iter().all(Option::is_some)
+            };
+            if bounded {
+                return t;
+            }
+            // One fresh skolem constant per bound var, substituted into the body.
+            // `mk_var(name, sort)` re-interns the bound occurrence (`Var(spur)`),
+            // so it is the exact key the matrix references.
+            let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
+            for (i, (name, sort)) in vars.iter().enumerate() {
+                let nm = m.resolve_str(*name).to_string();
+                let var_term = m.mk_var(&nm, *sort);
+                let sk = m.mk_var(&format!("sk!{tag}!{nm}!{i}"), *sort);
+                map.insert(var_term, sk);
+            }
+            let body2 = m.substitute(body, &map);
+            // A nested ∃ now sits at top level, and the body may be and/or.
+            skolemize_unbounded_existentials(m, body2, tag)
+        }
+        TermKind::And(args) => {
+            let new: Vec<TermId> = args
+                .iter()
+                .map(|&a| skolemize_unbounded_existentials(m, a, tag))
+                .collect();
+            m.mk_and(new)
+        }
+        TermKind::Or(args) => {
+            let new: Vec<TermId> = args
+                .iter()
+                .map(|&a| skolemize_unbounded_existentials(m, a, tag))
+                .collect();
+            m.mk_or(new)
+        }
+        _ => t,
+    }
+}
+
 impl<'a> TermLang for OxizHost<'a> {
     type Sig = OxizSig;
 
