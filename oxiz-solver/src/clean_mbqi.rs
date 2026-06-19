@@ -84,16 +84,60 @@ impl Sig for OxizSig {
 /// engine round. Holds `&mut` so the engine can intern instance terms.
 pub struct OxizHost<'a> {
     tm: &'a mut TermManager,
+    /// Top-level `(= const literal)` map (`const_term → IntConst_term`), used by
+    /// [`OxizHost::bounded_var_domains`] to resolve a SYMBOLIC guard bound (e.g.
+    /// `(< i n)` with `(= n 5)` asserted) to a concrete one before extracting
+    /// the finite domain. Empty unless built with [`OxizHost::with_int_consts`].
+    int_consts: FxHashMap<TermId, TermId>,
 }
 
 impl<'a> OxizHost<'a> {
     /// Wrap a mutable borrow of the term manager for one engine round.
     pub fn new(tm: &'a mut TermManager) -> Self {
-        OxizHost { tm }
+        OxizHost { tm, int_consts: FxHashMap::default() }
+    }
+    /// As [`OxizHost::new`], plus a `const → literal` map for symbolic-bound
+    /// resolution in `bounded_var_domains`.
+    pub fn with_int_consts(tm: &'a mut TermManager, int_consts: FxHashMap<TermId, TermId>) -> Self {
+        OxizHost { tm, int_consts }
     }
     #[inline]
     fn m(&self) -> &TermManager {
         &*self.tm
+    }
+}
+
+/// Scan top-level `(= term literal)` equalities (through conjunctions) and map
+/// each non-literal side to its `IntConst` literal term — the concrete values
+/// of declared integer constants like `(= n 5)`, for symbolic-bound resolution.
+pub fn collect_int_consts(
+    m: &TermManager,
+    assertions: &[TermId],
+    out: &mut FxHashMap<TermId, TermId>,
+) {
+    for &a in assertions {
+        collect_const_eqs(m, a, out);
+    }
+}
+
+fn collect_const_eqs(m: &TermManager, t: TermId, out: &mut FxHashMap<TermId, TermId>) {
+    match m.get(t).map(|x| &x.kind) {
+        Some(TermKind::And(args)) => {
+            for &c in args.iter() {
+                collect_const_eqs(m, c, out);
+            }
+        }
+        Some(TermKind::Eq(a, b)) => {
+            let (a, b) = (*a, *b);
+            let a_lit = matches!(m.get(a).map(|x| &x.kind), Some(TermKind::IntConst(_)));
+            let b_lit = matches!(m.get(b).map(|x| &x.kind), Some(TermKind::IntConst(_)));
+            if a_lit && !b_lit {
+                out.insert(b, a);
+            } else if b_lit && !a_lit {
+                out.insert(a, b);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -234,6 +278,17 @@ impl<'a> TermLang for OxizHost<'a> {
                 Some(TermKind::Implies(g, _)) => *g,
                 _ => return Vec::new(),
             }
+        };
+        // Resolve SYMBOLIC bounds: substitute every declared integer constant the
+        // top-level equalities pin (e.g. `(= n 5)` ⇒ `n ↦ 5`) so a guard like
+        // `(< i n)` becomes `(< i 5)` and `collect_int_bounds` can read a concrete
+        // range. Sound: a top-level `(= n 5)` holds in every model, so the guard
+        // with `n` is equivalent to the guard with `5`.
+        let guard = if self.int_consts.is_empty() {
+            guard
+        } else {
+            let consts = self.int_consts.clone();
+            self.tm.substitute(guard, &consts)
         };
         // Tightest concrete (lower, upper) integer bound per bound var.
         let mut lo: FxHashMap<Spur, i128> = FxHashMap::default();
@@ -928,6 +983,7 @@ impl SolverModel {
                             || self.body_is_valid(lang, args[1], depth - 1)
                             || self.body_is_unsat(lang, args[0], depth - 1)
                             || self.is_congruence_axiom(lang, args[0], args[1])
+                            || self.is_order_transitivity(lang, args[0], args[1])
                     }
                     // `ite(c, t, e)` is valid when both branches are valid.
                     OP_ITE if args.len() == 3 => {
@@ -1003,6 +1059,55 @@ impl SolverModel {
             TermView::App { sym: OP_AND } => {
                 for c in lang.children(t) {
                     Self::collect_eq_pairs(lang, c, out, depth - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Recognise TRANSITIVITY of `≤`: `(A ≤ B ∧ B ≤ C) ⇒ A ≤ C`. `≤` is a
+    /// transitive relation in every interpretation, so the implication is VALID
+    /// (e.g. the `trans_simple` axiom `(f(x)≤f(y) ∧ f(y)≤f(z)) ⇒ f(x)≤f(z)`).
+    /// Recognising it lets the engine skip instantiating the (unbounded,
+    /// trigger-free) transitivity axiom.
+    fn is_order_transitivity(&self, lang: &OxizHost<'_>, guard: TermId, conseq: TermId) -> bool {
+        // conseq must be `(<= A C)`.
+        let TermView::App { sym: OP_LE } = lang.view(conseq) else {
+            return false;
+        };
+        let cc = lang.children(conseq);
+        if cc.len() != 2 {
+            return false;
+        }
+        let (a, c) = (cc[0], cc[1]);
+        // The guard must give `(<= A B)` and `(<= B C)` for some intermediate `B`.
+        let mut le: Vec<(TermId, TermId)> = Vec::new();
+        Self::collect_le_pairs(lang, guard, &mut le, 32);
+        le.iter()
+            .any(|&(p, q)| p == a && le.iter().any(|&(r, s)| r == q && s == c))
+    }
+
+    /// Collect the `(lhs, rhs)` of every `(<= a b)` atom reachable through a
+    /// conjunction, for the transitivity check.
+    fn collect_le_pairs(
+        lang: &OxizHost<'_>,
+        t: TermId,
+        out: &mut Vec<(TermId, TermId)>,
+        depth: u32,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        match lang.view(t) {
+            TermView::App { sym: OP_LE } => {
+                let a = lang.children(t);
+                if a.len() == 2 {
+                    out.push((a[0], a[1]));
+                }
+            }
+            TermView::App { sym: OP_AND } => {
+                for c in lang.children(t) {
+                    Self::collect_le_pairs(lang, c, out, depth - 1);
                 }
             }
             _ => {}

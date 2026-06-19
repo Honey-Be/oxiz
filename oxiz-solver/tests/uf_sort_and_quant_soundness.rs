@@ -300,6 +300,41 @@ fn congruence_conflict_still_caught_by_builtin_closure() {
 }
 
 #[test]
+fn order_transitivity_axiom_is_recognized() {
+    // #281: `(f(x)≤f(y) ∧ f(y)≤f(z)) ⇒ f(x)≤f(z)` is VALID (≤ is transitive),
+    // so it is recognized as a tautology and not instantiated — terminates with
+    // the correct Sat. (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((x Int) (y Int) (z Int)) \
+            (=> (and (<= (f x) (f y)) (<= (f y) (f z))) (<= (f x) (f z)))))",
+        "(assert (= (f 0) 1))",
+        "(assert (= (f 5) 10))",
+        "(assert (<= (f 0) (f 5)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "transitivity axiom is valid, must be Sat");
+}
+
+#[test]
+fn symbolic_bound_guard_resolves_to_a_finite_domain() {
+    // #281: a guard `(< i n)` with `(= n 3)` asserted is a bounded `∀` once `n`
+    // is resolved — the host substitutes `n ↦ 3`, so `∀i.(0≤i<n ⇒ a(i)≥0)` is
+    // instantiated over `[0,2]` and the solver-verified `Saturated` gives Sat.
+    // (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun a (Int) Int)",
+        "(declare-const n Int)",
+        "(assert (= n 3))",
+        "(assert (forall ((i Int)) (=> (and (>= i 0) (< i n)) (>= (a i) 0))))",
+        "(assert (= (+ (a 0) (+ (a 1) (a 2))) 10))",
+        "(assert (forall ((i Int)) (=> (and (>= i 0) (< i n)) (<= (a i) 5))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "symbolic-bound ∀ (n=3) must resolve + be Sat");
+}
+
+#[test]
 fn cdqi_finds_a_conflict_at_an_existing_ground_term() {
     // ∀a. f(a)>0 (NO pattern), with the existing ground term f(7) forced to
     // -3. CDQI instantiates at a=7 (an existing term), the body `f(7)>0` is

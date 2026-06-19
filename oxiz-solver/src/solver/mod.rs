@@ -610,8 +610,17 @@ impl Solver {
                         // One instantiation round against the current model.
                         let verdict = {
                             let model = self.build_clean_model(manager);
+                            // Declared integer constants the top-level equalities
+                            // pin (`(= n 5)`), so the host can resolve a symbolic
+                            // guard bound `(< i n)` to a finite domain.
+                            let mut int_consts = FxHashMap::default();
+                            crate::clean_mbqi::collect_int_consts(
+                                manager,
+                                &self.assertions,
+                                &mut int_consts,
+                            );
                             let eng = clean_engine.as_mut().expect("just built above");
-                            let mut host = OxizHost::new(manager);
+                            let mut host = OxizHost::with_int_consts(manager, int_consts);
                             eng.round_with(&mut host, &model)
                         };
                         match verdict {
