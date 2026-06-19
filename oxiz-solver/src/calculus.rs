@@ -411,13 +411,37 @@ pub fn level0_primitives() -> Vec<Primitive> {
     ]
 }
 
+/// A certified monotonicity fact: the direction, and whether the function is
+/// TOTAL (domain = all reals, range ⊆ reals). Only total functions compose
+/// freely and soundly — composing through a domain-restricted function (`ln`,
+/// needing its argument `> 0`) would need a range analysis we do not yet have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fact {
+    pub dir: MonoDir,
+    pub total: bool,
+}
+
+/// Monotonicity of a composition `f ∘ g` — the sign-multiply rule (`↑∘↑=↑`,
+/// `↓∘↓=↑`, mixed `=↓`; a constant on either side is constant).
+fn compose_dir(outer: MonoDir, inner: MonoDir) -> MonoDir {
+    use MonoDir::*;
+    match (outer, inner) {
+        (Const, _) | (_, Const) => Const,
+        (Inc, Inc) | (Dec, Dec) => Inc,
+        (Inc, Dec) | (Dec, Inc) => Dec,
+    }
+}
+
 /// A leveled knowledge base of certified monotonicity facts. Level 0 is the
-/// primitive catalogue; each `derive_next_level` adds the facts the
-/// first-derivative test certifies from the levels below. Lookups walk newest
+/// primitive catalogue; level 1 the derivative-test-certified primitives; each
+/// `derive_next_level` composes the newest level's TOTAL facts with the total
+/// base functions, accumulating one composition deeper. Lookups walk newest
 /// level first (keeps each level small — no monolithic table to scan).
 #[derive(Default)]
 pub struct Kb {
-    levels: Vec<HashMap<String, MonoDir>>,
+    levels: Vec<HashMap<String, Fact>>,
+    /// The total-domain base functions used as composition building blocks.
+    total_base: Vec<(String, Fact)>,
 }
 
 impl Kb {
@@ -433,7 +457,7 @@ impl Kb {
         let mut l0 = HashMap::new();
         for p in &prims {
             if let Some(d) = p.expected {
-                l0.insert(p.name.to_string(), d);
+                l0.insert(p.name.to_string(), Fact { dir: d, total: domain_is_all(&p.domain) });
             }
         }
         kb.levels.push(l0);
@@ -444,18 +468,23 @@ impl Kb {
         let mut l1 = HashMap::new();
         let mut mismatches = 0usize;
         for p in &prims {
-            if p.differentiable {
+            let fact = if p.differentiable {
                 let derived = p.body.monotonicity(&p.domain);
                 if let (Some(exp), Some(got)) = (p.expected, derived) {
                     if exp != got {
                         mismatches += 1;
                     }
                 }
-                if let Some(got) = derived {
-                    l1.insert(p.name.to_string(), got);
+                derived
+            } else {
+                p.expected
+            };
+            if let Some(dir) = fact {
+                let f = Fact { dir, total: domain_is_all(&p.domain) };
+                l1.insert(p.name.to_string(), f);
+                if f.total {
+                    kb.total_base.push((p.name.to_string(), f));
                 }
-            } else if let Some(d) = p.expected {
-                l1.insert(p.name.to_string(), d);
             }
         }
         kb.levels.push(l1);
@@ -464,6 +493,11 @@ impl Kb {
 
     /// Look up a function's certified monotonicity, newest level first.
     pub fn monotonicity_of(&self, name: &str) -> Option<MonoDir> {
+        self.levels.iter().rev().find_map(|lvl| lvl.get(name).map(|f| f.dir))
+    }
+
+    /// Look up the full fact (direction + totality).
+    pub fn fact_of(&self, name: &str) -> Option<Fact> {
         self.levels.iter().rev().find_map(|lvl| lvl.get(name).copied())
     }
 
@@ -471,16 +505,39 @@ impl Kb {
         self.levels.len()
     }
 
-    /// Derive the next level: re-run the derivative test (a placeholder for the
-    /// compositional derivation that future increments will add — composing
-    /// certified lower-level facts). Returns the number of newly certified facts.
+    /// Derive the next level by COMPOSITION: for every total fact `f` in the
+    /// current newest level and every total base function `g`, certify `f ∘ g`
+    /// (sign-multiply rule). Only total functions compose (sound — no range
+    /// mismatch). Skips a composite already known at a lower level. Returns the
+    /// number of NEW facts added.
     pub fn derive_next_level(&mut self) -> usize {
-        // Future increment: derive monotonicity of COMPOSITES of already-certified
-        // functions (sum/product/composition) and append as a new level. For now
-        // this is a no-op stub keeping the leveled-growth API in place.
-        self.levels.push(HashMap::new());
-        0
+        let top: Vec<(String, Fact)> = self
+            .levels
+            .last()
+            .map(|lvl| lvl.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
+        let mut next: HashMap<String, Fact> = HashMap::new();
+        for (fname, ff) in &top {
+            if !ff.total {
+                continue;
+            }
+            for (gname, gf) in &self.total_base {
+                let name = format!("{fname}∘{gname}");
+                if self.fact_of(&name).is_some() {
+                    continue; // already known lower down
+                }
+                next.insert(name, Fact { dir: compose_dir(ff.dir, gf.dir), total: true });
+            }
+        }
+        let added = next.len();
+        self.levels.push(next);
+        added
     }
+}
+
+/// Is the domain all of the reals (both bounds unbounded)?
+fn domain_is_all(d: &Domain) -> bool {
+    d.lo.is_none() && d.hi.is_none()
 }
 
 #[cfg(test)]
@@ -536,6 +593,22 @@ mod tests {
         // sin/cos have no constant-sign derivative over an unrestricted domain.
         assert_eq!(Sin(Box::new(X)).monotonicity(&Domain::all()), None);
         assert_eq!(Cos(Box::new(X)).monotonicity(&Domain::all()), None);
+    }
+
+    #[test]
+    fn compositional_derivation_grows_leveled_kb() {
+        let (mut kb, mism) = Kb::build_and_verify();
+        assert_eq!(mism, 0);
+        let n0 = kb.num_levels();
+        let added = kb.derive_next_level();
+        assert!(added > 0, "composition should certify new facts");
+        assert_eq!(kb.num_levels(), n0 + 1);
+        // Sign-multiply through composition (`↑∘↑=↑`, `↓∘↓=↑`, mixed `=↓`):
+        assert_eq!(kb.monotonicity_of("neg∘sinh"), Some(MonoDir::Dec)); // ↓∘↑
+        assert_eq!(kb.monotonicity_of("sinh∘neg"), Some(MonoDir::Dec)); // ↑∘↓
+        assert_eq!(kb.monotonicity_of("neg∘neg"), Some(MonoDir::Inc)); // ↓∘↓
+        // A non-differentiable (axiomatic) total function composes too:
+        assert_eq!(kb.monotonicity_of("floor∘tanh"), Some(MonoDir::Inc)); // ↑∘↑
     }
 
     #[test]
