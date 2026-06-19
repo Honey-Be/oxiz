@@ -538,6 +538,12 @@ impl Solver {
         // sound. See `verify_clean_unsat`.
         let mut clean_instances: Vec<TermId> = Vec::new();
 
+        // Propagate the wall-clock deadline INTO the ground SAT solver so a single
+        // non-terminating ground solve (e.g. a dense-real f-tower instance set)
+        // bails to `Unknown` rather than overshooting the cap — the MBQI
+        // between-round check alone cannot interrupt a hung `solve_*` call.
+        #[cfg(feature = "std")]
+        self.sat.set_deadline(mbqi_deadline);
         loop {
             #[cfg(feature = "std")]
             if self.has_quantifiers && mbqi_deadline.is_some_and(|d| std::time::Instant::now() >= d)

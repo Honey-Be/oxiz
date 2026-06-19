@@ -371,6 +371,11 @@ pub struct Solver {
     pub(super) lrb: LRB,
     /// Statistics
     pub(super) stats: SolverStats,
+    /// Optional wall-clock deadline. When set, the main solve loops bail to
+    /// `Unknown` once it passes — bounding a single ground solve so an MBQI
+    /// caller's timeout cannot be overshot by a non-terminating round.
+    #[cfg(feature = "std")]
+    pub(super) deadline: Option<std::time::Instant>,
     /// Learnt clause for conflict analysis
     pub(super) learnt: SmallVec<[Lit; 16]>,
     /// Seen flags for conflict analysis
@@ -473,6 +478,8 @@ impl Solver {
             chb: CHB::new(0),
             lrb: LRB::new(0),
             stats: SolverStats::default(),
+            #[cfg(feature = "std")]
+            deadline: None,
             learnt: SmallVec::new(),
             seen: Vec::new(),
             analyze_stack: Vec::new(),
@@ -567,6 +574,21 @@ impl Solver {
             let _ = d.add_clause(&[]);
             let _ = d.flush();
         }
+    }
+
+    /// Set (or clear) the wall-clock deadline honoured by the main solve loops.
+    /// On expiry they return [`SolverResult::Unknown`] — sound: a bailed solve
+    /// concludes nothing.
+    #[cfg(feature = "std")]
+    pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// Has the configured deadline passed?
+    #[cfg(feature = "std")]
+    #[inline]
+    fn deadline_expired(&self) -> bool {
+        self.deadline.is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     /// Create a new variable
@@ -1095,8 +1117,20 @@ impl Solver {
         // We only send NEW assignments (not previously processed ones) to avoid
         // duplicate theory constraints that would cause spurious UNSAT.
         let mut theory_processed: usize = 0;
+        #[cfg(feature = "std")]
+        let mut deadline_tick: u32 = 0;
 
         loop {
+            // Wall-clock deadline (throttled so `Instant::now()` is not on every
+            // propagation): a single ground solve that would otherwise run past
+            // an MBQI caller's timeout bails to the sound `Unknown`.
+            #[cfg(feature = "std")]
+            {
+                deadline_tick = deadline_tick.wrapping_add(1);
+                if deadline_tick % 1024 == 0 && self.deadline_expired() {
+                    return SolverResult::Unknown;
+                }
+            }
             // Boolean propagation
             if let Some(conflict) = self.propagate() {
                 self.stats.conflicts += 1;
@@ -1380,7 +1414,17 @@ impl Solver {
             return SolverResult::Unsat;
         }
 
+        #[cfg(feature = "std")]
+        let mut deadline_tick: u32 = 0;
         loop {
+            // Wall-clock deadline (throttled), as in `solve_with_theory`.
+            #[cfg(feature = "std")]
+            {
+                deadline_tick = deadline_tick.wrapping_add(1);
+                if deadline_tick % 1024 == 0 && self.deadline_expired() {
+                    return SolverResult::Unknown;
+                }
+            }
             // (1) Boolean propagation.
             if let Some(conflict) = self.propagate() {
                 if self.handle_boolean_conflict_hooks(conflict).is_unsat() {
