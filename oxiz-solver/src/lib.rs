@@ -131,6 +131,10 @@ pub mod shared_terms;
 // removed once `clean_mbqi` became the suite-validated default (#262).
 pub mod clean_mbqi;
 
+// Symbolic calculus engine + leveled monotonicity knowledge base (the
+// derivative-sign certifier behind the monotonicity recognizers in clean_mbqi).
+pub mod calculus;
+
 // Z3 API compatibility layer (std-only)
 #[cfg(feature = "std")]
 pub mod z3_compat;
