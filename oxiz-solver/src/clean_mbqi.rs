@@ -141,6 +141,132 @@ fn collect_const_eqs(m: &TermManager, t: TermId, out: &mut FxHashMap<TermId, Ter
     }
 }
 
+/// Push negations inward to the QUANTIFIER BOUNDARIES so the clean engine's
+/// (polarity-blind) `collect_quants` — which records `universal: forall`
+/// syntactically — sees every quantifier at its TRUE polarity. A quantifier
+/// under an odd number of negations is semantically flipped (`¬∀ ≡ ∃¬`,
+/// `¬∃ ≡ ∀¬`); left unflipped, a negated `∃` is collected as an (inactive)
+/// existential and never instantiated, so `(not (exists y. (= (f y) 0)))` with
+/// `(= (f 5) 0)` asserted — an unsat the engine should reach by instantiating
+/// the implied `∀y. f(y)≠0` at the ground term `f(5)` — silently came back
+/// `sat`. After this pass that assertion is `(forall y. (not (= (f y) 0)))`, a
+/// positive universal the engine enumerates at `5` → `f(5)≠0` → conflict.
+///
+/// SURGICAL, and BODY-OPAQUE. (1) Only the boolean spine that actually reaches a
+/// quantifier is rewritten (`has_quant` gate); a quantifier-free subterm is kept
+/// verbatim (positive) or wrapped in one `not` (negative), so ground structure
+/// and theory atoms never churn. (2) A quantifier's BODY is left untouched — a
+/// flipped quantifier wraps its body in a SINGLE `not` rather than recursively
+/// NNF-ing it — because the validity/bounded-domain recognizers
+/// ([`SolverModel::body_is_valid`]'s congruence/transitivity arms,
+/// [`OxizHost::bounded_var_domains`]) pattern-match on the body's `=>` shape and
+/// would stop matching if the body were rewritten. Two-polarity contexts
+/// (`ite`/`xor`/bool-`=`) carrying a quantifier are left verbatim (sound, merely
+/// unnormalized there). Composes before [`fold_valid_quantifiers`] (now-positive
+/// valid quantifiers fold) and [`skolemize_unbounded_existentials`] (the `∃`
+/// that a `¬∀` becomes gets skolemized).
+pub fn nnf_push_negations(m: &mut TermManager, t: TermId) -> TermId {
+    to_nnf(m, t, true)
+}
+
+/// Does `t` contain a quantifier anywhere in its boolean structure? (Quantifiers
+/// are `Bool`-sorted, so they can only sit under boolean connectives — an
+/// arithmetic/UF atom is a leaf for this purpose.)
+fn has_quant(m: &TermManager, t: TermId) -> bool {
+    let kids: Vec<TermId> = match m.get(t) {
+        Some(term) => match &term.kind {
+            TermKind::Forall { .. } | TermKind::Exists { .. } => return true,
+            TermKind::Not(a) => vec![*a],
+            TermKind::And(v) | TermKind::Or(v) => v.to_vec(),
+            TermKind::Implies(a, b) | TermKind::Xor(a, b) | TermKind::Eq(a, b) => vec![*a, *b],
+            TermKind::Ite(a, b, c) => vec![*a, *b, *c],
+            _ => return false,
+        },
+        None => return false,
+    };
+    kids.iter().any(|&c| has_quant(m, c))
+}
+
+fn to_nnf(m: &mut TermManager, t: TermId, positive: bool) -> TermId {
+    if !has_quant(m, t) {
+        return if positive { t } else { m.mk_not(t) };
+    }
+    let kind = match m.get(t) {
+        Some(x) => x.kind.clone(),
+        None => return if positive { t } else { m.mk_not(t) },
+    };
+    match kind {
+        TermKind::Not(a) => to_nnf(m, a, !positive),
+        TermKind::And(args) => {
+            let v: Vec<TermId> = args.iter().map(|&a| to_nnf(m, a, positive)).collect();
+            // De Morgan: ¬⋀ = ⋁¬.
+            if positive { m.mk_and(v) } else { m.mk_or(v) }
+        }
+        TermKind::Or(args) => {
+            let v: Vec<TermId> = args.iter().map(|&a| to_nnf(m, a, positive)).collect();
+            if positive { m.mk_or(v) } else { m.mk_and(v) }
+        }
+        TermKind::Implies(a, b) => {
+            if positive {
+                // a ⇒ b ≡ ¬a ∨ b
+                let na = to_nnf(m, a, false);
+                let b2 = to_nnf(m, b, true);
+                m.mk_or(vec![na, b2])
+            } else {
+                // ¬(a ⇒ b) ≡ a ∧ ¬b
+                let a2 = to_nnf(m, a, true);
+                let nb = to_nnf(m, b, false);
+                m.mk_and(vec![a2, nb])
+            }
+        }
+        TermKind::Forall { vars, body, .. } => {
+            if positive {
+                t // keep; body opaque (preserves the recognizers + bounded_var_domains)
+            } else {
+                let nb = m.mk_not(body); // ¬∀x.φ ≡ ∃x.¬φ
+                mk_flipped_quant(m, &vars, nb, false)
+            }
+        }
+        TermKind::Exists { vars, body, .. } => {
+            if positive {
+                t
+            } else {
+                let nb = m.mk_not(body); // ¬∃x.φ ≡ ∀x.¬φ
+                mk_flipped_quant(m, &vars, nb, true)
+            }
+        }
+        // ite/xor/bool-= carrying a quantifier: two-polarity, leave verbatim.
+        _ => {
+            if positive {
+                t
+            } else {
+                m.mk_not(t)
+            }
+        }
+    }
+}
+
+/// Rebuild a polarity-flipped quantifier with the (already single-negated) body,
+/// dropping the original patterns (they targeted the un-negated body; the
+/// flipped quantifier is discharged by enumeration / skolemization instead).
+fn mk_flipped_quant(
+    m: &mut TermManager,
+    vars: &[(Spur, SortId)],
+    body: TermId,
+    forall: bool,
+) -> TermId {
+    let named: Vec<(String, SortId)> = vars
+        .iter()
+        .map(|(s, sort)| (m.resolve_str(*s).to_string(), *sort))
+        .collect();
+    let it = named.iter().map(|(s, sort)| (s.as_str(), *sort));
+    if forall {
+        m.mk_forall(it, body)
+    } else {
+        m.mk_exists(it, body)
+    }
+}
+
 /// Constant-fold a quantifier whose matrix is a recognized *tautology* to the
 /// literal `true` — POLARITY-INDEPENDENTLY, anywhere it appears in the boolean
 /// structure of an assertion. A valid body makes the whole quantifier valid:

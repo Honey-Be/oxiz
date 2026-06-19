@@ -783,3 +783,47 @@ fn negated_congruence_valid_forall_folds_to_unsat() {
         "the negation of a valid ∀ over an uninterpreted application must be unsat"
     );
 }
+
+#[test]
+fn negated_existential_with_ground_witness_is_unsat_via_nnf() {
+    // `(not (exists y. (= (f y) 0)))` with `(= (f 5) 0)` asserted. The negated
+    // existential is the CONTINGENT universal `forall y. f(y) != 0` — unsat only
+    // via the ground fact f(5)=0, NOT a tautology, so no validity recognizer
+    // catches it. Pre-fix it was a spurious `sat`: `collect_quants` recorded the
+    // negated `exists` SYNTACTICALLY as an (inactive) existential and never
+    // instantiated it. NNF (push the negation in: `not(exists) -> forall(not)`)
+    // turns it into a positive universal the engine ENUMERATES at the ground
+    // term 5 -> `f(5) != 0` -> conflict with `f(5)=0`. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (not (exists ((y Int)) (= (f y) 0))))",
+        "(assert (= (f 5) 0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "a negated existential refuted by a ground witness must be unsat, not spurious sat"
+    );
+}
+
+#[test]
+fn negated_existential_consistent_is_not_unsat() {
+    // The soundness control for the case above: same shape but CONSISTENT
+    // (`f(5)=1`, never 0). `forall y. f(y) != 0` together with `f(5)=1` is
+    // satisfiable, so the verdict must be sat or the sound Unknown — NEVER a
+    // spurious unsat from over-eager NNF instantiation. (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(assert (not (exists ((y Int)) (= (f y) 0))))",
+        "(assert (= (f 5) 1))",
+        "(check-sat)",
+    ]);
+    assert_ne!(
+        r,
+        SolverResult::Unsat,
+        "a consistent negated existential must not be driven to a spurious unsat"
+    );
+}
