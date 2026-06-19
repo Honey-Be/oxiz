@@ -997,3 +997,59 @@ fn idempotent_violated_is_unsat() {
     ]);
     assert_eq!(r, SolverResult::Unsat, "an idempotency-violating ground point is unsat");
 }
+
+#[test]
+fn array_extensionality_premise_with_equal_arrays_is_sat() {
+    // `∀i. select(a,i) = select(b,i)` is a congruence consequence of `a = b`, so
+    // asserting both is satisfiable (the universal is automatically satisfied).
+    // (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic AUFLIA)",
+        "(declare-const a (Array Int Int))",
+        "(declare-const b (Array Int Int))",
+        "(assert (forall ((i Int)) (= (select a i) (select b i))))",
+        "(assert (= a b))",
+        "(assert (= (select a 0) 10))",
+        "(assert (= (select b 0) 10))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "the extensionality premise is entailed by a=b");
+}
+
+#[test]
+fn array_read_over_write_with_store_is_sat() {
+    // `∀i. i≠k ⇒ select(b,i)=select(a,i)` is the read-over-write axiom, entailed
+    // by `b = store(a,k,v)`. (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic AUFLIA)",
+        "(declare-const a (Array Int Int))",
+        "(declare-const b (Array Int Int))",
+        "(declare-const k Int)",
+        "(declare-const v Int)",
+        "(assert (= b (store a k v)))",
+        "(assert (= k 3))",
+        "(assert (= v 99))",
+        "(assert (forall ((i Int)) (=> (not (= i k)) (= (select b i) (select a i)))))",
+        "(assert (= (select b k) v))",
+        "(assert (= (select a 0) 10))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "read-over-write is entailed by b=store(a,k,v)");
+}
+
+#[test]
+fn array_extensionality_without_array_equality_is_not_spurious_sat() {
+    // Soundness: `∀i. select(a,i)=select(b,i)` WITHOUT `a=b`, where `a` and `b`
+    // disagree at index 0 — the recognizer must decline (no array equality), and
+    // the engine instantiates at 0 → `10 = 20` → unsat. Never a spurious sat.
+    let r = solve_streamed(&[
+        "(set-logic AUFLIA)",
+        "(declare-const a (Array Int Int))",
+        "(declare-const b (Array Int Int))",
+        "(assert (forall ((i Int)) (= (select a i) (select b i))))",
+        "(assert (= (select a 0) 10))",
+        "(assert (= (select b 0) 20))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "extensionality with disagreeing arrays and no a=b is unsat");
+}

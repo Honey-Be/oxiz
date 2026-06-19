@@ -1893,6 +1893,111 @@ fn try_idempotent(m: &TermManager, facts: &CompletionFacts, body: TermId, bound:
     true
 }
 
+// ─────────────────────────── array axiom recognizers ───────────────────────
+//
+// Two array axioms are VALID consequences of an asserted array equality, so a
+// universal asserting one is automatically satisfied (sound `Sat`):
+//   * extensionality premise `∀i. select(a,i)=select(b,i)` is entailed by
+//     `a = b` (function congruence);
+//   * read-over-write `∀i. i≠k ⇒ select(b,i)=select(a,i)` is entailed by
+//     `b = store(a,k,v)` (the select-store axiom).
+
+/// If `t` is `(select c (Var i))`, return the array `c`.
+fn select_over_var(m: &TermManager, t: TermId, i: Spur) -> Option<TermId> {
+    let TermKind::Select(arr, idx) = m.get(t)?.kind.clone() else {
+        return None;
+    };
+    match m.get(idx)?.kind {
+        TermKind::Var(s) if s == i => Some(arr),
+        _ => None,
+    }
+}
+
+#[inline]
+fn is_var_term(m: &TermManager, t: TermId, v: Spur) -> bool {
+    matches!(m.get(t).map(|x| &x.kind), Some(TermKind::Var(s)) if *s == v)
+}
+
+/// Is `c1 = c2` asserted at the top level (in either pin direction)?
+fn terms_eq_pinned(facts: &CompletionFacts, c1: TermId, c2: TermId) -> bool {
+    facts.eq_pins.get(&c1).is_some_and(|v| v.contains(&c2))
+        || facts.eq_pins.get(&c2).is_some_and(|v| v.contains(&c1))
+}
+
+/// Is `b` asserted equal to `(store a k _)` for some value?
+fn array_is_store_of(m: &TermManager, facts: &CompletionFacts, b: TermId, a: TermId, k: TermId) -> bool {
+    facts.eq_pins.get(&b).is_some_and(|pins| {
+        pins.iter().any(|&p| {
+            matches!(m.get(p).map(|t| t.kind.clone()),
+                Some(TermKind::Store(sa, sk, _)) if sa == a && sk == k)
+        })
+    })
+}
+
+/// `∀i. select(a,i) = select(b,i)` — valid when `a = b` is asserted (congruence).
+fn try_array_extensionality(m: &TermManager, facts: &CompletionFacts, body: TermId, bound: &[Spur]) -> bool {
+    if bound.len() != 1 {
+        return false;
+    }
+    let i = bound[0];
+    let TermKind::Eq(o1, o2) = (match m.get(body) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    match (select_over_var(m, o1, i), select_over_var(m, o2, i)) {
+        (Some(c1), Some(c2)) => terms_eq_pinned(facts, c1, c2),
+        _ => false,
+    }
+}
+
+/// `∀i. i≠k ⇒ select(b,i) = select(a,i)` — valid when `b = store(a,k,v)`.
+fn try_array_store(m: &TermManager, facts: &CompletionFacts, body: TermId, bound: &[Spur]) -> bool {
+    if bound.len() != 1 {
+        return false;
+    }
+    let i = bound[0];
+    let TermKind::Implies(guard, conseq) = (match m.get(body) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    // guard = (not (= i k)) → extract k.
+    let TermKind::Not(eq) = (match m.get(guard) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let TermKind::Eq(g1, g2) = (match m.get(eq) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let k = if is_var_term(m, g1, i) {
+        g2
+    } else if is_var_term(m, g2, i) {
+        g1
+    } else {
+        return false;
+    };
+    // conseq = (= (select b i) (select a i)).
+    let TermKind::Eq(c1, c2) = (match m.get(conseq) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let (Some(arr1), Some(arr2)) = (select_over_var(m, c1, i), select_over_var(m, c2, i)) else {
+        return false;
+    };
+    // Either array may be the store of the other (read-over-write either order).
+    array_is_store_of(m, facts, arr1, arr2, k) || array_is_store_of(m, facts, arr2, arr1, k)
+}
+
 /// Walk the boolean skeleton of `t` recording each uninterpreted PREDICATE
 /// symbol's polarity (`pos`/`neg`); a symbol reached in a non-monotone context
 /// (Eq/Xor/Ite/Distinct/arith comparison) or in term (argument) position is
@@ -2101,6 +2206,14 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // (6) Idempotent axiom `∀x. f(f(x)) = f(x)`: satisfiable when the ground
         // f-points are idempotency-consistent (each `f(t)=v` needs `f(v)=v`).
         if try_idempotent(lang.m(), facts, body, &bound) {
+            return Some(true);
+        }
+        // (7) Array axioms that are VALID consequences of an asserted array
+        // equality: extensionality premise (`a=b`) and read-over-write
+        // (`b=store(a,k,v)`).
+        if try_array_extensionality(lang.m(), facts, body, &bound)
+            || try_array_store(lang.m(), facts, body, &bound)
+        {
             return Some(true);
         }
         None
