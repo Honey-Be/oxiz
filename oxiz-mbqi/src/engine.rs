@@ -145,6 +145,19 @@ impl<S: Sig> Engine<S> {
             }
             active[qi] = true;
 
+            // 0. EXISTENTIALS are NOT instantiated. Ground-instantiating an `∃`
+            //    as if it were `∀` — asserting `Q ⇒ φ[x̄↦t̄]` for an arbitrary
+            //    ground `t̄` — is UNSOUND: a `t̄` outside the existential's guard
+            //    makes `φ` false, so `Q ⇒ false` = `¬Q` refutes the asserted
+            //    existential (spurious `unsat`, e.g. `∃i.(0≤i≤1 ∧ a(i)=42)`
+            //    instantiated at `i:=42`). An `∃` only guarantees SOME witness;
+            //    sound discharge needs host-side skolemization (a fresh witness),
+            //    which the no-fabrication firewall forbids inside the engine — so
+            //    we skip it and report the sound `Unknown` at saturation (below).
+            if !self.quants[qi].universal {
+                continue;
+            }
+
             // 1. CDQI — a conflicting instance, if the model reveals one.
             if let Some(binding) = cdqi::find_conflict(
                 lang,
@@ -226,6 +239,15 @@ impl<S: Sig> Engine<S> {
         // `Unknown`, never a guessed `Sat`).
         for q in &self.quants {
             if q.triggers.is_empty() && model.is_active(lang, q.term) {
+                // An active EXISTENTIAL was not (and cannot soundly be)
+                // instantiated here (skolemization is host-side). Its witness
+                // constraint is therefore unverified — the sound verdict is
+                // `Unknown`, NEVER a guessed `Sat` (the `∃` might be unsat, so a
+                // `Saturated`→`Sat` that dropped it would be unsound). `eval_forall`
+                // is a `∀`-only recognizer and must not run on an `∃`.
+                if !q.universal {
+                    return Verdict::Inconclusive;
+                }
                 match model.eval_forall(lang, q.term) {
                     Some(true) => {}
                     Some(false) | None => return Verdict::Inconclusive,

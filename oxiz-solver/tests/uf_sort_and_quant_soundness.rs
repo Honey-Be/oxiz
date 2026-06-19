@@ -189,6 +189,29 @@ fn axiomatized_add_satisfiable_countermodel_is_sat() {
 // prunes in one step, without fabricating synthetic domain values.
 
 #[test]
+fn existential_is_not_instantiated_as_universal() {
+    // SOUNDNESS (#278): an existential must NOT be ground-instantiated like a
+    // universal. `∃i.(0≤i≤1 ∧ a(i)=42) ∧ a(0)=42` is SAT (witness i=0), but the
+    // engine used to register the `∃` as a `Quant` and emit `Q ⇒ φ[i↦t]` for
+    // ground terms `t`; at `t:=42` the guard `0≤42≤1` is false so `Q ⇒ false`
+    // = `¬Q` refuted the asserted existential → spurious `unsat`. The engine now
+    // skips existentials (sound discharge needs host-side skolemization) and
+    // reports the sound `Unknown` — the key invariant is NEVER the spurious
+    // `Unsat`. (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun a (Int) Int)",
+        "(assert (exists ((i Int)) (and (>= i 0) (<= i 1) (= (a i) 42))))",
+        "(assert (= (a 0) 42))",
+        "(check-sat)",
+    ]);
+    assert_ne!(
+        r,
+        SolverResult::Unsat,
+        "a satisfiable bounded existential must NOT be a spurious Unsat (∃ ≠ ∀)"
+    );
+}
+
+#[test]
 fn cdqi_finds_a_conflict_at_an_existing_ground_term() {
     // ∀a. f(a)>0 (NO pattern), with the existing ground term f(7) forced to
     // -3. CDQI instantiates at a=7 (an existing term), the body `f(7)>0` is
