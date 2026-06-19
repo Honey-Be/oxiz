@@ -342,6 +342,95 @@ pub enum MonoDir {
     Const,
 }
 
+/// Function parity — the second attribute on the lattice. `Both` is the zero
+/// function (odd AND even); `Neither` has no symmetry. Differentiation flips
+/// `Odd ↔ Even` (the user's KB rule), which the engine self-verifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parity {
+    Odd,
+    Even,
+    Both,
+    Neither,
+}
+
+impl Parity {
+    /// Differentiation swaps odd and even (`Both`/`Neither` are fixed points).
+    fn flip(self) -> Parity {
+        match self {
+            Parity::Odd => Parity::Even,
+            Parity::Even => Parity::Odd,
+            Parity::Both => Parity::Both,
+            Parity::Neither => Parity::Neither,
+        }
+    }
+    /// Parity of a sum: same parity is preserved; `Even + Odd` loses symmetry.
+    fn add(self, o: Parity) -> Parity {
+        use Parity::*;
+        match (self, o) {
+            (Both, x) | (x, Both) => x,
+            (Neither, _) | (_, Neither) => Neither,
+            (a, b) if a == b => a,
+            _ => Neither,
+        }
+    }
+    /// Parity of a product: `Odd·Odd = Even`, `Even·Even = Even`, `Odd·Even = Odd`.
+    fn mul(self, o: Parity) -> Parity {
+        use Parity::*;
+        match (self, o) {
+            (Both, _) | (_, Both) => Both, // a zero factor ⇒ the zero function
+            (Neither, _) | (_, Neither) => Neither,
+            (a, b) if a == b => Even,
+            _ => Odd,
+        }
+    }
+}
+
+impl Expr {
+    /// The parity of this expression (as a function over a symmetric domain).
+    /// Conservative — `Neither` is always sound.
+    pub fn parity(&self) -> Parity {
+        match self {
+            X => Parity::Odd,
+            Const(c) if c.is_zero() => Parity::Both,
+            Const(_) => Parity::Even,
+            Neg(a) => a.parity(), // −f has the same parity as f
+            Add(xs) => xs.iter().fold(Parity::Both, |acc, x| acc.add(x.parity())),
+            Mul(xs) => xs.iter().fold(Parity::Even, |acc, x| acc.mul(x.parity())),
+            Pow(b, k) => {
+                let pb = b.parity();
+                if !k.is_integer() {
+                    Parity::Neither
+                } else if pb == Parity::Odd {
+                    if (k.numer() % BigInt::from(2)).is_zero() {
+                        Parity::Even // odd^even = even
+                    } else {
+                        Parity::Odd // odd^odd = odd
+                    }
+                } else {
+                    pb // even^k = even; Both/Neither pass through
+                }
+            }
+            // ODD outer functions (`sin`/`tan`/`sinh`/`tanh`/`atan`) inherit the
+            // inner parity.
+            Sin(g) | Tan(g) | Sinh(g) | Tanh(g) | Atan(g) => g.parity(),
+            // EVEN outer functions (`cos`/`cosh`/`abs`) are even whenever the
+            // inner is symmetric at all (`cos(−g)=cos(g)`).
+            Cos(g) | Cosh(g) | Abs(g) => match g.parity() {
+                Parity::Neither => Parity::Neither,
+                _ => Parity::Even,
+            },
+            // `a^g` / `ln g` are NOT even outer functions: even ONLY when the
+            // inner is even (`a^{g(−x)}=a^{g(x)}` needs `g` even); an odd inner
+            // gives `a^{−g}=1/a^g`, which has no parity.
+            ExpBase(_, g) | Ln(g) => match g.parity() {
+                Parity::Even | Parity::Both => Parity::Even,
+                _ => Parity::Neither,
+            },
+            Floor(_) | Ceil(_) | Round(_) | Undefined => Parity::Neither,
+        }
+    }
+}
+
 /// A primitive (level-0) function in the KB: its symbol, its body as an `Expr`
 /// of `x`, its domain, and the monotonicity the level-1 derivation must confirm.
 /// `differentiable = false` marks a function (step/abs) whose monotonicity is
@@ -593,6 +682,47 @@ mod tests {
         // sin/cos have no constant-sign derivative over an unrestricted domain.
         assert_eq!(Sin(Box::new(X)).monotonicity(&Domain::all()), None);
         assert_eq!(Cos(Box::new(X)).monotonicity(&Domain::all()), None);
+    }
+
+    #[test]
+    fn parity_lattice_basics() {
+        assert_eq!(X.parity(), Parity::Odd);
+        assert_eq!(Expr::c(0).parity(), Parity::Both);
+        assert_eq!(Expr::c(5).parity(), Parity::Even);
+        assert_eq!(Pow(Box::new(X), rat(2)).parity(), Parity::Even); // x² even
+        assert_eq!(Pow(Box::new(X), rat(3)).parity(), Parity::Odd); // x³ odd
+        assert_eq!(Sin(Box::new(X)).parity(), Parity::Odd); // sin odd
+        assert_eq!(Cos(Box::new(X)).parity(), Parity::Even); // cos even
+        assert_eq!(Abs(Box::new(X)).parity(), Parity::Even); // |x| even
+        assert_eq!(Cosh(Box::new(X)).parity(), Parity::Even);
+        assert_eq!(Sinh(Box::new(X)).parity(), Parity::Odd);
+        // cos(x²): even outer, symmetric inner → even.
+        assert_eq!(Cos(Box::new(Pow(Box::new(X), rat(2)))).parity(), Parity::Even);
+        // a^x has no parity (odd inner x ⇒ 1/a^x).
+        assert_eq!(ExpBase(rat(2), Box::new(X)).parity(), Parity::Neither);
+    }
+
+    #[test]
+    fn differentiation_flips_parity() {
+        // The user's KB rule: the derivative of an ODD function is EVEN and vice
+        // versa. Self-verify it on every parity-bearing primitive.
+        for p in level0_primitives() {
+            if !p.differentiable {
+                continue;
+            }
+            let pf = p.body.parity();
+            if matches!(pf, Parity::Odd | Parity::Even | Parity::Both) {
+                let dpf = diff(&p.body).parity();
+                assert_eq!(
+                    dpf,
+                    pf.flip(),
+                    "d/dx must flip parity for `{}`: f is {:?}, f' is {:?}",
+                    p.name,
+                    pf,
+                    dpf
+                );
+            }
+        }
     }
 
     #[test]
