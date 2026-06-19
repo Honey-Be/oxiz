@@ -1893,6 +1893,125 @@ fn try_idempotent(m: &TermManager, facts: &CompletionFacts, body: TermId, bound:
     true
 }
 
+// ───────────────────── fresh-Skolem equality-witness recognizer ─────────────
+//
+// The `∀∃` "anchorless" case. A formula `∀x̄. ∃ȳ. φ` skolemizes
+// ([`skolemize_unbounded_existentials`]) to `∀x̄. φ[ȳ ↦ sk(x̄)]` for a fresh
+// Skolem function `sk`. When `φ` is an EQUALITY `L = f(ȳ)` — e.g.
+// `∀x.∃y. g(x)=f(y)` → `∀x. g(x)=f(sk(x))` — neither the pure-predicate nor the
+// single-function-completion recognizer fires (both sides mention `x`), yet the
+// axiom is satisfiable by a free choice of the Skolem witness. This recognizer
+// closes exactly that gap.
+
+/// Free **variable names** (Spurs) occurring in `t`, built from the manager's
+/// capture-free `free_vars`.
+fn free_var_spurs(m: &TermManager, t: TermId) -> FxHashSet<Spur> {
+    m.free_vars(t)
+        .into_iter()
+        .filter_map(|v| match m.get(v).map(|x| &x.kind) {
+            Some(TermKind::Var(s)) => Some(*s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Is `t` an application of a FRESH Skolem function — one minted by
+/// [`skolemize_unbounded_existentials`] (name `sk!…`)?  Each such name is unique
+/// per existential, so the symbol occurs in exactly the one axiom it was
+/// introduced for and in no ground fact: its interpretation is entirely the
+/// model-builder's to choose.  Returns the skolem's `view`-symbol on a match.
+fn fresh_skolem_head(m: &TermManager, t: TermId) -> Option<u64> {
+    let TermKind::Apply { func, .. } = &m.get(t)?.kind else {
+        return None;
+    };
+    m.resolve_str(*func).starts_with("sk!").then(|| spur_sym(*func))
+}
+
+/// **M3 recognizer — fresh-Skolem equality witness** (the `∀∃` anchorless case
+/// after skolemization).  Body `∀x̄. (= L R)` where one side is `(f … sk(x̄) …)`:
+///   * `f` is uninterpreted and constrained by NO other quantifier
+///     (`quant_count[f] == 1`) — so the REST of the formula pins `f` only at
+///     finitely many GROUND points;
+///   * `sk` is a fresh Skolem function (name `sk!…`, single-quantifier) whose
+///     arguments cover EVERY bound variable — so `x̄ ↦ sk(x̄)` is injective and
+///     its values are the model-builder's free choice, all of which can be kept
+///     distinct from the (finitely many) ground `f`-points;
+///   * the OTHER side `L` does NOT mention `f` — so `L`'s value is fixed by any
+///     model of the rest, with no circular dependence on the points we define.
+///
+/// Then for every `x̄` pick a fresh integer `sk(x̄)` outside the ground
+/// `f`-points and set `f(sk(x̄)) := L(x̄)`: the equation holds and no term of the
+/// rest of the formula changes value (`sk` occurs nowhere else, the ground
+/// `f`-points are untouched).  A CONSERVATIVE EXTENSION over `f` and `sk` — sound
+/// `Sat`.  Declines (sound `None`/`Unknown`) on any unmet guard.
+///
+/// Example (`skolem_test`): `∀x. (g x) = (f (sk x))` with ground `g 0 = 10`,
+/// `f 5 = 10`, `g 1 = 20`, `f 7 = 20` — witnessed by `sk 0 = 5`, `sk 1 = 7`.
+fn try_skolem_witness_eq(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    body: TermId,
+    bound: &[Spur],
+) -> bool {
+    if bound.is_empty() {
+        return false;
+    }
+    let TermKind::Eq(o1, o2) = (match m.get(body) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    // Try each orientation: (witness side `f(…sk(x̄)…)`, other side `L`).
+    skolem_witness_side(m, facts, o1, o2, bound) || skolem_witness_side(m, facts, o2, o1, bound)
+}
+
+/// One orientation of [`try_skolem_witness_eq`]: `w` is the candidate witness
+/// side `f(… sk(x̄) …)`, `o` the other side `L`.
+fn skolem_witness_side(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    w: TermId,
+    o: TermId,
+    bound: &[Spur],
+) -> bool {
+    // `w` = an application of an uninterpreted function `f`.
+    let TermKind::Apply { func: f_func, args: f_args } = (match m.get(w) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let fsym = spur_sym(f_func);
+    if fsym & OP != 0 {
+        return false; // a builtin op, not an uninterpreted function (defensive)
+    }
+    // `f` must be this axiom's SOLE universal constraint — the rest of the
+    // formula then pins `f` only at finitely many ground points, all distinct
+    // from the fresh skolem witness points we are about to define.
+    if facts.quant_count.get(&fsym).copied().unwrap_or(0) != 1 {
+        return false;
+    }
+    // The other side must NOT mention `f`: defining `f` at the (fresh) witness
+    // points must not feed back into the value `L` we are matching it to.
+    let mut osyms: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(m, o, &mut osyms);
+    if osyms.contains_key(&fsym) {
+        return false;
+    }
+    // Some argument of `f` is a fresh Skolem application `sk(…)` whose arguments
+    // cover EVERY bound variable (so `x̄ ↦ sk(x̄)` is injective) and which is
+    // itself single-quantifier (fresh ⇒ free to choose).
+    let want: FxHashSet<Spur> = bound.iter().copied().collect();
+    f_args.iter().any(|&a| match fresh_skolem_head(m, a) {
+        Some(sksym) => {
+            facts.quant_count.get(&sksym).copied().unwrap_or(0) == 1
+                && want.is_subset(&free_var_spurs(m, a))
+        }
+        None => false,
+    })
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -2214,6 +2333,12 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         if try_array_extensionality(lang.m(), facts, body, &bound)
             || try_array_store(lang.m(), facts, body, &bound)
         {
+            return Some(true);
+        }
+        // (8) Fresh-Skolem equality witness: a skolemized `∀x̄.∃ȳ. L = f(ȳ)`
+        // (body `∀x̄. L = f(…sk(x̄)…)`), satisfiable by a free choice of the
+        // Skolem witness when `f` is single-quantifier and `L` is `f`-free.
+        if try_skolem_witness_eq(lang.m(), facts, body, &bound) {
             return Some(true);
         }
         None

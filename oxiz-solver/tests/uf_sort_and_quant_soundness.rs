@@ -1053,3 +1053,43 @@ fn array_extensionality_without_array_equality_is_not_spurious_sat() {
     ]);
     assert_eq!(r, SolverResult::Unsat, "extensionality with disagreeing arrays and no a=b is unsat");
 }
+
+#[test]
+fn skolem_existential_inside_universal_eq_is_sat() {
+    // `∀x. ∃y. g(x)=f(y)` skolemizes to `∀x. g(x)=f(sk(x))`. With ground
+    // g(0)=10, g(1)=20, f(5)=10, f(7)=20, a witness exists (sk(0)=5, sk(1)=7),
+    // and for any other x a fresh preimage can be minted. The fresh-Skolem
+    // equality-witness recognizer certifies it. (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(declare-fun g (Int) Int)",
+        "(assert (forall ((x Int)) (exists ((y Int)) (= (g x) (f y)))))",
+        "(assert (= (g 0) 10))",
+        "(assert (= (g 1) 20))",
+        "(assert (= (f 5) 10))",
+        "(assert (= (f 7) 20))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "skolemized ∀x.∃y.g(x)=f(y) is sat");
+}
+
+#[test]
+fn skolem_witness_blocked_by_universal_f_bound_is_not_spurious_sat() {
+    // Soundness control: the SAME `∀x.∃y.g(x)=f(y)` but now `f` is ALSO bounded
+    // universally (`∀y. f(y) ≤ 5`) while `g(0)=10`. The witness needs f(·)=10 > 5
+    // — UNSAT. `f` then appears in TWO quantifiers, so the recognizer's
+    // `quant_count[f]==1` gate DECLINES (the universal bound could forbid the
+    // witness it would otherwise assume free). The clean engine must NOT report
+    // a spurious `sat`. (z3: unsat → clean engine: sound `unknown`/`unsat`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int) Int)",
+        "(declare-fun g (Int) Int)",
+        "(assert (forall ((x Int)) (exists ((y Int)) (= (g x) (f y)))))",
+        "(assert (forall ((y Int)) (<= (f y) 5)))",
+        "(assert (= (g 0) 10))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "f universally bounded below the witness must not be spurious sat");
+}
