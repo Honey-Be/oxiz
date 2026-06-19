@@ -167,15 +167,23 @@ deliberate soundness control (a near-miss that must stay `Unknown`/`Unsat`, neve
 
 ## 5. Remaining real/quantifier frontier
 
-Three `z3=Sat` cases stay the sound `Unknown`, each needing machinery beyond this
-note's single-/multi-axiom completions:
+`real_fixed_point` is now handled (§5.1 below). Two `z3=Sat` cases stay the sound
+`Unknown`, each needing machinery beyond this note's completions:
 
-- **`real_fixed_point`** — `∀x∈[0,1]. 0≤f(x)≤1` **plus** `∃x∈[0,1]. f(x)=x`. The
-  ∀ is a guarded range completion, but the witness lives in a bounded-REAL ∃ (the
-  bounded-∃ disjunction is integer-domain only) and the skolemized witness `f(sk)`
-  is a symbolic point the accounting gate rejects. Needs real-domain ∃ handling
-  (or a ground-witness recognizer: `f(0.5)=0.5` already witnesses it).
 - **`nested_quantifiers`** — triple-nested `∀x.∃y.∀z. (z≥y ⇒ f(x,z)≥0)`. Needs
   Skolem-function reasoning under an inner ∀.
 - **`array_sorted`** — a cross-variable triangular guard `i≤j` (not an axis-aligned
   box), beyond the current bounded-domain machinery.
+
+### 5.1 Done — `real_fixed_point` (guard-aware range + Skolem fixed-point)
+
+`∀x∈[0,1]. 0≤f(x)≤1` **plus** `∃x∈[0,1]. f(x)=x` plus `f(0.5)=0.5`. Two parts:
+(a) the range completion (§3.1) now peels an optional `(=> guard …)`, so the
+GUARDED range certifies; (b) the ∃ skolemizes to `f(sk)=sk` with `sk` bounded —
+a symbolic point that is nonetheless IN-RANGE (`f(sk)=sk`, `sk` bounded). Pass 8
+(`collect_skolem_fixedpoints`) records each such fresh-Skolem self-fixed-point
+with `sk`'s bounds; the range completion accounts for it and folds `sk`'s bounds
+into the feasible interval for the constant `k` (since `f(sk)=k` forces `sk=k`).
+An out-of-range fixed-point folds to an empty interval and is declined; a
+non-eq-pinned `f(c)` (real_unsat) is not a self-fixed-point and still trips the
+plain accounting gate.
