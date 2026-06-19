@@ -1270,3 +1270,41 @@ fn commuting_functions_contradictory_pins_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "contradictory commuting-function pins must not be spurious sat");
 }
+
+#[test]
+fn layered_bounds_interp_is_sat() {
+    // §3.5 multi-axiom: f sign-bounded (≥0 on x≥0), f ≤ g on [0,10], g=2x+1 on
+    // [0,10]. The layered model f≡0, g≡2x+1 is feasible (0 ≤ 2x+1 on [0,10]).
+    // (z3: sat; corpus `real_interp.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(declare-fun g (Real) Real)",
+        "(assert (forall ((x Real)) (=> (>= x 0.0) (>= (f x) 0.0))))",
+        "(assert (forall ((x Real)) (=> (and (>= x 0.0) (<= x 10.0)) (<= (f x) (g x)))))",
+        "(assert (forall ((x Real)) (=> (and (>= x 0.0) (<= x 10.0)) (= (g x) (+ (* 2.0 x) 1.0)))))",
+        "(assert (= (f 0.0) 0.5))",
+        "(assert (= (f 5.0) 8.0))",
+        "(assert (= (g 0.0) 1.0))",
+        "(assert (= (g 5.0) 11.0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "layered f≤g=2x+1, f≥0 is sat");
+}
+
+#[test]
+fn layered_bounds_infeasible_negative_affine_is_not_spurious_sat() {
+    // Soundness control: same layering but g=2x-15 on [0,10] — at x=0, g(0)=-15,
+    // so 0 ≤ f(0) ≤ -15 is impossible, UNSAT. The recognizer computes the affine
+    // min (-15) < L (0) and DECLINES; the engine instantiates and refutes.
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(declare-fun g (Real) Real)",
+        "(assert (forall ((x Real)) (=> (>= x 0.0) (>= (f x) 0.0))))",
+        "(assert (forall ((x Real)) (=> (and (>= x 0.0) (<= x 10.0)) (<= (f x) (g x)))))",
+        "(assert (forall ((x Real)) (=> (and (>= x 0.0) (<= x 10.0)) (= (g x) (- (* 2.0 x) 15.0)))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "infeasible negative-affine layering must not be spurious sat");
+}

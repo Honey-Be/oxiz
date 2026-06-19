@@ -834,6 +834,13 @@ struct CompletionFacts {
     /// Count of `Apply` heads that appear inside a HANDLED ground bound/relation
     /// above (so the accounting guard can confirm nothing else constrains `f`).
     mono_handled_occ: FxHashMap<u64, u32>,
+    /// (§3.5) Quantifier bodies belonging to a VERIFIED layered-bounds group — a
+    /// function bounded by several universals (constant lower/upper + an upper
+    /// bound by an affine-defined function) that is jointly satisfiable by the
+    /// canonical model `f ≡ L`, `g ≡ affine`. Precomputed (Pass 7) because the
+    /// group spans MULTIPLE quantifiers, so the single-quantifier per-recognizer
+    /// gate cannot see it; `eval_forall` certifies each member by membership.
+    layered_ok: FxHashSet<TermId>,
 }
 
 impl CompletionFacts {
@@ -944,6 +951,11 @@ impl CompletionFacts {
         for &a in assertions {
             collect_mono_facts(m, a, &mut f);
         }
+
+        // Pass 7 (§3.5): verify layered-bounds groups (a function bounded across
+        // several universals by an affine-defined function) and mark every member
+        // quantifier whose canonical model is jointly consistent.
+        collect_layered_bounds(m, assertions, &mut f);
         f
     }
 
@@ -2612,6 +2624,372 @@ fn try_commuting_functions(
     true
 }
 
+// ───────────────── layered-bounds group recognizer (§3.5) ───────────────────
+//
+// The multi-axiom capstone (`real_interp`): a function `f` constrained by SEVERAL
+// universals at once — a constant lower bound `∀x≥0. f(x) ≥ 0`, an upper bound by
+// another function `∀x∈[0,10]. f(x) ≤ g(x)`, and a definition of that function
+// `∀x∈[0,10]. g(x) = 2x+1`. No single-quantifier recognizer can fire (`f` is in
+// two universals). The model is LAYERED: `g ≡ affine`, `f ≡ L` (the max constant
+// lower bound). It is sound when, over the bounded region, `L` lies in the band
+// `[max lower, min(upper consts, affine of g)]` — i.e. the layers are compatible
+// — and the pinned points + accounting hold. Because the group spans several
+// quantifiers, the analysis runs once (Pass 7) and marks each member in
+// `layered_ok`; `eval_forall` certifies each by membership, all backed by the one
+// canonical model.
+
+#[inline]
+fn rat0() -> num_rational::BigRational {
+    num_rational::BigRational::from_integer(num_bigint::BigInt::from(0))
+}
+
+/// The body of `a` with any leading `(=> guard …)` peeled to the consequent.
+fn peel_implies(m: &TermManager, a: TermId) -> Option<(Spur, TermId, TermId)> {
+    let TermKind::Forall { vars, body, .. } = m.get(a)?.kind.clone() else {
+        return None;
+    };
+    if vars.len() != 1 {
+        return None;
+    }
+    let (guard, matrix) = match m.get(body)?.kind.clone() {
+        TermKind::Implies(g, c) => (g, c),
+        _ => (a, body), // no guard (sentinel guard = the assertion itself, unused)
+    };
+    Some((vars[0].0, guard, matrix))
+}
+
+/// Parse `t` as an affine form `c1·x + c0` in the single variable `x` (linear
+/// arithmetic over `x` and constants only — no function applications). `None` if
+/// `t` is not affine in `x`.
+fn parse_affine(
+    m: &TermManager,
+    t: TermId,
+    x: Spur,
+    depth: u32,
+) -> Option<(num_rational::BigRational, num_rational::BigRational)> {
+    use num_rational::BigRational;
+    if depth == 0 {
+        return None;
+    }
+    if let Some(c) = term_to_rational(m, t) {
+        return Some((rat0(), c)); // a pure constant
+    }
+    match m.get(t)?.kind.clone() {
+        TermKind::Var(s) if s == x => Some((BigRational::from_integer(1.into()), rat0())),
+        TermKind::Neg(a) => parse_affine(m, a, x, depth - 1).map(|(c1, c0)| (-c1, -c0)),
+        TermKind::Add(parts) => {
+            let (mut c1, mut c0) = (rat0(), rat0());
+            for p in parts {
+                let (a, b) = parse_affine(m, p, x, depth - 1)?;
+                c1 += a;
+                c0 += b;
+            }
+            Some((c1, c0))
+        }
+        TermKind::Sub(a, b) => {
+            let (a1, a0) = parse_affine(m, a, x, depth - 1)?;
+            let (b1, b0) = parse_affine(m, b, x, depth - 1)?;
+            Some((a1 - b1, a0 - b0))
+        }
+        TermKind::Mul(parts) => {
+            // A product is affine only if at most one factor is non-constant.
+            let mut k = BigRational::from_integer(1.into());
+            let mut lin: Option<(BigRational, BigRational)> = None;
+            for p in parts {
+                let (c1, c0) = parse_affine(m, p, x, depth - 1)?;
+                if c1 == rat0() {
+                    k *= c0;
+                } else if lin.is_none() {
+                    lin = Some((c1, c0));
+                } else {
+                    return None; // two non-constant factors ⇒ nonlinear
+                }
+            }
+            Some(match lin {
+                Some((c1, c0)) => (k.clone() * c1, k * c0),
+                None => (rat0(), k),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Accumulate constant `[lo, hi]` bounds on `x` from a guard (`(>= x c)`,
+/// `(<= x c)`, strict variants, and `(and …)`). Strict bounds are recorded as
+/// the closed endpoint — sound for the "L ≤ affine over the region" check (the
+/// open region's infimum is the endpoint value).
+fn guard_bounds(
+    m: &TermManager,
+    guard: TermId,
+    x: Spur,
+    depth: u32,
+    lo: &mut Option<num_rational::BigRational>,
+    hi: &mut Option<num_rational::BigRational>,
+) {
+    if depth == 0 {
+        return;
+    }
+    let raise_lo = |lo: &mut Option<num_rational::BigRational>, c: num_rational::BigRational| {
+        if lo.as_ref().is_none_or(|l| &c > l) {
+            *lo = Some(c);
+        }
+    };
+    let lower_hi = |hi: &mut Option<num_rational::BigRational>, c: num_rational::BigRational| {
+        if hi.as_ref().is_none_or(|h| &c < h) {
+            *hi = Some(c);
+        }
+    };
+    match m.get(guard).map(|t| t.kind.clone()) {
+        Some(TermKind::And(parts)) => {
+            for p in parts {
+                guard_bounds(m, p, x, depth - 1, lo, hi);
+            }
+        }
+        // `x ≥ c` / `x > c` ⇒ lower; `c ≥ x` / `c > x` ⇒ upper.
+        Some(TermKind::Ge(a, b)) | Some(TermKind::Gt(a, b)) => {
+            if is_var_term(m, a, x) {
+                if let Some(c) = term_to_rational(m, b) {
+                    raise_lo(lo, c);
+                }
+            } else if is_var_term(m, b, x) {
+                if let Some(c) = term_to_rational(m, a) {
+                    lower_hi(hi, c);
+                }
+            }
+        }
+        // `x ≤ c` / `x < c` ⇒ upper; `c ≤ x` / `c < x` ⇒ lower.
+        Some(TermKind::Le(a, b)) | Some(TermKind::Lt(a, b)) => {
+            if is_var_term(m, a, x) {
+                if let Some(c) = term_to_rational(m, b) {
+                    lower_hi(hi, c);
+                }
+            } else if is_var_term(m, b, x) {
+                if let Some(c) = term_to_rational(m, a) {
+                    raise_lo(lo, c);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `(g, c1, c0, glo, ghi)` if `a` is `∀x. (glo≤x≤ghi) ⇒ (= (g x) c1·x+c0)`.
+#[allow(clippy::type_complexity)]
+fn classify_affine_def(
+    m: &TermManager,
+    a: TermId,
+) -> Option<(
+    u64,
+    num_rational::BigRational,
+    num_rational::BigRational,
+    Option<num_rational::BigRational>,
+    Option<num_rational::BigRational>,
+)> {
+    let (x, guard, matrix) = peel_implies(m, a)?;
+    let TermKind::Eq(o1, o2) = m.get(matrix)?.kind.clone() else {
+        return None;
+    };
+    let want: FxHashSet<Spur> = [x].into_iter().collect();
+    for (gside, aff) in [(o1, o2), (o2, o1)] {
+        if let Some((g, _)) = fapp_of_var(m, gside, &want) {
+            if let Some((c1, c0)) = parse_affine(m, aff, x, 32) {
+                let (mut lo, mut hi) = (None, None);
+                if guard != a {
+                    guard_bounds(m, guard, x, 32, &mut lo, &mut hi);
+                }
+                return Some((g, c1, c0, lo, hi));
+            }
+        }
+    }
+    None
+}
+
+/// `(f, is_lower, value)` if `a` is `∀x. [guard ⇒] cmp(f(x), const)` — a pure
+/// constant lower or upper bound on `f`.
+fn classify_const_bound(m: &TermManager, a: TermId) -> Option<(u64, bool, num_rational::BigRational)> {
+    let (x, _guard, matrix) = peel_implies(m, a)?;
+    let want: FxHashSet<Spur> = [x].into_iter().collect();
+    let (fsym, lo, hi) = range_atom(m, matrix, &want)?;
+    match (lo, hi) {
+        (Some((v, _)), None) => Some((fsym, true, v)),
+        (None, Some((v, _))) => Some((fsym, false, v)),
+        _ => None, // an equality pins both sides; not a one-sided bound
+    }
+}
+
+/// `(f, g, lo, hi)` if `a` is `∀x. (lo≤x≤hi) ⇒ (<= (f x) (g x))`.
+#[allow(clippy::type_complexity)]
+fn classify_fn_upper(
+    m: &TermManager,
+    a: TermId,
+) -> Option<(u64, u64, Option<num_rational::BigRational>, Option<num_rational::BigRational>)> {
+    let (x, guard, matrix) = peel_implies(m, a)?;
+    let TermKind::Le(lhs, rhs) = m.get(matrix)?.kind.clone() else {
+        return None;
+    };
+    let want: FxHashSet<Spur> = [x].into_iter().collect();
+    let (f, _) = fapp_of_var(m, lhs, &want)?;
+    let (g, _) = fapp_of_var(m, rhs, &want)?;
+    if f == g {
+        return None;
+    }
+    let (mut lo, mut hi) = (None, None);
+    if guard != a {
+        guard_bounds(m, guard, x, 32, &mut lo, &mut hi);
+    }
+    Some((f, g, lo, hi))
+}
+
+/// Minimum of `c1·x + c0` over `[lo, hi]`. `None` if the affine decreases toward
+/// an UNBOUNDED side (no finite minimum ⇒ cannot certify `L ≤ g`).
+fn affine_min_over(
+    c1: &num_rational::BigRational,
+    c0: &num_rational::BigRational,
+    lo: &Option<num_rational::BigRational>,
+    hi: &Option<num_rational::BigRational>,
+) -> Option<num_rational::BigRational> {
+    let z = rat0();
+    if *c1 == z {
+        Some(c0.clone())
+    } else if *c1 > z {
+        lo.as_ref().map(|l| c1 * l + c0) // increasing ⇒ min at the low end
+    } else {
+        hi.as_ref().map(|h| c1 * h + c0) // decreasing ⇒ min at the high end
+    }
+}
+
+/// Is `[ulo, uhi] ⊆ [glo, ghi]`? (An unbounded `g`-side contains anything; an
+/// unbounded `u`-side is contained only by an unbounded `g`-side.)
+fn region_subset(
+    ulo: &Option<num_rational::BigRational>,
+    uhi: &Option<num_rational::BigRational>,
+    glo: &Option<num_rational::BigRational>,
+    ghi: &Option<num_rational::BigRational>,
+) -> bool {
+    let lo_ok = match (glo, ulo) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(g), Some(u)) => u >= g,
+    };
+    let hi_ok = match (ghi, uhi) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(g), Some(u)) => u <= g,
+    };
+    lo_ok && hi_ok
+}
+
+/// Pass 7 (§3.5). See [`CompletionFacts::layered_ok`].
+fn collect_layered_bounds(m: &TermManager, assertions: &[TermId], facts: &mut CompletionFacts) {
+    use num_rational::BigRational;
+    // Classify every universal that could participate.
+    let affine: Vec<(TermId, u64, BigRational, BigRational, Option<BigRational>, Option<BigRational>)> =
+        assertions
+            .iter()
+            .filter_map(|&a| classify_affine_def(m, a).map(|(g, c1, c0, lo, hi)| (a, g, c1, c0, lo, hi)))
+            .collect();
+    let consts: Vec<(TermId, u64, bool, BigRational)> = assertions
+        .iter()
+        .filter_map(|&a| classify_const_bound(m, a).map(|(f, lo, v)| (a, f, lo, v)))
+        .collect();
+    let uppers: Vec<(TermId, u64, u64, Option<BigRational>, Option<BigRational>)> = assertions
+        .iter()
+        .filter_map(|&a| classify_fn_upper(m, a).map(|(f, g, lo, hi)| (a, f, g, lo, hi)))
+        .collect();
+
+    // For each `f ≤ g` over a bounded region where `g` is affine-defined, try to
+    // certify the whole group around `f`.
+    for &(a_up, f, g, ref ulo, ref uhi) in &uppers {
+        let gdefs: Vec<_> = affine.iter().filter(|d| d.1 == g).collect();
+        if gdefs.len() != 1 {
+            continue; // `g` must have exactly one affine definition
+        }
+        let (a_def, _, ref c1, ref c0, ref glo, ref ghi) = *gdefs[0];
+        // The `f ≤ g` region must lie inside the region where `g = affine`.
+        if !region_subset(ulo, uhi, glo, ghi) {
+            continue;
+        }
+        let f_lowers: Vec<&(TermId, u64, bool, BigRational)> =
+            consts.iter().filter(|c| c.1 == f && c.2).collect();
+        let f_uppers: Vec<&(TermId, u64, bool, BigRational)> =
+            consts.iter().filter(|c| c.1 == f && !c.2).collect();
+        if f_lowers.is_empty() {
+            continue; // need a constant lower bound to fix the canonical `f ≡ L`
+        }
+        // L = the tightest (max) constant lower bound.
+        let big_l = f_lowers.iter().map(|c| c.3.clone()).max().unwrap();
+        // L must respect every constant upper bound …
+        if f_uppers.iter().any(|c| big_l > c.3) {
+            continue;
+        }
+        // … and `L ≤ g` over the `f ≤ g` region (so `f ≡ L ≤ g` holds there).
+        let Some(amin) = affine_min_over(c1, c0, ulo, uhi) else {
+            continue; // affine unbounded below over the region ⇒ cannot certify
+        };
+        if big_l > amin {
+            continue;
+        }
+        // Verify ground `g`-points equal the affine, and ground `f`-points lie in
+        // the band [each lower, each const upper] AND ≤ the affine at their arg.
+        let Some(gmap) = resolve_app_map(m, facts, g) else {
+            continue;
+        };
+        if gmap.iter().any(|(arg, val)| *val != c1 * arg + c0) {
+            continue;
+        }
+        let Some(fmap) = resolve_app_map(m, facts, f) else {
+            continue;
+        };
+        let f_ok = fmap.iter().all(|(arg, v)| {
+            f_lowers.iter().all(|c| v >= &c.3)
+                && f_uppers.iter().all(|c| v <= &c.3)
+                && *v <= c1 * arg + c0
+        });
+        if !f_ok {
+            continue;
+        }
+        // ACCOUNTING: `f` and `g` must each appear ONLY in this group's universals
+        // plus their literal ground points — no other axiom or symbolic app.
+        let f_universals: Vec<TermId> = std::iter::once(a_up)
+            .chain(f_lowers.iter().map(|c| c.0))
+            .chain(f_uppers.iter().map(|c| c.0))
+            .collect();
+        let g_universals = [a_def, a_up];
+        if !group_accounted(m, facts, f, &f_universals)
+            || !group_accounted(m, facts, g, &g_universals)
+        {
+            continue;
+        }
+        // Verified — the canonical model `f ≡ L`, `g ≡ affine` satisfies every
+        // member. Mark them all.
+        for u in f_universals.into_iter().chain(g_universals) {
+            facts.layered_ok.insert(u);
+        }
+    }
+}
+
+/// Does `sym` occur ONLY inside the given group `universals` (summed body
+/// occurrences) plus its literal ground points? (The §3.5 accounting gate.)
+fn group_accounted(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    sym: u64,
+    universals: &[TermId],
+) -> bool {
+    let mut body_total = 0u32;
+    let mut seen: FxHashSet<TermId> = FxHashSet::default();
+    for &u in universals {
+        if !seen.insert(u) {
+            continue; // a universal may appear in both lists (e.g. `f ≤ g`)
+        }
+        let mut occ: FxHashMap<u64, u32> = FxHashMap::default();
+        count_syms(m, u, &mut occ);
+        body_total += occ.get(&sym).copied().unwrap_or(0);
+    }
+    let ground = facts.ground_apps.get(&sym).map_or(0, |p| p.len() as u32);
+    facts.global_occ.get(&sym).copied().unwrap_or(0) == body_total + ground
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -2899,6 +3277,12 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // (2) Definitional axiom `∀x̄. (= (f x̄) rhs)`, `f` fresh ⇒ conservative
         // extension (define `f := λx̄. rhs`), always satisfiable.
         if facts.definitional_quants.contains(&quant) {
+            return Some(true);
+        }
+        // (2b) §3.5 layered-bounds group member: the canonical model `f ≡ L`,
+        // `g ≡ affine` (verified jointly in Pass 7 across all group members)
+        // satisfies this universal.
+        if facts.layered_ok.contains(&quant) {
             return Some(true);
         }
         // (3) Pure-polarity predicate: a single-literal body whose uninterpreted
