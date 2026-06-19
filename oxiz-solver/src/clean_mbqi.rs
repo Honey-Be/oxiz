@@ -224,7 +224,7 @@ fn to_nnf(m: &mut TermManager, t: TermId, positive: bool) -> TermId {
                 t // keep; body opaque (preserves the recognizers + bounded_var_domains)
             } else {
                 let nb = m.mk_not(body); // ¬∀x.φ ≡ ∃x.¬φ
-                mk_flipped_quant(m, &vars, nb, false)
+                mk_quant_dropping_patterns(m, &vars, nb, false)
             }
         }
         TermKind::Exists { vars, body, .. } => {
@@ -232,7 +232,7 @@ fn to_nnf(m: &mut TermManager, t: TermId, positive: bool) -> TermId {
                 t
             } else {
                 let nb = m.mk_not(body); // ¬∃x.φ ≡ ∀x.¬φ
-                mk_flipped_quant(m, &vars, nb, true)
+                mk_quant_dropping_patterns(m, &vars, nb, true)
             }
         }
         // ite/xor/bool-= carrying a quantifier: two-polarity, leave verbatim.
@@ -246,10 +246,11 @@ fn to_nnf(m: &mut TermManager, t: TermId, positive: bool) -> TermId {
     }
 }
 
-/// Rebuild a polarity-flipped quantifier with the (already single-negated) body,
-/// dropping the original patterns (they targeted the un-negated body; the
-/// flipped quantifier is discharged by enumeration / skolemization instead).
-fn mk_flipped_quant(
+/// Rebuild a quantifier from `vars` + a rewritten `body`, DROPPING the original
+/// patterns (they targeted the pre-rewrite body). Used by NNF (to materialise a
+/// polarity-flipped quantifier) and by skolemization (to rebuild a `∀` whose
+/// body had a nested `∃` lowered to a Skolem function).
+fn mk_quant_dropping_patterns(
     m: &mut TermManager,
     vars: &[(Spur, SortId)],
     body: TermId,
@@ -337,68 +338,121 @@ pub fn fold_valid_quantifiers(m: &mut TermManager, t: TermId) -> TermId {
     }
 }
 
-/// Skolemize a top-level POSITIVE unbounded existential. Replacing `∃x.φ(x)`
-/// with `φ(c)` for a fresh constant `c` is *equisatisfiable* — a model of the
-/// skolemized form extends to a model of the original by reading the witness off
-/// `c`, and vice versa — so doing it to an asserted formula never changes the
-/// answer. It does, however, turn a surjectivity-style obligation
-/// (`∃y. f(y) = 0`) into a ground constraint the solver can actually witness;
-/// the clean MBQI engine, which never fabricates witnesses, would otherwise
-/// report `Unknown` on it.
+/// Skolemize POSITIVE existentials. Replacing `∃ȳ. φ` (sitting inside the scope
+/// of universals `x̄`) with `φ[ȳ ↦ sk(x̄)]` for fresh Skolem *functions* `sk` is
+/// *equisatisfiable* — a model of the Skolemized form extends to a model of the
+/// original by reading each witness off `sk`, and vice versa — so doing it to an
+/// asserted formula never changes the answer. It turns goals the clean MBQI
+/// engine (which never fabricates witnesses) would leave `Unknown` into pure
+/// universals / ground facts it can instantiate:
+///   * a top-level `∃y. f(y)=0` (empty scope) → `f(c)=0` for a fresh CONSTANT
+///     `c` (the nullary Skolem function) — surjectivity goals;
+///   * a nested `∀x. ∃y. φ(x,y)` → `∀x. φ(x, sk(x))` for a fresh unary Skolem
+///     FUNCTION `sk` — e.g. `∀x.∃y.f(x,y)>0` with `∀x,y.f(x,y)≤0` becomes
+///     refutable by instantiating both universals at the same `x`.
 ///
-/// Fires only on a *positive* top-level occurrence: a bare `∃`, or one reached
-/// through `and`/`or` (both polarity-preserving). A `∃` under `not`/`=>`/`ite`
-/// — anywhere polarity could flip — is left untouched, since skolemizing a
-/// negative `∃` (an effective `∀`) would be unsound. A BOUNDED `∃` (finite
-/// integer domain) is also left untouched: the engine discharges it precisely
-/// via its finite disjunction ([`Engine::emit_existential_disjunction`], #279),
-/// which is complete and needs no fresh symbol. Leaving an existential for the
-/// engine is always sound — at worst it yields `Unknown`, never a wrong verdict.
+/// Only POSITIVE occurrences are Skolemized: descends through `and`/`or`
+/// (polarity-preserving), the CONSEQUENT of `=>`, and `∀` bodies (extending the
+/// Skolem scope with the universal's variables). A `∃` under `not` or in an `=>`
+/// ANTECEDENT — where it is effectively a `∀` — is left untouched (Skolemizing a
+/// negative `∃` would be unsound). A BOUNDED top-level `∃` is left for the
+/// engine's finite disjunction ([`Engine::emit_existential_disjunction`], #279);
+/// leaving any existential for the engine is always sound (at worst `Unknown`).
 ///
-/// `tag` makes the minted skolem names unique across assertions.
+/// `tag` makes the minted Skolem names unique across assertions.
 pub fn skolemize_unbounded_existentials(m: &mut TermManager, t: TermId, tag: &str) -> TermId {
+    let mut counter: usize = 0;
+    skolemize_rec(m, t, &[], tag, &mut counter)
+}
+
+fn skolemize_rec(
+    m: &mut TermManager,
+    t: TermId,
+    scope: &[(Spur, SortId)],
+    tag: &str,
+    counter: &mut usize,
+) -> TermId {
     let kind = match m.get(t) {
         Some(x) => x.kind.clone(),
         None => return t,
     };
     match kind {
         TermKind::Exists { vars, body, .. } => {
-            // Bounded ∃ → leave it for the engine's finite disjunction (#279).
-            let bounded = {
-                let mut host = OxizHost::new(m);
-                let doms = host.bounded_var_domains(t);
-                !doms.is_empty() && doms.iter().all(Option::is_some)
-            };
-            if bounded {
-                return t;
+            // A BOUNDED top-level ∃ stays for the engine's finite disjunction
+            // (#279). Nested existentials are always Skolemized (the disjunction
+            // does not reach inside a universal anyway).
+            if scope.is_empty() {
+                let bounded = {
+                    let mut host = OxizHost::new(m);
+                    let doms = host.bounded_var_domains(t);
+                    !doms.is_empty() && doms.iter().all(Option::is_some)
+                };
+                if bounded {
+                    return t;
+                }
             }
-            // One fresh skolem constant per bound var, substituted into the body.
-            // `mk_var(name, sort)` re-interns the bound occurrence (`Var(spur)`),
-            // so it is the exact key the matrix references.
+            // Resolve the enclosing-universal names ONCE (the Skolem function's
+            // argument list `x̄`); `mk_var(name, sort)` re-interns each as the
+            // exact `Var` the body references.
+            let scope_named: Vec<(String, SortId)> = scope
+                .iter()
+                .map(|(s, sort)| (m.resolve_str(*s).to_string(), *sort))
+                .collect();
             let mut map: FxHashMap<TermId, TermId> = FxHashMap::default();
-            for (i, (name, sort)) in vars.iter().enumerate() {
+            for (name, sort) in vars.iter() {
                 let nm = m.resolve_str(*name).to_string();
                 let var_term = m.mk_var(&nm, *sort);
-                let sk = m.mk_var(&format!("sk!{tag}!{nm}!{i}"), *sort);
+                *counter += 1;
+                let skname = format!("sk!{tag}!{}!{nm}", *counter);
+                let sk = if scope_named.is_empty() {
+                    m.mk_var(&skname, *sort) // nullary Skolem = a fresh constant
+                } else {
+                    let args: Vec<TermId> =
+                        scope_named.iter().map(|(n, s)| m.mk_var(n, *s)).collect();
+                    m.mk_apply(&skname, args, *sort) // sk(x̄)
+                };
                 map.insert(var_term, sk);
             }
             let body2 = m.substitute(body, &map);
-            // A nested ∃ now sits at top level, and the body may be and/or.
-            skolemize_unbounded_existentials(m, body2, tag)
+            // The body may itself hold more positive structure / existentials.
+            skolemize_rec(m, body2, scope, tag, counter)
+        }
+        TermKind::Forall { vars, body, .. } => {
+            // Descend to reach nested existentials, extending the Skolem scope
+            // with this universal's variables. Rebuild only if the body changed
+            // (else keep `t` verbatim — preserves patterns + identity).
+            let mut scope2 = scope.to_vec();
+            scope2.extend(vars.iter().copied());
+            let body2 = skolemize_rec(m, body, &scope2, tag, counter);
+            if body2 == body {
+                t
+            } else {
+                mk_quant_dropping_patterns(m, &vars, body2, true)
+            }
         }
         TermKind::And(args) => {
             let new: Vec<TermId> = args
                 .iter()
-                .map(|&a| skolemize_unbounded_existentials(m, a, tag))
+                .map(|&a| skolemize_rec(m, a, scope, tag, counter))
                 .collect();
             m.mk_and(new)
         }
         TermKind::Or(args) => {
             let new: Vec<TermId> = args
                 .iter()
-                .map(|&a| skolemize_unbounded_existentials(m, a, tag))
+                .map(|&a| skolemize_rec(m, a, scope, tag, counter))
                 .collect();
             m.mk_or(new)
+        }
+        TermKind::Implies(a, b) => {
+            // Only the CONSEQUENT is positive; the antecedent's polarity is
+            // flipped, so a `∃` there must not be Skolemized.
+            let b2 = skolemize_rec(m, b, scope, tag, counter);
+            if b2 == b {
+                t
+            } else {
+                m.mk_implies(a, b2)
+            }
         }
         _ => t,
     }

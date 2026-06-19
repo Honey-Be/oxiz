@@ -827,3 +827,42 @@ fn negated_existential_consistent_is_not_unsat() {
         "a consistent negated existential must not be driven to a spurious unsat"
     );
 }
+
+#[test]
+fn forall_exists_skolemized_to_a_function_is_sat() {
+    // `∀x. ∃y. f(x,y) > 0` with ground anchors. Skolemization lowers the nested
+    // `∃y` to a fresh unary Skolem FUNCTION of the enclosing universal x:
+    // `∀x. f(x, sk(x)) > 0`. The engine instantiates that pure universal over
+    // the ground anchors and the model completion verifies it satisfiable —
+    // where the un-Skolemized `∀∃` was left Unknown (no witness to fabricate).
+    // (z3: sat.)
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int Int) Int)",
+        "(assert (forall ((x Int)) (exists ((y Int)) (> (f x y) 0))))",
+        "(assert (= (f 0 0) 1))",
+        "(assert (= (f 1 1) 2))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "a ∀∃ with ground anchors must verify sat after Skolem-function lowering"
+    );
+}
+
+#[test]
+fn skolemized_forall_exists_unsat_is_never_spurious_sat() {
+    // Soundness control: `∀x.∃y.f(x,y)>0` ∧ `∀x,y.f(x,y)≤0` is unsat, but with
+    // NO ground constant to anchor enumeration the never-fabricate engine cannot
+    // reach the conflict — the only sound verdicts are unsat or Unknown. The
+    // Skolem-function lowering must never turn it into a spurious `sat`.
+    let r = solve_streamed(&[
+        "(set-logic UFLIA)",
+        "(declare-fun f (Int Int) Int)",
+        "(assert (forall ((x Int)) (exists ((y Int)) (> (f x y) 0))))",
+        "(assert (forall ((x Int) (y Int)) (<= (f x y) 0)))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an unsat ∀∃ must not be Skolemized into a spurious sat");
+}
