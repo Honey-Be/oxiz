@@ -1287,10 +1287,69 @@ fn term_mentions_var(m: &TermManager, t: TermId, var: Spur) -> bool {
     }
 }
 
+/// Certify the monotonicity of `e` in `var`. Tries the fast structural
+/// sign-algebra first, then falls back to the symbolic-calculus engine
+/// ([`crate::calculus`]) — translating `e` to a calculus expression and running
+/// the first-derivative test over all reals. Both are sound; the calculus engine
+/// covers shapes (powers, and — once the symbols exist — the transcendental KB)
+/// the affine sign-algebra alone cannot.
+fn monotonicity(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mono> {
+    monotonicity_structural(m, e, var, depth).or_else(|| monotonicity_via_calculus(m, e, var))
+}
+
+/// Translate an OxiZ arithmetic term to a single-variable [`calculus::Expr`]
+/// (the bound `var` becomes the calculus variable; literals become constants).
+/// `None` if any subterm is outside the translatable fragment (another variable
+/// — an unknown-sign constant w.r.t. `var` — or an uninterpreted application).
+fn term_to_calculus(m: &TermManager, t: TermId, var: Spur) -> Option<crate::calculus::Expr> {
+    use crate::calculus::Expr as E;
+    match m.get(t).map(|x| x.kind.clone())? {
+        TermKind::Var(s) => {
+            if s == var {
+                Some(E::X)
+            } else {
+                None // another variable: its sign w.r.t. `var` is unknown
+            }
+        }
+        TermKind::IntConst(b) => Some(E::Const(num_rational::BigRational::from_integer(b))),
+        TermKind::RealConst(r) => Some(E::Const(num_rational::BigRational::new(
+            num_bigint::BigInt::from(*r.numer()),
+            num_bigint::BigInt::from(*r.denom()),
+        ))),
+        TermKind::Neg(a) => Some(E::Neg(Box::new(term_to_calculus(m, a, var)?))),
+        TermKind::Add(args) => {
+            let xs: Option<Vec<E>> = args.iter().map(|&a| term_to_calculus(m, a, var)).collect();
+            Some(E::Add(xs?))
+        }
+        TermKind::Mul(args) => {
+            let xs: Option<Vec<E>> = args.iter().map(|&a| term_to_calculus(m, a, var)).collect();
+            Some(E::Mul(xs?))
+        }
+        TermKind::Sub(a, b) => Some(E::Add(vec![
+            term_to_calculus(m, a, var)?,
+            E::Neg(Box::new(term_to_calculus(m, b, var)?)),
+        ])),
+        _ => None,
+    }
+}
+
+/// The calculus-engine fallback for [`monotonicity`]: translate + first-derivative
+/// test over all reals, mapping the verdict back to the local [`Mono`].
+fn monotonicity_via_calculus(m: &TermManager, e: TermId, var: Spur) -> Option<Mono> {
+    let expr = term_to_calculus(m, e, var)?;
+    let (dir, strict) = expr.monotonicity_strict(&crate::calculus::Domain::all())?;
+    let local = match dir {
+        crate::calculus::MonoDir::Inc => MonoDir::Inc,
+        crate::calculus::MonoDir::Dec => MonoDir::Dec,
+        crate::calculus::MonoDir::Const => MonoDir::Const,
+    };
+    Some((local, strict))
+}
+
 /// Certify the monotonicity of arithmetic expression `e` in `var` using only
 /// sound structural rules. `None` when no rule applies (caller stays
 /// conservative). `depth`-bounded against pathological nesting.
-fn monotonicity(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mono> {
+fn monotonicity_structural(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mono> {
     if depth == 0 {
         return None;
     }
@@ -1303,17 +1362,17 @@ fn monotonicity(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mon
         } else {
             (MonoDir::Const, false)
         }),
-        TermKind::Neg(a) => Some(mono_flip(monotonicity(m, a, var, depth - 1)?)),
+        TermKind::Neg(a) => Some(mono_flip(monotonicity_structural(m, a, var, depth - 1)?)),
         TermKind::Add(args) => {
             let parts: Option<Vec<Mono>> = args
                 .iter()
-                .map(|&a| monotonicity(m, a, var, depth - 1))
+                .map(|&a| monotonicity_structural(m, a, var, depth - 1))
                 .collect();
             mono_sum(&parts?)
         }
         TermKind::Sub(a, b) => {
-            let ma = monotonicity(m, a, var, depth - 1)?;
-            let mb = mono_flip(monotonicity(m, b, var, depth - 1)?);
+            let ma = monotonicity_structural(m, a, var, depth - 1)?;
+            let mb = mono_flip(monotonicity_structural(m, b, var, depth - 1)?);
             mono_sum(&[ma, mb])
         }
         TermKind::Mul(args) => {
@@ -1331,7 +1390,7 @@ fn monotonicity(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mon
                     sign *= literal_sign(m, a)?;
                 }
             }
-            Some(mono_scale(sign, monotonicity(m, var_factor?, var, depth - 1)?))
+            Some(mono_scale(sign, monotonicity_structural(m, var_factor?, var, depth - 1)?))
         }
         TermKind::Div(a, b) => {
             // `a / c` for a nonzero literal `c` = scale by sign(c).
@@ -1342,7 +1401,7 @@ fn monotonicity(m: &TermManager, e: TermId, var: Spur, depth: u32) -> Option<Mon
             if sign == 0 {
                 return None;
             }
-            Some(mono_scale(sign, monotonicity(m, a, var, depth - 1)?))
+            Some(mono_scale(sign, monotonicity_structural(m, a, var, depth - 1)?))
         }
         _ => None,
     }
