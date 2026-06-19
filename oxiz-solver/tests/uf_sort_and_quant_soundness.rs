@@ -1158,3 +1158,40 @@ fn int_function_completion_with_symbolic_point_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "a symbolic out-of-bound f-application must not be spurious sat");
 }
+
+#[test]
+fn bounded_oscillation_lipschitz_is_sat() {
+    // `∀x,y∈[0,5]. |f(x)-f(y)| ≤ 10` with pinned f(0)=0, f(1)=1.5, f(3)=4
+    // (spread 4 ≤ 10). The constant default δ=min satisfies it. (z3: sat;
+    // corpus `real_lipschitz.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((x Real) (y Real))
+           (=> (and (>= x 0.0) (<= x 5.0) (>= y 0.0) (<= y 5.0))
+               (and (<= (- (f x) (f y)) 10.0) (<= (- (f y) (f x)) 10.0)))))",
+        "(assert (= (f 0.0) 0.0))",
+        "(assert (= (f 1.0) 1.5))",
+        "(assert (= (f 3.0) 4.0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "Lipschitz with in-window pinned values is sat");
+}
+
+#[test]
+fn bounded_oscillation_violated_spread_is_not_spurious_sat() {
+    // Soundness control: the same shape but pinned f(0)=0, f(1)=100 — spread
+    // 100 > 10, so the universal at (0,1) forces 100 ≤ 10, UNSAT. The recognizer
+    // sees max-min=100 > 10 and DECLINES; the engine instantiates and refutes.
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(assert (forall ((x Real) (y Real))
+           (=> (and (>= x 0.0) (<= x 5.0) (>= y 0.0) (<= y 5.0))
+               (and (<= (- (f x) (f y)) 10.0) (<= (- (f y) (f x)) 10.0)))))",
+        "(assert (= (f 0.0) 0.0))",
+        "(assert (= (f 1.0) 100.0))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "an oscillation-violating pinned pair must not be spurious sat");
+}

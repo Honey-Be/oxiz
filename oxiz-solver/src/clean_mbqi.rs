@@ -2273,6 +2273,142 @@ fn try_range_completion(
     true
 }
 
+// ─────────────────── bounded-oscillation recognizer (§3.2) ──────────────────
+//
+// A Lipschitz-style bound `∀x,y∈G. |f(x)−f(y)| ≤ B` (encoded as the two-sided
+// `f(x)−f(y) ≤ B ∧ f(y)−f(x) ≤ B`) over an uninterpreted `f`. The model is again
+// the `else`-value `δ ≡ const`: between two non-pinned points the difference is
+// `0 ≤ B`; between a non-pinned and a pinned point it is `|δ−vᵢ|`; between two
+// pinned points it is `|vᵢ−vⱼ|`. Choosing `δ = min vᵢ` makes every gap `≤
+// (max vᵢ − min vᵢ)`, so the axiom is `Sat` iff the pinned `f`-values lie in an
+// interval of width `≤ B`. (Pinned points outside the guard are conservatively
+// included — that can only make the recognizer DECLINE, never wrongly certify.)
+
+/// `(f-symbol, var)` if `t` is `(f v)` for an uninterpreted `f` and a single
+/// bound variable `v`.
+fn fapp_of_var(m: &TermManager, t: TermId, want: &FxHashSet<Spur>) -> Option<(u64, Spur)> {
+    let TermKind::Apply { func, args } = m.get(t)?.kind.clone() else {
+        return None;
+    };
+    let fsym = spur_sym(func);
+    if fsym & OP != 0 || args.len() != 1 {
+        return None;
+    }
+    let TermKind::Var(s) = m.get(args[0])?.kind.clone() else {
+        return None;
+    };
+    want.contains(&s).then_some((fsym, s))
+}
+
+/// Parse a difference-bound atom `(<= (- (f a) (f b)) B)` — `a`,`b` bound vars,
+/// `f` one uninterpreted function, `B` a ground rational. Returns `(f, a, b, B)`.
+fn diff_bound_atom(
+    m: &TermManager,
+    atom: TermId,
+    want: &FxHashSet<Spur>,
+) -> Option<(u64, Spur, Spur, num_rational::BigRational)> {
+    let TermKind::Le(lhs, rhs) = m.get(atom)?.kind.clone() else {
+        return None;
+    };
+    let b = ground_rational(m, rhs, want)?;
+    let TermKind::Sub(p, q) = m.get(lhs)?.kind.clone() else {
+        return None;
+    };
+    let (fp, ap) = fapp_of_var(m, p, want)?;
+    let (fq, aq) = fapp_of_var(m, q, want)?;
+    if fp != fq {
+        return None;
+    }
+    Some((fp, ap, aq, b))
+}
+
+/// **M3 recognizer — bounded oscillation** (§3.2). Body
+/// `∀x,y. [guard ⇒] (and (<= (- (f x)(f y)) B) (<= (- (f y)(f x)) B))`. Complete
+/// `f` to the constant `δ = min pinned value`; the axiom holds iff the pinned
+/// `f`-values lie in an interval of width `≤ B` (`max − min ≤ B`). Same soundness
+/// gates as the range completion (single-quantifier + accounting); `B ≥ 0` is
+/// required (the diagonal `x=y` forces `0 ≤ B`).
+fn try_bounded_oscillation(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    body: TermId,
+    bound: &[Spur],
+) -> bool {
+    if bound.len() != 2 {
+        return false;
+    }
+    let want: FxHashSet<Spur> = bound.iter().copied().collect();
+    // Peel an optional guard (`(=> guard matrix)`); out-of-guard pairs are vacuous.
+    let matrix = match m.get(body).map(|t| t.kind.clone()) {
+        Some(TermKind::Implies(_, c)) => c,
+        Some(_) => body,
+        None => return false,
+    };
+    // The matrix is the two-sided pair `(and (f(x)−f(y) ≤ B) (f(y)−f(x) ≤ B))`.
+    let TermKind::And(conj) = (match m.get(matrix) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    if conj.len() != 2 {
+        return false;
+    }
+    let (Some((f1, a1, b1, bd1)), Some((f2, a2, b2, bd2))) = (
+        diff_bound_atom(m, conj[0], &want),
+        diff_bound_atom(m, conj[1], &want),
+    ) else {
+        return false;
+    };
+    // Same `f`, same bound, opposite arg order over two DISTINCT bound vars.
+    if f1 != f2 || bd1 != bd2 || a1 != b2 || b1 != a2 || a1 == b1 {
+        return false;
+    }
+    let fsym = f1;
+    let bnd = bd1;
+    // `B ≥ 0` — the diagonal `x=y` instance forces `0 ≤ B`, so a negative bound is
+    // unsatisfiable (decline; the engine then refutes via instantiation).
+    if bnd < num_rational::BigRational::from_integer(num_bigint::BigInt::from(0)) {
+        return false;
+    }
+    // `f` must be this axiom's SOLE universal constraint.
+    if facts.quant_count.get(&fsym).copied() != Some(1) {
+        return false;
+    }
+    // ACCOUNTING GUARD (as in `try_range_completion`): every `f`-application must
+    // be one of the body's `f(x)`/`f(y)` or a literal ground point we verify — a
+    // symbolic `f(c)` could carry an oscillation-violating value we cannot see.
+    let mut body_occ: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(m, body, &mut body_occ);
+    let accounted = body_occ.get(&fsym).copied().unwrap_or(0)
+        + facts.ground_apps.get(&fsym).map_or(0, |p| p.len() as u32);
+    if facts.global_occ.get(&fsym).copied().unwrap_or(0) != accounted {
+        return false;
+    }
+    // VERIFY: collect the pinned `f`-values; their spread must be `≤ B`. A ground
+    // point not eq-pinned to a concrete rational ⇒ value unknown ⇒ decline.
+    let Some(points) = facts.ground_apps.get(&fsym) else {
+        return true; // no ground points ⇒ the constant model has oscillation 0 ≤ B
+    };
+    let mut lo: Option<num_rational::BigRational> = None;
+    let mut hi: Option<num_rational::BigRational> = None;
+    for &k in points {
+        let Some(v) = resolve_eq_rational(m, k, &facts.eq_pins, 16) else {
+            return false;
+        };
+        if lo.as_ref().is_none_or(|l| &v < l) {
+            lo = Some(v.clone());
+        }
+        if hi.as_ref().is_none_or(|h| &v > h) {
+            hi = Some(v);
+        }
+    }
+    match (lo, hi) {
+        (Some(l), Some(h)) => h - l <= bnd,
+        _ => true,
+    }
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -2582,6 +2718,11 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // constants `∀x̄. ⋀ cmp(f(x̄), cᵢ)` — complete `f` to a constant in the
         // intersected interval (e.g. `∀x. 0 ≤ f(x) ≤ 1`).
         if try_range_completion(lang.m(), facts, body, &bound) {
+            return Some(true);
+        }
+        // (4c) Bounded oscillation (§3.2): a Lipschitz-style `∀x,y∈G. |f(x)−f(y)|
+        // ≤ B` — complete `f` to a constant when the pinned values span ≤ B.
+        if try_bounded_oscillation(lang.m(), facts, body, &bound) {
             return Some(true);
         }
         // (5) Bare monotonicity axiom over an uninterpreted `f`: satisfiable when
