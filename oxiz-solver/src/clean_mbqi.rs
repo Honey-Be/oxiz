@@ -917,11 +917,17 @@ impl SolverModel {
                     // `∨` is valid if any disjunct is valid.
                     OP_OR => args.iter().any(|&a| self.body_is_valid(lang, a, depth - 1)),
                     // `a ⇒ b` is valid if `b` is valid or `a` is a contradiction
-                    // (covers `p ⇒ p` via `args[0] == args[1]` too).
+                    // (covers `p ⇒ p` via `args[0] == args[1]` too) — or if it is
+                    // the CONGRUENCE axiom `(⋀ aᵢ=bᵢ) ⇒ f(ā)=f(b̄)` (valid for any
+                    // function `f`; UF's congruence closure makes the explicit
+                    // axiom redundant, so recognising it avoids instantiating it —
+                    // an unbounded `∀x,y.(=x y)⇒(=(f x)(f y))` otherwise spirals
+                    // into an `f`-tower matching loop that OOMs the EUF solver).
                     OP_IMPLIES if args.len() == 2 => {
                         args[0] == args[1]
                             || self.body_is_valid(lang, args[1], depth - 1)
                             || self.body_is_unsat(lang, args[0], depth - 1)
+                            || self.is_congruence_axiom(lang, args[0], args[1])
                     }
                     // `ite(c, t, e)` is valid when both branches are valid.
                     OP_ITE if args.len() == 3 => {
@@ -932,6 +938,74 @@ impl SolverModel {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// Recognise the CONGRUENCE axiom `(⋀ᵢ aᵢ = bᵢ) ⇒ (= (f a₁…aₙ) (f b₁…bₙ))`
+    /// for an uninterpreted function `f`. This is VALID in every interpretation
+    /// (a function maps equal inputs to equal outputs), so handing it back as a
+    /// tautology is sound — and it is exactly redundant with the EUF solver's
+    /// built-in congruence closure, so recognising it lets the engine SKIP
+    /// instantiating it (the unbounded `∀x,y.(=x y)⇒(=(f x)(f y))` otherwise
+    /// enumerates `f`-of-`f` towers without bound).
+    fn is_congruence_axiom(&self, lang: &OxizHost<'_>, guard: TermId, conseq: TermId) -> bool {
+        // conseq must be `(= (f ā) (f b̄))` with `f` the SAME uninterpreted function.
+        let TermView::App { sym: ceq } = lang.view(conseq) else {
+            return false;
+        };
+        if ceq != OP_EQ {
+            return false;
+        }
+        let cargs = lang.children(conseq);
+        if cargs.len() != 2 {
+            return false;
+        }
+        let (TermView::App { sym: f1 }, TermView::App { sym: f2 }) =
+            (lang.view(cargs[0]), lang.view(cargs[1]))
+        else {
+            return false;
+        };
+        if f1 != f2 || f1 & OP != 0 {
+            return false; // different heads, or a builtin op (not an uninterpreted `f`)
+        }
+        let fa = lang.children(cargs[0]);
+        let fb = lang.children(cargs[1]);
+        if fa.is_empty() || fa.len() != fb.len() {
+            return false;
+        }
+        // The guard must assert `aᵢ = bᵢ` for EVERY argument position (or `aᵢ`
+        // is syntactically `bᵢ`). Collect the equalities the guard provides.
+        let mut pairs: Vec<(TermId, TermId)> = Vec::new();
+        Self::collect_eq_pairs(lang, guard, &mut pairs, 32);
+        fa.iter().zip(fb.iter()).all(|(&a, &b)| {
+            a == b || pairs.iter().any(|&(p, q)| (p == a && q == b) || (p == b && q == a))
+        })
+    }
+
+    /// Collect the `(lhs, rhs)` of every equality atom reachable through a
+    /// conjunction (`(= a b)` or `(and (= a₁ b₁) …)`), for the congruence check.
+    fn collect_eq_pairs(
+        lang: &OxizHost<'_>,
+        t: TermId,
+        out: &mut Vec<(TermId, TermId)>,
+        depth: u32,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        match lang.view(t) {
+            TermView::App { sym: OP_EQ } => {
+                let a = lang.children(t);
+                if a.len() == 2 {
+                    out.push((a[0], a[1]));
+                }
+            }
+            TermView::App { sym: OP_AND } => {
+                for c in lang.children(t) {
+                    Self::collect_eq_pairs(lang, c, out, depth - 1);
+                }
+            }
+            _ => {}
         }
     }
 

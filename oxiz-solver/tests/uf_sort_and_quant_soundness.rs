@@ -258,6 +258,48 @@ fn unbounded_existential_stays_sound_unknown() {
 }
 
 #[test]
+fn congruence_axiom_is_recognized_not_instantiated() {
+    // #276: the EXPLICIT congruence axiom `∀x,y.(= x y) ⇒ (= (f x) (f y))` is
+    // VALID (a function maps equal inputs to equal outputs) and exactly
+    // redundant with UF's built-in congruence closure. Instantiating it spirals
+    // into an `f`-of-`f` matching loop that OOMs the EUF solver; recognising it
+    // as a tautology (skip instantiation) terminates with the correct verdict.
+    // Here a=b=c with f/g constrained consistently ⇒ Sat. (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(declare-fun g (Int) Int)",
+        "(assert (forall ((x Int) (y Int)) (=> (= x y) (= (f x) (f y)))))",
+        "(assert (forall ((x Int) (y Int)) (=> (= x y) (= (g x) (g y)))))",
+        "(declare-const a Int)",
+        "(declare-const b Int)",
+        "(assert (= a b))",
+        "(assert (= (f a) 42))",
+        "(assert (= (g b) 100))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "consistent congruence problem must be Sat (no OOM)");
+}
+
+#[test]
+fn congruence_conflict_still_caught_by_builtin_closure() {
+    // Soundness guard: recognising the congruence axiom as valid (and so NOT
+    // instantiating it) must NOT hide a genuine congruence conflict — the EUF
+    // solver's built-in congruence still forces `f(a)=f(b)` when `a=b`, so
+    // `a=b ∧ f(a)=1 ∧ f(b)=2` is Unsat. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(declare-fun f (Int) Int)",
+        "(declare-const a Int)",
+        "(declare-const b Int)",
+        "(assert (forall ((x Int) (y Int)) (=> (= x y) (= (f x) (f y)))))",
+        "(assert (= a b))",
+        "(assert (= (f a) 1))",
+        "(assert (= (f b) 2))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "a=b ∧ f(a)=1 ∧ f(b)=2 is unsat by built-in congruence");
+}
+
+#[test]
 fn cdqi_finds_a_conflict_at_an_existing_ground_term() {
     // ∀a. f(a)>0 (NO pattern), with the existing ground term f(7) forced to
     // -3. CDQI instantiates at a=7 (an existing term), the body `f(7)>0` is
