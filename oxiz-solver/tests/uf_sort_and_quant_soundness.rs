@@ -1228,3 +1228,45 @@ fn var_relative_bound_violated_pin_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "a pin below the identity bound must not be spurious sat");
 }
+
+#[test]
+fn commuting_functions_identity_collapse_is_sat() {
+    // `∀x∈[0,5]. f(g(x))=g(f(x))` with f,g pinned-agreeing on 0,1,2. The g≡f
+    // collapse satisfies commutativity structurally. (z3: sat; corpus
+    // `real_composition.smt2`.)
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(declare-fun g (Real) Real)",
+        "(assert (forall ((x Real))
+           (=> (and (>= x 0.0) (<= x 5.0)) (= (f (g x)) (g (f x))))))",
+        "(assert (= (f 0.0) 0.0))",
+        "(assert (= (g 0.0) 0.0))",
+        "(assert (= (f 1.0) 1.0))",
+        "(assert (= (g 1.0) 1.0))",
+        "(assert (= (f 2.0) 2.0))",
+        "(assert (= (g 2.0) 2.0))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "commuting functions with agreeing pins is sat");
+}
+
+#[test]
+fn commuting_functions_contradictory_pins_is_not_spurious_sat() {
+    // Soundness control: `∀x∈[0,5]. f(g(x))=g(f(x))` with f(0)=1, g(0)=0, g(1)=2.
+    // At x=0: f(g(0))=f(0)=1, g(f(0))=g(1)=2 → 1=2, UNSAT. f and g disagree at 0
+    // (f(0)=1, g(0)=0) so the collapse DECLINES; the engine instantiates and
+    // refutes. Never spurious sat.
+    let r = solve_streamed(&[
+        "(set-logic UFLRA)",
+        "(declare-fun f (Real) Real)",
+        "(declare-fun g (Real) Real)",
+        "(assert (forall ((x Real))
+           (=> (and (>= x 0.0) (<= x 5.0)) (= (f (g x)) (g (f x))))))",
+        "(assert (= (f 0.0) 1.0))",
+        "(assert (= (g 0.0) 0.0))",
+        "(assert (= (g 1.0) 2.0))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Sat, "contradictory commuting-function pins must not be spurious sat");
+}

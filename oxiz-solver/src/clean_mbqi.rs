@@ -2497,6 +2497,121 @@ fn try_var_relative_bound(
     true
 }
 
+// ────────────────── commuting-functions recognizer (§3.4) ───────────────────
+//
+// A commutativity axiom `∀x[∈G]. f(g(x)) = g(f(x))` over two uninterpreted unary
+// functions. The model is RELATIONAL: identify `g ≡ f` (one shared graph). Then
+// `f(g(x)) = f(f(x))` and `g(f(x)) = f(f(x))`, equal by construction for EVERY
+// `x` — guard-irrelevant. Sound when `f` and `g` agree on every shared pinned
+// point (so the merge breaks no ground fact) and both are otherwise local (the
+// single-quantifier + accounting gates, applied to BOTH functions).
+
+/// `(outer, inner)` if `t` is `outer(inner(x))` for two uninterpreted unary
+/// functions applied to the bound variable `x`.
+fn compose_of_var(m: &TermManager, t: TermId, x: Spur) -> Option<(u64, u64)> {
+    let TermKind::Apply { func: outer, args: oargs } = m.get(t)?.kind.clone() else {
+        return None;
+    };
+    let osym = spur_sym(outer);
+    if osym & OP != 0 || oargs.len() != 1 {
+        return None;
+    }
+    let want: FxHashSet<Spur> = [x].into_iter().collect();
+    let (isym, _) = fapp_of_var(m, oargs[0], &want)?;
+    Some((osym, isym))
+}
+
+/// Build the `arg → value` rational map for a unary function's ground points,
+/// or `None` if any point's argument is not a literal or its value is not
+/// eq-pinned to a concrete (⇒ the merge cannot be confirmed ⇒ decline).
+fn resolve_app_map(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    fsym: u64,
+) -> Option<FxHashMap<num_rational::BigRational, num_rational::BigRational>> {
+    let mut map = FxHashMap::default();
+    if let Some(points) = facts.ground_apps.get(&fsym) {
+        for &k in points {
+            let TermKind::Apply { args, .. } = m.get(k)?.kind.clone() else {
+                return None;
+            };
+            if args.len() != 1 {
+                return None;
+            }
+            let arg = term_to_rational(m, args[0])?;
+            let val = resolve_eq_rational(m, k, &facts.eq_pins, 16)?;
+            map.insert(arg, val);
+        }
+    }
+    Some(map)
+}
+
+/// **M3 recognizer — commuting functions** (§3.4). Body `∀x. [guard ⇒]
+/// (= (f (g x)) (g (f x)))` for two DISTINCT uninterpreted unary `f`, `g`.
+/// The `g ≡ f` collapse satisfies it structurally; sound when both functions are
+/// single-quantifier + fully accounted and agree on every shared pinned point.
+fn try_commuting_functions(
+    m: &TermManager,
+    facts: &CompletionFacts,
+    body: TermId,
+    bound: &[Spur],
+) -> bool {
+    if bound.len() != 1 {
+        return false;
+    }
+    let x = bound[0];
+    let matrix = match m.get(body).map(|t| t.kind.clone()) {
+        Some(TermKind::Implies(_, c)) => c,
+        Some(_) => body,
+        None => return false,
+    };
+    let TermKind::Eq(s1, s2) = (match m.get(matrix) {
+        Some(t) => t.kind.clone(),
+        None => return false,
+    }) else {
+        return false;
+    };
+    let (Some((a_out, a_in)), Some((b_out, b_in))) =
+        (compose_of_var(m, s1, x), compose_of_var(m, s2, x))
+    else {
+        return false;
+    };
+    // The two sides are `f∘g` and `g∘f` for two DISTINCT functions.
+    if !(a_out == b_in && a_in == b_out && a_out != a_in) {
+        return false;
+    }
+    let (f, g) = (a_out, a_in);
+    // Both functions must be single-quantifier and fully accounted (body + literal
+    // ground points) — so neither carries an unmodeled or symbolic constraint
+    // that the `g ≡ f` merge could break.
+    let mut occ: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(m, body, &mut occ);
+    for sym in [f, g] {
+        if facts.quant_count.get(&sym).copied() != Some(1) {
+            return false;
+        }
+        let accounted = occ.get(&sym).copied().unwrap_or(0)
+            + facts.ground_apps.get(&sym).map_or(0, |p| p.len() as u32);
+        if facts.global_occ.get(&sym).copied().unwrap_or(0) != accounted {
+            return false;
+        }
+    }
+    // AGREEMENT: every point pinned in BOTH `f` and `g` must carry the same value,
+    // else `g ≡ f` would contradict a ground fact.
+    let (Some(fmap), Some(gmap)) = (resolve_app_map(m, facts, f), resolve_app_map(m, facts, g))
+    else {
+        return false;
+    };
+    for (arg, fv) in &fmap {
+        if let Some(gv) = gmap.get(arg) {
+            if fv != gv {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // ─────────────────────────── array axiom recognizers ───────────────────────
 //
 // Two array axioms are VALID consequences of an asserted array equality, so a
@@ -2816,6 +2931,11 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         // (4d) Variable-relative bound (§3.3): `∀r. f(r) ⋛ r` (e.g. `ceil(r)≥r`)
         // — the identity completion `f(r):=r` makes the body reflexively true.
         if try_var_relative_bound(lang.m(), facts, body, &bound) {
+            return Some(true);
+        }
+        // (4e) Commuting functions (§3.4): `∀x. f(g(x))=g(f(x))` — the `g≡f`
+        // collapse satisfies it structurally when the two functions agree.
+        if try_commuting_functions(lang.m(), facts, body, &bound) {
             return Some(true);
         }
         // (5) Bare monotonicity axiom over an uninterpreted `f`: satisfiable when
