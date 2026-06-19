@@ -878,6 +878,45 @@ impl CompletionFacts {
         for &a in assertions {
             collect_eq_pins(m, a, &mut f.eq_pins);
         }
+
+        // Pass 5: a definitional axiom `∀x̄. (= (f x̄) rhs)` whose head `f` ALSO
+        // appears in GROUND facts is rejected by Pass 1's once-globally guard —
+        // yet it is still satisfiable by `f := λx̄. rhs` AS LONG AS those ground
+        // facts AGREE with the definition (e.g. `∀x. f(x)=x` with `f(3)=3`).
+        // Accept it when: `f` occurs in no OTHER quantifier, and every ground
+        // `f`-application is eq-pinned to exactly the value the definition
+        // predicts. A non-pinned app (e.g. `(< (f 5) 0)`) or a disagreeing pin
+        // ⇒ NOT added (sound: the engine then instantiates `f(t)=rhs[t]` and the
+        // ground core refutes the inconsistency, never a spurious `sat`).
+        for &a in assertions {
+            if f.definitional_quants.contains(&a) {
+                continue;
+            }
+            let Some(fsym) = definitional_head(m, a) else {
+                continue;
+            };
+            let in_other_quant = assertions.iter().any(|&b| {
+                b != a
+                    && matches!(
+                        m.get(b).map(|t| &t.kind),
+                        Some(TermKind::Forall { .. } | TermKind::Exists { .. })
+                    )
+                    && {
+                        let mut occ: FxHashMap<u64, u32> = FxHashMap::default();
+                        count_syms(m, b, &mut occ);
+                        occ.contains_key(&fsym)
+                    }
+            });
+            if in_other_quant {
+                continue;
+            }
+            if let Some((lhs_args, rhs)) = definitional_lhs_rhs(m, a) {
+                if definitional_ground_consistent(m, &lhs_args, rhs, fsym, &f.ground_apps, &f.eq_pins)
+                {
+                    f.definitional_quants.insert(a);
+                }
+            }
+        }
         f
     }
 
@@ -1021,21 +1060,47 @@ fn mark_mixed(m: &TermManager, t: TermId, f: &mut CompletionFacts) {
 /// If `a` is a conservative definition `∀x̄. (= (f x̄) rhs)` — `f` uninterpreted,
 /// applied to exactly the distinct bound vars, not occurring in `rhs` — return
 /// `f`'s `view`-style symbol. (The caller still checks `f` occurs nowhere else.)
+///
+/// The application may sit on EITHER side of the equation: `TermManager` builds
+/// `Eq` with its operands in a canonical order, so for `∀x. (= (f x) x)` the
+/// bound var (interned earlier than the application) becomes the lhs and `(f x)`
+/// the rhs — both orderings are tried.
 fn definitional_head(m: &TermManager, a: TermId) -> Option<u64> {
+    let (_, _, fsym) = definitional_match(m, a)?;
+    Some(fsym)
+}
+
+/// Extract `(lhs argument terms, rhs, f-symbol)` of a definitional axiom
+/// `∀x̄. (= (f x̄) rhs)` (operand order canonicalised — see [`definitional_head`]).
+/// The argument terms are the bound-var occurrences `Var(x_i)`.
+fn definitional_match(m: &TermManager, a: TermId) -> Option<(Vec<TermId>, TermId, u64)> {
     let TermKind::Forall { vars, body, .. } = &m.get(a)?.kind else {
         return None;
     };
-    let TermKind::Eq(lhs, rhs) = &m.get(*body)?.kind else {
+    let TermKind::Eq(o1, o2) = &m.get(*body)?.kind else {
         return None;
     };
-    let (lhs, rhs) = (*lhs, *rhs);
-    let TermKind::Apply { func, args } = &m.get(lhs)?.kind else {
+    let (o1, o2) = (*o1, *o2);
+    let bound: Vec<Spur> = vars.iter().map(|(n, _)| *n).collect();
+    // The defining application is whichever side is `(f x̄)` over the distinct
+    // bound vars; the other side is the rhs.
+    definitional_side(m, o1, o2, &bound).or_else(|| definitional_side(m, o2, o1, &bound))
+}
+
+/// If `app` is `(f x̄)` applied to exactly the distinct `bound` vars and `f` does
+/// not occur in `rhs`, return `(app's argument terms, rhs, f-symbol)`.
+fn definitional_side(
+    m: &TermManager,
+    app: TermId,
+    rhs: TermId,
+    bound: &[Spur],
+) -> Option<(Vec<TermId>, TermId, u64)> {
+    let TermKind::Apply { func, args } = &m.get(app)?.kind else {
         return None;
     };
-    if args.len() != vars.len() {
+    if args.len() != bound.len() {
         return None;
     }
-    let bound: Vec<Spur> = vars.iter().map(|(n, _)| *n).collect();
     let mut seen: FxHashSet<Spur> = FxHashSet::default();
     for &arg in args.iter() {
         let TermKind::Var(s) = &m.get(arg)?.kind else {
@@ -1045,14 +1110,71 @@ fn definitional_head(m: &TermManager, a: TermId) -> Option<u64> {
             return None;
         }
     }
-    // `f` must not occur in the rhs (else the equation constrains `f`).
     let fsym = spur_sym(*func);
     let mut rhs_occ: FxHashMap<u64, u32> = FxHashMap::default();
     count_syms(m, rhs, &mut rhs_occ);
     if rhs_occ.contains_key(&fsym) {
         return None;
     }
-    Some(fsym)
+    Some((args.to_vec(), rhs, fsym))
+}
+
+/// Extract the `(lhs argument terms, rhs)` of a definitional axiom (order-agnostic).
+fn definitional_lhs_rhs(m: &TermManager, a: TermId) -> Option<(Vec<TermId>, TermId)> {
+    let (args, rhs, _) = definitional_match(m, a)?;
+    Some((args, rhs))
+}
+
+/// Does `f := λx̄. rhs` agree with every GROUND `f`-application? Sound only for
+/// an `rhs` we can evaluate at the ground arguments WITHOUT interning: a
+/// projection onto one bound var (`f(x̄) = x_i`, so `f(t̄) = t_i`) or a literal
+/// constant (`f(x̄) = c`). Any other `rhs`, a non-eq-pinned application, or a
+/// pin that disagrees ⇒ `false` (the caller then leaves the axiom for the engine
+/// to instantiate — the sound `Unknown`/`unsat`, never a guessed `sat`).
+fn definitional_ground_consistent(
+    m: &TermManager,
+    lhs_args: &[TermId],
+    rhs: TermId,
+    fsym: u64,
+    ground_apps: &FxHashMap<u64, Vec<TermId>>,
+    eq_pins: &FxHashMap<TermId, Vec<TermId>>,
+) -> bool {
+    let Some(apps) = ground_apps.get(&fsym) else {
+        return true; // no ground applications → the definition constrains nothing else
+    };
+    enum Rhs {
+        Proj(usize),
+        Const(TermId),
+        Other,
+    }
+    let rhs_class = if let Some(i) = lhs_args.iter().position(|&la| la == rhs) {
+        Rhs::Proj(i)
+    } else if matches!(
+        m.get(rhs).map(|t| &t.kind),
+        Some(TermKind::IntConst(_) | TermKind::RealConst(_))
+    ) {
+        Rhs::Const(rhs)
+    } else {
+        Rhs::Other
+    };
+    for &app in apps {
+        let Some(TermKind::Apply { args, .. }) = m.get(app).map(|t| &t.kind) else {
+            return false;
+        };
+        let predicted = match &rhs_class {
+            Rhs::Proj(i) => match args.get(*i) {
+                Some(&t) => t,
+                None => return false,
+            },
+            Rhs::Const(c) => *c,
+            Rhs::Other => return false,
+        };
+        match eq_pins.get(&app) {
+            Some(vals) if vals.contains(&predicted) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Walk the boolean skeleton of `t` recording each uninterpreted PREDICATE
