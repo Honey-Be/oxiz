@@ -167,11 +167,9 @@ deliberate soundness control (a near-miss that must stay `Unknown`/`Unsat`, neve
 
 ## 5. Remaining real/quantifier frontier
 
-`real_fixed_point` is now handled (§5.1 below). Two `z3=Sat` cases stay the sound
-`Unknown`, each needing machinery beyond this note's completions:
+`real_fixed_point` (§5.1) and `nested_quantifiers` (§5.2) are now handled. One
+`z3=Sat` case stays the sound `Unknown`:
 
-- **`nested_quantifiers`** — triple-nested `∀x.∃y.∀z. (z≥y ⇒ f(x,z)≥0)`. Needs
-  Skolem-function reasoning under an inner ∀.
 - **`array_sorted`** — a cross-variable triangular guard `i≤j` (not an axis-aligned
   box), beyond the current bounded-domain machinery.
 
@@ -187,3 +185,18 @@ into the feasible interval for the constant `k` (since `f(sk)=k` forces `sk=k`).
 An out-of-range fixed-point folds to an empty interval and is declined; a
 non-eq-pinned `f(c)` (real_unsat) is not a self-fixed-point and still trips the
 plain accounting gate.
+
+### 5.2 Done — `nested_quantifiers` (substitute fix + threshold guard)
+
+Triple-nested `∀x.∃y.∀z. (z≥y ⇒ f(x,z)≥0)`. Two parts: (a) a CORE bug — the
+manager's `substitute` left `Forall`/`Exists` unchanged, so skolemizing the inner
+`∃y` LEAKED `y` into the nested `∀z` (and nested-quantifier instantiation kept its
+bound var); fixed with capture-avoiding quantifier arms (`subst_under_binder`).
+(b) With the skolemized `∀x,z. (z≥sk(x) ⇒ f(x,z)≥0)`, the FRESH threshold `sk(x)`
+can be pushed above every (finitely many) ground point of `f` — so the pinned
+points fall in the excluded region `z<sk(x)` (vacuous) and the constrained region
+holds only fresh points where `f` is free. `try_threshold_guard` recognizes the
+shape (fresh-skolem lower threshold on a bound var, feasible single-`f` range
+consequent with the threshold var as an `f`-arg, `f` single-quantifier) and
+certifies. An infeasible consequent makes the axiom `∀z. z<sk` — unsat — so it
+declines.
