@@ -201,18 +201,39 @@ impl<'a> TermLang for OxizHost<'a> {
         self.tm.mk_implies(a, b)
     }
 
+    fn mk_or(&mut self, args: Vec<TermId>) -> TermId {
+        self.tm.mk_or(args)
+    }
+
     fn bounded_var_domains(&mut self, quant: TermId) -> Vec<Option<Vec<TermId>>> {
-        // Bound variables + matrix of the (universal) quantifier.
-        let (bound, body) = match self.m().get(quant).map(|t| &t.kind) {
+        // Bound variables + matrix of the quantifier, plus whether it is an
+        // existential. For a `∀` the guarded shape is `(=> guard φ)`; for a
+        // bounded `∃` it is `(and guard… φ)` — both pin the bound vars to a
+        // finite integer range we can enumerate.
+        let (bound, body, is_exists) = match self.m().get(quant).map(|t| &t.kind) {
             Some(TermKind::Forall { vars, body, .. }) => {
-                (vars.iter().map(|(n, _)| *n).collect::<Vec<Spur>>(), *body)
+                (vars.iter().map(|(n, _)| *n).collect::<Vec<Spur>>(), *body, false)
+            }
+            Some(TermKind::Exists { vars, body, .. }) => {
+                (vars.iter().map(|(n, _)| *n).collect::<Vec<Spur>>(), *body, true)
             }
             _ => return Vec::new(),
         };
-        // Only the guarded shape `(=> guard φ)` carries a concrete range.
-        let guard = match self.m().get(body).map(|t| &t.kind) {
-            Some(TermKind::Implies(g, _)) => *g,
-            _ => return Vec::new(),
+        // `∀`: the range lives in the `(=> guard φ)` ANTECEDENT (out-of-range ⇒
+        // vacuous). `∃`: the range lives in the `(and guard… φ)` body itself
+        // (out-of-range ⇒ no witness); using the whole conjunction as the
+        // "guard" lets `collect_int_bounds` pick out the bound-var comparisons
+        // and ignore the non-bound conjuncts (`collect_int_bounds` only records
+        // bounds for the quantifier's OWN variables). For a `∀` we must NOT
+        // treat an `(and …)` body as a guard — that would unsoundly restrict a
+        // non-guarded universal — so the And path is existential-only.
+        let guard = if is_exists {
+            body
+        } else {
+            match self.m().get(body).map(|t| &t.kind) {
+                Some(TermKind::Implies(g, _)) => *g,
+                _ => return Vec::new(),
+            }
         };
         // Tightest concrete (lower, upper) integer bound per bound var.
         let mut lo: FxHashMap<Spur, i128> = FxHashMap::default();

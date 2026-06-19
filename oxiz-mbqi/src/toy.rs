@@ -30,6 +30,7 @@ enum Node {
     Var(Name),
     App(Sym, Vec<Tid>),
     Implies(Tid, Tid),
+    Or(Vec<Tid>),
     Quant {
         forall: bool,
         vars: Vec<(Name, Sort)>,
@@ -112,8 +113,9 @@ impl TermLang for Toy {
         match &self.nodes[t as usize] {
             Node::Var(n) => TermView::Var { name: *n },
             Node::App(s, _) => TermView::App { sym: *s },
-            // Treat `⇒` as an app under a reserved pseudo-symbol.
+            // Treat `⇒` / `∨` as apps under reserved pseudo-symbols.
             Node::Implies(_, _) => TermView::App { sym: u32::MAX },
+            Node::Or(_) => TermView::App { sym: u32::MAX - 1 },
             Node::Quant { forall, body, .. } => TermView::Quant {
                 forall: *forall,
                 vars: &self.quant_vars[t as usize],
@@ -127,6 +129,7 @@ impl TermLang for Toy {
         match &self.nodes[t as usize] {
             Node::App(_, args) => args.clone(),
             Node::Implies(a, b) => vec![*a, *b],
+            Node::Or(args) => args.clone(),
             _ => Vec::new(),
         }
     }
@@ -151,6 +154,11 @@ impl TermLang for Toy {
         let bs = self.sort_of(a);
         self.mk(Node::Implies(a, b), bs)
     }
+
+    fn mk_or(&mut self, args: Vec<Tid>) -> Tid {
+        let bs = args.first().map(|&a| self.sort_of(a)).unwrap_or(0);
+        self.mk(Node::Or(args), bs)
+    }
 }
 
 impl Toy {
@@ -167,6 +175,11 @@ impl Toy {
                 let nb = self.subst_rec(b, binding);
                 let bs = self.sort[t as usize];
                 self.mk(Node::Implies(na, nb), bs)
+            }
+            Node::Or(args) => {
+                let new: Vec<Tid> = args.iter().map(|&a| self.subst_rec(a, binding)).collect();
+                let bs = self.sort[t as usize];
+                self.mk(Node::Or(new), bs)
             }
             // Do not substitute under a nested quantifier's own binders in the
             // toy (the corpus does not need nested capture); a real host

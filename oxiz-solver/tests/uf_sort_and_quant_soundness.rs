@@ -212,6 +212,52 @@ fn existential_is_not_instantiated_as_universal() {
 }
 
 #[test]
+fn bounded_existential_discharged_by_disjunction_is_sat() {
+    // COMPLETENESS (#279): a BOUNDED existential is discharged by its exact
+    // finite disjunction `Q ⇒ ⋁_{t∈D} φ[i↦t]` over the guard's domain. Here
+    // `∃i.(0≤i≤1 ∧ a(i)=42) ∧ a(0)=42` ⇒ `(a(0)=42 ∨ a(1)=42)` is satisfied by
+    // a(0)=42 → the witness exists → Sat (not just the sound Unknown). (z3: sat.)
+    let r = solve_streamed(&[
+        "(declare-fun a (Int) Int)",
+        "(assert (exists ((i Int)) (and (>= i 0) (<= i 1) (= (a i) 42))))",
+        "(assert (= (a 0) 42))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "bounded ∃ disjunction must recover the decisive Sat");
+}
+
+#[test]
+fn bounded_existential_disjunction_is_complete_for_unsat() {
+    // The disjunction is EXACT, so it is complete in BOTH directions: with
+    // a(0)≠42 ∧ a(1)≠42 the witness disjunction `(a(0)=42 ∨ a(1)=42)` is
+    // refuted → the existential has no witness → Unsat. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(declare-fun a (Int) Int)",
+        "(assert (exists ((i Int)) (and (>= i 0) (<= i 1) (= (a i) 42))))",
+        "(assert (not (= (a 0) 42)))",
+        "(assert (not (= (a 1) 42)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "the bounded ∃ disjunction must derive the genuine Unsat");
+}
+
+#[test]
+fn unbounded_existential_stays_sound_unknown() {
+    // An UNBOUNDED existential (no finite guard domain) has no finite
+    // disjunction, so it emits nothing and stays the sound `Unknown` — never a
+    // guessed verdict. `∃i.(a(i)=42) ∧ a(0)=42` is SAT (z3), but the clean
+    // engine cannot decide it without skolemization; the invariant is only that
+    // it is NOT the spurious Unsat.
+    let r = solve_streamed(&[
+        "(declare-fun a (Int) Int)",
+        "(assert (exists ((i Int)) (= (a i) 42)))",
+        "(assert (= (a 0) 42))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Unsat, "an unbounded ∃ must stay sound (Unknown), never spurious Unsat");
+}
+
+#[test]
 fn cdqi_finds_a_conflict_at_an_existing_ground_term() {
     // ∀a. f(a)>0 (NO pattern), with the existing ground term f(7) forced to
     // -3. CDQI instantiates at a=7 (an existing term), the body `f(7)>0` is

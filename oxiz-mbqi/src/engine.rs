@@ -19,7 +19,7 @@ use crate::cdqi;
 use crate::ground::GroundIndex;
 use crate::instantiate::{InstResult, Quant, instantiate};
 use crate::model::{ModelEval, NoModel};
-use crate::term::{Sig, TermLang, TermView};
+use crate::term::{Binding, Sig, TermLang, TermView};
 use crate::trigger;
 use rustc_hash::FxHashSet;
 
@@ -145,16 +145,18 @@ impl<S: Sig> Engine<S> {
             }
             active[qi] = true;
 
-            // 0. EXISTENTIALS are NOT instantiated. Ground-instantiating an `∃`
-            //    as if it were `∀` — asserting `Q ⇒ φ[x̄↦t̄]` for an arbitrary
-            //    ground `t̄` — is UNSOUND: a `t̄` outside the existential's guard
-            //    makes `φ` false, so `Q ⇒ false` = `¬Q` refutes the asserted
-            //    existential (spurious `unsat`, e.g. `∃i.(0≤i≤1 ∧ a(i)=42)`
-            //    instantiated at `i:=42`). An `∃` only guarantees SOME witness;
-            //    sound discharge needs host-side skolemization (a fresh witness),
-            //    which the no-fabrication firewall forbids inside the engine — so
-            //    we skip it and report the sound `Unknown` at saturation (below).
+            // 0. EXISTENTIALS are never ground-instantiated like universals —
+            //    asserting `Q ⇒ φ[x̄↦t̄]` for an arbitrary ground `t̄` is UNSOUND
+            //    (a `t̄` outside the guard makes `φ` false, so `Q ⇒ false` = `¬Q`
+            //    refutes the asserted `∃` → spurious `unsat`). A BOUNDED `∃` is
+            //    discharged SOUNDLY by its finite disjunction `Q ⇒ ⋁_{t̄∈D} φ[t̄]`
+            //    (exactly the existential over its guard's integer domain — the
+            //    guard inside each disjunct self-excludes out-of-range tuples).
+            //    An UNBOUNDED `∃` emits nothing and reports the sound `Unknown`
+            //    at saturation (host-side skolemization, forbidden by the
+            //    no-fabrication firewall inside the engine, would be needed).
             if !self.quants[qi].universal {
+                self.emit_existential_disjunction(lang, qi, &mut lemmas);
                 continue;
             }
 
@@ -237,15 +239,24 @@ impl<S: Sig> Engine<S> {
         // `f`-tower (no hang); the VERDICT now defers to `eval_forall`, which is
         // sound (a bounded quantifier it cannot verify yields the sound
         // `Unknown`, never a guessed `Sat`).
-        for q in &self.quants {
-            if q.triggers.is_empty() && model.is_active(lang, q.term) {
-                // An active EXISTENTIAL was not (and cannot soundly be)
-                // instantiated here (skolemization is host-side). Its witness
-                // constraint is therefore unverified — the sound verdict is
-                // `Unknown`, NEVER a guessed `Sat` (the `∃` might be unsat, so a
-                // `Saturated`→`Sat` that dropped it would be unsound). `eval_forall`
-                // is a `∀`-only recognizer and must not run on an `∃`.
+        for qi in 0..self.quants.len() {
+            let q = &self.quants[qi];
+            if !(q.triggers.is_empty() && model.is_active(lang, q.term)) {
+                continue;
+            }
+            {
+                // A BOUNDED existential was discharged by its exact finite
+                // disjunction lemma `Q ⇒ ⋁φ[t̄]` — the ground solver decides it,
+                // so it is satisfied here (sound: the disjunction IS the `∃`, and
+                // satisfiability of a disjunction is the easy direction, immune to
+                // the incremental conflict-miss). An UNBOUNDED existential emitted
+                // nothing and is unverified → the sound `Unknown`, NEVER a guessed
+                // `Sat`. `eval_forall` is a `∀`-only recognizer and must not run
+                // on an `∃`.
                 if !q.universal {
+                    if self.bounded_finite(qi) {
+                        continue;
+                    }
                     return Verdict::Inconclusive;
                 }
                 match model.eval_forall(lang, q.term) {
@@ -373,5 +384,93 @@ impl<S: Sig> Engine<S> {
             }
             InstResult::Rejected => self.rejected += 1,
         }
+    }
+
+    /// Discharge a BOUNDED existential by its exact finite disjunction
+    /// `Q ⇒ ⋁_{t̄∈D} φ[x̄↦t̄]` over the guard's integer domain `D`. Emitted at
+    /// most ONCE per quantifier (deduped via the empty-tuple `seen` sentinel).
+    /// For an UNBOUNDED existential (a bound var with no finite domain, or a
+    /// product exceeding the cap) nothing is emitted — the saturation check
+    /// then reports the sound `Unknown`.
+    ///
+    /// SOUND + COMPLETE: `∃x̄. (guard ∧ φ)` is exactly `⋁_{t̄∈D} (guard[t̄] ∧
+    /// φ[t̄])`, where `D` is the integer box the guard pins. Each disjunct
+    /// substitutes the FULL body (guard included), so a tuple outside the guard
+    /// has a false guard and contributes nothing — no need for `D` to be exactly
+    /// the guard's support. Unlike the universal verdict, this is the EASY
+    /// satisfiability direction (find ONE true disjunct), so it is immune to the
+    /// incremental conflict-miss that forced `∀` to the sound `Unknown` (#277).
+    fn emit_existential_disjunction<L: TermLang<Sig = S>>(
+        &mut self,
+        lang: &mut L,
+        qi: usize,
+        out: &mut Vec<S::Term>,
+    ) {
+        // Once per quantifier (the bound-var list is never empty, so the empty
+        // tuple is a free sentinel that never collides with a real instance).
+        if !self.seen.insert((qi, Vec::new())) {
+            return;
+        }
+        if self.quants[qi].var_domains.is_none() {
+            let vd = lang.bounded_var_domains(self.quants[qi].term);
+            self.quants[qi].var_domains = Some(vd);
+        }
+        if !self.bounded_finite(qi) {
+            return; // unbounded ∃ ⇒ no lemma ⇒ sound Unknown at saturation
+        }
+        let vd = self.quants[qi].var_domains.clone().unwrap_or_default();
+        let domains: Vec<Vec<S::Term>> = vd.iter().map(|o| o.clone().unwrap_or_default()).collect();
+        if domains.iter().any(|d| d.is_empty()) {
+            return;
+        }
+        let vars: Vec<S::VarName> = self.quants[qi].vars.iter().map(|(n, _)| *n).collect();
+        let body = self.quants[qi].body;
+        let k = domains.len();
+        let mut idx = vec![0usize; k];
+        let mut disjuncts: Vec<S::Term> = Vec::new();
+        loop {
+            let binding: Vec<(S::VarName, S::Term)> = vars
+                .iter()
+                .copied()
+                .zip((0..k).map(|i| domains[i][idx[i]]))
+                .collect();
+            let b = Binding::<S>::new(&binding);
+            disjuncts.push(lang.substitute(body, &b));
+            let mut carry = true;
+            for i in 0..k {
+                if carry {
+                    idx[i] += 1;
+                    if idx[i] >= domains[i].len() {
+                        idx[i] = 0;
+                    } else {
+                        carry = false;
+                    }
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+        let disj = lang.mk_or(disjuncts);
+        let lemma = lang.mk_implies(self.quants[qi].term, disj);
+        self.ground.add_term(lang, lemma);
+        out.push(lemma);
+        self.emitted += 1;
+    }
+
+    /// Whether `qi`'s bound vars ALL have a finite literal domain whose product
+    /// fits the per-quant cap (computed via `bounded_var_domains`, cached on the
+    /// quantifier). For a bounded `∃` this means it was (or can be) discharged by
+    /// its finite disjunction; for anything else it is `false`.
+    fn bounded_finite(&self, qi: usize) -> bool {
+        self.quants[qi].var_domains.as_ref().is_some_and(|vds| {
+            !vds.is_empty()
+                && vds.iter().all(|d| d.is_some())
+                && vds
+                    .iter()
+                    .map(|d| d.as_ref().map_or(0, Vec::len))
+                    .fold(1usize, usize::saturating_mul)
+                    <= self.cfg.max_tuples_per_quant
+        })
     }
 }

@@ -128,6 +128,12 @@ pub trait TermLang {
         b: <Self::Sig as Sig>::Term,
     ) -> <Self::Sig as Sig>::Term;
 
+    /// Build the disjunction `⋁ args` (used to discharge a BOUNDED existential
+    /// soundly: `∃x̄∈D. φ` is exactly `⋁_{t̄∈D} φ[x̄↦t̄]`, a finite disjunction
+    /// over the guard's literal domain). An empty `args` is `false`; a singleton
+    /// is itself.
+    fn mk_or(&mut self, args: Vec<<Self::Sig as Sig>::Term>) -> <Self::Sig as Sig>::Term;
+
     /// **Bounded-guard finite domains.** For each bound variable of `quant`,
     /// return `Some(literals)` when the quantifier body has the guarded shape
     /// `∀x̄. (guard ⇒ φ)` and `guard` pins that variable to a CONCRETE integer
