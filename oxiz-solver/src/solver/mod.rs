@@ -289,9 +289,65 @@ impl Solver {
         instances: &[TermId],
         manager: &mut TermManager,
     ) -> SolverResult {
+        match self.fresh_ground_resolve(instances, manager) {
+            SolverResult::Unsat => {
+                self.build_unsat_core();
+                SolverResult::Unsat
+            }
+            // Not confirmed by a sound ground solve ⇒ the incremental `unsat`
+            // was spurious; report the sound `Unknown`.
+            _ => SolverResult::Unknown,
+        }
+    }
+
+    /// Confirm a clean-engine `Saturated` (→ `sat`) with the same SINGLE-SHOT
+    /// ground re-solve — the DUAL of [`Self::verify_clean_unsat`].
+    ///
+    /// The incremental CDCL(T) can also MISS a conflict GLOBAL across the
+    /// emitted instances (e.g. pigeonhole), so a bounded quantifier's
+    /// `Saturated` does not by itself justify `Sat`. A bounded quantifier is
+    /// FULLY captured by its emitted instances (a `∀`'s box conjunction / a
+    /// `∃`'s box disjunction), so re-solving `{ground assertions ∪ instances}`
+    /// in a FRESH solver gives the true verdict: a fresh `unsat` is a real
+    /// `unsat` (the instances are sound ground consequences); a fresh `sat` is a
+    /// genuine model (sound `Sat`); anything else is the sound `Unknown`.
+    fn verify_clean_saturated(
+        &mut self,
+        instances: &[TermId],
+        manager: &mut TermManager,
+    ) -> SolverResult {
+        match self.fresh_ground_resolve(instances, manager) {
+            SolverResult::Unsat => {
+                self.build_unsat_core();
+                SolverResult::Unsat
+            }
+            SolverResult::Sat => {
+                self.unsat_core = None;
+                SolverResult::Sat
+            }
+            SolverResult::Unknown => SolverResult::Unknown,
+        }
+    }
+
+    /// Re-solve `{non-quantifier assertions ∪ ground instances}` in a FRESH,
+    /// single-shot solver that instantiates nothing. Shared by both clean-engine
+    /// verifications.
+    ///
+    /// CRUCIAL: the fresh solver must carry the LOGIC. `logic` is a `Solver`
+    /// field, NOT part of `SolverConfig`, so `with_config(self.config.clone())`
+    /// would leave it `None` — and a logic-less solve does not enable the right
+    /// theory wiring (it misses the EUF↔LIA combination that refutes
+    /// pigeonhole), so an unsat re-solve would spuriously come back `sat`/
+    /// `unknown`. `set_logic` both records the logic and runs its theory setup.
+    fn fresh_ground_resolve(
+        &self,
+        instances: &[TermId],
+        manager: &mut TermManager,
+    ) -> SolverResult {
         let mut config = self.config.clone();
         config.clean_mbqi = false;
         let mut verifier = Solver::with_config(config);
+        verifier.set_logic(self.logic.as_deref().unwrap_or("ALL"));
         let assertions = self.assertions.clone();
         for a in assertions {
             // Skip quantifiers — their ground instances stand in for them, so
@@ -307,15 +363,7 @@ impl Solver {
         for &inst in instances {
             verifier.assert(inst, manager);
         }
-        match verifier.check(manager) {
-            SolverResult::Unsat => {
-                self.build_unsat_core();
-                SolverResult::Unsat
-            }
-            // Not confirmed by a sound ground solve ⇒ the incremental `unsat`
-            // was spurious; report the sound `Unknown`.
-            _ => SolverResult::Unknown,
-        }
+        verifier.check(manager)
     }
 
     /// Move this solver's persistent theory state — the EUF/arith/BV solvers,
@@ -660,7 +708,19 @@ impl Solver {
                                 }
                             }
                             CleanVerdict::Saturated => {
-                                // Every quantifier satisfied by the model.
+                                // Every quantifier satisfied by the (incremental)
+                                // model. But the incremental CDCL(T) can MISS a
+                                // conflict GLOBAL across instances accumulated over
+                                // rounds (pigeonhole: a bounded ∀ whose box
+                                // conjunction is jointly unsat). When instances were
+                                // emitted (bounded quantifiers), confirm the model
+                                // with a single-shot ground re-solve before trusting
+                                // `sat`; with none (pure model-completion) the
+                                // `Saturated` is already sound.
+                                if self.config.clean_mbqi && !clean_instances.is_empty() {
+                                    return self
+                                        .verify_clean_saturated(&clean_instances, manager);
+                                }
                                 self.unsat_core = None;
                                 return SolverResult::Sat;
                             }

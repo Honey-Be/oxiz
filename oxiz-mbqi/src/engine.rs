@@ -244,25 +244,27 @@ impl<S: Sig> Engine<S> {
             if !(q.triggers.is_empty() && model.is_active(lang, q.term)) {
                 continue;
             }
-            {
-                // A BOUNDED existential was discharged by its exact finite
-                // disjunction lemma `Q ⇒ ⋁φ[t̄]` — the ground solver decides it,
-                // so it is satisfied here (sound: the disjunction IS the `∃`, and
-                // satisfiability of a disjunction is the easy direction, immune to
-                // the incremental conflict-miss). An UNBOUNDED existential emitted
-                // nothing and is unverified → the sound `Unknown`, NEVER a guessed
-                // `Sat`. `eval_forall` is a `∀`-only recognizer and must not run
-                // on an `∃`.
-                if !q.universal {
-                    if self.bounded_finite(qi) {
-                        continue;
-                    }
-                    return Verdict::Inconclusive;
-                }
-                match model.eval_forall(lang, q.term) {
-                    Some(true) => {}
-                    Some(false) | None => return Verdict::Inconclusive,
-                }
+            // A BOUNDED-FINITE quantifier emitted ALL its instances over the
+            // guard's box, so it is FULLY captured: a `∀`'s box conjunction
+            // (`⋀_{t̄∈D} φ[t̄]`) or a `∃`'s box disjunction (`⋁_{t̄∈D} φ[t̄]`,
+            // emitted as one lemma). Both defer the verdict to the ground solver
+            // via `Saturated` — and for the `∀` direction the SOLVER confirms
+            // that `Saturated` with a single-shot re-solve (the incremental
+            // `Saturated`→`Sat` alone was the #277 spurious-sat; the re-solve is
+            // sound now that it carries the logic). The `∃` disjunction is the
+            // easy satisfiability direction and needs no re-solve.
+            if self.bounded_finite(qi) {
+                continue;
+            }
+            // An UNBOUNDED existential emitted nothing and is unverified → the
+            // sound `Unknown`, NEVER a guessed `Sat`. `eval_forall` is a
+            // `∀`-only recognizer and must not run on an `∃`.
+            if !q.universal {
+                return Verdict::Inconclusive;
+            }
+            match model.eval_forall(lang, q.term) {
+                Some(true) => {}
+                Some(false) | None => return Verdict::Inconclusive,
             }
         }
         Verdict::Saturated

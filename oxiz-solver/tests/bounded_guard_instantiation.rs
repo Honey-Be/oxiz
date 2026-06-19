@@ -8,13 +8,14 @@
 //! 0≤n≤5) ⇒ ack(m,n)>0`) used to spin at 100% CPU forever; the bounded domain
 //! defuses that — it solves in milliseconds with no hang.
 //!
-//! VERDICT NOTE: the bounded enumeration prevents the hang, but the clean
-//! engine does NOT auto-conclude `Sat` from "all bounded instances emitted".
-//! An earlier "finite exhaustion ⇒ sat" shortcut trusted the incremental
-//! model, which can MISS a GLOBAL conflict among the instances (pigeonhole) and
-//! so reported a spurious `sat`. The verdict now defers to `eval_forall`, so a
-//! bounded grid the engine cannot model-verify reports the sound `Unknown` —
-//! never a guessed `Sat`, and never the spurious `Unsat`.
+//! VERDICT NOTE: a bounded `∀` is FULLY captured by its box conjunction of
+//! emitted instances, so the engine reaches `Saturated` and the SOLVER confirms
+//! the verdict with a single-shot ground re-solve (#280). The re-solve carries
+//! the logic, so it enables the EUF↔LIA combination that the incremental
+//! `Saturated`-trusting shortcut missed (#277's pigeonhole spurious-`sat`): a
+//! genuinely-sat grid (ackermann) comes back `Sat`, a jointly-unsat box
+//! (pigeonhole) comes back `Unsat`. The bounded enumeration still prevents the
+//! `f`-tower hang.
 
 use oxiz_solver::Context;
 
@@ -43,12 +44,10 @@ fn bounded_grid_positivity_terminates_soundly_no_hang() {
         "unknown" => Some("unknown"),
         _ => None,
     });
-    // z3: sat. The bounded enumeration must terminate (no `f`-tower hang) and be
-    // SOUND: the clean engine reports `Unknown` here (it cannot model-verify the
-    // bounded monotonicity grid), NEVER the spurious `Unsat` and never a guessed
-    // `Sat`. (Recovering the decisive `Sat` would need a sound finite-domain
-    // model check — see task #277 follow-up.)
-    assert_eq!(verdict, Some("unknown"), "bounded ackermann grid must be sound Unknown, got {out:?}");
+    // z3: sat. The bounded ∀ is fully instantiated over its box and the
+    // solver-side single-shot re-solve (with the logic) confirms `Sat` — no
+    // hang, no spurious `Unsat`, and no longer the conservative `Unknown` (#280).
+    assert_eq!(verdict, Some("sat"), "bounded ackermann grid must be Sat (solver-verified), got {out:?}");
 }
 
 #[test]
@@ -76,12 +75,11 @@ fn out_of_guard_unsat_still_caught() {
 }
 
 #[test]
-fn corpus_ackermann_file_is_sound_not_hang() {
+fn corpus_ackermann_file_is_sat_not_hang() {
     // The vendored `UFLIA/ackermann.smt2` (positivity via bounded monotonicity,
-    // #benchmark-fix) must terminate soundly under the clean engine: the bounded
-    // enumeration defuses the `f`-tower hang, and the verdict is the sound
-    // `Unknown` (z3: sat — the clean engine is incomplete here, but NEVER
-    // unsound: no spurious `Unsat`, no guessed `Sat`).
+    // #benchmark-fix): the bounded enumeration defuses the `f`-tower hang, the
+    // bounded `∀` reaches `Saturated`, and the solver-side single-shot re-solve
+    // confirms `Sat` (= z3 4.16) — sound and decisive (#280).
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/corpus/z3_parity/benchmarks/UFLIA/ackermann.smt2"
@@ -97,5 +95,36 @@ fn corpus_ackermann_file_is_sound_not_hang() {
         "unknown" => Some("unknown"),
         _ => None,
     });
-    assert_eq!(verdict, Some("unknown"), "corpus ackermann.smt2 must be sound Unknown, got {out:?}");
+    assert_eq!(verdict, Some("sat"), "corpus ackermann.smt2 must be Sat (solver-verified), got {out:?}");
+}
+
+#[test]
+fn bounded_pigeonhole_is_unsat_via_resolve() {
+    // The dual of the ackermann recovery: a bounded `∀` whose box conjunction is
+    // jointly UNSAT must come back `Unsat`. `∀i,j∈[0,2]. i≠j ⇒ hole(i)≠hole(j)`
+    // with hole(0..2) ∈ [1,2] is 3 distinct values in 2 slots — impossible. The
+    // engine `Saturated`s the bounded `∀` and the solver-side re-solve (carrying
+    // the logic, so EUF↔LIA combination fires) refutes the box. This is the case
+    // the incremental `Saturated`-trust got wrong (#277). (z3: unsat.)
+    let script = "\
+        (set-logic UFLIA)\
+        (declare-fun hole (Int) Int)\
+        (assert (and (>= (hole 0) 1) (<= (hole 0) 2)))\
+        (assert (and (>= (hole 1) 1) (<= (hole 1) 2)))\
+        (assert (and (>= (hole 2) 1) (<= (hole 2) 2)))\
+        (assert (forall ((i Int) (j Int)) \
+            (=> (and (>= i 0) (<= i 2) (>= j 0) (<= j 2) (not (= i j))) \
+                (not (= (hole i) (hole j))))))\
+        (check-sat)";
+    let mut ctx = Context::new();
+    ctx.set_clean_mbqi(true);
+    ctx.set_timeout_ms(2000);
+    let out = ctx.execute_script(script).expect("script runs");
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_eq!(verdict, Some("unsat"), "bounded pigeonhole box is jointly unsat, got {out:?}");
 }
