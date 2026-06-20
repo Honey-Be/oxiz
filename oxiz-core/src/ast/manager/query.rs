@@ -541,6 +541,24 @@ impl TermManager {
             // is still a substitution gap for those theories — the FO/UF/LIA +
             // quantifier fragment above covers the clean engine's needs;
             // broadening the rest is a follow-up.
+            //
+            // ⚠ SOUNDNESS INVARIANT (clean-MBQI, audit 2026-06-20): returning a
+            // term UNCHANGED here means an instance body over a dropped kind can
+            // RETAIN a bound variable. That is contained today ONLY because every
+            // kind dropped here is also mapped to `TermView::Opaque` by
+            // `OxizHost::view` (clean_mbqi.rs) and registered by `GroundIndex` as a
+            // non-descended LEAF — so the retained bound var never becomes a
+            // standalone candidate, and the engine's `instantiate` ground gate plus
+            // the solver's per-quantifier `retains_bound` drop never see it.
+            // The coupling **`view`-Opaque set ≡ this drop set** is therefore
+            // soundness-critical and UNASSERTED: if a future `TermKind` is mapped to
+            // a structured `view` (App/…) but left in this `_` arm, `add_rec` would
+            // descend and register a bare bound-var `Var` as ground → the B/E
+            // self-match capture class reopens (and the solver's `retains_bound`
+            // only screens the CURRENT quantifier's bound names, so a SIBLING
+            // quantifier's bound var would slip through). The real fix is to make
+            // this substitution TOTAL (recurse through every kind); until then, do
+            // NOT add a kind to `view`-App without also handling it here.
             Some(_) => id,
         };
 
