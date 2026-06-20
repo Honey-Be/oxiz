@@ -18,7 +18,7 @@ pub use types::{
     Statistics, TheoryMode, UnsatCore,
 };
 
-use crate::clean_mbqi::{OxizHost, OxizSig, SolverModel};
+use crate::clean_mbqi::{EufCongruence, OxizHost, OxizSig, SolverModel};
 #[allow(unused_imports)]
 use crate::prelude::*;
 use oxiz_mbqi::{Config as CleanConfig, Engine as CleanEngine, Verdict as CleanVerdict};
@@ -604,7 +604,11 @@ impl Solver {
                     if self.config.clean_mbqi {
                         // Build + assert the formula once; persist across rounds.
                         if clean_engine.is_none() {
-                            let mut eng = CleanEngine::new(CleanConfig::default());
+                            let mut eng = CleanEngine::new(CleanConfig {
+                                // CCFV (P2): opt-in congruence-aware e-matching.
+                                ccfv_ematch: self.config.ccfv_ematch,
+                                ..CleanConfig::default()
+                            });
                             {
                                 let host = OxizHost::new(manager);
                                 for &a in &self.assertions {
@@ -627,7 +631,13 @@ impl Solver {
                             );
                             let eng = clean_engine.as_mut().expect("just built above");
                             let mut host = OxizHost::with_int_consts(manager, int_consts);
-                            eng.round_with(&mut host, &model)
+                            // CCFV (P2): single-pattern e-matching runs modulo the
+                            // live post-solve EUF congruence (`self.euf`, restored by
+                            // `restore_theory_manager` above) when `ccfv_ematch` is
+                            // on. With the flag off the engine ignores the oracle, so
+                            // the default path is byte-identical to `round_with`.
+                            let cong = EufCongruence::new(&self.euf);
+                            eng.round_with_cong(&mut host, &model, &cong)
                         };
                         match verdict {
                             CleanVerdict::NewLemmas(lemmas) => {

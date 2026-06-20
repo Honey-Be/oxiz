@@ -70,6 +70,14 @@ fn solve_clean(path: &Path) -> Verdict {
     };
     let mut ctx = Context::new();
     ctx.set_clean_mbqi(true);
+    // CCFV (Phase P2) A/B gate: set OXIZ_CCFV_EMATCH=1 to run the whole z3-parity
+    // corpus with congruence-aware single-pattern e-matching ON. The pass bar is
+    // unchanged (no spurious sat/unsat vs z3) — CCFV matching is a superset of
+    // syntactic — and `matches ≥ old`; this env hook is how the default-flip gets
+    // validated before flipping `SolverConfig::ccfv_ematch` on by default.
+    if std::env::var("OXIZ_CCFV_EMATCH").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        let _ = ctx.execute_script("(set-option :oxiz.ccfv-ematch true)");
+    }
     // Cap per-case wall-clock so the WHOLE corpus completes in CI-time. The
     // SOUNDNESS gate is unaffected — a spurious `unsat` is a wrong conclusion
     // reached fast, not a non-termination, so a short deadline cannot hide it;

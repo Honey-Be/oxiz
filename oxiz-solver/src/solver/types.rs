@@ -295,6 +295,17 @@ pub struct SolverConfig {
     /// frame unrepresentable, the hooks path also skips the `arith`
     /// stale-bound suppression guards (kept active for the legacy fallback).
     pub use_hooks_driver: bool,
+    /// CCFV (Phase P2): route the clean-MBQI engine's single-pattern trigger
+    /// e-matching through the congruence-aware `ccfv::match_trigger` (backed by
+    /// the live EUF via `EufCongruence`) instead of the syntactic
+    /// `trigger::match_single`. **OFF by default** until the z3-parity corpus
+    /// confirms no spurious verdicts and `matches ≥ old` — CCFV matching is a
+    /// superset of syntactic (it only adds matches holding modulo the congruence)
+    /// and every match still passes the unchanged `instantiate`/`emit` firewall,
+    /// so this can only add sound instances; the gate is for completeness/
+    /// performance regression, not soundness. See `clean_mbqi.rs` and the design
+    /// `external/oxiz/docs/design/CCFV_UNIFIED_INSTANTIATION.md` §P2.
+    pub ccfv_ematch: bool,
 }
 
 impl Default for SolverConfig {
@@ -329,6 +340,7 @@ impl SolverConfig {
             inprocessing_interval: 0,
             clean_mbqi: true,
             use_hooks_driver: true,
+            ccfv_ematch: false,
         }
     }
 
@@ -357,6 +369,7 @@ impl SolverConfig {
             inprocessing_interval: 10000,
             clean_mbqi: true,
             use_hooks_driver: true,
+            ccfv_ematch: false,
         }
     }
 
@@ -385,6 +398,7 @@ impl SolverConfig {
             inprocessing_interval: 5000, // More frequent inprocessing
             clean_mbqi: true,
             use_hooks_driver: true,
+            ccfv_ematch: false,
         }
     }
 
@@ -413,6 +427,7 @@ impl SolverConfig {
             inprocessing_interval: 0,
             clean_mbqi: true,
             use_hooks_driver: true,
+            ccfv_ematch: false,
         }
     }
 

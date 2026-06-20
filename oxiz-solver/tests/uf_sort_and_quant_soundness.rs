@@ -109,6 +109,31 @@ fn ematching_pattern_axiom_consistent_instance_is_sat() {
 }
 
 #[test]
+fn ccfv_ematch_on_is_sound_on_the_pattern_axiom() {
+    // CCFV (Phase P2) end-to-end: with `:oxiz.ccfv-ematch true` the live driver
+    // (mod.rs builds `EufCongruence` and calls `round_with_cong`) routes
+    // single-pattern e-matching through the congruence-aware CCFV matcher. The
+    // verdicts must be unchanged — CCFV matching is a superset of syntactic.
+    let unsat = solve_streamed(&[
+        "(set-option :oxiz.ccfv-ematch true)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((a Int)) (! (= (f a) a) :pattern ((f a)))))",
+        "(assert (= (f 3) 4))",
+        "(check-sat)",
+    ]);
+    assert_eq!(unsat, SolverResult::Unsat, "CCFV e-matching still derives f(3)=3 → unsat");
+
+    let sat = solve_streamed(&[
+        "(set-option :oxiz.ccfv-ematch true)",
+        "(declare-fun f (Int) Int)",
+        "(assert (forall ((a Int)) (! (= (f a) a) :pattern ((f a)))))",
+        "(assert (= (f 3) 3))",
+        "(check-sat)",
+    ]);
+    assert_eq!(sat, SolverResult::Sat, "consistent instance stays sat under CCFV");
+}
+
+#[test]
 fn axiomatized_add_consistent_ground_fact_is_sat() {
     // ∀a b. Add(a,b)=a+b [:pattern (Add a b)] ∧ Add(2,3)=5 — the axiom forces
     // Add(2,3)=2+3=5, consistent with the assertion (z3: sat).

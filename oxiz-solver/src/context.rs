@@ -765,6 +765,16 @@ impl Context {
                 config.clean_mbqi = value == "true";
                 self.solver.set_config(config);
             }
+            // CCFV (Phase P2): opt-in congruence-aware single-pattern trigger
+            // e-matching in the clean-MBQI engine. Off by default; this is the
+            // SMT-LIB switch to A/B it (and to run the z3-parity corpus with it on
+            // for the completeness/performance gate). Soundness is unaffected —
+            // CCFV matching is a superset of syntactic, gated by the same firewall.
+            "oxiz.ccfv-ematch" => {
+                let mut config = self.solver.config().clone();
+                config.ccfv_ematch = value == "true";
+                self.solver.set_config(config);
+            }
             _ => {}
         }
     }
