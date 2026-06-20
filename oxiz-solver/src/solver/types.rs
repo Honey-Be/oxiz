@@ -295,10 +295,11 @@ pub struct SolverConfig {
     /// frame unrepresentable, the hooks path also skips the `arith`
     /// stale-bound suppression guards (kept active for the legacy fallback).
     pub use_hooks_driver: bool,
-    /// CCFV (Phase P2): route the clean-MBQI engine's single-pattern trigger
-    /// e-matching through the congruence-aware `ccfv::match_trigger` (backed by
-    /// the live EUF via `EufCongruence`) instead of the syntactic
-    /// `trigger::match_single`. **ON by default.** The default-flip gates passed:
+    /// CCFV (Phase P2): run the clean-MBQI engine's trigger e-matching **modulo
+    /// congruence** via `ccfv::match_trigger` (backed by the live EUF through
+    /// `EufCongruence`). CCFV is the engine's sole matcher; this flag selects the
+    /// congruence-aware oracle vs. the syntactic-equivalent `NoCong`.
+    /// **ON by default.** The default-flip gates passed:
     /// the z3-parity corpus is byte-identical to syntactic matching (166/168
     /// agree, 0 spurious) and the full-prelude consult shows no measurable
     /// overhead (most congruence classes are singletons). The flip is also a

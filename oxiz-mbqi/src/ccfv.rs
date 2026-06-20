@@ -5,9 +5,11 @@
 //! (a term whose holes are the quantifier's bound variables) and the ground
 //! congruence `E` (read through the [`Congruence`] oracle, P0), find every
 //! substitution `σ` grounding the holes such that `E ⊨ pσ ≃ g` for a ground
-//! candidate `g`. It is the inference the current *syntactic* matcher
-//! (`trigger::match_term`) cannot make — two terms in one congruence class but
-//! syntactically distinct now match.
+//! candidate `g`. It is the inference a purely *syntactic* matcher cannot make
+//! — two terms in one congruence class but syntactically distinct now match.
+//! CCFV is now the engine's SOLE matcher: with a real congruence oracle it
+//! matches modulo `E`; with the trivial [`NoCong`](crate::congruence::NoCong) it
+//! degenerates to exactly syntactic matching (the old `trigger` module).
 //!
 //! It is the executable refinement of the verus-pre-verified abstract model
 //! (`ccfv-verification`): the **ASSIGN** rule is binding a hole to a ground term
@@ -63,6 +65,58 @@ where
         out.extend(unify(cong, host, pat, g, holes, Subst::<S>::new()));
     }
     out
+}
+
+/// Match a **multi-pattern** trigger group: every pattern in `patterns` must
+/// match under ONE consistent substitution, modulo the congruence. `seeds[i]`
+/// are the ground candidates for `patterns[i]` (the ground applications sharing
+/// `patterns[i]`'s head — supplied by the caller, like [`match_trigger`]).
+///
+/// The join threads the accumulated substitution through each pattern in turn:
+/// a hole shared between patterns is bound once (ASSIGN) and re-checked for
+/// congruence by every later pattern (the consistency case of ASSIGN). A
+/// returned `σ` therefore satisfies `E ⊨ patternsᵢ·σ ≃ gᵢ` simultaneously for a
+/// `gᵢ ∈ seeds[i]` per pattern. Each yield is still a vector of ground bindings
+/// (the engine's `instantiate`/`emit` gate filters to full, sound instances).
+///
+/// Unlike the prior syntactic `trigger::match_multi`, the seed of the join does
+/// NOT require the first pattern to bind every variable — partial bindings are
+/// threaded forward and completed by the remaining patterns — so a genuine
+/// multi-pattern `((f x) (g y))` that no single pattern fully covers now matches.
+pub fn match_trigger_multi<S, C, L>(
+    cong: &C,
+    host: &L,
+    patterns: &[S::Term],
+    holes: &[S::VarName],
+    seeds: &[Vec<S::Term>],
+) -> Vec<Subst<S>>
+where
+    S: Sig,
+    C: Congruence<S>,
+    L: TermLang<Sig = S>,
+{
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    // Seed with the first pattern's matches (each a fresh accumulator).
+    let mut accs: Vec<Subst<S>> = Vec::new();
+    for &g in seeds.first().map(Vec::as_slice).unwrap_or(&[]) {
+        accs.extend(unify(cong, host, patterns[0], g, holes, Subst::<S>::new()));
+    }
+    // Filter-extend by each remaining pattern, threading the substitution.
+    for (i, &p) in patterns.iter().enumerate().skip(1) {
+        let mut next = Vec::new();
+        for acc in &accs {
+            for &g in seeds.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+                next.extend(unify(cong, host, p, g, holes, acc.clone()));
+            }
+        }
+        accs = next;
+        if accs.is_empty() {
+            break;
+        }
+    }
+    accs
 }
 
 /// Unify pattern `pat` against ground term `g` modulo `E`, extending `acc`.
@@ -299,5 +353,77 @@ mod tests {
         let fx = h.app(10, &[x], S);
         let cong = ToyCong::new(vec![]);
         assert!(match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[ha]).is_empty());
+    }
+
+    const Y: u32 = 101; // a second hole name
+
+    #[test]
+    fn multi_pattern_joins_partial_bindings_no_single_covers() {
+        // A genuine multi-pattern `((f x) (g y))` over `∀x y`: neither pattern
+        // covers both holes. CCFV threads x from `(f x)`~f(a) and y from
+        // `(g y)`~g(b) into one substitution {x↦a, y↦b} — the match the prior
+        // syntactic `match_multi` dropped (its seed required the FIRST pattern
+        // to bind every var).
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let y = h.var(Y, S);
+        let fa = h.app(10, &[a], S);
+        let gb = h.app(20, &[b], S);
+        let fx = h.app(10, &[x], S);
+        let gy = h.app(20, &[y], S);
+
+        let cong = ToyCong::new(vec![]); // syntactic (NoCong-equivalent)
+        let res =
+            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![gb]]);
+        assert_eq!(res.len(), 1, "the two patterns join into one substitution");
+        assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
+        assert_eq!(subst_get::<ToySig>(&res[0], Y), Some(b));
+    }
+
+    #[test]
+    fn multi_pattern_shared_hole_enforces_consistency() {
+        // `((f x) (g x))` shares the hole x: it matches f(a)+g(c) only when the
+        // two bindings for x agree modulo congruence. With a≡c the join holds
+        // (x↦a); with a≢c it is dropped.
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let c = h.konst(3, S);
+        let x = h.var(X, S);
+        let fa = h.app(10, &[a], S);
+        let gc = h.app(20, &[c], S);
+        let fx = h.app(10, &[x], S);
+        let gx = h.app(20, &[x], S);
+
+        // a ≡ c ⟹ consistent, one match x↦a (rep of the class).
+        let cong = ToyCong::new(vec![vec![a, c]]);
+        let r1 =
+            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gx], &[X], &[vec![fa], vec![gc]]);
+        assert_eq!(r1.len(), 1, "shared hole consistent under a≡c");
+        assert_eq!(subst_get::<ToySig>(&r1[0], X), Some(a));
+
+        // a ≢ c ⟹ no consistent binding for the shared hole.
+        let cong0 = ToyCong::new(vec![]);
+        let r2 =
+            match_trigger_multi::<ToySig, _, _>(&cong0, &h, &[fx, gx], &[X], &[vec![fa], vec![gc]]);
+        assert!(r2.is_empty(), "shared hole inconsistent under a≢c");
+    }
+
+    #[test]
+    fn multi_pattern_empty_seed_for_one_pattern_yields_nothing() {
+        // If any pattern has no ground candidate, the whole group cannot match.
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let x = h.var(X, S);
+        let y = h.var(Y, S);
+        let fa = h.app(10, &[a], S);
+        let fx = h.app(10, &[x], S);
+        let gy = h.app(20, &[y], S);
+        let cong = ToyCong::new(vec![]);
+        assert!(
+            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![]])
+                .is_empty()
+        );
     }
 }

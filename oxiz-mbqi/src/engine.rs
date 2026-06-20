@@ -22,7 +22,6 @@ use crate::ground::GroundIndex;
 use crate::instantiate::{InstResult, Quant, instantiate};
 use crate::model::{ModelEval, NoModel};
 use crate::term::{Binding, Sig, TermLang, TermView};
-use crate::trigger;
 use rustc_hash::FxHashSet;
 
 /// What a round produced. Note the absence of an `Unsat` variant — by design.
@@ -46,14 +45,18 @@ pub enum Verdict<T> {
 pub struct Config {
     pub max_instances: usize,
     pub max_tuples_per_quant: usize,
-    /// Opt-in (default `false`): route single-pattern trigger e-matching through
-    /// the CCFV congruence-aware matcher (`ccfv::match_trigger`) instead of the
-    /// syntactic `trigger::match_single`. Only effective when a real congruence
-    /// oracle is supplied via [`Engine::round_with_cong`]; `round_with` passes the
-    /// trivial [`NoCong`], so the default path is byte-identical regardless. CCFV
-    /// matching is a *superset* of syntactic (it adds matches that hold modulo the
-    /// congruence), and every match still flows through the unchanged
-    /// `instantiate`/`emit` firewall — so this can only add sound instances.
+    /// Whether trigger e-matching runs **modulo congruence**. CCFV is the sole
+    /// matcher either way; this flag only selects the *oracle* `ematch_all`
+    /// passes it: the real congruence (congruence-aware — fires modulo `E`) when
+    /// `true`, or the trivial [`NoCong`] (syntactic-equivalent) when `false`.
+    /// It is only meaningful when a real congruence is supplied via
+    /// [`Engine::round_with_cong`]; `round_with` passes [`NoCong`], so the flag is
+    /// moot there. CCFV-with-congruence is a *superset* of syntactic matching (it
+    /// adds matches holding modulo `E`), and every match still flows through the
+    /// unchanged `instantiate`/`emit` firewall — so enabling it can only add sound
+    /// instances. The engine's own [`Config::default`] leaves it `false` (the
+    /// `oxiz-mbqi` unit tests exercise the syntactic-equivalent path); the live
+    /// solver sets it from `SolverConfig::ccfv_ematch`, which defaults `true`.
     pub ccfv_ematch: bool,
 }
 
@@ -306,6 +309,18 @@ impl<S: Sig> Engine<S> {
         Verdict::Saturated
     }
 
+    /// E-match every trigger group of quantifier `qi` against the ground index,
+    /// returning the full bound-variable bindings (in `q.vars` order) to emit.
+    ///
+    /// CCFV is the **sole** matcher (the syntactic `trigger` module was deleted in
+    /// the P2 follow-up). The `cfg.ccfv_ematch` flag selects the *oracle*: the
+    /// real congruence `cong` (congruence-aware — fires modulo `E`) when set, or
+    /// the trivial [`NoCong`] (syntactic-equivalent) when clear, so the flag-off
+    /// path is byte-identical to the old `trigger::match_*`. Every raw CCFV
+    /// substitution is normalised into `q.vars` order and dropped unless it binds
+    /// EVERY bound variable (an instance must be fully ground — the same fullness
+    /// filter the syntactic matcher applied; the canonical order also keeps the
+    /// `seen` dedup tuple aligned with CDQI/enumeration).
     fn ematch_all<L: TermLang<Sig = S>, C: Congruence<S>>(
         &self,
         lang: &L,
@@ -314,9 +329,10 @@ impl<S: Sig> Engine<S> {
     ) -> Vec<Vec<(S::VarName, S::Term)>> {
         let q = &self.quants[qi];
         let watermark = self.scanned[qi];
+        let holes: Vec<S::VarName> = q.vars.iter().map(|(n, _)| *n).collect();
         let mut out = Vec::new();
         for group in &q.triggers {
-            let bs = if group.len() == 1 {
+            let raw: Vec<ccfv::Subst<S>> = if group.len() == 1 {
                 // Frontier filter: only match against ground terms (with the
                 // trigger head) that are NEW since this quantifier last scanned.
                 // Matches whose candidate is old were already found in a prior
@@ -332,21 +348,56 @@ impl<S: Sig> Engine<S> {
                     .copied()
                     .filter(|&c| self.ground.idx_of(c) >= watermark)
                     .collect();
+                // CCFV with the real oracle is a *superset* of syntactic matches —
+                // it also fires when the pattern matches a candidate *modulo
+                // congruence*; with `NoCong` it is exactly syntactic.
                 if self.cfg.ccfv_ematch {
-                    // CCFV (P2): congruence-aware matching over the same candidate
-                    // seeds. A superset of the syntactic matches — it also fires
-                    // when the pattern matches a candidate *modulo congruence*.
-                    let holes: Vec<S::VarName> = q.vars.iter().map(|(n, _)| *n).collect();
                     ccfv::match_trigger(cong, lang, group[0], &holes, &cands)
                 } else {
-                    trigger::match_single(lang, &cands, group[0], &q.vars)
+                    ccfv::match_trigger(&NoCong, lang, group[0], &holes, &cands)
                 }
             } else {
-                // Multi-pattern groups stay on the syntactic joint matcher for
-                // now (CCFV multi-trigger is a follow-up); always sound.
-                trigger::match_multi(lang, &self.ground, group, &q.vars)
+                // Multi-pattern join: per-pattern candidate seeds (the ground
+                // applications sharing each pattern's head — no frontier filter,
+                // the joint match re-scans every round as `match_multi` did). A
+                // non-App pattern makes the whole group unmatchable.
+                let mut seeds: Vec<Vec<S::Term>> = Vec::with_capacity(group.len());
+                let mut ok = true;
+                for &p in group {
+                    match lang.view(p) {
+                        TermView::App { sym, .. } => seeds.push(self.ground.with_head(sym).to_vec()),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                if self.cfg.ccfv_ematch {
+                    ccfv::match_trigger_multi(cong, lang, group, &holes, &seeds)
+                } else {
+                    ccfv::match_trigger_multi(&NoCong, lang, group, &holes, &seeds)
+                }
             };
-            out.extend(bs);
+            // Normalise to `q.vars` order; drop any binding that is not fully ground.
+            for s in &raw {
+                let mut binding: Vec<(S::VarName, S::Term)> = Vec::with_capacity(q.vars.len());
+                let mut full = true;
+                for (n, _) in &q.vars {
+                    match s.iter().find(|(m, _)| m == n) {
+                        Some(&(_, t)) => binding.push((*n, t)),
+                        None => {
+                            full = false;
+                            break;
+                        }
+                    }
+                }
+                if full {
+                    out.push(binding);
+                }
+            }
         }
         out
     }

@@ -6,8 +6,9 @@
 //! of a class, congruence of two ground terms, class enumeration, and the
 //! `E^cc` application index (every ground `f(t̄)` grouped by argument class).
 //! These are exactly the queries CCFV's E-ground (dis)unification core makes to
-//! match *modulo congruence* — the inference the current syntactic matcher
-//! (`trigger::match_term`) cannot make.
+//! match *modulo congruence* — the inference a purely syntactic matcher cannot
+//! make. (CCFV with the trivial [`NoCong`] degenerates back to syntactic
+//! matching, which is how the engine's flag-off path stays byte-identical.)
 //!
 //! The host implements it by delegating to its EUF solver (the `E^cc` index is
 //! already maintained there). **Pure addition in P0**: this trait has no
