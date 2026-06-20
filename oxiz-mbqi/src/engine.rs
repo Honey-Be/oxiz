@@ -199,15 +199,26 @@ impl<S: Sig> Engine<S> {
                 continue;
             }
 
-            // 1. CDQI — a conflicting instance, if the model reveals one.
-            if let Some(binding) = cdqi::find_conflict(
+            // 1. CDQI — every conflicting instance the model reveals (P3: CCFV
+            //    `C = ¬ψ`, congruence-deduped candidates). A non-empty conflict
+            //    set is the strongest, most relevant lemma, so it short-circuits
+            //    e-matching/enumeration for this quantifier this round.
+            let conflicts = cdqi::find_conflicts(
                 lang,
                 &self.ground,
                 model,
+                cong,
                 &self.quants[qi],
                 self.cfg.max_tuples_per_quant,
-            ) {
-                self.emit(lang, qi, &binding, &mut lemmas);
+            );
+            if !conflicts.is_empty() {
+                for b in &conflicts {
+                    if self.emitted >= self.cfg.max_instances {
+                        budget_hit = true;
+                        break;
+                    }
+                    self.emit(lang, qi, b, &mut lemmas);
+                }
                 continue;
             }
 
