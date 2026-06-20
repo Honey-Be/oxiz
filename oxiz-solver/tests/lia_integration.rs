@@ -274,3 +274,38 @@ fn div_mod_are_not_parsed_as_subtraction() {
         "(= (mod 7 3) 1) is satisfiable — mod parsed as subtraction would be a spurious unsat (false proof)"
     );
 }
+
+/// Companion soundness guard (the P4-consistency fix): div/mod are not decided
+/// by the theory (uninterpreted → an over-approximation), so a `Sat` resting on
+/// an arbitrary div/mod value is untrustworthy and `check_sat` must downgrade it
+/// to `Unknown` — NEVER report `sat`. `(not (= (mod 7 3) 1))` is UNSAT (z3:
+/// `mod 7 3 = 1`); the uninterpreted treatment alone would call it `sat` (pick
+/// `mod 7 3 ≠ 1`), a spurious sat — the exact "incomplete reasoning concludes
+/// Sat" failure the P4 verdict-flip was deferred to avoid. The downgrade makes
+/// it the sound `Unknown`.
+#[test]
+fn undecided_div_mod_never_reports_a_spurious_sat() {
+    use oxiz_solver::SolverResult;
+    let mut ctx = Context::new();
+    let out = ctx
+        .execute_script("(assert (not (= (mod 7 3) 1)))\n(check-sat)")
+        .expect("execute_script");
+    assert_ne!(
+        last_verdict(out),
+        SolverResult::Sat,
+        "(not (= (mod 7 3) 1)) is unsat (mod 7 3 = 1) — an undecided div/mod must \
+         NEVER yield a spurious sat; the sound verdict is Unknown (or unsat)"
+    );
+
+    // A div/mod-free contradiction must still be decided unsat (the downgrade is
+    // gated on div/mod presence — it must not blunt ordinary reasoning).
+    let mut ctx = Context::new();
+    let out = ctx
+        .execute_script("(declare-const z Int)\n(assert (= z 3))\n(assert (= z 4))\n(check-sat)")
+        .expect("execute_script");
+    assert_eq!(
+        last_verdict(out),
+        SolverResult::Unsat,
+        "a div/mod-free contradiction must stay decided unsat"
+    );
+}

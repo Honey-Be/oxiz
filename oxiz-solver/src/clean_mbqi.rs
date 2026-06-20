@@ -1143,7 +1143,7 @@ impl CompletionFacts {
 /// All immediate sub-terms of `t` (including a quantifier's body), for the
 /// recursive `count_syms` / `mark_mixed` walks. Mirrors `OxizHost::children`
 /// but over `TermKind` directly and descends into quantifier bodies.
-fn subterms(m: &TermManager, t: TermId) -> Vec<TermId> {
+pub(crate) fn subterms(m: &TermManager, t: TermId) -> Vec<TermId> {
     let Some(term) = m.get(t) else { return Vec::new() };
     match &term.kind {
         TermKind::Apply { args, .. } => args.to_vec(),

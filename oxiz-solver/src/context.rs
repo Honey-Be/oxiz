@@ -19,6 +19,28 @@ use std::path::{Path, PathBuf};
 /// `oxiz_core::model` types into the public API of this file.
 pub type RawFuncInterp = (Vec<(Vec<String>, String)>, String, usize);
 
+/// Whether `t` (or any subterm, including under quantifiers) is an integer
+/// `div`/`mod` application. Used by [`Context::check_sat`] to downgrade an
+/// untrustworthy `Sat` (div/mod are not decided by the theory — see there).
+/// `visited` dedups the hash-consed DAG so a shared subterm is walked once.
+fn term_contains_div_mod(
+    terms: &TermManager,
+    t: TermId,
+    visited: &mut std::collections::HashSet<TermId>,
+) -> bool {
+    if !visited.insert(t) {
+        return false;
+    }
+    if let Some(term) = terms.get(t) {
+        if matches!(term.kind, TermKind::Div(..) | TermKind::Mod(..)) {
+            return true;
+        }
+    }
+    crate::clean_mbqi::subterms(terms, t)
+        .into_iter()
+        .any(|c| term_contains_div_mod(terms, c, visited))
+}
+
 /// A declared constant
 #[derive(Debug, Clone)]
 struct DeclaredConst {
@@ -255,7 +277,30 @@ impl Context {
 
     /// Check satisfiability
     pub fn check_sat(&mut self) -> SolverResult {
-        let result = self.solver.check(&mut self.terms);
+        let mut result = self.solver.check(&mut self.terms);
+        // SOUNDNESS — undecided `div`/`mod` downgrade. The integer `div`/`mod`
+        // operators are NOT decided by the theory layer (they reach EUF/arith as
+        // uninterpreted applications); a model is free to assign them arbitrary
+        // values, so the solved formula is an OVER-approximation of the real one.
+        // By the soundness asymmetry (dropping/weakening a constraint preserves
+        // `unsat` but can fabricate `sat`), an `Unsat` here is still sound, but a
+        // `Sat` is untrustworthy — it may rest on a div/mod value the Euclidean
+        // semantics forbid. Downgrade such a `Sat` to the sound `Unknown`. (The
+        // alternative placeholder — parsing div/mod as subtraction — was worse: a
+        // confidently-wrong value that fabricated `unsat`, a false proof.)
+        // Deciding constant/linear div/mod via the Euclidean axioms
+        // (`b≠0 → a = b·(div a b) + (mod a b)`, `0 ≤ mod a b < |b|`) is the
+        // completeness follow-up.
+        if result == SolverResult::Sat {
+            let mut visited = std::collections::HashSet::new();
+            if self
+                .assertions
+                .iter()
+                .any(|&a| term_contains_div_mod(&self.terms, a, &mut visited))
+            {
+                result = SolverResult::Unknown;
+            }
+        }
         self.last_result = Some(result);
 
         // Write a binary proof log if a path is configured (std-only).
