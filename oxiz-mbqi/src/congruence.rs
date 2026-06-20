@@ -91,3 +91,158 @@ impl<S: Sig> Congruence<S> for NoCong {
         Vec::new()
     }
 }
+
+/// Which of the three CCFV instantiation strategies a search is running — the
+/// design's §3 parameterization (`CCFV_UNIFIED_INSTANTIATION.md`). All three are
+/// `ccfv::solve(cong, C)` over the SAME unification core, differing only in the
+/// constraint `C` and the congruence *view*:
+///
+/// | mode         | constraint `C`        | congruence view |
+/// |--------------|-----------------------|-----------------|
+/// | `Trigger`    | `⋀ pattern ≃ out-var` | [`ground`](Mode::view) — the real `E` |
+/// | `Conflict`   | `¬ψ` (CDQI)           | `ground` — the real `E` |
+/// | `ModelCompl` | `¬ψ` (MBQI)           | [`total`](Mode::view) — `E_TOT` |
+///
+/// `Trigger` is the e-matcher ([`crate::ccfv::match_trigger`]); `Conflict` is
+/// CDQI ([`crate::cdqi::find_conflicts`], landed). `ModelCompl` solves `¬ψ`
+/// against the **total** view [`TotalView`] (`E_TOT`): if CCFV finds *no*
+/// conflict, the completed model satisfies `∀x̄.ψ` → the host may answer
+/// `Some(true)` from `eval_forall`. That verdict-producing flip is **gated**
+/// (design §6, [`TotalView`]) and is NOT yet live — it needs the complete
+/// disequality CCFV (`R_VAR`/`R_FAPP`/`R_GEN`) so "no conflict" is sound, plus
+/// the verus pre-verification the project's `[선검증→구현→후검증]` discipline
+/// requires. The structure lands here ready for that step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// E-matching: ground the `:pattern` terms in the real congruence `E`.
+    Trigger,
+    /// CDQI: every `σ` with `E ⊨ ¬ψσ` — a conflicting ground instance.
+    Conflict,
+    /// MBQI / model-completion: `¬ψ` against the total view `E_TOT`.
+    ModelCompl,
+}
+
+impl Mode {
+    /// Whether this mode solves against the **total** model view `E_TOT`
+    /// (default-extended congruence) rather than the real ground congruence `E`.
+    /// Only `ModelCompl` does; `Trigger`/`Conflict` use the real `E`.
+    #[must_use]
+    pub fn total_view(self) -> bool {
+        matches!(self, Mode::ModelCompl)
+    }
+}
+
+/// The **total-model view** `E_TOT` (design §3/§6): the real ground congruence
+/// `E` (the wrapped `base`) extended with default values `ξ_f` for
+/// under-specified applications, for CCFV's model-completion (`Mode::ModelCompl`)
+/// mode. `rep`/`equal`/`class`/`apps_like` are exactly the base congruence — a
+/// completion never merges or splits real classes — so the ONLY added capability
+/// is `default_value`, supplied by the wrapped closure `xi`.
+///
+/// SOUNDNESS (the reason this is structure-only until the gated flip): `E_TOT`
+/// may be trusted as a model witness — i.e. "CCFV finds no conflict in `E_TOT`"
+/// concluded as `∀x̄.ψ` holding — ONLY when it is a *conservative extension* of
+/// `E` (the defaults contradict no asserted ground fact), which the host's
+/// accounting gate (`global_occ[f] == body_occ + |ground_apps[f]|`, design §6)
+/// must confirm first, AND when the conflict search is *complete* (the
+/// disequality rules, not yet implemented). The wrapper itself makes no verdict;
+/// it only routes `ξ_f` to CCFV, so adding it changes nothing on its own.
+pub struct TotalView<'a, S: Sig, C: Congruence<S>, F>
+where
+    F: Fn(S::Sym, &[S::Term]) -> Option<S::Term>,
+{
+    base: &'a C,
+    xi: F,
+    _marker: core::marker::PhantomData<S>,
+}
+
+impl<'a, S: Sig, C: Congruence<S>, F> TotalView<'a, S, C, F>
+where
+    F: Fn(S::Sym, &[S::Term]) -> Option<S::Term>,
+{
+    /// Wrap a base congruence `E` with a default-value function `xi` to form the
+    /// total view `E_TOT`. `xi(f, args)` returns the completion's value `ξ_f` for
+    /// an under-specified `f`-application, or `None` to defer to the real `E`.
+    pub fn new(base: &'a C, xi: F) -> Self {
+        TotalView {
+            base,
+            xi,
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<S: Sig, C: Congruence<S>, F> Congruence<S> for TotalView<'_, S, C, F>
+where
+    F: Fn(S::Sym, &[S::Term]) -> Option<S::Term>,
+{
+    fn rep(&self, t: S::Term) -> S::Term {
+        self.base.rep(t)
+    }
+    fn equal(&self, a: S::Term, b: S::Term) -> bool {
+        self.base.equal(a, b)
+    }
+    fn class(&self, t: S::Term) -> Vec<S::Term> {
+        self.base.class(t)
+    }
+    fn apps_like(&self, app: S::Term) -> Vec<FuncApp<S>> {
+        self.base.apps_like(app)
+    }
+    fn default_value(&self, f: S::Sym, args: &[S::Term]) -> Option<S::Term> {
+        (self.xi)(f, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term::Sig;
+
+    // A minimal `Sig` for unit-testing the congruence wrappers in isolation
+    // (Term/Sort/VarName/Sym are all `u32` — the trait only needs Copy+Eq+Hash).
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    struct TestSig;
+    impl Sig for TestSig {
+        type Term = u32;
+        type Sort = u32;
+        type VarName = u32;
+        type Sym = u32;
+    }
+
+    #[test]
+    fn nocong_is_syntactic_identity() {
+        let c = NoCong;
+        assert!(<NoCong as Congruence<TestSig>>::equal(&c, 7, 7));
+        assert!(!<NoCong as Congruence<TestSig>>::equal(&c, 7, 8));
+        assert_eq!(<NoCong as Congruence<TestSig>>::rep(&c, 7), 7);
+        assert_eq!(<NoCong as Congruence<TestSig>>::class(&c, 7), vec![7]);
+        assert_eq!(<NoCong as Congruence<TestSig>>::default_value(&c, 1, &[2]), None);
+    }
+
+    #[test]
+    fn total_view_delegates_congruence_and_adds_defaults() {
+        // E_TOT over the trivial base: rep/equal/class are the base (NoCong),
+        // but default_value returns ξ_f from the wrapped closure — the one new
+        // capability the model-completion mode needs.
+        let base = NoCong;
+        let view: TotalView<TestSig, _, _> =
+            TotalView::new(&base, |f: u32, args: &[u32]| if f == 10 { Some(args[0] + 100) } else { None });
+
+        // Congruence delegated to the base (no class merges/splits).
+        assert!(view.equal(5, 5));
+        assert!(!view.equal(5, 6));
+        assert_eq!(view.rep(5), 5);
+        assert_eq!(view.class(5), vec![5]);
+
+        // The completion value ξ_f is supplied for the covered symbol only.
+        assert_eq!(view.default_value(10, &[7]), Some(107));
+        assert_eq!(view.default_value(11, &[7]), None);
+    }
+
+    #[test]
+    fn mode_total_view_only_for_model_completion() {
+        assert!(!Mode::Trigger.total_view());
+        assert!(!Mode::Conflict.total_view());
+        assert!(Mode::ModelCompl.total_view());
+    }
+}
