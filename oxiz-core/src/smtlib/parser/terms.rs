@@ -460,15 +460,19 @@ impl<'a> Parser<'a> {
                 let lhs = self.parse_term()?;
                 let rhs = self.parse_term()?;
                 self.expect_rparen()?;
-                // For now, treat div as subtraction placeholder
-                self.manager.mk_sub(lhs, rhs)
+                // SMT-LIB integer division — `TermKind::Div`, interpreted by
+                // rewrite_div / eval_div downstream. (A prior placeholder parsed
+                // this as `(- lhs rhs)`, an UNSOUND mis-translation.)
+                self.manager.mk_div(lhs, rhs)
             }
             "mod" => {
                 let lhs = self.parse_term()?;
                 let rhs = self.parse_term()?;
                 self.expect_rparen()?;
-                // For now, treat mod as subtraction placeholder
-                self.manager.mk_sub(lhs, rhs)
+                // SMT-LIB integer modulo — `TermKind::Mod`, interpreted by
+                // rewrite_mod / eval downstream. (A prior placeholder parsed this
+                // as `(- lhs rhs)`, an UNSOUND mis-translation.)
+                self.manager.mk_mod(lhs, rhs)
             }
             "<" => {
                 let lhs = self.parse_term()?;

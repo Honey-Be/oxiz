@@ -227,3 +227,50 @@ fn i128_widening_recovers_a_cancelling_overflow_intermediate() {
         result
     );
 }
+
+/// Regression (audit 2026-06-20): the SMT-LIB `div` / `mod` operators must NOT
+/// be parsed as subtraction. The parser used `mk_sub` as a "placeholder"
+/// (`(div a b)` → `(- a b)`), which is *confidently wrong arithmetic*: e.g.
+/// `(div 6 3)` became `(- 6 3) = 3`, so `(= (div 6 3) 2)` was a spurious
+/// `unsat` — a FALSE PROOF for any verifier that reads `unsat` as "discharged".
+/// The fix routes them to `mk_div`/`mk_mod` (`TermKind::Div`/`Mod`). div/mod are
+/// not yet fully decided (treated as uninterpreted → sound over-approximation,
+/// so a forced-value case may report the sound `sat`/`Unknown` rather than the
+/// decided verdict), but the INVARIANT this test guards is the one that matters
+/// for soundness: a constant div/mod equality that z3 calls `sat` must NEVER be
+/// reported `unsat`.
+fn last_verdict(out: Vec<String>) -> oxiz_solver::SolverResult {
+    use oxiz_solver::SolverResult::*;
+    out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some(Sat),
+        "unsat" => Some(Unsat),
+        "unknown" => Some(Unknown),
+        _ => None,
+    }).unwrap_or(Unknown)
+}
+
+#[test]
+fn div_mod_are_not_parsed_as_subtraction() {
+    use oxiz_solver::SolverResult;
+    // (div 6 3) = 2 is sat (z3); the subtraction placeholder made it (= 3 2) → unsat.
+    let mut ctx = Context::new();
+    let out = ctx
+        .execute_script("(declare-const x Int)\n(assert (= (div 6 3) 2))\n(check-sat)")
+        .expect("execute_script");
+    assert_ne!(
+        last_verdict(out),
+        SolverResult::Unsat,
+        "(= (div 6 3) 2) is satisfiable — div parsed as subtraction would be a spurious unsat (false proof)"
+    );
+
+    // (mod 7 3) = 1 is sat (z3); the placeholder made it (= 4 1) → unsat.
+    let mut ctx = Context::new();
+    let out = ctx
+        .execute_script("(declare-const y Int)\n(assert (= (mod 7 3) 1))\n(check-sat)")
+        .expect("execute_script");
+    assert_ne!(
+        last_verdict(out),
+        SolverResult::Unsat,
+        "(= (mod 7 3) 1) is satisfiable — mod parsed as subtraction would be a spurious unsat (false proof)"
+    );
+}
