@@ -62,8 +62,18 @@ impl Solver {
             // mutable borrow of the watch lists coexist without copying the
             // literals out — `Lit` is `Copy`, so `negate()` is itself free.
             if let Some(clause) = self.clauses.get(id) {
+                // A binary learned clause ALSO lives in the binary implication
+                // graph (`learn_clause` inserts both edges), and `propagate` reads
+                // that graph with NO deleted-clause guard — so a recycled id would
+                // inherit a stale binary implication that keeps firing as a free
+                // propagation. Scrub those edges (keyed, like the watchers, on the
+                // negations of the clause's literals) alongside the watch lists.
+                let is_binary = clause.lits.len() == 2;
                 for &lit in &clause.lits {
                     self.watches.remove_clause(lit.negate(), id);
+                    if is_binary {
+                        self.binary_graph.remove(lit.negate(), id);
+                    }
                 }
             }
             // DRAT: log the deletion (learned clauses only) before removal.

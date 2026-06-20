@@ -64,6 +64,17 @@ impl BinaryImplicationGraph {
         &self.implications[lit.code() as usize]
     }
 
+    /// Remove every implication edge contributed by `clause_id` from the list
+    /// keyed on `key`. A binary clause `(l0 ∨ l1)` keys its two edges on
+    /// `l0.negate()` and `l1.negate()` (see `add` callers), so a caller scrubs a
+    /// forgotten/popped binary clause by calling this on `l.negate()` for each
+    /// literal `l`. Necessary because `propagate` consumes this graph with NO
+    /// deleted-clause guard, so a recycled `clause_id` would otherwise inherit a
+    /// stale binary implication and mis-propagate (a spurious conflict → unsat).
+    fn remove(&mut self, key: Lit, clause_id: ClauseId) {
+        self.implications[key.code() as usize].retain(|&(_, id)| id != clause_id);
+    }
+
     fn clear(&mut self) {
         for implications in &mut self.implications {
             implications.clear();
@@ -1682,14 +1693,34 @@ impl Solver {
             if let Some(mark) = self.assertion_clause_marks.pop() {
                 let removed: SmallVec<[ClauseId; 32]> = self.clause_ledger.drain_since(mark).collect();
                 for clause_id in removed {
+                    // Detach this clause's watchers AND binary-implication edges
+                    // BEFORE freeing its slot. `clauses.remove` pushes the id onto
+                    // the free list, and the next incremental `add_*` recycles it
+                    // (clearing the slot's `deleted` flag) — so a stale watcher
+                    // would defeat `propagate`'s "skip deleted clause" guard, and a
+                    // stale binary edge has NO guard at all. The earlier "watch
+                    // lists are cleaned up naturally" assumption was the exact
+                    // spurious-`unsat` hazard `forget_learned_since` already
+                    // repudiates for learned clauses. A clause's (≤2) watchers and
+                    // its binary edges live in the lists keyed on the negations of
+                    // its own literals. `clauses`/`watches`/`binary_graph` are
+                    // disjoint fields, so the immutable read of the literals and the
+                    // mutable scrubs coexist without copying.
+                    if let Some(clause) = self.clauses.get(clause_id) {
+                        let is_binary = clause.lits.len() == 2;
+                        for &lit in &clause.lits {
+                            self.watches.remove_clause(lit.negate(), clause_id);
+                            if is_binary {
+                                self.binary_graph.remove(lit.negate(), clause_id);
+                            }
+                        }
+                    }
+
                     // Remove from clause database
                     self.clauses.remove(clause_id);
 
                     // Remove from learned clause tracking if it's a learned clause
                     self.learned_clause_ids.retain(|&id| id != clause_id);
-
-                    // Note: Watch lists will be cleaned up naturally during propagation
-                    // as they check if clauses are deleted before using them
                 }
             }
 
