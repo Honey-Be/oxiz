@@ -6,7 +6,6 @@
 
 use oxiz_solver::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 /// Result of model counting
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,127 +65,55 @@ impl ModelCounter {
         self
     }
 
-    /// Count models for a given SMT-LIB2 script
+    /// Count models for a given SMT-LIB2 script.
+    ///
+    /// Model counting (#SAT) is **not implemented**. Earlier revisions of this
+    /// module fabricated a result — exact counting always returned `0`, and
+    /// approximate counting returned a pure size heuristic that never checked
+    /// satisfiability. Returning those numbers as if they were a real model
+    /// count is unsound, so `count` now returns an error instead. The CLI
+    /// surfaces this to the user rather than printing a bogus figure.
     pub fn count(
-        &self,
-        ctx: &mut Context,
-        script: &str,
-        method: CountingMethod,
-    ) -> ModelCountResult {
-        let start = std::time::Instant::now();
-
-        match method {
-            CountingMethod::Exact => self.count_exact(ctx, script, start),
-            CountingMethod::ApproximateSampling => self.count_approximate(ctx, script, start),
-        }
-    }
-
-    /// Exact counting by enumerating all models
-    fn count_exact(
         &self,
         _ctx: &mut Context,
         _script: &str,
-        start: std::time::Instant,
-    ) -> ModelCountResult {
-        // For exact counting, we would enumerate all models
-        // This is a simplified implementation that returns a placeholder
-        // In a real implementation, we would:
-        // 1. Parse the script and extract variables
-        // 2. Enumerate all possible assignments
-        // 3. Check satisfiability for each assignment
-
-        // For now, return a simple result indicating exact counting needs full enumeration
-        ModelCountResult {
-            estimated_count: 0.0,
-            lower_bound: 0.0,
-            upper_bound: 0.0,
-            samples: 0,
-            confidence: 1.0,
-            is_exact: true,
-            time_ms: start.elapsed().as_millis(),
-        }
+        method: CountingMethod,
+    ) -> Result<ModelCountResult, ModelCountError> {
+        Err(ModelCountError::NotImplemented(method))
     }
+}
 
-    /// Approximate counting using sampling
-    fn count_approximate(
-        &self,
-        _ctx: &mut Context,
-        script: &str,
-        start: std::time::Instant,
-    ) -> ModelCountResult {
-        // Approximate model counting using sampling technique
-        // This is a simplified implementation using basic statistical estimation
+/// Reason a model count could not be produced.
+#[derive(Debug, Clone)]
+pub enum ModelCountError {
+    /// Model counting for the requested method is not implemented.
+    NotImplemented(CountingMethod),
+}
 
-        // In a real implementation, we would:
-        // 1. Parse variables from the script
-        // 2. Find one satisfying assignment
-        // 3. Sample the solution space by adding random constraints
-        // 4. Estimate total count based on sampling results
-
-        // For demonstration, use a simple heuristic based on problem size
-        let var_count = estimate_variable_count(script);
-        let clause_count = estimate_clause_count(script);
-
-        // Rough estimate: if problem is satisfiable, estimate based on constraints
-        // More constraints = fewer models
-        let constraint_ratio = if var_count > 0 {
-            clause_count as f64 / var_count as f64
-        } else {
-            1.0
-        };
-
-        // Heuristic: as constraints increase, model count decreases exponentially
-        let base_count = 2_f64.powi(var_count as i32);
-        let estimated = base_count / (1.0 + constraint_ratio).powi(2);
-
-        // Calculate confidence bounds (using simple standard error estimate)
-        let std_error = estimated / (self.samples as f64).sqrt();
-        let z_score = 1.96; // 95% confidence
-
-        ModelCountResult {
-            estimated_count: estimated,
-            lower_bound: (estimated - z_score * std_error).max(1.0),
-            upper_bound: estimated + z_score * std_error,
-            samples: self.samples,
-            confidence: self.confidence,
-            is_exact: false,
-            time_ms: start.elapsed().as_millis(),
+impl std::fmt::Display for ModelCountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelCountError::NotImplemented(method) => {
+                let method = match method {
+                    CountingMethod::Exact => "exact",
+                    CountingMethod::ApproximateSampling => "approximate",
+                };
+                write!(
+                    f,
+                    "model counting is not implemented ({method} counting is unavailable); \
+                     no count was produced"
+                )
+            }
         }
     }
 }
+
+impl std::error::Error for ModelCountError {}
 
 impl Default for ModelCounter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Estimate number of variables in an SMT-LIB2 script
-fn estimate_variable_count(script: &str) -> usize {
-    // Count declare-const and declare-fun statements
-    let mut count = 0;
-    let mut seen = HashSet::new();
-
-    for line in script.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("(declare-const") || trimmed.starts_with("(declare-fun") {
-            // Extract variable name (second token)
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let var_name = parts[1];
-                if seen.insert(var_name.to_string()) {
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    count
-}
-
-/// Estimate number of clauses/assertions in an SMT-LIB2 script
-fn estimate_clause_count(script: &str) -> usize {
-    script.matches("(assert").count()
 }
 
 /// Format model count result as human-readable string
@@ -221,30 +148,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_estimate_variable_count() {
-        let script = r#"
-            (declare-const x Bool)
-            (declare-const y Bool)
-            (assert (and x y))
-        "#;
-
-        let count = estimate_variable_count(script);
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn test_estimate_clause_count() {
-        let script = r#"
-            (declare-const x Bool)
-            (assert x)
-            (assert (not x))
-        "#;
-
-        let count = estimate_clause_count(script);
-        assert_eq!(count, 2);
-    }
-
-    #[test]
     fn test_model_counter_creation() {
         let counter = ModelCounter::new();
         assert_eq!(counter.samples, 1000);
@@ -258,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_approximate_counting() {
+    fn test_counting_is_not_implemented() {
         let mut ctx = Context::new();
         let counter = ModelCounter::new();
 
@@ -268,13 +171,18 @@ mod tests {
             (assert (or x y))
         "#;
 
-        let result = counter.count(&mut ctx, script, CountingMethod::ApproximateSampling);
-
-        // Should have a non-zero estimate
-        assert!(result.estimated_count > 0.0);
-        assert!(result.lower_bound > 0.0);
-        assert!(result.upper_bound >= result.estimated_count);
-        assert!(!result.is_exact);
+        // Model counting is not implemented: both methods must return an
+        // explicit error rather than a fabricated count.
+        for method in [
+            CountingMethod::ApproximateSampling,
+            CountingMethod::Exact,
+        ] {
+            let result = counter.count(&mut ctx, script, method);
+            assert!(
+                matches!(result, Err(ModelCountError::NotImplemented(_))),
+                "model counting must not fabricate a result"
+            );
+        }
     }
 
     #[test]

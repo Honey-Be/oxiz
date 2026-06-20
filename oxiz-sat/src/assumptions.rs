@@ -225,19 +225,33 @@ impl AssumptionCoreMinimizer {
         self.fixed_assumptions.insert(lit);
     }
 
-    /// Minimize a core using deletion-based minimization
+    /// Minimize a core using deletion-based minimization.
+    ///
+    /// Real deletion-based minimization (repeatedly drop one assumption and
+    /// re-check that the remainder is still UNSAT) is NOT yet implemented here:
+    /// it requires a solver handle to re-check, which this struct does not hold.
+    ///
+    /// To stay sound, this method conservatively returns the input core
+    /// UNMINIMIZED — a non-minimal but valid (over-approximating) UNSAT core.
+    /// It must never drop a genuinely-needed assumption, because an
+    /// under-approximation would be an UNSOUND "core" (claiming fewer
+    /// assumptions suffice for unsat than actually do). A superset of a real
+    /// core is always itself a sound core, so the identity pass is safe.
     pub fn minimize_deletion(&self, core: &[Lit]) -> Vec<Lit> {
-        // Simple deletion: try removing each assumption and see if still UNSAT
-        // This is a placeholder - actual implementation would need solver access
-        let mut minimal = core.to_vec();
-        minimal.retain(|&lit| self.fixed_assumptions.contains(&lit));
-        minimal
+        core.to_vec()
     }
 
-    /// Minimize a core using QuickXplain algorithm
+    /// Minimize a core using the QuickXplain algorithm.
+    ///
+    /// Real QuickXplain (a divide-and-conquer minimization that re-checks
+    /// unsat on subsets) is NOT yet implemented here; like
+    /// [`Self::minimize_deletion`] it would require a solver handle to
+    /// re-check, which this struct does not hold.
+    ///
+    /// To stay sound, this method conservatively returns the input core
+    /// UNMINIMIZED — a non-minimal but valid (over-approximating) UNSAT core,
+    /// never a too-small subset.
     pub fn minimize_quickxplain(&self, core: &[Lit]) -> Vec<Lit> {
-        // QuickXplain is a divide-and-conquer algorithm for core minimization
-        // This is a placeholder implementation
         core.to_vec()
     }
 

@@ -89,8 +89,11 @@ impl Proof {
         Ok(())
     }
 
-    /// Verify that this is a complete proof (has a conclusion)
-    #[allow(dead_code)]
+    /// Verify that this is a complete proof (has a conclusion).
+    ///
+    /// This is the strict, user-facing entry point: it requires the proof to
+    /// derive the empty clause (a genuine refutation) before running the
+    /// per-step inference checks via [`Self::verify`].
     pub fn verify_complete(&self) -> Result<(), String> {
         if self.conclusion.is_none() {
             return Err("Proof has no conclusion (empty clause)".to_string());
@@ -105,9 +108,14 @@ impl Proof {
             "factoring" => self.verify_factoring(step),
             "subsumption" => self.verify_subsumption(step),
             "tautology" => self.verify_tautology(step),
-            _ => {
-                // Unknown rule, but we'll allow it for extensibility
-                Ok(())
+            other => {
+                // Unknown inference rule: we cannot verify it, so we must NOT
+                // trust it. Silently accepting unrecognized rules would let an
+                // invalid proof be reported as VALID (soundness hole).
+                Err(format!(
+                    "Step {} uses unknown/unverifiable inference rule '{}'",
+                    step.id, other
+                ))
             }
         }
     }

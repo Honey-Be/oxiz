@@ -745,7 +745,7 @@ impl Model {
                         _ => {}
                     }
                 }
-                manager.mk_not(arg_val)
+                manager.mk_neg(arg_val)
             }
 
             TermKind::Add(ref args) => {

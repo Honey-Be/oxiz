@@ -638,6 +638,10 @@ impl OptContext {
 
         // Binary search for minimum cost.
         let mut best_model_snapshot: Option<FxHashMap<TermId, ModelValue>> = None;
+        // Set if the underlying solver returns `Unknown` during the search:
+        // the binary search aborts at a non-tight `[lo, hi]` bound, so the
+        // optimum was NOT proven and we must not report `Optimal`.
+        let mut inconclusive = false;
 
         while lo < hi {
             let mid: BigInt = (lo.clone() + hi.clone()) / 2i32;
@@ -676,7 +680,10 @@ impl OptContext {
                 SolverResult::Unsat => {
                     lo = mid + BigInt::from(1i32);
                 }
-                SolverResult::Unknown => break,
+                SolverResult::Unknown => {
+                    inconclusive = true;
+                    break;
+                }
             }
         }
 
@@ -713,7 +720,15 @@ impl OptContext {
         }
 
         self.best_model = best_model_snapshot;
-        Ok(OptResult::Optimal)
+        if inconclusive {
+            // The search aborted on an inconclusive (`Unknown`) solver result,
+            // so the bound is not provably tight. The problem is known to be
+            // feasible (the feasibility check above passed), but optimality was
+            // not proven — report a solution without claiming optimality.
+            Ok(OptResult::Satisfiable)
+        } else {
+            Ok(OptResult::Optimal)
+        }
     }
 
     /// Optimize a single objective using `oxiz_solver::Optimizer`.

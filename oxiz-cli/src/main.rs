@@ -973,29 +973,37 @@ pub(crate) fn execute_and_format(ctx: &mut Context, script: &str, args: &Args) -
 
         let counter = model_counter::ModelCounter::new().with_samples(args.count_samples);
 
-        let result = counter.count(ctx, script, method);
+        match counter.count(ctx, script, method) {
+            Ok(result) => {
+                // Export to JSON if requested
+                if let Some(export_path) = &args.count_export {
+                    if let Err(e) = std::fs::write(
+                        export_path,
+                        serde_json::to_string_pretty(&result).unwrap_or_default(),
+                    ) {
+                        eprintln!("Failed to export model count: {}", e);
+                    } else if args.verbosity >= Verbosity::Normal {
+                        println!("Model count exported to {}", export_path.display());
+                    }
+                }
 
-        // Export to JSON if requested
-        if let Some(export_path) = &args.count_export {
-            if let Err(e) = std::fs::write(
-                export_path,
-                serde_json::to_string_pretty(&result).unwrap_or_default(),
-            ) {
-                eprintln!("Failed to export model count: {}", e);
-            } else if args.verbosity >= Verbosity::Normal {
-                println!("Model count exported to {}", export_path.display());
+                // Display count information
+                if args.count_models {
+                    return model_counter::format_model_count(&result);
+                }
+
+                // If only exporting, return success message
+                if args.count_export.is_some() {
+                    return "Model counting complete".to_string();
+                }
             }
-        }
-
-        // Display count information
-        if args.count_models {
-            let formatted = model_counter::format_model_count(&result);
-            return formatted;
-        }
-
-        // If only exporting, return success message
-        if args.count_export.is_some() {
-            return "Model counting complete".to_string();
+            Err(e) => {
+                // Model counting is not implemented. Do NOT emit a fabricated
+                // count: report the reason to stderr and exit without writing
+                // any export file or printing a bogus figure.
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -1113,7 +1121,10 @@ pub(crate) fn execute_and_format(ctx: &mut Context, script: &str, args: &Args) -
 
                 if !proof_text.is_empty() {
                     match proof_checker::parse_simple_proof(&proof_text) {
-                        Ok(proof) => match proof.verify() {
+                        // Use the strict checker: a user-facing proof must be a
+                        // complete refutation (it must derive the empty clause),
+                        // not merely a sequence of valid intermediate steps.
+                        Ok(proof) => match proof.verify_complete() {
                             Ok(()) => {
                                 if args.verbosity >= Verbosity::Verbose {
                                     eprintln_colored(args, "; Proof verification: VALID");

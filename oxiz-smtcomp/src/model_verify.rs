@@ -205,6 +205,31 @@ impl VerificationResult {
             verification_time: Duration::ZERO,
         }
     }
+
+    /// Create a "not verified" result: the solver reported SAT but the model was
+    /// not actually checked against the assertions.
+    ///
+    /// This is distinct from [`Self::success`]: it deliberately leaves
+    /// `model_valid` as `None` (we make no claim about validity) so a caller can
+    /// never mistake "trusted the solver verdict" for "checked the model". The
+    /// optional `model` is recorded for diagnostics only.
+    #[must_use]
+    pub fn not_verified(
+        benchmark: &str,
+        model: Option<Model>,
+        reason: String,
+        time: Duration,
+    ) -> Self {
+        Self {
+            benchmark: benchmark.to_string(),
+            solver_status: BenchmarkStatus::Sat,
+            verified: false,
+            model_valid: None,
+            model,
+            error: Some(reason),
+            verification_time: time,
+        }
+    }
 }
 
 /// Model verifier
@@ -296,13 +321,22 @@ impl ModelVerifier {
             );
         }
 
-        // Extract model from solver
+        // Attempt to extract the actual solver model.
         let model = self.extract_model(&solver, &variables, &tm);
 
-        // For now, we trust that if the solver says SAT and we can extract a model,
-        // the model is valid. Full verification would require evaluating all assertions
-        // under the model, which is more complex.
-        VerificationResult::success(&benchmark_name, model, start.elapsed())
+        // NOTE: a real model check (evaluating every assertion under the model)
+        // is not implemented yet. We must NOT report `success` here, because that
+        // would mark `model_valid = Some(true)` and let a wrong model pass this
+        // self-check. Report an explicit "not verified" status instead: the
+        // solver said SAT, but this tool did not check the model.
+        VerificationResult::not_verified(
+            &benchmark_name,
+            model,
+            "model verification is not implemented: solver reported SAT but the \
+             model was not evaluated against the assertions"
+                .to_string(),
+            start.elapsed(),
+        )
     }
 
     /// Verify multiple results
@@ -318,33 +352,23 @@ impl ModelVerifier {
             .collect()
     }
 
-    /// Extract model from solver
+    /// Extract the model from the solver.
+    ///
+    /// Returns `None` when the actual solver model cannot be obtained. We
+    /// deliberately do NOT fabricate an all-default (`true`/`0`/`0.0`) model:
+    /// returning fake values would let callers treat a placeholder as the real
+    /// assignment. Querying the solver for concrete model values is not yet
+    /// implemented, so this currently always returns `None`.
     fn extract_model(
         &self,
         _solver: &Solver,
-        variables: &[(String, String)],
+        _variables: &[(String, String)],
         _tm: &TermManager,
-    ) -> Model {
-        let mut model = Model::new();
-
-        // For now, create a placeholder model
-        // Full implementation would query the solver for model values
-        for (name, sort) in variables {
-            match sort.as_str() {
-                "Bool" => {
-                    model.add_bool(name, true); // Placeholder
-                }
-                "Int" => {
-                    model.add_int(name, 0); // Placeholder
-                }
-                "Real" => {
-                    model.add_real(name, "0.0"); // Placeholder
-                }
-                _ => {}
-            }
-        }
-
-        model
+    ) -> Option<Model> {
+        // TODO: query the solver for concrete model values per variable.
+        // Until that is implemented, signal "no model extracted" rather than
+        // returning fabricated default assignments.
+        None
     }
 }
 
