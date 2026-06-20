@@ -158,6 +158,17 @@ impl Congruence<OxizSig> for EufCongruence<'_> {
             })
             .collect()
     }
+
+    fn disequal(&self, a: TermId, b: TermId) -> bool {
+        // Provably disequal in `E` only when both terms are interned and an
+        // asserted disequality separates their classes (sound, conservative —
+        // `false` when merely not-provably-equal). Delegates to the EUF's
+        // immutable disequality reader.
+        match (self.euf.term_to_node(a), self.euf.term_to_node(b)) {
+            (Some(na), Some(nb)) => self.euf.are_disequal_immutable(na, nb),
+            _ => false,
+        }
+    }
 }
 
 /// A short-lived wrapper around the persistent `TermManager`, created per

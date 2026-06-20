@@ -68,6 +68,34 @@ pub trait Congruence<S: Sig> {
     fn default_value(&self, _f: S::Sym, _args: &[S::Term]) -> Option<S::Term> {
         None
     }
+
+    /// Are `a` and `b` **provably disequal** in `E` (`E ⊨ a ≄ b`)? A sound,
+    /// conservative test (`false` when undetermined) — the disequality dual of
+    /// [`equal`](Self::equal), needed by the complete E-ground *dis*unification
+    /// core (design §2.3 `R_*` rules). NOTE: for the model-completion verdict-flip
+    /// the decision primitive is the *total* view's "distinct class reps are
+    /// distinct by construction" (via [`class_reps_of_sort`](Self::class_reps_of_sort)),
+    /// NOT this asserted-disequality query — `disequal` is a building block.
+    /// Default `false`.
+    fn disequal(&self, _a: S::Term, _b: S::Term) -> bool {
+        false
+    }
+
+    /// Every ground term of sort `s` known to `E` — the domain the complete
+    /// solver enumerates output/disequality witnesses over (maps to the engine's
+    /// `GroundIndex::of_sort`, threaded in by the host). Default empty.
+    fn ground_of_sort(&self, _s: S::Sort) -> Vec<S::Term> {
+        Vec::new()
+    }
+
+    /// One representative ground term per congruence **class** of sort `s` — the
+    /// disjoint witness set for the disequality / `R_GEN` enumeration (a dedup of
+    /// [`ground_of_sort`](Self::ground_of_sort) by [`rep`](Self::rep)). On a total
+    /// view its members are pairwise distinct by construction, which is what makes
+    /// `!equal` over them a genuine `≄`. Default empty.
+    fn class_reps_of_sort(&self, _s: S::Sort) -> Vec<S::Term> {
+        Vec::new()
+    }
 }
 
 /// The trivial (empty) congruence: every term is its own class, equality is

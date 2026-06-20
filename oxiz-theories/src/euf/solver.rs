@@ -863,6 +863,37 @@ impl EufSolver {
         self.uf.same_no_compress(a, b)
     }
 
+    /// Are `a` and `b` PROVABLY disequal in the current congruence (immutable)?
+    ///
+    /// A **sound, conservative** test: returns `true` only when `a` and `b` fall
+    /// in different classes AND some *asserted* disequality separates those two
+    /// classes. It NEVER returns `true` for a pair that is merely "not provably
+    /// equal" — that distinction is the whole point (the CCFV verdict-flip needs
+    /// genuine `≄` entailment, not the weaker `¬equal`). Used by the clean-MBQI
+    /// `Congruence::disequal` oracle as a building block; it does not mutate (no
+    /// `explain_equality`, unlike the conflict path), so it is safe to call on the
+    /// post-solve congruence. Total over any `u32` (stale indices → `false`).
+    #[inline]
+    pub fn are_disequal_immutable(&self, a: u32, b: u32) -> bool {
+        if a == b {
+            return false;
+        }
+        let live = self.nodes.len() as u32;
+        if a >= live || b >= live {
+            return false;
+        }
+        let ra = self.uf.find_no_compress(a);
+        let rb = self.uf.find_no_compress(b);
+        if ra == rb {
+            return false; // same class ⇒ congruent, not disequal
+        }
+        self.diseqs.iter().any(|d| {
+            let dl = self.uf.find_no_compress(d.lhs);
+            let dr = self.uf.find_no_compress(d.rhs);
+            (dl == ra && dr == rb) || (dl == rb && dr == ra)
+        })
+    }
+
     /// Get the number of E-graph nodes
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -1203,6 +1234,34 @@ mod tests {
         // Then assert a = b -> conflict
         solver.merge(a, b, TermId::new(11)).unwrap_or(());
         assert!(solver.check_conflicts().is_some());
+    }
+
+    #[test]
+    fn test_are_disequal_immutable_is_sound_and_conservative() {
+        // The CCFV `Congruence::disequal` building block: true ONLY when an
+        // asserted diseq separates the classes; false (not a panic) otherwise.
+        let mut solver = EufSolver::new();
+        let a = solver.intern(TermId::new(1));
+        let b = solver.intern(TermId::new(2));
+        let c = solver.intern(TermId::new(3));
+
+        // Nothing asserted yet: not provably disequal (merely unknown).
+        assert!(!solver.are_disequal_immutable(a, b));
+        assert!(!solver.are_disequal_immutable(a, a)); // reflexive: never disequal
+
+        // Assert a != b → now provably disequal, symmetric.
+        solver.assert_diseq(a, b, TermId::new(10));
+        assert!(solver.are_disequal_immutable(a, b));
+        assert!(solver.are_disequal_immutable(b, a));
+        // c is unconstrained → still not provably disequal from a or b.
+        assert!(!solver.are_disequal_immutable(a, c));
+        assert!(!solver.are_disequal_immutable(b, c));
+
+        // Congruence: merge c=a, then b≠c follows from b≠a (a,c same class).
+        solver.merge(a, c, TermId::new(11)).unwrap_or(());
+        assert!(solver.are_disequal_immutable(b, c));
+        // Stale indices are total → false, no panic.
+        assert!(!solver.are_disequal_immutable(9999, 8888));
     }
 
     #[test]
