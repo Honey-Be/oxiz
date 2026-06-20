@@ -134,6 +134,50 @@ fn ccfv_ematch_on_is_sound_on_the_pattern_axiom() {
 }
 
 #[test]
+fn nested_congruence_trigger_is_sound() {
+    // CCFV (Phase P2) **default-on soundness fix**, fed WITHOUT a set-option (the
+    // `ccfv_ematch` default is now `true`). This is the shape the syntactic
+    // matcher gets WRONG:
+    //
+    //   ∀x. ensL(bx x) = (x > 5)   [:pattern ((ensL (bx x)))]
+    //   c = bx(yc)  ∧  ensL(c)  ∧  ¬(yc > 5)
+    //
+    // The only ground `ensL`-application is `ensL(c)`. Syntactically it is NOT an
+    // instance of the trigger `(ensL (bx x))` — its argument is the constant `c`,
+    // not a `bx`-application. But `c = bx(yc)`, so MODULO the congruence
+    // `ensL(c) ≡ ensL(bx yc)` and the trigger fires with `x ↦ yc`, yielding
+    // `ensL(bx yc) = (yc > 5)`. With `ensL(c)` true and `c = bx(yc)` that forces
+    // `yc > 5`, contradicting `¬(yc > 5)` → **unsat** (z3-confirmed).
+    //
+    // With the syntactic matcher (CCFV off) the trigger never fires, the axiom is
+    // left to model-completion, and the engine certifies a congruence-blind model
+    // as the SPURIOUS `sat`. The congruence-aware CCFV matcher sees the match
+    // through `c = bx(yc)` and derives the genuine `unsat`. This case is what
+    // turned the default-flip from "safe, no measured benefit" into a soundness
+    // repair (the corpus/prelude have no nested-congruence trigger shapes, so it
+    // is a constructed-but-real witness; likely relevant to verus-fork boxed
+    // `ens%`-predicate patterns).
+    let r = solve_streamed(&[
+        "(declare-fun ensL (Int) Bool)",
+        "(declare-fun bx (Int) Int)",
+        "(declare-const c Int)",
+        "(declare-const yc Int)",
+        "(assert (forall ((x Int)) (! (= (ensL (bx x)) (> x 5)) :pattern ((ensL (bx x))))))",
+        "(assert (= c (bx yc)))",
+        "(assert (ensL c))",
+        "(assert (not (> yc 5)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "the trigger fires modulo c=bx(yc) → ensL(bx yc)=(yc>5) → yc>5 contradicts \
+         ¬(yc>5); CCFV-on (default) must derive this unsat, not the congruence-blind \
+         spurious sat"
+    );
+}
+
+#[test]
 fn axiomatized_add_consistent_ground_fact_is_sat() {
     // ∀a b. Add(a,b)=a+b [:pattern (Add a b)] ∧ Add(2,3)=5 — the axiom forces
     // Add(2,3)=2+3=5, consistent with the assertion (z3: sat).

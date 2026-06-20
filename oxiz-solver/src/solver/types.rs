@@ -298,12 +298,19 @@ pub struct SolverConfig {
     /// CCFV (Phase P2): route the clean-MBQI engine's single-pattern trigger
     /// e-matching through the congruence-aware `ccfv::match_trigger` (backed by
     /// the live EUF via `EufCongruence`) instead of the syntactic
-    /// `trigger::match_single`. **OFF by default** until the z3-parity corpus
-    /// confirms no spurious verdicts and `matches ≥ old` — CCFV matching is a
-    /// superset of syntactic (it only adds matches holding modulo the congruence)
-    /// and every match still passes the unchanged `instantiate`/`emit` firewall,
-    /// so this can only add sound instances; the gate is for completeness/
-    /// performance regression, not soundness. See `clean_mbqi.rs` and the design
+    /// `trigger::match_single`. **ON by default.** The default-flip gates passed:
+    /// the z3-parity corpus is byte-identical to syntactic matching (166/168
+    /// agree, 0 spurious) and the full-prelude consult shows no measurable
+    /// overhead (most congruence classes are singletons). The flip is also a
+    /// *soundness* fix: the syntactic matcher misses triggers that fire only
+    /// modulo congruence (e.g. `(P (f x))` against ground `(P c)` where
+    /// `c = (f a)`), so model-completion could certify a congruence-blind model
+    /// as `sat` on a nested-congruence shape that z3 calls `unsat` (regression
+    /// test `nested_congruence_trigger_is_sound` in
+    /// `tests/uf_sort_and_quant_soundness.rs`). CCFV matching is a superset of
+    /// syntactic — it only adds matches holding modulo the congruence — and every
+    /// match still passes the unchanged `instantiate`/`emit` firewall, so it can
+    /// only add sound instances. See `clean_mbqi.rs` and the design
     /// `external/oxiz/docs/design/CCFV_UNIFIED_INSTANTIATION.md` §P2.
     pub ccfv_ematch: bool,
 }
@@ -340,7 +347,7 @@ impl SolverConfig {
             inprocessing_interval: 0,
             clean_mbqi: true,
             use_hooks_driver: true,
-            ccfv_ematch: false,
+            ccfv_ematch: true,
         }
     }
 
@@ -369,7 +376,7 @@ impl SolverConfig {
             inprocessing_interval: 10000,
             clean_mbqi: true,
             use_hooks_driver: true,
-            ccfv_ematch: false,
+            ccfv_ematch: true,
         }
     }
 
@@ -398,7 +405,7 @@ impl SolverConfig {
             inprocessing_interval: 5000, // More frequent inprocessing
             clean_mbqi: true,
             use_hooks_driver: true,
-            ccfv_ematch: false,
+            ccfv_ematch: true,
         }
     }
 
@@ -427,7 +434,7 @@ impl SolverConfig {
             inprocessing_interval: 0,
             clean_mbqi: true,
             use_hooks_driver: true,
-            ccfv_ematch: false,
+            ccfv_ematch: true,
         }
     }
 
