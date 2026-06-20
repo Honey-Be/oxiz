@@ -345,79 +345,19 @@ impl TheoryCombiner {
     ///
     /// This avoids the O(2^n) equality propagation of Nelson-Oppen
     pub fn check_polite_combination(&mut self) -> Result<TheoryResult> {
-        // Check if we can use polite combination
-        // EUF is polite, so we check arithmetic first then extend EUF
-        let euf_is_polite = self.is_theory_polite(TheoryId::EUF);
-
-        if euf_is_polite {
-            // Arithmetic is the "difficult" theory, EUF is polite
-            // 1. Check arithmetic for satisfiability
-            match self.arith.check() {
-                Ok(TheoryResult::Sat) => {
-                    // 2. Extract arrangement of shared variables from arithmetic model
-                    let arrangement = self.extract_arrangement_from_arith();
-
-                    // 3. Assert this arrangement in EUF
-                    // Note: We use a special reason term (0) to indicate polite combination arrangement
-                    let polite_reason = TermId::new(0);
-                    for (a, b) in &arrangement.equalities {
-                        self.euf.merge(a.raw(), b.raw(), polite_reason)?;
-                    }
-                    for (a, b) in &arrangement.disequalities {
-                        self.euf.assert_diseq(a.raw(), b.raw(), polite_reason);
-                    }
-
-                    // 4. Check EUF (should always succeed for polite theories)
-                    match self.euf.check() {
-                        Ok(TheoryResult::Sat) => Ok(TheoryResult::Sat),
-                        Ok(TheoryResult::Unsat(conflict)) => {
-                            // This shouldn't happen for a truly polite theory
-                            // But we handle it gracefully
-                            Ok(TheoryResult::Unsat(conflict))
-                        }
-                        Ok(TheoryResult::Unknown) => Ok(TheoryResult::Unknown),
-                        Ok(TheoryResult::Propagate(_)) => {
-                            // Propagate and continue checking
-                            Ok(TheoryResult::Sat)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                Ok(TheoryResult::Unsat(conflict)) => Ok(TheoryResult::Unsat(conflict)),
-                Ok(TheoryResult::Unknown) => Ok(TheoryResult::Unknown),
-                Ok(TheoryResult::Propagate(_)) => {
-                    // Propagate and retry
-                    Ok(TheoryResult::Sat)
-                }
-                Err(e) => Err(e),
-            }
-        } else {
-            // Fall back to standard Nelson-Oppen
-            self.check_nelson_oppen()
-        }
-    }
-
-    /// Extract the arrangement of shared variables from the arithmetic model
-    fn extract_arrangement_from_arith(&self) -> EqualityArrangement {
-        let mut arrangement = EqualityArrangement::new();
-
-        // Get values of all shared variables in the arithmetic model
-        let shared_vars: Vec<TermId> = self.shared_vars.iter().copied().collect();
-
-        // Compare all pairs to determine equalities/disequalities
-        for i in 0..shared_vars.len() {
-            for j in (i + 1)..shared_vars.len() {
-                let vi = shared_vars[i];
-                let vj = shared_vars[j];
-
-                // In a full implementation, we would query the arithmetic model
-                // to determine if vi == vj
-                // For now, assume they're different (conservative)
-                arrangement.add_disequality(vi, vj);
-            }
-        }
-
-        arrangement
+        // SOUNDNESS: the polite-combination shortcut needs the EXACT arrangement
+        // (equalities/disequalities) of the shared variables in the arithmetic
+        // model. Building it requires a query into the arith model that is not
+        // implemented here — the previous code instead FABRICATED a disequality
+        // between every pair of shared variables and called it "conservative".
+        // It is not: asserting unentailed disequalities into EUF can manufacture a
+        // spurious conflict (spurious UNSAT) or mask a real model. Until a real
+        // arrangement query exists, delegate to the sound Nelson-Oppen combination
+        // (which discovers the correct arrangement by case-splitting on shared
+        // equalities) instead of the broken polite path. (`EUF` politeness is what
+        // would let N-O be replaced by this shortcut, so no information is lost.)
+        let _ = self.is_theory_polite(TheoryId::EUF);
+        self.check_nelson_oppen()
     }
 
     /// Register a term with a specific theory

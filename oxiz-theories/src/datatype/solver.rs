@@ -550,9 +550,18 @@ impl Theory for DatatypeSolver {
     }
 
     fn assert_false(&mut self, _term: TermId) -> Result<TheoryResult> {
-        // Handle negated recognizer assertions
-        // This means the term is NOT of that constructor
-        Ok(TheoryResult::Sat)
+        // A negated recognizer `(not (is-C t))` asserts `t` is NOT constructor C —
+        // a real constraint (e.g. it conflicts with `(is-C t)`, and if asserted
+        // for every constructor of the sort it is unsatisfiable). This solver has
+        // no negative-recognizer tracking yet, so it CANNOT soundly account for
+        // the constraint. Returning `Sat` here would silently DROP it — and
+        // dropping a constraint can only fabricate a `Sat` (per the soundness
+        // asymmetry: a subset model may violate the omitted constraint). Report
+        // the sound `Unknown` instead so no verdict rests on the dropped fact.
+        // (`DatatypeSolver` is not currently wired as a live theory — datatypes go
+        // through `encode.rs` + EUF — so this is a latent-landmine hardening;
+        // proper negative-recognizer reasoning is the completeness follow-up.)
+        Ok(TheoryResult::Unknown)
     }
 
     fn check(&mut self) -> Result<TheoryResult> {

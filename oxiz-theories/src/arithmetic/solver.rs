@@ -620,6 +620,11 @@ impl Theory for ArithSolver {
 
     fn check(&mut self) -> Result<TheoryResult> {
         match self.simplex.check() {
+            // `Ok(())` = no conflict. But if the simplex gave up at the pivot cap,
+            // feasibility is UNPROVEN — report the sound `Unknown`, never a
+            // spurious `Sat` (a cycling/large LP would otherwise be certified
+            // satisfiable without proof).
+            Ok(()) if self.simplex.last_check_incomplete() => Ok(TheoryResult::Unknown),
             Ok(()) => Ok(TheoryResult::Sat),
             Err(reasons) => {
                 // Record the conflict shape so the theory manager can recognise

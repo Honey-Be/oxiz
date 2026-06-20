@@ -217,6 +217,12 @@ pub struct Simplex {
     pivoting_rule: PivotingRule,
     /// Maximum number of pivot operations before giving up
     max_pivots: usize,
+    /// Set when the last `check()` exhausted `max_pivots` without reaching a
+    /// feasible OR infeasible verdict. `check()` returns `Ok(())` in that case
+    /// (it found no conflict), but that is NOT a proof of feasibility — the
+    /// caller must treat it as **Unknown**, never `Sat` (else a cycling/large LP
+    /// that hits the cap is a spurious sat).
+    incomplete: bool,
 }
 
 impl Default for Simplex {
@@ -251,6 +257,7 @@ impl Simplex {
             saved_tableaux: Vec::new(),
             pivoting_rule: config.pivoting_rule,
             max_pivots: config.max_pivots,
+            incomplete: false,
         }
     }
 
@@ -487,6 +494,7 @@ impl Simplex {
 
     /// Check if bounds are consistent
     pub fn check(&mut self) -> Result<(), Vec<u32>> {
+        self.incomplete = false;
         // Check for trivially infeasible bounds
         for i in 0..self.assignment.len() {
             if let (Some(lo), Some(hi)) = (&self.lower[i], &self.upper[i])
@@ -575,8 +583,17 @@ impl Simplex {
             }
         }
 
-        // Too many pivots - unknown
+        // Too many pivots: no conflict was found, but feasibility is UNPROVEN.
+        // Flag it so the caller reports Unknown rather than a spurious Sat.
+        self.incomplete = true;
         Ok(())
+    }
+
+    /// Whether the last [`check`](Self::check) gave up at the pivot cap without
+    /// proving feasibility OR infeasibility — its `Ok(())` must be read as
+    /// `Unknown`, not `Sat`.
+    pub(super) fn last_check_incomplete(&self) -> bool {
+        self.incomplete
     }
 
     /// Dual Simplex: Restore primal feasibility while maintaining dual feasibility
