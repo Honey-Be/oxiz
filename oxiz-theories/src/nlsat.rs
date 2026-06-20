@@ -241,14 +241,23 @@ struct PolyAtom {
 // Assertion-level translation (integer mode)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Translate an assertion into polynomial atoms. **Returns `true` if ANY
+/// subterm was DROPPED** — a connective `extract` does not model (top-level
+/// `Or`/`Not`/`Implies`/`Ite`/`Xor`, the `_` arm) or an atom whose operand fails
+/// to translate (`Div`/`Mod`/`Apply`/`Ite` → `translate` returns `None`). The
+/// caller needs this for soundness: a `Sat` over the RETAINED subset of atoms is
+/// only valid for the original formula when NOTHING was dropped (a dropped
+/// constraint could be exactly the one a retained-subset model violates →
+/// spurious sat). `Unsat` over a subset stays sound regardless (subset-unsat ⟹
+/// full-unsat), which is why only the `Sat` side consults this.
 fn extract_poly_atoms(
     term_id: TermId,
     manager: &TermManager,
     translator: &mut TermPolyTranslator<'_>,
     out: &mut Vec<PolyAtom>,
-) {
+) -> bool {
     let Some(term) = manager.get(term_id) else {
-        return;
+        return true;
     };
     match &term.kind.clone() {
         TermKind::Eq(lhs, rhs) => {
@@ -258,6 +267,9 @@ fn extract_poly_atoms(
                     kind: AtomKind::Eq,
                     positive: true,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Lt(lhs, rhs) => {
@@ -268,6 +280,9 @@ fn extract_poly_atoms(
                     kind: AtomKind::Gt,
                     positive: true,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Le(lhs, rhs) => {
@@ -278,6 +293,9 @@ fn extract_poly_atoms(
                     kind: AtomKind::Lt,
                     positive: false,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Gt(lhs, rhs) => {
@@ -288,6 +306,9 @@ fn extract_poly_atoms(
                     kind: AtomKind::Gt,
                     positive: true,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Ge(lhs, rhs) => {
@@ -298,14 +319,19 @@ fn extract_poly_atoms(
                     kind: AtomKind::Lt,
                     positive: false,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::And(args) => {
+            let mut dropped = false;
             for &arg in args.iter() {
-                extract_poly_atoms(arg, manager, translator, out);
+                dropped |= extract_poly_atoms(arg, manager, translator, out);
             }
+            dropped
         }
-        _ => {}
+        _ => true,
     }
 }
 
@@ -342,8 +368,9 @@ pub fn dispatch_nia_constraints(
     let mut translator = TermPolyTranslator::new(manager, &mut nia, integer_mode);
 
     let mut poly_atoms: Vec<PolyAtom> = Vec::new();
+    let mut dropped = false;
     for &assertion in assertions {
-        extract_poly_atoms(assertion, manager, &mut translator, &mut poly_atoms);
+        dropped |= extract_poly_atoms(assertion, manager, &mut translator, &mut poly_atoms);
     }
 
     if poly_atoms.is_empty() {
@@ -352,6 +379,13 @@ pub fn dispatch_nia_constraints(
 
     let unsat_is_trustworthy =
         !has_unsupported_ops && poly_atoms.iter().all(|atom| atom.poly.is_univariate());
+    // A `Sat` over the RETAINED atoms is only valid for the original formula when
+    // every assertion was fully captured — no connective dropped, no operand
+    // untranslatable. Otherwise a dropped constraint could be the one a
+    // subset-model violates → spurious sat (the nlsat soundness hole). When it is
+    // NOT trustworthy we return `None` (Unknown) and let the full CDCL(T) path
+    // decide, rather than trusting nlsat's `Sat`.
+    let sat_is_trustworthy = !dropped && !has_unsupported_ops;
 
     for atom in &poly_atoms {
         let atom_id = translator
@@ -367,8 +401,8 @@ pub fn dispatch_nia_constraints(
 
     match translator.nlsat.solve() {
         SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
-        SolverResult::Sat => Some(NlDispatchResult::Sat),
-        SolverResult::Unsat | SolverResult::Unknown => None,
+        SolverResult::Sat if sat_is_trustworthy => Some(NlDispatchResult::Sat),
+        SolverResult::Sat | SolverResult::Unsat | SolverResult::Unknown => None,
     }
 }
 
@@ -447,14 +481,17 @@ impl<'a> RealPolyTranslator<'a> {
     }
 }
 
+/// Real-arithmetic twin of [`extract_poly_atoms`]; **returns `true` if any
+/// subterm was DROPPED** (unmodeled connective or untranslatable operand). See
+/// that function for why the `Sat` side must consult it.
 fn extract_real_poly_atoms(
     term_id: TermId,
     manager: &TermManager,
     translator: &mut RealPolyTranslator<'_>,
     out: &mut Vec<PolyAtom>,
-) {
+) -> bool {
     let Some(term) = manager.get(term_id) else {
-        return;
+        return true;
     };
     match &term.kind.clone() {
         TermKind::Eq(lhs, rhs) => {
@@ -464,6 +501,9 @@ fn extract_real_poly_atoms(
                     kind: AtomKind::Eq,
                     positive: true,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Lt(lhs, rhs) => {
@@ -473,6 +513,9 @@ fn extract_real_poly_atoms(
                     kind: AtomKind::Gt,
                     positive: true,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Le(lhs, rhs) => {
@@ -482,6 +525,9 @@ fn extract_real_poly_atoms(
                     kind: AtomKind::Lt,
                     positive: false,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Gt(lhs, rhs) => {
@@ -491,6 +537,9 @@ fn extract_real_poly_atoms(
                     kind: AtomKind::Gt,
                     positive: true,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::Ge(lhs, rhs) => {
@@ -500,14 +549,19 @@ fn extract_real_poly_atoms(
                     kind: AtomKind::Lt,
                     positive: false,
                 });
+                false
+            } else {
+                true
             }
         }
         TermKind::And(args) => {
+            let mut dropped = false;
             for &arg in args.iter() {
-                extract_real_poly_atoms(arg, manager, translator, out);
+                dropped |= extract_real_poly_atoms(arg, manager, translator, out);
             }
+            dropped
         }
-        _ => {}
+        _ => true,
     }
 }
 
@@ -525,8 +579,9 @@ pub fn dispatch_nra_constraints(
     let mut translator = RealPolyTranslator::new(manager, &mut nlsat);
 
     let mut poly_atoms: Vec<PolyAtom> = Vec::new();
+    let mut dropped = false;
     for &assertion in assertions {
-        extract_real_poly_atoms(assertion, manager, &mut translator, &mut poly_atoms);
+        dropped |= extract_real_poly_atoms(assertion, manager, &mut translator, &mut poly_atoms);
     }
 
     if poly_atoms.is_empty() {
@@ -534,6 +589,10 @@ pub fn dispatch_nra_constraints(
     }
 
     let unsat_is_trustworthy = poly_atoms.iter().all(|atom| atom.kind != AtomKind::Eq);
+    // `Sat` is only valid for the original formula when nothing was dropped (see
+    // `extract_poly_atoms`). Otherwise fall back to `None` (Unknown) — never trust
+    // a `Sat` over a retained SUBSET of the constraints.
+    let sat_is_trustworthy = !dropped;
 
     for atom in &poly_atoms {
         let atom_id = translator.nlsat.new_ineq_atom(atom.poly.clone(), atom.kind);
@@ -543,8 +602,8 @@ pub fn dispatch_nra_constraints(
 
     match translator.nlsat.solve() {
         SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
-        SolverResult::Sat => Some(NlDispatchResult::Sat),
-        SolverResult::Unsat | SolverResult::Unknown => None,
+        SolverResult::Sat if sat_is_trustworthy => Some(NlDispatchResult::Sat),
+        SolverResult::Sat | SolverResult::Unsat | SolverResult::Unknown => None,
     }
 }
 
@@ -966,6 +1025,63 @@ mod tests {
         assert!(
             matches!(result, Some(NlDispatchResult::Unsat) | None),
             "x*x<0 should be UNSAT or unknown, got {:?}",
+            result
+        );
+    }
+
+    // ── Sat-trustworthiness gate (audit 2026-06-20) ──────────────────────────
+    // `extract_*_poly_atoms` silently drops connectives it does not model
+    // (top-level Or/Not/…) and atoms whose operand fails to translate. A `Sat`
+    // over the RETAINED subset is then NOT a model of the original formula. The
+    // gate must turn such a `Sat` into `None` (Unknown), never `Some(Sat)`.
+
+    #[test]
+    fn dropped_disjunct_does_not_yield_a_trusted_sat() {
+        // (and (= (* x x) 4) (or (< 1 0) (< 2 0)))  — the `or` is FALSE, so the
+        // whole conjunction is UNSAT. `extract` keeps only `x*x = 4` (sat at
+        // x=2) and DROPS the `or`. Pre-fix this returned Some(Sat) — a spurious
+        // sat ignoring the false disjunction. The gate now returns None.
+        let mut m = TermManager::new();
+        let int_sort = m.sorts.int_sort;
+        let x = m.mk_var("x", int_sort);
+        let sq = m.mk_mul(vec![x, x]);
+        let four = m.mk_int(4);
+        let eq = m.mk_eq(sq, four);
+        let one = m.mk_int(1);
+        let two = m.mk_int(2);
+        let zero = m.mk_int(0);
+        let lt1 = m.mk_lt(one, zero); // 1 < 0  (false)
+        let lt2 = m.mk_lt(two, zero); // 2 < 0  (false)
+        let or = m.mk_or(vec![lt1, lt2]);
+        let conj = m.mk_and(vec![eq, or]);
+        let result = dispatch_nia_constraints(&[conj], &m, true);
+        assert!(
+            !matches!(result, Some(NlDispatchResult::Sat)),
+            "a Sat over the retained atoms while a disjunct was dropped is a \
+             spurious sat — must be None/Unsat, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn fully_captured_conjunction_still_reports_sat() {
+        // Positive control: nothing dropped, so a genuine model IS trustworthy.
+        // (and (= (* x x) 4) (> x 0))  — sat at x=2; the gate must not over-block.
+        let mut m = TermManager::new();
+        let int_sort = m.sorts.int_sort;
+        let x = m.mk_var("x", int_sort);
+        let sq = m.mk_mul(vec![x, x]);
+        let four = m.mk_int(4);
+        let eq = m.mk_eq(sq, four);
+        let zero = m.mk_int(0);
+        let gt = m.mk_gt(x, zero);
+        let conj = m.mk_and(vec![eq, gt]);
+        let result = dispatch_nia_constraints(&[conj], &m, true);
+        // Either a trusted Sat or (if the NIA solver is itself inconclusive) None
+        // — but NEVER a spurious Unsat, and the gate must not suppress a real Sat.
+        assert!(
+            !matches!(result, Some(NlDispatchResult::Unsat)),
+            "x*x=4 ∧ x>0 is sat (x=2) — must not be reported unsat, got {:?}",
             result
         );
     }
