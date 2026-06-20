@@ -474,6 +474,28 @@ impl<'a> Parser<'a> {
                 // as `(- lhs rhs)`, an UNSOUND mis-translation.)
                 self.manager.mk_mod(lhs, rhs)
             }
+            "/" => {
+                let lhs = self.parse_term()?;
+                let rhs = self.parse_term()?;
+                self.expect_rparen()?;
+                // SMT-LIB real division — `TermKind::Div` (rewrite_div folds
+                // rational constants). Previously fell through to an uninterpreted
+                // `mk_apply` with a wrong `bool_sort`; routing it to `Div` keeps it
+                // sound (undecided div is over-approximated, never wrong-verdict —
+                // see `Context::check_sat`'s div/mod Sat→Unknown downgrade).
+                self.manager.mk_div(lhs, rhs)
+            }
+            // NOTE — `abs`, `to_real`, `to_int`, `is_int`, `(_ divisible n)` are
+            // NOT yet parsed here; they fall through to the uninterpreted `_` arm
+            // below. `abs` desugars exactly to `(ite (>= x 0) x (- x))`, but the
+            // ground ite/arith condition is not decided during solving (the same
+            // gap that makes constant `div`/`mod` undecided), so that path would
+            // still admit a spurious `sat` on a forced-unsat case — i.e. it needs
+            // the same Sat→Unknown trustworthiness downgrade as div/mod before it
+            // can be added soundly. Left as a noted follow-up rather than shipped
+            // as a "fix" that is still unsound. (`(/ a b)` above is sound: it
+            // routes to `TermKind::Div`, which `Context::check_sat`'s div/mod
+            // downgrade already covers.)
             "<" => {
                 let lhs = self.parse_term()?;
                 let rhs = self.parse_term()?;
