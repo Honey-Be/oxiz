@@ -820,6 +820,17 @@ impl Context {
                 config.ccfv_ematch = value == "true";
                 self.solver.set_config(config);
             }
+            // CCFV (Phase P4): opt-in model-completion verdict-flip — CCFV `¬ψ`
+            // over the total view `E_TOT` lets a trigger-free universal the
+            // structural recognizers miss contribute a `Sat`. OFF by default and
+            // SOUNDNESS-CRITICAL (a missed conflict is a spurious `sat`); this
+            // switch arms it for the corpus 0-spurious gate that precedes any
+            // default flip. See `CCFV_UNIFIED_INSTANTIATION.md` §P4/§6.
+            "oxiz.ccfv-model-compl" => {
+                let mut config = self.solver.config().clone();
+                config.ccfv_model_compl = value == "true";
+                self.solver.set_config(config);
+            }
             _ => {}
         }
     }

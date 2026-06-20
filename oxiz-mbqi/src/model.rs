@@ -11,6 +11,7 @@
 //! `view`/`children` to fold connectives), and references the host's term type
 //! through the lifetime-free signature as `<L::Sig as Sig>::Term`.
 
+use crate::congruence::Congruence;
 use crate::term::{Sig, TermLang};
 
 pub trait ModelEval<L: TermLang> {
@@ -34,6 +35,43 @@ pub trait ModelEval<L: TermLang> {
     /// Default `None` (engine then reports the quantifier unverified →
     /// `Unknown`, never a guess).
     fn eval_forall(&self, _lang: &L, _quant: <L::Sig as Sig>::Term) -> Option<bool> {
+        None
+    }
+
+    /// **M3+ / P4 model-completion verdict-flip (design §3 `Mode::ModelCompl`).**
+    /// The fallback the engine consults (only when [`crate::engine::Config::ccfv_model_compl`]
+    /// is set) for a trigger-free universal that [`eval_forall`](Self::eval_forall)
+    /// left unverified (`None`). The host lowers `¬ψ` to a (dis)equality DNF
+    /// [`Constraint`](crate::ccfv::Constraint) and runs the brute-force CCFV
+    /// [`solve`](crate::ccfv::solve) against the **total view** `E_TOT` it builds
+    /// from `cong` (a [`TotalView`](crate::congruence::TotalView), whose
+    /// `disequal = !equal` makes "distinct class reps are distinct" a genuine
+    /// `≄`): if the conflict set is EMPTY, the completed model satisfies `∀x̄.ψ`,
+    /// so the host returns `Some(true)` (a `Sat` contribution).
+    ///
+    /// SOUNDNESS (why this is gated, not on by default): a `Some(true)` here is a
+    /// model witness, so it is only sound when (i) the conflict search is
+    /// COMPLETE (a missed `σ` is a spurious `sat`, the cardinal sin), (ii) the
+    /// host's accounting gate has confirmed `E_TOT` is a conservative extension of
+    /// `E` (the completion defaults contradict no asserted ground fact, design
+    /// §6), and (iii) the witness domain is inhabited. The contract is strictly
+    /// one-sided: any conflict found, undecidable lowering, or unmet gate ⇒
+    /// `None` (the engine then yields the sound `Unknown`) — this method NEVER
+    /// returns `Some(false)`, because "found a conflict over the *sampled* domain"
+    /// is not "the axiom is violated in every model" (a different completion might
+    /// satisfy it). Default `None` (no host completion).
+    ///
+    /// `cong` is the SAME congruence oracle the engine solves with this round
+    /// (e.g. the host's live EUF view), carrying the by-sort witness index
+    /// ([`Congruence::class_reps_of_sort`]) the brute-force enumeration ranges
+    /// over. Generic over `C` (never used as a trait object), so the method stays
+    /// zero-cost when the flag is clear.
+    fn model_completion<C: Congruence<L::Sig>>(
+        &self,
+        _lang: &L,
+        _cong: &C,
+        _quant: <L::Sig as Sig>::Term,
+    ) -> Option<bool> {
         None
     }
 

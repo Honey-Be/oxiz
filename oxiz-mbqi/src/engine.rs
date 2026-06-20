@@ -58,6 +58,19 @@ pub struct Config {
     /// `oxiz-mbqi` unit tests exercise the syntactic-equivalent path); the live
     /// solver sets it from `SolverConfig::ccfv_ematch`, which defaults `true`.
     pub ccfv_ematch: bool,
+    /// **CCFV model-completion verdict-flip (P4, design §3 `Mode::ModelCompl`).**
+    /// When set, a trigger-free universal that the host's structural recognizers
+    /// (`eval_forall`) leave unverified is given one more chance: the host runs
+    /// CCFV `¬ψ` against the **total view** `E_TOT` ([`crate::congruence::TotalView`])
+    /// via [`ModelEval::model_completion`]; *no* conflict ⇒ the completed model
+    /// satisfies `∀x̄.ψ` ⇒ `Some(true)` (a `Sat` contribution). This is the
+    /// completeness half of CCFV — but it is **SOUNDNESS-CRITICAL**: a missed
+    /// conflict is a spurious `sat`, so it stays **default `false`** until the
+    /// disequality search is complete + verus-pre-verified + corpus-0-spurious
+    /// gated (design §6). With the flag clear the backstop is never consulted, so
+    /// the path is byte-identical. Set by the live solver from
+    /// `SolverConfig::ccfv_model_compl`.
+    pub ccfv_model_compl: bool,
 }
 
 impl Default for Config {
@@ -66,6 +79,7 @@ impl Default for Config {
             max_instances: 100_000,
             max_tuples_per_quant: 4_096,
             ccfv_ematch: false,
+            ccfv_model_compl: false,
         }
     }
 }
@@ -254,6 +268,21 @@ impl<S: Sig> Engine<S> {
                 continue;
             }
 
+            // 2.6. Model-completion short-circuit (P4, `Mode::ModelCompl`). When
+            //    the verdict-flip is enabled, give an unverified trigger-free
+            //    universal a CCFV `¬ψ` conflict search over the total view
+            //    `E_TOT` BEFORE enumerating it: no conflict ⇒ the completed model
+            //    satisfies it ⇒ skip (the same divergence-defusing role as the
+            //    `eval_forall` short-circuit above, for the cases the structural
+            //    recognizers miss). Gated (default off) so the path is unchanged
+            //    unless the flip is on; `Some(true)` only — any conflict /
+            //    undecidable lowering ⇒ fall through to sound enumeration.
+            if self.cfg.ccfv_model_compl
+                && model.model_completion(lang, cong, self.quants[qi].term) == Some(true)
+            {
+                continue;
+            }
+
             // 3. Enumeration — trigger-free, REAL ground index only (no
             //    fabricated witness ⇒ D bug impossible). Completeness over the
             //    ground universe; the model-based check below decides Sat vs
@@ -314,7 +343,23 @@ impl<S: Sig> Engine<S> {
             }
             match model.eval_forall(lang, q.term) {
                 Some(true) => {}
-                Some(false) | None => return Verdict::Inconclusive,
+                Some(false) => return Verdict::Inconclusive,
+                None => {
+                    // P4 model-completion backstop: the structural recognizers
+                    // could not verify this saturated universal — give CCFV `¬ψ`
+                    // over the total view `E_TOT` the final word. No conflict ⇒
+                    // the completed model satisfies it (`Some(true)`) → this
+                    // quantifier is satisfied. Any conflict / undecidable
+                    // lowering / unmet gate ⇒ `None` here too → the sound
+                    // `Unknown`. Gated (default off): with the flip disabled this
+                    // is exactly the old `None ⇒ Inconclusive`.
+                    if self.cfg.ccfv_model_compl
+                        && model.model_completion(lang, cong, q.term) == Some(true)
+                    {
+                        continue;
+                    }
+                    return Verdict::Inconclusive;
+                }
             }
         }
         Verdict::Saturated

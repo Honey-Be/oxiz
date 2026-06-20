@@ -607,6 +607,8 @@ impl Solver {
                             let mut eng = CleanEngine::new(CleanConfig {
                                 // CCFV (P2): opt-in congruence-aware e-matching.
                                 ccfv_ematch: self.config.ccfv_ematch,
+                                // CCFV (P4): opt-in model-completion verdict-flip.
+                                ccfv_model_compl: self.config.ccfv_model_compl,
                                 ..CleanConfig::default()
                             });
                             {
@@ -636,7 +638,22 @@ impl Solver {
                             // `restore_theory_manager` above) when `ccfv_ematch` is
                             // on. With the flag off the engine ignores the oracle, so
                             // the default path is byte-identical to `round_with`.
-                            let cong = EufCongruence::new(&self.euf);
+                            //
+                            // CCFV (P4): when the model-completion flip is armed the
+                            // oracle ALSO carries the by-sort ground-term index the
+                            // brute-force conflict search enumerates witnesses over
+                            // (`build_ground_by_sort`, computed once per round). The
+                            // index is empty on the default (flip-off) path, so the
+                            // matching/CDQI queries pay nothing.
+                            let cong = if self.config.ccfv_model_compl {
+                                let gbs = crate::clean_mbqi::build_ground_by_sort(
+                                    &self.euf,
+                                    host.tm_ref(),
+                                );
+                                EufCongruence::with_ground_index(&self.euf, gbs)
+                            } else {
+                                EufCongruence::new(&self.euf)
+                            };
                             eng.round_with_cong(&mut host, &model, &cong)
                         };
                         match verdict {

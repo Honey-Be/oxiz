@@ -30,8 +30,11 @@
 
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
-use oxiz_core::sort::SortId;
-use oxiz_mbqi::{Binding, Congruence, FuncApp, ModelEval, Sig, TermLang, TermView};
+use oxiz_core::sort::{SortId, SortKind};
+use oxiz_mbqi::{
+    solve, Binding, Congruence, Constraint, FuncApp, Lit, ModelEval, Sig, TermLang, TermView,
+    TotalView,
+};
 use oxiz_theories::euf::EufSolver;
 use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -92,13 +95,49 @@ impl Sig for OxizSig {
 /// CCFV core in Phase P1+ will be the sole caller), so it changes no behaviour.
 pub struct EufCongruence<'a> {
     euf: &'a EufSolver,
+    /// Ground terms of `E` bucketed by sort — the witness domain the CCFV
+    /// model-completion brute-force enumerates the bound-var holes over
+    /// ([`Congruence::class_reps_of_sort`]). Empty on the default [`new`](Self::new)
+    /// path (e-matching / CDQI never query it), populated only by
+    /// [`with_ground_index`](Self::with_ground_index) when the P4 verdict-flip is
+    /// armed — so the common path pays nothing.
+    ground_by_sort: FxHashMap<SortId, Vec<TermId>>,
 }
 
 impl<'a> EufCongruence<'a> {
-    /// Wrap an immutable borrow of the EUF solver as a congruence oracle.
+    /// Wrap an immutable borrow of the EUF solver as a congruence oracle (no
+    /// by-sort witness index — the matching/CDQI path never needs it).
     pub fn new(euf: &'a EufSolver) -> Self {
-        EufCongruence { euf }
+        EufCongruence { euf, ground_by_sort: FxHashMap::default() }
     }
+
+    /// As [`new`](Self::new), plus the by-sort ground-term index the P4
+    /// model-completion ([`SolverModel::model_completion`]) enumerates witnesses
+    /// over. Built once per round (only when `ccfv_model_compl` is on) by
+    /// [`build_ground_by_sort`].
+    pub fn with_ground_index(
+        euf: &'a EufSolver,
+        ground_by_sort: FxHashMap<SortId, Vec<TermId>>,
+    ) -> Self {
+        EufCongruence { euf, ground_by_sort }
+    }
+}
+
+/// Bucket every ground term interned in `euf` by its sort — the witness domain
+/// for the P4 model-completion enumeration. Read straight off the EUF's interned
+/// set (exactly `T(E)`), sorts resolved through the manager. Only called when the
+/// verdict-flip is armed.
+pub fn build_ground_by_sort(
+    euf: &EufSolver,
+    m: &TermManager,
+) -> FxHashMap<SortId, Vec<TermId>> {
+    let mut out: FxHashMap<SortId, Vec<TermId>> = FxHashMap::default();
+    for t in euf.interned_term_ids() {
+        if let Some(term) = m.get(t) {
+            out.entry(term.sort).or_default().push(t);
+        }
+    }
+    out
 }
 
 impl Congruence<OxizSig> for EufCongruence<'_> {
@@ -169,6 +208,30 @@ impl Congruence<OxizSig> for EufCongruence<'_> {
             _ => false,
         }
     }
+
+    fn ground_of_sort(&self, s: SortId) -> Vec<TermId> {
+        self.ground_by_sort.get(&s).cloned().unwrap_or_default()
+    }
+
+    fn class_reps_of_sort(&self, s: SortId) -> Vec<TermId> {
+        // One representative ground term per congruence class of sort `s` — the
+        // disjoint witness set the model-completion enumeration ranges over.
+        // Dedup `ground_of_sort` by class representative (`rep`); on a total view
+        // these are pairwise distinct, which is what makes `!equal` over them a
+        // genuine `≄`.
+        let Some(terms) = self.ground_by_sort.get(&s) else {
+            return Vec::new();
+        };
+        let mut seen: FxHashSet<TermId> = FxHashSet::default();
+        let mut reps = Vec::new();
+        for &t in terms {
+            let r = self.rep(t);
+            if seen.insert(r) {
+                reps.push(r);
+            }
+        }
+        reps
+    }
 }
 
 /// A short-lived wrapper around the persistent `TermManager`, created per
@@ -194,6 +257,14 @@ impl<'a> OxizHost<'a> {
     }
     #[inline]
     fn m(&self) -> &TermManager {
+        &*self.tm
+    }
+
+    /// Shared reborrow of the wrapped term manager — for callers (e.g. the P4
+    /// model-completion's [`build_ground_by_sort`]) that need read-only manager
+    /// access while the host holds the `&mut` borrow.
+    #[inline]
+    pub fn tm_ref(&self) -> &TermManager {
         &*self.tm
     }
 }
@@ -969,6 +1040,17 @@ struct CompletionFacts {
     /// uninterpreted symbol (the single-function range-completion gate requires
     /// exactly one). Keyed on the `view`-style `u64` symbol (`spur_sym`).
     quant_count: FxHashMap<u64, u32>,
+    /// Occurrences of each uninterpreted symbol that lie **inside some quantifier
+    /// body** (anywhere in the formula, including nested quantifiers under
+    /// `=>`/`and`/`ite`). The P4 model-completion gate ([`body_symbols_accounted`])
+    /// uses it to confirm that EVERY quantifier-scoped occurrence of a completion
+    /// target is in the body being verified — so no OTHER (possibly nested)
+    /// quantifier constrains it. The complement (occurrences NOT under any
+    /// quantifier) are ground, interned in `E`, and read at their real value by
+    /// the conflict search, so they need no separate accounting (unlike the
+    /// arith range-completion's literal-`ground_apps` count, which a declared
+    /// constant — modelled as a `Var` — would silently escape).
+    under_quant_occ: FxHashMap<u64, u32>,
     /// Every GROUND application (no variable anywhere in its subtree) of each
     /// uninterpreted function, keyed on the `view`-style `u64` symbol. These are
     /// the points a constant range-completion of `f` must NOT violate. Unlike
@@ -1058,6 +1140,11 @@ impl CompletionFacts {
                     *f.quant_count.entry(s).or_insert(0) += 1;
                 }
             }
+            // Tally quantifier-SCOPED symbol occurrences (handles nested
+            // quantifiers under `=>`/`and`/`ite`, which the top-level
+            // `quant_count` classification above misses) — the P4 flip's
+            // conservative-extension gate.
+            count_syms_under_quant(m, a, false, &mut f.under_quant_occ);
         }
 
         // Pass 3: collect every GROUND function application across ALL
@@ -1186,6 +1273,31 @@ fn count_syms(m: &TermManager, t: TermId, out: &mut FxHashMap<u64, u32>) {
     }
     for c in subterms(m, t) {
         count_syms(m, c, out);
+    }
+}
+
+/// Count occurrences of each uninterpreted `Apply` head that lie INSIDE a
+/// quantifier body — `inside` flips `true` on descent through any `Forall`/`Exists`
+/// and stays set for the whole sub-tree, so nested quantifiers (under
+/// `=>`/`and`/`ite`) are covered. The P4 flip's accounting gate compares this
+/// against the body it is verifying; a target symbol whose quantifier-scoped
+/// occurrences are exactly this body's is constrained by no other quantifier.
+fn count_syms_under_quant(
+    m: &TermManager,
+    t: TermId,
+    inside: bool,
+    out: &mut FxHashMap<u64, u32>,
+) {
+    let Some(term) = m.get(t) else { return };
+    if inside {
+        if let TermKind::Apply { func, .. } = &term.kind {
+            *out.entry(spur_sym(*func)).or_insert(0) += 1;
+        }
+    }
+    let now_inside = inside
+        || matches!(&term.kind, TermKind::Forall { .. } | TermKind::Exists { .. });
+    for c in subterms(m, t) {
+        count_syms_under_quant(m, c, now_inside, out);
     }
 }
 
@@ -3525,6 +3637,335 @@ fn walk_polarity(m: &TermManager, t: TermId, pos: bool, f: &mut CompletionFacts)
     }
 }
 
+/// The per-cube enumeration ceiling for the P4 model-completion [`solve`]. Also
+/// the cap [`SolverModel::model_completion`] pre-checks the witness-domain product
+/// against, so the brute-force search never truncates (a truncated search could
+/// miss a conflict → an unsound empty result). Generous enough for the
+/// realistic single/few-hole EUF fragment the flip targets; a larger product
+/// declines to the sound `Unknown`.
+const MAX_COMPL_TUPLES: usize = 4_096;
+
+/// Lower `¬body` into a (dis)equality DNF [`Constraint`] for the CCFV
+/// model-completion conflict search — the host half of the design's `Mode::ModelCompl`
+/// (`¬ψ`) lowering. Returns `None` the instant it meets an atom it cannot reduce
+/// to an equality/disequality literal SOUNDLY (any arithmetic / BV / array / ite
+/// / nested-quantifier atom), so the caller declines the whole flip rather than
+/// certify "no conflict" over a fragment it cannot see. The cube count is bounded
+/// (DNF of `∧`-over-`∨` can blow up); overflow ⇒ `None`.
+///
+/// The lowering is the standard NNF-of-`¬ψ` then distribute: `¬(a∧b)=¬a∨¬b`,
+/// `¬(a∨b)=¬a∧¬b`, `¬(a⇒b)=a∧¬b`, a Bool-sorted `=` is the iff `(a∧b)∨(¬a∧¬b)`
+/// (its negation the XOR `(a∧¬b)∨(¬a∧b)`), and an `=`/`distinct` over an
+/// **uninterpreted** sort becomes `Eq`/`Diseq` literal(s). Everything else —
+/// arithmetic atoms, bare Bool predicates, BV/array/datatype equalities, `ite`,
+/// nested quantifiers — declines (`None`), since the congruence is not
+/// authoritative over it and a missed conflict would be a spurious `sat`.
+fn negate_body_to_dnf(
+    lang: &OxizHost<'_>,
+    body: TermId,
+    true_id: TermId,
+    false_id: TermId,
+) -> Option<Constraint<OxizSig>> {
+    let cubes = lower_dnf(lang, body, true, true_id, false_id, 0)?;
+    Some(Constraint { cubes })
+}
+
+/// DNF cubes of `t` (when `negate` is false) or of `¬t` (when true). `Some(vec![])`
+/// is the constant `false` (no cube can be satisfied); `Some(vec![vec![]])` is the
+/// constant `true` (the empty cube is vacuously entailed). `None` ⇒ an
+/// un-lowerable atom (decline). `depth` bounds the recursion + cube blow-up.
+fn lower_dnf(
+    lang: &OxizHost<'_>,
+    t: TermId,
+    negate: bool,
+    true_id: TermId,
+    false_id: TermId,
+    depth: u32,
+) -> Option<Vec<Vec<Lit<OxizSig>>>> {
+    if depth > 64 {
+        return None; // too deep ⇒ decline (sound)
+    }
+    // Boolean literals first (the view maps True/False to `Opaque`, so test ids).
+    if t == true_id {
+        return Some(if negate { vec![] } else { vec![vec![]] });
+    }
+    if t == false_id {
+        return Some(if negate { vec![vec![]] } else { vec![] });
+    }
+    match lang.view(t) {
+        TermView::App { sym } if sym == OP_NOT => {
+            let inner = *lang.children(t).first()?;
+            lower_dnf(lang, inner, !negate, true_id, false_id, depth + 1)
+        }
+        TermView::App { sym } if sym == OP_AND || sym == OP_OR => {
+            // `∧` un-negated and `∨` negated both DISTRIBUTE (cross-product); the
+            // other two UNION. (De Morgan flips which is which under `negate`.)
+            let cross = (sym == OP_AND) ^ negate;
+            let kids = lang.children(t);
+            if cross {
+                let mut acc: Vec<Vec<Lit<OxizSig>>> = vec![vec![]]; // identity = true
+                for k in kids {
+                    let sub = lower_dnf(lang, k, negate, true_id, false_id, depth + 1)?;
+                    acc = cross_product(acc, sub);
+                    if acc.is_empty() {
+                        break; // any false factor ⇒ whole conjunction false
+                    }
+                    if acc.len() > MAX_COMPL_TUPLES {
+                        return None; // DNF blow-up ⇒ decline
+                    }
+                }
+                Some(acc)
+            } else {
+                let mut acc: Vec<Vec<Lit<OxizSig>>> = Vec::new();
+                for k in kids {
+                    let mut sub = lower_dnf(lang, k, negate, true_id, false_id, depth + 1)?;
+                    acc.append(&mut sub);
+                    if acc.len() > MAX_COMPL_TUPLES {
+                        return None;
+                    }
+                }
+                Some(acc)
+            }
+        }
+        TermView::App { sym } if sym == OP_IMPLIES => {
+            // `a ⇒ b ≡ ¬a ∨ b`; un-negated unions, negated (`a ∧ ¬b`) crosses.
+            let kids = lang.children(t);
+            let (a, b) = (*kids.first()?, *kids.get(1)?);
+            if negate {
+                let la = lower_dnf(lang, a, false, true_id, false_id, depth + 1)?;
+                let lb = lower_dnf(lang, b, true, true_id, false_id, depth + 1)?;
+                let acc = cross_product(la, lb);
+                if acc.len() > MAX_COMPL_TUPLES {
+                    return None;
+                }
+                Some(acc)
+            } else {
+                let mut la = lower_dnf(lang, a, true, true_id, false_id, depth + 1)?;
+                let mut lb = lower_dnf(lang, b, false, true_id, false_id, depth + 1)?;
+                la.append(&mut lb);
+                Some(la)
+            }
+        }
+        TermView::App { sym } if sym == OP_EQ => {
+            let kids = lang.children(t);
+            let (u, v) = (*kids.first()?, *kids.get(1)?);
+            // A Bool-sorted `=` is an iff — expand to its (dis)equality DNF so the
+            // boolean sub-structure is lowered, never treated as an EUF atom (the
+            // rc.39.2 `rewrite_bool_iff` discipline). Otherwise it is an EUF /
+            // theory equality literal.
+            let bool_sort = lang.sort_of(true_id);
+            if lang.sort_of(u) == bool_sort {
+                // A Bool `=` is an iff. `(= a b)` ≡ `(a∧b) ∨ (¬a∧¬b)`; its negation
+                // is the XOR `(a∧¬b) ∨ (¬a∧b)`. The per-operand polarities are NOT
+                // a uniform `^negate` (that would re-derive the iff, not its
+                // negation) — each disjunct flips exactly one side. The flags below
+                // are the `negate` argument handed to each operand's lowering.
+                let ((u1, v1), (u2, v2)) = if negate {
+                    ((false, true), (true, false)) // (a ∧ ¬b) ∨ (¬a ∧ b)
+                } else {
+                    ((false, false), (true, true)) // (a ∧ b)  ∨ (¬a ∧ ¬b)
+                };
+                let d1 = cross_product(
+                    lower_dnf(lang, u, u1, true_id, false_id, depth + 1)?,
+                    lower_dnf(lang, v, v1, true_id, false_id, depth + 1)?,
+                );
+                let d2 = cross_product(
+                    lower_dnf(lang, u, u2, true_id, false_id, depth + 1)?,
+                    lower_dnf(lang, v, v2, true_id, false_id, depth + 1)?,
+                );
+                let mut acc = d1;
+                acc.extend(d2);
+                if acc.len() > MAX_COMPL_TUPLES {
+                    return None;
+                }
+                Some(acc)
+            } else if !euf_authoritative_sort(lang, u) {
+                // A non-Bool, non-uninterpreted equality (Int/Real/BV/FP/String/
+                // Array/datatype): the bare congruence is NOT authoritative over
+                // it — a theory (arith, BV, …) could force a merge the conflict
+                // search would not see, risking a missed conflict (spurious
+                // `sat`). Restrict the flip to the fragment the EUF congruence
+                // decides on its own; decline the rest to the sound `Unknown`.
+                None
+            } else if negate {
+                Some(vec![vec![Lit::Diseq(u, v)]])
+            } else {
+                Some(vec![vec![Lit::Eq(u, v)]])
+            }
+        }
+        TermView::App { sym } if sym == OP_DISTINCT => {
+            // `(distinct t̄)` = pairwise `≠`: un-negated ⇒ one cube of all
+            // `Diseq`; negated ⇒ `⋁` of singleton `Eq` cubes.
+            let kids = lang.children(t);
+            if negate {
+                let mut acc = Vec::new();
+                for i in 0..kids.len() {
+                    for j in (i + 1)..kids.len() {
+                        acc.push(vec![Lit::Eq(kids[i], kids[j])]);
+                    }
+                }
+                Some(acc)
+            } else {
+                let mut cube = Vec::new();
+                for i in 0..kids.len() {
+                    for j in (i + 1)..kids.len() {
+                        cube.push(Lit::Diseq(kids[i], kids[j]));
+                    }
+                }
+                Some(vec![cube])
+            }
+        }
+        // A bare uninterpreted predicate application `P(t̄)` (Bool-sorted) is NOT
+        // lowered. `Bool` is a 2-valued INTERPRETED sort, so the total view's
+        // "distinct classes are distinct" — sound for an (infinite) uninterpreted
+        // sort, where a fresh element always exists — is UNSOUND here: a `P(c)`
+        // unmerged with both `true` and `false` is not a legal third Bool value,
+        // and reading `Eq(P(c), false)` as decidably-false would let
+        // `∀x.(P x ∧ ¬(P x))` (unsat) escape as `sat`. The flip is restricted to
+        // the uninterpreted-sort (dis)equality fragment the congruence decides
+        // soundly; a predicate body declines to the sound `Unknown` (the
+        // pure-polarity recognizer already covers the satisfiable predicate
+        // shapes anyway).
+        //
+        // Any other atom (arith cmp/op, ite, xor, array op, nested quantifier,
+        // opaque non-bool leaf) is likewise not soundly reducible to
+        // (dis)equality here ⇒ decline the whole flip.
+        _ => None,
+    }
+}
+
+/// Whether the bare EUF congruence is **authoritative** over equalities at `t`'s
+/// sort — i.e. it decides `≃`/`≄` there on its own, with no theory able to force
+/// a merge the conflict search would miss. True only for **uninterpreted**
+/// (declared) sorts; an interpreted sort (`Int`/`Real`/`BitVec`/`FloatingPoint`/
+/// `String`/`Array`/datatype) carries a theory whose propagated equalities the
+/// completion's free-distinct assumption could contradict (e.g. arith forcing
+/// `f(c)=5`), so the P4 flip restricts itself to the uninterpreted fragment.
+fn euf_authoritative_sort(lang: &OxizHost<'_>, t: TermId) -> bool {
+    let s = lang.sort_of(t);
+    matches!(
+        lang.m().sorts.get(s).map(|so| &so.kind),
+        Some(SortKind::Uninterpreted(_))
+    )
+}
+
+/// DNF cross-product: cubes of `a ∧ b` from cubes of `a` and cubes of `b` (each
+/// `ca ∈ a` paired with each `cb ∈ b`, literals concatenated). Empty when either
+/// side is empty (a false conjunct).
+fn cross_product(
+    a: Vec<Vec<Lit<OxizSig>>>,
+    b: Vec<Vec<Lit<OxizSig>>>,
+) -> Vec<Vec<Lit<OxizSig>>> {
+    let mut out = Vec::with_capacity(a.len().saturating_mul(b.len()));
+    for ca in &a {
+        for cb in &b {
+            let mut cube = Vec::with_capacity(ca.len() + cb.len());
+            cube.extend(ca.iter().map(clone_lit));
+            cube.extend(cb.iter().map(clone_lit));
+            out.push(cube);
+        }
+    }
+    out
+}
+
+/// `Lit` is not `Clone` (its `Sig` term type need not be), so clone explicitly.
+fn clone_lit(l: &Lit<OxizSig>) -> Lit<OxizSig> {
+    match l {
+        Lit::Eq(a, b) => Lit::Eq(*a, *b),
+        Lit::Diseq(a, b) => Lit::Diseq(*a, *b),
+    }
+}
+
+/// §6 conservative-extension accounting gate for the P4 flip: every **completion
+/// target** — an uninterpreted symbol the bound variables feed into (an `Apply`
+/// whose arguments mention a hole, i.e. the symbol whose interpretation the
+/// completion actually defines) — must be constrained ONLY by this single
+/// quantifier plus its (interned) ground applications. If so, the free completion
+/// the conflict search commits to — keeping every under-specified application
+/// free/distinct — contradicts no asserted ground fact (those live interned in
+/// `E`, which `solve` reads through `cong.equal`), so "no conflict ⇒ Sat" is
+/// sound. The exact equation mirrors [`SolverModel::try_function_completion`]'s
+/// symbolic-point guard: `global_occ[s] == body_occ[s] + |ground_apps[s]|`, plus
+/// `quant_count[s] == 1`. Any shortfall ⇒ an unaccounted occurrence ⇒ decline.
+///
+/// Ground constants (and symbols applied only to ground args) are NOT targets —
+/// they are fixed by `E`, interned, and read at their real value by `solve`; only
+/// the genuinely under-specified, bound-var-fed applications need the gate.
+fn body_symbols_accounted(
+    lang: &OxizHost<'_>,
+    body: TermId,
+    holes: &[Spur],
+    facts: &CompletionFacts,
+) -> bool {
+    let mut targets: FxHashSet<u64> = FxHashSet::default();
+    collect_completion_targets(lang, body, holes, &mut targets, 256);
+    if targets.is_empty() {
+        // No bound-var-fed application — the body constrains no completable
+        // symbol (e.g. a pure equality between the bound var and a ground term);
+        // the search is over `E` as-is, nothing to account for conservatively.
+        return true;
+    }
+    let mut body_occ: FxHashMap<u64, u32> = FxHashMap::default();
+    count_syms(lang.m(), body, &mut body_occ);
+    for s in &targets {
+        // EVERY quantifier-scoped occurrence of this target must be in the body
+        // being verified — i.e. no OTHER (possibly nested) quantifier constrains
+        // it. The complement (occurrences not under any quantifier) is ground,
+        // interned in `E`, and read at its true value by the conflict search, so
+        // it needs no separate accounting. A mismatch ⇒ an unaccounted
+        // quantifier occurrence ⇒ decline to the sound `Unknown`.
+        let bocc = body_occ.get(s).copied().unwrap_or(0);
+        let uqo = facts.under_quant_occ.get(s).copied().unwrap_or(0);
+        if uqo != bocc {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collect the func symbols of every `Apply` in `t` that has an argument
+/// mentioning a hole — the symbols whose value the completion must define (the
+/// gate targets). Depth-bounded.
+fn collect_completion_targets(
+    lang: &OxizHost<'_>,
+    t: TermId,
+    holes: &[Spur],
+    out: &mut FxHashSet<u64>,
+    depth: u32,
+) {
+    if depth == 0 {
+        return;
+    }
+    if let Some(term) = lang.m().get(t) {
+        if let TermKind::Apply { func, args } = &term.kind {
+            if args.iter().any(|&a| mentions_hole(lang, a, holes, 256)) {
+                out.insert(spur_sym(*func));
+            }
+        }
+    }
+    for c in lang.children(t) {
+        collect_completion_targets(lang, c, holes, out, depth - 1);
+    }
+}
+
+/// Whether `t` mentions any hole (bound-variable name). Depth-bounded;
+/// exhaustion returns `true` (conservative — never under-reports a hole, which
+/// would wrongly drop a symbol from the accounting gate).
+fn mentions_hole(lang: &OxizHost<'_>, t: TermId, holes: &[Spur], depth: u32) -> bool {
+    if depth == 0 {
+        return true;
+    }
+    match lang.view(t) {
+        TermView::Var { name } => holes.contains(&name),
+        TermView::App { .. } => lang
+            .children(t)
+            .iter()
+            .any(|&c| mentions_hole(lang, c, holes, depth - 1)),
+        TermView::Quant { body, .. } => mentions_hole(lang, body, holes, depth - 1),
+        TermView::Opaque => false,
+    }
+}
+
 impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
     fn eval_bool(&self, lang: &OxizHost<'a>, t: TermId) -> Option<bool> {
         // Direct true/false constant or assignment.
@@ -3737,6 +4178,90 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
             return Some(true);
         }
         None
+    }
+
+    /// **P4 model-completion verdict-flip (design §3 `Mode::ModelCompl`).** The
+    /// CCFV completeness backstop the engine consults — ONLY when
+    /// `Config::ccfv_model_compl` is set — for a trigger-free universal the
+    /// structural [`eval_forall`](Self::eval_forall) recognizers left unverified.
+    ///
+    /// Pipeline: lower `¬ψ` to a (dis)equality DNF [`Constraint`]
+    /// ([`negate_body_to_dnf`]); gate every uninterpreted body symbol through the
+    /// §6 conservative-extension **accounting** check ([`body_symbols_accounted`]);
+    /// then brute-force the CCFV [`solve`] over the **total view** `E_TOT` (a
+    /// [`TotalView`] of `cong`, whose `disequal = !equal` makes "distinct class
+    /// reps are distinct" a genuine `≄`). An EMPTY conflict set ⇒ the completed
+    /// model satisfies `∀x̄.ψ` ⇒ `Some(true)`.
+    ///
+    /// Strictly one-sided (never `Some(false)`): any conflict found, undecidable
+    /// lowering, unmet accounting gate, empty/over-budget witness domain ⇒ `None`
+    /// (the engine then yields the sound `Unknown`). The completion the search
+    /// implicitly commits to keeps every under-specified application free/distinct;
+    /// the accounting gate is what guarantees that free completion contradicts no
+    /// asserted ground fact (those are interned in `E`, so `solve` sees their real
+    /// value through `cong.equal`).
+    fn model_completion<C: Congruence<OxizSig>>(
+        &self,
+        lang: &OxizHost<'a>,
+        cong: &C,
+        quant: TermId,
+    ) -> Option<bool> {
+        // The completion FACTS gate the accounting check; absent ⇒ decline.
+        let facts = self.facts.as_ref()?;
+        let TermView::Quant { forall, vars, body } = lang.view(quant) else {
+            return None;
+        };
+        if !forall {
+            return None; // a `∀`-only flip (existentials are skolemized / bounded-disjoined)
+        }
+        let holes: Vec<(Spur, SortId)> = vars.to_vec();
+        if holes.is_empty() {
+            return None; // no bound vars ⇒ a ground formula, not our job
+        }
+
+        // (a) Lower `¬body` to a (dis)equality DNF. `None` ⇒ an undecidable atom
+        //     (arith / BV / ite / nested quantifier) we cannot certify "no
+        //     conflict" over ⇒ decline to the sound `Unknown`.
+        let constraint = negate_body_to_dnf(lang, body, self.true_id, self.false_id)?;
+
+        // (b) §6 accounting gate: every completion-target symbol (a function the
+        //     bound vars feed into) must be constrained ONLY by this quantifier +
+        //     its (interned) ground applications, so the free completion is a
+        //     conservative extension.
+        let hole_names: Vec<Spur> = holes.iter().map(|(n, _)| *n).collect();
+        if !body_symbols_accounted(lang, body, &hole_names, facts) {
+            return None;
+        }
+
+        // (c) The witness domain — one class rep per sort per hole. An EMPTY
+        //     domain for any hole would let the vacuous "no witness ⇒ no conflict"
+        //     read fabricate a `Sat` over a sort with no ground term (the
+        //     fresh-element gap, §6 / Phase 4); decline instead. Also bound the
+        //     enumeration so `solve`'s per-cube budget is never hit (a truncated
+        //     search could MISS a conflict ⇒ unsound empty).
+        let mut domain_product: usize = 1;
+        for (_, s) in &holes {
+            let reps = cong.class_reps_of_sort(*s).len();
+            if reps == 0 {
+                return None; // a sort with no ground witness — the fresh-element gap
+            }
+            domain_product = domain_product.saturating_mul(reps);
+        }
+        if domain_product > MAX_COMPL_TUPLES {
+            return None; // would truncate ⇒ cannot trust an empty result
+        }
+
+        // (d) Solve `¬body` over `E_TOT`. The `xi` defaults are not consulted by
+        //     the present (dis)equality search (it reads completion through
+        //     `disequal = !equal` + the accounting gate), so the closure defers to
+        //     the base — the wrapper's job here is purely the genuine-`≄` view.
+        let total = TotalView::new(cong, |_f: u64, _args: &[TermId]| None);
+        let conflicts = solve(&total, lang, &constraint, &holes, MAX_COMPL_TUPLES);
+        if conflicts.is_empty() {
+            Some(true)
+        } else {
+            None // a conflict survived ⇒ NOT certified (never `Some(false)`)
+        }
     }
 }
 

@@ -314,6 +314,16 @@ pub struct SolverConfig {
     /// only add sound instances. See `clean_mbqi.rs` and the design
     /// `external/oxiz/docs/design/CCFV_UNIFIED_INSTANTIATION.md` §P2.
     pub ccfv_ematch: bool,
+    /// **CCFV model-completion verdict-flip (P4, design §3 `Mode::ModelCompl`).**
+    /// When set, a trigger-free universal the structural recognizers leave
+    /// unverified is given a final CCFV `¬ψ` conflict search over the total view
+    /// `E_TOT`; *no* conflict ⇒ a `Sat` contribution (the completeness half of
+    /// CCFV). **OFF by default** and SOUNDNESS-CRITICAL: a missed conflict is a
+    /// spurious `sat` (the cardinal sin), so it stays gated until the disequality
+    /// search is complete, verus-pre-verified, and corpus-0-spurious-gated (design
+    /// §6). With the flag clear the backstop is never consulted, so the verdict
+    /// path is byte-identical. Toggled by `(set-option :oxiz.ccfv-model-compl true)`.
+    pub ccfv_model_compl: bool,
 }
 
 impl Default for SolverConfig {
@@ -349,6 +359,7 @@ impl SolverConfig {
             clean_mbqi: true,
             use_hooks_driver: true,
             ccfv_ematch: true,
+            ccfv_model_compl: false,
         }
     }
 
@@ -378,6 +389,7 @@ impl SolverConfig {
             clean_mbqi: true,
             use_hooks_driver: true,
             ccfv_ematch: true,
+            ccfv_model_compl: false,
         }
     }
 
@@ -407,6 +419,7 @@ impl SolverConfig {
             clean_mbqi: true,
             use_hooks_driver: true,
             ccfv_ematch: true,
+            ccfv_model_compl: false,
         }
     }
 
@@ -436,6 +449,7 @@ impl SolverConfig {
             clean_mbqi: true,
             use_hooks_driver: true,
             ccfv_ematch: true,
+            ccfv_model_compl: false,
         }
     }
 
