@@ -7,16 +7,22 @@
 //! e-matching + CDQI candidate selection; M3 adds model-based verification
 //! for trigger-free quantifiers; M4 ports into OxiZ.
 
+pub mod ccfv;
 pub mod cdqi;
+pub mod congruence;
 pub mod engine;
 pub mod ground;
 pub mod instantiate;
+pub mod ledger;
 pub mod model;
 pub mod term;
 pub mod toy;
 pub mod trigger;
 
+pub use ccfv::{match_trigger, Subst};
+pub use congruence::{Congruence, FuncApp};
 pub use engine::{Config, Engine, Verdict};
+pub use ledger::{CongruenceSink, GroundLedger, LedgerMark};
 pub use instantiate::Quant;
 pub use model::{ModelEval, NoModel};
 pub use term::{Binding, Sig, TermLang, TermView};

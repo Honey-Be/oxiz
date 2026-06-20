@@ -31,7 +31,8 @@
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_core::sort::SortId;
-use oxiz_mbqi::{Binding, ModelEval, Sig, TermLang, TermView};
+use oxiz_mbqi::{Binding, Congruence, FuncApp, ModelEval, Sig, TermLang, TermView};
+use oxiz_theories::euf::EufSolver;
 use num_traits::ToPrimitive;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -78,6 +79,85 @@ impl Sig for OxizSig {
     type Sort = SortId;
     type VarName = Spur;
     type Sym = u64;
+}
+
+/// A read-only [`Congruence`] oracle over the ground E-graph, backed by the
+/// EUF solver (design `CCFV_UNIFIED_INSTANTIATION.md` §5/§10, Phase **P0**).
+///
+/// Borrows an [`EufSolver`] and delegates every query to its already-maintained
+/// `E^cc` index — `find_immutable` / `are_equal_immutable` / `class_members` /
+/// `function_application_entries` — all immutable, so the oracle never perturbs
+/// the congruence. This is the one new capability CCFV needs behind the
+/// `Sig`/`TermLang` boundary; **nothing consumes it yet** (pure P0 addition — the
+/// CCFV core in Phase P1+ will be the sole caller), so it changes no behaviour.
+pub struct EufCongruence<'a> {
+    euf: &'a EufSolver,
+}
+
+impl<'a> EufCongruence<'a> {
+    /// Wrap an immutable borrow of the EUF solver as a congruence oracle.
+    pub fn new(euf: &'a EufSolver) -> Self {
+        EufCongruence { euf }
+    }
+}
+
+impl Congruence<OxizSig> for EufCongruence<'_> {
+    fn rep(&self, t: TermId) -> TermId {
+        match self.euf.term_to_node(t) {
+            Some(node) => {
+                let r = self.euf.find_immutable(node);
+                self.euf.node_term(r).unwrap_or(t)
+            }
+            None => t,
+        }
+    }
+
+    fn equal(&self, a: TermId, b: TermId) -> bool {
+        match (self.euf.term_to_node(a), self.euf.term_to_node(b)) {
+            (Some(na), Some(nb)) => self.euf.are_equal_immutable(na, nb),
+            // A term not yet interned is congruent only to itself.
+            _ => a == b,
+        }
+    }
+
+    fn class(&self, t: TermId) -> Vec<TermId> {
+        match self.euf.term_to_node(t) {
+            Some(node) => {
+                let r = self.euf.find_immutable(node);
+                self.euf
+                    .class_members(r)
+                    .into_iter()
+                    .filter_map(|idx| self.euf.node_term(idx))
+                    .collect()
+            }
+            None => vec![t],
+        }
+    }
+
+    fn apps_like(&self, app: TermId) -> Vec<FuncApp<OxizSig>> {
+        // Resolve the head function from the witness application's node, so we
+        // never need the host-symbol(u64) ↔ EUF-func-id(u32) bridge here.
+        let Some(node) = self.euf.term_to_node(app) else {
+            return Vec::new();
+        };
+        let Some(func) = self.euf.node_func(node) else {
+            return Vec::new();
+        };
+        self.euf
+            .function_application_entries(func)
+            .into_iter()
+            .filter_map(|e| {
+                // One representative term per argument class; skip an entry whose
+                // arg or result class carries no interned term (no term witness).
+                let mut arg_reps = Vec::with_capacity(e.arg_class_terms.len());
+                for class in e.arg_class_terms.iter() {
+                    arg_reps.push(*class.first()?);
+                }
+                let result = *e.result_class_terms.first()?;
+                Some(FuncApp { arg_reps, result })
+            })
+            .collect()
+    }
 }
 
 /// A short-lived wrapper around the persistent `TermManager`, created per
@@ -4021,5 +4101,61 @@ impl SolverModel {
             TermView::Quant { body, .. } => self.has_bound(lang, body, bound, depth - 1),
             TermView::Opaque => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod ccfv_congruence_tests {
+    //! P0 — delegation smoke for [`EufCongruence`] (the CCFV congruence oracle).
+    //! Builds the textbook congruence E-graph `f(a), f(b)` with `a = b` directly
+    //! over an [`EufSolver`] (TermIds are opaque ids; no `TermManager` needed) and
+    //! checks the oracle reads back the congruence the EUF maintains.
+    use super::{Congruence, EufCongruence};
+    use oxiz_core::ast::TermId;
+    use oxiz_theories::euf::EufSolver;
+
+    #[test]
+    fn euf_congruence_oracle_reads_back_congruence() {
+        let mut euf = EufSolver::new();
+        // a, b (leaves) and f(a), f(b) (apps of func id 0).
+        let (a_t, b_t, fa_t, fb_t) =
+            (TermId::new(1), TermId::new(2), TermId::new(3), TermId::new(4));
+        let a = euf.intern(a_t);
+        let b = euf.intern(b_t);
+        let _fa = euf.intern_app(fa_t, 0, [a]);
+        let _fb = euf.intern_app(fb_t, 0, [b]);
+
+        // Before merge: a ≠ b, f(a) ≠ f(b) (no congruence yet).
+        {
+            let cong = EufCongruence::new(&euf);
+            assert!(!cong.equal(a_t, b_t));
+            assert!(!cong.equal(fa_t, fb_t));
+        }
+
+        // Assert a = b; congruence closes f(a) = f(b).
+        euf.merge(a, b, TermId::new(0)).unwrap();
+
+        let cong = EufCongruence::new(&euf);
+        // direct equality + the congruence inference the syntactic matcher can't make
+        assert!(cong.equal(a_t, b_t), "a = b asserted");
+        assert!(cong.equal(fa_t, fb_t), "f(a) = f(b) by congruence");
+        // rep collapses the class; class enumerates both members
+        assert_eq!(cong.rep(a_t), cong.rep(b_t), "a, b share a representative");
+        let class_a = cong.class(a_t);
+        assert!(class_a.contains(&a_t) && class_a.contains(&b_t), "class(a) ⊇ {{a, b}}");
+        // E^cc index: the witness f(a) surfaces the f-applications
+        assert!(!cong.apps_like(fa_t).is_empty(), "apps_like(f(a)) finds f-applications");
+    }
+
+    #[test]
+    fn uninterned_term_is_congruent_only_to_itself() {
+        let euf = EufSolver::new();
+        let cong = EufCongruence::new(&euf);
+        let (x, y) = (TermId::new(7), TermId::new(8));
+        assert!(cong.equal(x, x));
+        assert!(!cong.equal(x, y));
+        assert_eq!(cong.rep(x), x);
+        assert_eq!(cong.class(x), vec![x]);
+        assert!(cong.apps_like(x).is_empty());
     }
 }

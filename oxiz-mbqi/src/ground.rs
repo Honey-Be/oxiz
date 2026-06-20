@@ -29,6 +29,12 @@ pub struct GroundIndex<S: Sig> {
     /// per-round matching from "all ground terms" into "the delta".
     idx: FxHashMap<S::Term, u32>,
     next_idx: u32,
+    /// Registration order: `order[i]` is the term registered with index `i`.
+    /// Lets [`rollback_to`](Self::rollback_to) identify exactly the terms added
+    /// since a frontier checkpoint. Additive — the live (monotone) engine never
+    /// rolls back; only a [`GroundLedger`](crate::ledger::GroundLedger) does, to
+    /// keep the index in lock-step with a scoped congruence store (design §10).
+    order: Vec<S::Term>,
 }
 
 impl<S: Sig> Default for GroundIndex<S> {
@@ -45,6 +51,7 @@ impl<S: Sig> GroundIndex<S> {
             by_head: FxHashMap::default(),
             idx: FxHashMap::default(),
             next_idx: 0,
+            order: Vec::new(),
         }
     }
 
@@ -128,7 +135,37 @@ impl<S: Sig> GroundIndex<S> {
         if self.all.insert(t) {
             self.by_sort.entry(lang.sort_of(t)).or_default().push(t);
             self.idx.insert(t, self.next_idx);
+            self.order.push(t);
             self.next_idx += 1;
         }
+    }
+
+    /// Roll the index back to a `frontier` previously read from
+    /// [`frontier`](Self::frontier): every term registered at or after it is
+    /// removed from ALL buckets (`all` / `by_sort` / `by_head` / `idx`), exactly
+    /// inverting the registrations done since. A no-op if `frontier` is already
+    /// current or ahead.
+    ///
+    /// Additive scoped capability used by [`GroundLedger`](crate::ledger::GroundLedger):
+    /// the live monotone engine never calls it, so the structural invariant #1
+    /// and the cross-round candidate accumulation are unaffected. It is what lets
+    /// the index move in lock-step with a scoped congruence store so the two can
+    /// never desync (design §10).
+    pub fn rollback_to(&mut self, frontier: u32) {
+        if frontier >= self.next_idx {
+            return;
+        }
+        // Exactly the terms registered at index ≥ frontier (`order[i]` has idx i).
+        let removed = self.order.split_off(frontier as usize);
+        for t in &removed {
+            self.all.remove(t);
+            self.idx.remove(t);
+        }
+        // Drop the removed terms from the sort/head buckets (split borrow: `all`
+        // and the bucket maps are disjoint fields).
+        let all = &self.all;
+        self.by_sort.values_mut().for_each(|b| b.retain(|t| all.contains(t)));
+        self.by_head.values_mut().for_each(|b| b.retain(|t| all.contains(t)));
+        self.next_idx = frontier;
     }
 }
