@@ -18,7 +18,7 @@ pub mod model;
 pub mod term;
 pub mod toy;
 
-pub use ccfv::{match_trigger, match_trigger_multi, Subst};
+pub use ccfv::{match_trigger, match_trigger_multi, solve, Conj, Constraint, Lit, Subst};
 pub use congruence::{Congruence, FuncApp, Mode, NoCong, TotalView};
 pub use engine::{Config, Engine, Verdict};
 pub use ledger::{CongruenceSink, GroundLedger, LedgerMark};

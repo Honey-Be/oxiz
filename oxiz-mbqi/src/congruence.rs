@@ -219,6 +219,23 @@ where
     fn default_value(&self, f: S::Sym, args: &[S::Term]) -> Option<S::Term> {
         (self.xi)(f, args)
     }
+    /// On the TOTAL view, two ground terms are disequal iff they fall in DIFFERENT
+    /// base classes — `E_TOT`'s all-pairs separation among distinct class reps
+    /// makes "not congruent" a genuine `≄`. This is precisely what lets the
+    /// complete `solve`'s disequality gate (`cong.disequal`) be sound for the
+    /// model-completion conflict search (whereas the bare ground congruence's
+    /// `disequal` is the weaker asserted-only query, unsound for the flip).
+    fn disequal(&self, a: S::Term, b: S::Term) -> bool {
+        !self.base.equal(a, b)
+    }
+    /// The witness enumeration domain is unchanged by the completion — `E_TOT`
+    /// adds default *values*, not new classes — so delegate to the base.
+    fn ground_of_sort(&self, s: S::Sort) -> Vec<S::Term> {
+        self.base.ground_of_sort(s)
+    }
+    fn class_reps_of_sort(&self, s: S::Sort) -> Vec<S::Term> {
+        self.base.class_reps_of_sort(s)
+    }
 }
 
 #[cfg(test)]

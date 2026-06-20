@@ -119,6 +119,223 @@ where
     accs
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The complete E-ground (dis)unification core — `solve` (design §2, the P4
+// keystone). `match_trigger` above is the equality-matching half; `solve` is the
+// COMPLETE conflict search the model-completion verdict-flip needs: given a
+// constraint `C` (a DNF of Eq/Diseq literals over the bound-var holes) and the
+// congruence `E`, it enumerates every σ for which `E ⊨ Cσ` MIGHT hold — a
+// SUPERSET of the genuine conflicts (an undecidable literal is kept, never
+// dropped). So an EMPTY result soundly means "no conflict exists over the witness
+// domain" — exactly what the flip reads to conclude `Sat`. This is the verus-
+// verified model (`ccfv-verification/src/complete.rs` `no_conflict_when_empty`):
+// BRUTE-FORCE over the finite witness domain (each hole ranges over
+// `cong.class_reps_of_sort(sort)`), so completeness holds by construction (no
+// pruning to prove sound — that is the deferred P5 `R_*`/FAIL optimization). The
+// per-σ literal check reuses the verified `unify` (applied terms matched modulo
+// congruence). SOUNDNESS PRECONDITION: the disequality gate `cong.disequal` is a
+// genuine `≄` only on a TOTAL view (E_TOT) where distinct class reps are
+// disequal by construction — the flip MUST pass a `TotalView`, never the bare
+// ground congruence (whose `disequal` is the conservative asserted-only query).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One (dis)equality literal over terms that may contain bound-var holes.
+pub enum Lit<S: Sig> {
+    /// `lhs ≃ rhs`.
+    Eq(S::Term, S::Term),
+    /// `lhs ≄ rhs`.
+    Diseq(S::Term, S::Term),
+}
+
+/// A DNF cube — a conjunction of literals.
+pub type Conj<S> = Vec<Lit<S>>;
+
+/// A constraint in disjunctive normal form (⋁ of cubes, each a ⋀ of literals) —
+/// the lowered `¬ψ` for the conflict search. The host builds it (only its term
+/// language knows the connective symbols).
+pub struct Constraint<S: Sig> {
+    /// The disjuncts; `E ⊨ Cσ` iff SOME cube's literals are all entailed.
+    pub cubes: Vec<Conj<S>>,
+}
+
+/// Solve `c` against `cong`: return every σ (grounding `holes` to class reps of
+/// their sorts) that MIGHT satisfy some cube — a SUPERSET of the conflicts. Empty
+/// ⇒ no conflict over the witness domain (the flip's soundness). `holes` carries
+/// each bound var's sort (the enumeration domain). SPLIT over cubes (union),
+/// bounded by `max_tuples` per cube (a budget — hitting it yields a partial set,
+/// still a superset, so still sound for the empty-means-no-conflict read… as long
+/// as the budget is not hit, which the caller must ensure for a decisive `Sat`).
+pub fn solve<S, C, L>(
+    cong: &C,
+    host: &L,
+    c: &Constraint<S>,
+    holes: &[(S::VarName, S::Sort)],
+    max_tuples: usize,
+) -> Vec<Subst<S>>
+where
+    S: Sig,
+    C: Congruence<S>,
+    L: TermLang<Sig = S>,
+{
+    let mut out = Vec::new();
+    for cube in &c.cubes {
+        solve_cube(cong, host, cube, holes, max_tuples, &mut out);
+    }
+    out
+}
+
+/// Brute-force a single cube: enumerate every hole→class-rep tuple and keep those
+/// for which NO literal is decidably FALSE (every literal is `Some(true)` or
+/// undecidable `None`). Keeping the undecidable ones is what makes an empty result
+/// mean "no conflict" rather than the weaker "no DECIDED conflict".
+fn solve_cube<S, C, L>(
+    cong: &C,
+    host: &L,
+    cube: &Conj<S>,
+    holes: &[(S::VarName, S::Sort)],
+    max_tuples: usize,
+    out: &mut Vec<Subst<S>>,
+) where
+    S: Sig,
+    C: Congruence<S>,
+    L: TermLang<Sig = S>,
+{
+    let names: Vec<S::VarName> = holes.iter().map(|(n, _)| *n).collect();
+    let domains: Vec<Vec<S::Term>> =
+        holes.iter().map(|(_, s)| cong.class_reps_of_sort(*s)).collect();
+    // A hole with no witness ⇒ no grounding ⇒ this cube contributes nothing.
+    if domains.iter().any(|d| d.is_empty()) {
+        return;
+    }
+    let k = domains.len();
+    let mut idx = vec![0usize; k];
+    let mut tuples = 0usize;
+    loop {
+        if tuples >= max_tuples {
+            break;
+        }
+        tuples += 1;
+        let subst: Subst<S> = names
+            .iter()
+            .copied()
+            .zip((0..k).map(|i| domains[i][idx[i]]))
+            .collect();
+        if cube
+            .iter()
+            .all(|lit| lit_eval(cong, host, lit, &subst, &names) != Some(false))
+        {
+            out.push(subst);
+        }
+        let mut carry = true;
+        for i in 0..k {
+            if carry {
+                idx[i] += 1;
+                if idx[i] >= domains[i].len() {
+                    idx[i] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+}
+
+/// Evaluate one literal under a fully-bound σ. `Some(true)` = it holds (so σ is a
+/// conflict for `¬ψ`), `Some(false)` = decidably violated, `None` = undecidable
+/// (handled conservatively by the caller — never read as `false`).
+fn lit_eval<S, C, L>(
+    cong: &C,
+    host: &L,
+    lit: &Lit<S>,
+    subst: &Subst<S>,
+    holes: &[S::VarName],
+) -> Option<bool>
+where
+    S: Sig,
+    C: Congruence<S>,
+    L: TermLang<Sig = S>,
+{
+    let (u, v, is_eq) = match lit {
+        Lit::Eq(u, v) => (*u, *v, true),
+        Lit::Diseq(u, v) => (*u, *v, false),
+    };
+    let congruent = terms_congruent(cong, host, u, v, subst, holes)?;
+    Some(if is_eq { congruent } else { !congruent })
+}
+
+/// Whether `uσ ≃ vσ` in `E`, when decidable. Reuses the verified `unify` so
+/// applied terms are matched modulo congruence: if one side grounds under σ (a
+/// hole's binding or a hole-free term), the other is matched against it as a
+/// pattern. `None` when neither side grounds (both applied with holes — the
+/// `U_GEN` shared-class join, conservatively undecidable here).
+fn terms_congruent<S, C, L>(
+    cong: &C,
+    host: &L,
+    u: S::Term,
+    v: S::Term,
+    subst: &Subst<S>,
+    holes: &[S::VarName],
+) -> Option<bool>
+where
+    S: Sig,
+    C: Congruence<S>,
+    L: TermLang<Sig = S>,
+{
+    match (
+        ground_after_subst(host, u, subst, holes),
+        ground_after_subst(host, v, subst, holes),
+    ) {
+        (Some(ug), Some(vg)) => Some(cong.equal(ug, vg)),
+        (Some(ug), None) => Some(!unify(cong, host, v, ug, holes, subst.clone()).is_empty()),
+        (None, Some(vg)) => Some(!unify(cong, host, u, vg, holes, subst.clone()).is_empty()),
+        (None, None) => None,
+    }
+}
+
+/// The single ground term `term` becomes under σ, if it grounds: a hole → its
+/// binding; a hole-free term (already interned, incl. ground applications) →
+/// itself. `None` for a term still containing a hole (a pattern — matched by
+/// `unify` against the other, ground, side).
+fn ground_after_subst<S, L>(
+    host: &L,
+    term: S::Term,
+    subst: &Subst<S>,
+    holes: &[S::VarName],
+) -> Option<S::Term>
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+{
+    if let TermView::Var { name } = host.view(term) {
+        if is_hole::<S>(holes, name) {
+            return subst_get::<S>(subst, name);
+        }
+    }
+    if !contains_hole(host, term, holes) {
+        return Some(term);
+    }
+    None
+}
+
+/// Whether `term` mentions any hole. Bounded by term depth.
+fn contains_hole<S, L>(host: &L, term: S::Term, holes: &[S::VarName]) -> bool
+where
+    S: Sig,
+    L: TermLang<Sig = S>,
+{
+    match host.view(term) {
+        TermView::Var { name } => is_hole::<S>(holes, name),
+        TermView::App { .. } => host
+            .children(term)
+            .iter()
+            .any(|&c| contains_hole(host, c, holes)),
+        TermView::Opaque | TermView::Quant { .. } => false,
+    }
+}
+
 /// Unify pattern `pat` against ground term `g` modulo `E`, extending `acc`.
 /// Returns every consistent extension (∅ on failure). Recursion is bounded by the
 /// pattern's variable-depth (DECOMPOSE strictly shrinks it — verus invariant
@@ -231,6 +448,10 @@ mod tests {
     struct ToyCong {
         classes: Vec<Vec<u32>>,
         of: FxHashMap<u32, usize>,
+        /// The ground witness universe (for `class_reps_of_sort` — `solve`'s
+        /// enumeration domain). Empty by default (the matching-half tests don't
+        /// use it).
+        universe: Vec<u32>,
     }
     impl ToyCong {
         fn new(classes: Vec<Vec<u32>>) -> Self {
@@ -240,7 +461,11 @@ mod tests {
                     of.insert(t, i);
                 }
             }
-            ToyCong { classes, of }
+            ToyCong { classes, of, universe: Vec::new() }
+        }
+        fn with_universe(mut self, u: Vec<u32>) -> Self {
+            self.universe = u;
+            self
         }
     }
     impl Congruence<ToySig> for ToyCong {
@@ -255,6 +480,23 @@ mod tests {
         }
         fn apps_like(&self, _app: u32) -> Vec<FuncApp<ToySig>> {
             Vec::new() // unused — the matcher takes seeds directly
+        }
+        /// Total-view semantics (the `solve`/flip precondition): distinct classes
+        /// are disequal by construction.
+        fn disequal(&self, a: u32, b: u32) -> bool {
+            !self.equal(a, b)
+        }
+        /// One representative ground term per class over the universe.
+        fn class_reps_of_sort(&self, _s: u32) -> Vec<u32> {
+            let mut seen: FxHashMap<u32, ()> = FxHashMap::default();
+            let mut out = Vec::new();
+            for &t in &self.universe {
+                let r = self.rep(t);
+                if seen.insert(r, ()).is_none() {
+                    out.push(r);
+                }
+            }
+            out
         }
     }
 
@@ -425,5 +667,93 @@ mod tests {
             match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![]])
                 .is_empty()
         );
+    }
+
+    // ── the complete `solve` (Phase 2: the brute-force E-ground (dis)unification
+    //    conflict search the P4 model-completion verdict-flip reads) ────────────
+
+    #[test]
+    fn solve_finds_an_equality_conflict() {
+        // C = [[x ≃ a]] over the universe {a, b} (a, b apart). x↦a is a conflict
+        // (a ≃ a); x↦b is not. So solve enumerates exactly {x↦a} — non-empty, so
+        // the flip would NOT (wrongly) conclude no-conflict.
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let cong = ToyCong::new(vec![]).with_universe(vec![a, b]);
+        let c = Constraint { cubes: vec![vec![Lit::Eq(x, a)]] };
+        let res = solve::<ToySig, _, _>(&cong, &h, &c, &[(X, S)], 64);
+        assert_eq!(res.len(), 1, "exactly x↦a is a conflict");
+        assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
+    }
+
+    #[test]
+    fn solve_empty_means_no_conflict_the_flip_keystone() {
+        // C = [[x ≄ x]] — a reflexive disequality, NEVER satisfiable. solve returns
+        // ∅, which is EXACTLY what the model-completion flip reads to conclude
+        // `Sat` (verus `complete::no_conflict_when_empty`).
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let cong = ToyCong::new(vec![]).with_universe(vec![a, b]);
+        let c = Constraint { cubes: vec![vec![Lit::Diseq(x, x)]] };
+        let res = solve::<ToySig, _, _>(&cong, &h, &c, &[(X, S)], 64);
+        assert!(res.is_empty(), "x ≄ x is unsatisfiable ⇒ no conflict ⇒ empty");
+    }
+
+    #[test]
+    fn solve_disequality_uses_the_total_view_separation() {
+        // C = [[x ≃ a ∧ x ≄ b]] over {a, b} apart. x↦a: a≃a ∧ a≄b (distinct
+        // classes ⇒ disequal on the total view) → conflict. x↦b: b≃a is false →
+        // dropped. So exactly {x↦a}.
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let cong = ToyCong::new(vec![]).with_universe(vec![a, b]);
+        let c = Constraint { cubes: vec![vec![Lit::Eq(x, a), Lit::Diseq(x, b)]] };
+        let res = solve::<ToySig, _, _>(&cong, &h, &c, &[(X, S)], 64);
+        assert_eq!(res.len(), 1);
+        assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
+    }
+
+    #[test]
+    fn solve_applied_term_reuses_unify_modulo_congruence() {
+        // C = [[f(x) ≃ c]] with f(a) ≡ c in the congruence, universe {a, b}.
+        // x↦a: f(x) is a pattern (has a hole) vs ground c ⇒ the per-σ check reuses
+        // `unify(f(x), c, {x↦a})`, which matches f(a) in c's class ⇒ conflict.
+        // x↦b: f(b) ∉ c's class ⇒ no match ⇒ dropped. So exactly {x↦a}.
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let c = h.konst(3, S);
+        let x = h.var(X, S);
+        let fa = h.app(10, &[a], S); // f(a)
+        let fx = h.app(10, &[x], S); // f(x)
+        // f(a) ≡ c
+        let cong = ToyCong::new(vec![vec![fa, c]]).with_universe(vec![a, b]);
+        let constraint = Constraint { cubes: vec![vec![Lit::Eq(fx, c)]] };
+        let res = solve::<ToySig, _, _>(&cong, &h, &constraint, &[(X, S)], 64);
+        assert_eq!(res.len(), 1, "f(a)≡c ⇒ only x↦a is a conflict");
+        assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
+    }
+
+    #[test]
+    fn solve_keeps_an_undecidable_literal_conservatively() {
+        // Both sides applied-with-holes (no side grounds) ⇒ the per-σ check is
+        // undecidable (`None`) ⇒ σ is KEPT (a superset), so the empty-means-
+        // no-conflict read stays sound (the flip declines rather than wrongly
+        // firing). C = [[f(x) ≃ g(x)]].
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let x = h.var(X, S);
+        let fx = h.app(10, &[x], S);
+        let gx = h.app(20, &[x], S);
+        let cong = ToyCong::new(vec![]).with_universe(vec![a]);
+        let c = Constraint { cubes: vec![vec![Lit::Eq(fx, gx)]] };
+        let res = solve::<ToySig, _, _>(&cong, &h, &c, &[(X, S)], 64);
+        assert_eq!(res.len(), 1, "an undecidable literal is kept (superset), not dropped");
     }
 }
