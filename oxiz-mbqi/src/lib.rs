@@ -20,7 +20,7 @@ pub mod toy;
 pub mod trigger;
 
 pub use ccfv::{match_trigger, Subst};
-pub use congruence::{Congruence, FuncApp};
+pub use congruence::{Congruence, FuncApp, NoCong};
 pub use engine::{Config, Engine, Verdict};
 pub use ledger::{CongruenceSink, GroundLedger, LedgerMark};
 pub use instantiate::Quant;

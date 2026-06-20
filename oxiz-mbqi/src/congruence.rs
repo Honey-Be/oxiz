@@ -68,3 +68,25 @@ pub trait Congruence<S: Sig> {
         None
     }
 }
+
+/// The trivial (empty) congruence: every term is its own class, equality is
+/// syntactic identity. Used as the placeholder oracle on the non-CCFV path
+/// (`Engine::round_with`), where the congruence is never queried — so it costs
+/// nothing and keeps the default behaviour byte-identical. Matching through CCFV
+/// with `NoCong` is exactly syntactic matching.
+pub struct NoCong;
+
+impl<S: Sig> Congruence<S> for NoCong {
+    fn rep(&self, t: S::Term) -> S::Term {
+        t
+    }
+    fn equal(&self, a: S::Term, b: S::Term) -> bool {
+        a == b
+    }
+    fn class(&self, t: S::Term) -> Vec<S::Term> {
+        vec![t]
+    }
+    fn apps_like(&self, _app: S::Term) -> Vec<FuncApp<S>> {
+        Vec::new()
+    }
+}
