@@ -32,7 +32,7 @@
 use super::simplex::{LinExpr, VarId};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::{One, Zero};
 use smallvec::SmallVec;
 
@@ -40,9 +40,9 @@ use smallvec::SmallVec;
 #[derive(Debug, Clone)]
 pub struct LinearEquation {
     /// Terms: (variable, coefficient)
-    pub terms: SmallVec<[(VarId, Rational64); 4]>,
+    pub terms: SmallVec<[(VarId, ArithRat); 4]>,
     /// Right-hand side constant
-    pub rhs: Rational64,
+    pub rhs: ArithRat,
 }
 
 impl LinearEquation {
@@ -51,7 +51,7 @@ impl LinearEquation {
     pub fn new() -> Self {
         Self {
             terms: SmallVec::new(),
-            rhs: Rational64::zero(),
+            rhs: ArithRat::zero(),
         }
     }
 
@@ -70,7 +70,7 @@ impl LinearEquation {
             && !first_coef.is_zero()
             && !first_coef.is_one()
         {
-            let inv = Rational64::one() / first_coef;
+            let inv = ArithRat::one() / first_coef;
             for (_, coef) in &mut self.terms {
                 *coef *= inv;
             }
@@ -89,12 +89,12 @@ impl LinearEquation {
 
     /// Get the coefficient of a variable
     #[must_use]
-    pub fn coef(&self, var: VarId) -> Rational64 {
+    pub fn coef(&self, var: VarId) -> ArithRat {
         self.terms
             .iter()
             .find(|(v, _)| *v == var)
             .map(|(_, c)| *c)
-            .unwrap_or_else(Rational64::zero)
+            .unwrap_or_else(ArithRat::zero)
     }
 
     /// Eliminate a variable using another equation
@@ -113,7 +113,7 @@ impl LinearEquation {
         self.rhs -= factor * other.rhs;
 
         // Build a map of other's coefficients for efficient lookup
-        let mut other_map: FxHashMap<VarId, Rational64> = FxHashMap::default();
+        let mut other_map: FxHashMap<VarId, ArithRat> = FxHashMap::default();
         for &(v, c) in &other.terms {
             other_map.insert(v, c);
         }
@@ -264,7 +264,7 @@ impl GaussianElimination {
         let mut substituted = FxHashMap::default();
 
         // Replace each variable with its substitution if available (one pass)
-        let mut new_terms: SmallVec<[(VarId, Rational64); 4]> = SmallVec::new();
+        let mut new_terms: SmallVec<[(VarId, ArithRat); 4]> = SmallVec::new();
         let mut new_constant = result.constant;
 
         for &(var, coef) in &result.terms {
@@ -281,9 +281,9 @@ impl GaussianElimination {
         }
 
         // Combine like terms
-        let mut combined: FxHashMap<VarId, Rational64> = FxHashMap::default();
+        let mut combined: FxHashMap<VarId, ArithRat> = FxHashMap::default();
         for (var, coef) in new_terms {
-            let entry = combined.entry(var).or_insert_with(Rational64::zero);
+            let entry = combined.entry(var).or_insert_with(ArithRat::zero);
             *entry += coef;
         }
 
@@ -313,36 +313,36 @@ mod tests {
     #[test]
     fn test_linear_equation_normalize() {
         let mut eq = LinearEquation {
-            terms: smallvec::smallvec![(0, Rational64::new(2, 1)), (1, Rational64::new(4, 1))],
-            rhs: Rational64::new(6, 1),
+            terms: smallvec::smallvec![(0, ArithRat::new(2, 1)), (1, ArithRat::new(4, 1))],
+            rhs: ArithRat::new(6, 1),
         };
         eq.normalize();
-        assert_eq!(eq.coef(0), Rational64::one());
-        assert_eq!(eq.coef(1), Rational64::new(2, 1));
-        assert_eq!(eq.rhs, Rational64::new(3, 1));
+        assert_eq!(eq.coef(0), ArithRat::one());
+        assert_eq!(eq.coef(1), ArithRat::new(2, 1));
+        assert_eq!(eq.rhs, ArithRat::new(3, 1));
     }
 
     #[test]
     fn test_linear_equation_eliminate() {
         // eq1: x + 2y = 5
         let mut eq1 = LinearEquation {
-            terms: smallvec::smallvec![(0, Rational64::one()), (1, Rational64::new(2, 1))],
-            rhs: Rational64::new(5, 1),
+            terms: smallvec::smallvec![(0, ArithRat::one()), (1, ArithRat::new(2, 1))],
+            rhs: ArithRat::new(5, 1),
         };
 
         // eq2: x + y = 3
         let eq2 = LinearEquation {
-            terms: smallvec::smallvec![(0, Rational64::one()), (1, Rational64::one())],
-            rhs: Rational64::new(3, 1),
+            terms: smallvec::smallvec![(0, ArithRat::one()), (1, ArithRat::one())],
+            rhs: ArithRat::new(3, 1),
         };
 
         // Eliminate x from eq1 using eq2
         // Result: y = 2
         eq1.eliminate(0, &eq2);
 
-        assert_eq!(eq1.coef(0), Rational64::zero());
-        assert_eq!(eq1.coef(1), Rational64::one());
-        assert_eq!(eq1.rhs, Rational64::new(2, 1));
+        assert_eq!(eq1.coef(0), ArithRat::zero());
+        assert_eq!(eq1.coef(1), ArithRat::one());
+        assert_eq!(eq1.rhs, ArithRat::new(2, 1));
     }
 
     #[test]
@@ -353,12 +353,12 @@ mod tests {
         // x + y = 3
         // 2x + y = 5
         ge.add_equation(LinearEquation {
-            terms: smallvec::smallvec![(0, Rational64::one()), (1, Rational64::one())],
-            rhs: Rational64::new(3, 1),
+            terms: smallvec::smallvec![(0, ArithRat::one()), (1, ArithRat::one())],
+            rhs: ArithRat::new(3, 1),
         });
         ge.add_equation(LinearEquation {
-            terms: smallvec::smallvec![(0, Rational64::new(2, 1)), (1, Rational64::one())],
-            rhs: Rational64::new(5, 1),
+            terms: smallvec::smallvec![(0, ArithRat::new(2, 1)), (1, ArithRat::one())],
+            rhs: ArithRat::new(5, 1),
         });
 
         let (simplified, _) = ge.eliminate();
@@ -375,21 +375,21 @@ mod tests {
 
         // x = 2
         ge.add_equation(LinearEquation {
-            terms: smallvec::smallvec![(0, Rational64::one())],
-            rhs: Rational64::new(2, 1),
+            terms: smallvec::smallvec![(0, ArithRat::one())],
+            rhs: ArithRat::new(2, 1),
         });
 
         ge.eliminate();
 
         // Expression: 3x + 5
         let mut expr = LinExpr::new();
-        expr.add_term(0, Rational64::new(3, 1));
-        expr.add_constant(Rational64::new(5, 1));
+        expr.add_term(0, ArithRat::new(3, 1));
+        expr.add_constant(ArithRat::new(5, 1));
 
         let result = ge.apply_substitutions(&expr);
 
         // Should become: 3*2 + 5 = 11
         assert_eq!(result.terms.len(), 0);
-        assert_eq!(result.constant, Rational64::new(11, 1));
+        assert_eq!(result.constant, ArithRat::new(11, 1));
     }
 }

@@ -4,19 +4,21 @@ use super::super::simplex::VarId;
 use super::types::{CutInfo, LiaSolver};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::Zero;
 use oxiz_core::error::Result;
 impl LiaSolver {
     /// Feasibility Pump heuristic for finding integer-feasible solutions
     /// Feasibility Pump heuristic for finding integer-feasible solutions
-    pub fn feasibility_pump(&mut self, max_iterations: usize) -> Result<Option<Vec<i64>>> {
+    pub fn feasibility_pump(&mut self, max_iterations: usize) -> Result<Option<Vec<i128>>> {
         // Start by solving the LP relaxation
         if self.simplex.check().is_err() {
             return Ok(None); // LP infeasible, can't use feasibility pump
         }
 
-        let mut prev_rounded: Option<Vec<i64>> = None;
+        // `Vec<i128>` since the solution values come from `ArithRat`
+        // (= `Ratio<i128>`) via `to_integer()` ([`crate::ArithRat`]).
+        let mut prev_rounded: Option<Vec<i128>> = None;
 
         for _iteration in 0..max_iterations {
             // Step 1: Round current solution to nearest integers
@@ -50,7 +52,7 @@ impl LiaSolver {
             // Add soft constraints pulling toward rounded values (approximation)
             // In practice, this would be done via an objective function
             for (&var, &target) in self.int_vars.keys().zip(rounded.iter()) {
-                let target_rational = Rational64::from_integer(target);
+                let target_rational = ArithRat::from_integer(target);
                 // Don't override bounds, but bias toward target if possible
                 // (This is a simplified version - full implementation needs objective function)
                 if let Some(ub) = self.simplex.get_upper(var)
@@ -82,7 +84,7 @@ impl LiaSolver {
     }
 
     /// Round the current solution to nearest integers
-    pub fn round_solution(&self) -> Vec<i64> {
+    pub fn round_solution(&self) -> Vec<i128> {
         self.int_vars
             .keys()
             .map(|&var| {
@@ -93,7 +95,7 @@ impl LiaSolver {
     }
 
     /// Get the current integer solution
-    fn get_integer_solution(&self) -> Vec<i64> {
+    fn get_integer_solution(&self) -> Vec<i128> {
         self.int_vars
             .keys()
             .map(|&var| {
@@ -183,7 +185,7 @@ impl LiaSolver {
 
             // Probe lower bound: try x = lb_int
             self.simplex.push();
-            let lb_val = Rational64::from_integer(lb_int);
+            let lb_val = ArithRat::from_integer(lb_int);
             self.simplex.set_lower(var, lb_val, lb_reason);
             self.simplex.set_upper(var, lb_val, lb_reason); // Fix to lb
 
@@ -192,14 +194,14 @@ impl LiaSolver {
 
             if !lb_feasible {
                 // Lower bound is infeasible, tighten: x >= lb + 1
-                let new_lb = Rational64::from_integer(lb_int + 1);
+                let new_lb = ArithRat::from_integer(lb_int + 1);
                 self.simplex.set_lower(var, new_lb, lb_reason);
                 bounds_tightened += 1;
             }
 
             // Probe upper bound: try x = ub_int
             self.simplex.push();
-            let ub_val = Rational64::from_integer(ub_int);
+            let ub_val = ArithRat::from_integer(ub_int);
             self.simplex.set_lower(var, ub_val, ub_reason);
             self.simplex.set_upper(var, ub_val, ub_reason); // Fix to ub
 
@@ -208,7 +210,7 @@ impl LiaSolver {
 
             if !ub_feasible {
                 // Upper bound is infeasible, tighten: x <= ub - 1
-                let new_ub = Rational64::from_integer(ub_int - 1);
+                let new_ub = ArithRat::from_integer(ub_int - 1);
                 self.simplex.set_upper(var, new_ub, ub_reason);
                 bounds_tightened += 1;
             }

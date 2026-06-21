@@ -4,10 +4,35 @@
 use crate::prelude::*;
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
+use oxiz_theories::ArithRat;
 
 use super::Solver;
 use super::types::Constraint;
 use super::types::{Model, UnsatCore};
+
+/// Narrow an `ArithRat` (= `Ratio<i128>`, the LRA/LIA core's rational) model
+/// value back to oxiz-core's `RealConst` rational (`Rational64`) so it can be
+/// stored as a `RealConst` term.
+///
+/// This is a MODEL-OUTPUT boundary only — it runs after the verdict is decided,
+/// on a satisfying assignment, so it can never change a sat/unsat result. It
+/// narrows EXACTLY when both numerator and denominator fit `i64` (the universal
+/// case for any model derived from 64-bit SMT-LIB literals). For the
+/// astronomically rare value whose reduced numer/denom exceeds `i64`, it falls
+/// back to the (necessarily approximate) integer part — never a silent wrap.
+fn narrow_arith_to_real64(r: ArithRat) -> num_rational::Rational64 {
+    match (i64::try_from(*r.numer()), i64::try_from(*r.denom())) {
+        (Ok(n), Ok(d)) => num_rational::Rational64::new(n, d),
+        // Out of `i64` range (model value beyond what `RealConst` can hold):
+        // approximate by the integer part. `to_integer()` truncates toward zero;
+        // clamp to `i64` so the display value is well-defined. This is reachable
+        // only on adversarial, i64-overflowing bounds and only affects the
+        // printed model, not the (already sound) verdict.
+        _ => num_rational::Rational64::from_integer(
+            r.to_integer().clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        ),
+    }
+}
 
 impl Solver {
     pub(super) fn build_model(&mut self, manager: &mut TermManager) {
@@ -115,11 +140,16 @@ impl Solver {
                     .map(|t| t.sort == manager.sorts.int_sort)
                     .unwrap_or(true);
                 let value_term = if is_int_sort {
-                    // Integer-sorted term: convert to BigInt
+                    // Integer-sorted term: the arith value is integral; its i128
+                    // numerator converts straight to BigInt (`mk_int` takes any
+                    // `Into<BigInt>`), so there is no narrowing here.
                     manager.mk_int(*value.numer())
                 } else {
-                    // Real-sorted term: always use RealConst regardless of denominator
-                    manager.mk_real(value)
+                    // Real-sorted term: always use RealConst regardless of
+                    // denominator. `RealConst` is `Rational64`, so the i128 model
+                    // value is narrowed at this output boundary (see
+                    // `narrow_arith_to_real64` — post-verdict, never affects sat).
+                    manager.mk_real(narrow_arith_to_real64(value))
                 };
                 model.set(term, value_term);
             } else {

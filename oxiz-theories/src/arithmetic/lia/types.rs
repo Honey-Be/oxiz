@@ -10,7 +10,7 @@ use super::super::simplex::{Simplex, VarId};
 use crate::config::LiaConfig;
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 
 /// A bound on an integer variable
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +31,7 @@ pub(super) struct BranchNode {
     /// Branch direction: true = x >= ceil(value), false = x <= floor(value)
     pub(super) branch_up: bool,
     /// The fractional value that triggered the branch
-    pub(super) fractional_value: Rational64,
+    pub(super) fractional_value: ArithRat,
 }
 
 /// Cut metadata for management and aging

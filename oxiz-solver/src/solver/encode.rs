@@ -2,28 +2,12 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::{Ratio, Rational64};
+use num_rational::Ratio;
 use num_traits::{CheckedAdd, CheckedMul, One, ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_sat::{Lit, Var};
+use oxiz_theories::ArithRat;
 use smallvec::SmallVec;
-
-/// Narrow a 128-bit linear-arithmetic coefficient back to the simplex's
-/// `Rational64`. `extract_linear_terms` accumulates in `Ratio<i128>` so an
-/// INTERMEDIATE product/sum that would overflow `i64` (e.g. `scale * coeff`
-/// before like terms cancel) no longer forces the comparison opaque; the final
-/// reduced coefficient is narrowed here. `None` (⇒ the comparison stays opaque,
-/// exactly as the old `i64` path) iff the FINAL value does not fit `i64` — the
-/// downstream LRA core is `i64`, so this preserves parity: every input that did
-/// not overflow `i64` intermediates yields a byte-identical `Rational64`, and
-/// only previously-bailing intermediates are recovered. `Ratio` is kept reduced,
-/// so `numer`/`denom` are already minimal here.
-#[inline]
-fn narrow_r128(r: Ratio<i128>) -> Option<Rational64> {
-    let n = i64::try_from(*r.numer()).ok()?;
-    let d = i64::try_from(*r.denom()).ok()?;
-    Some(Rational64::new(n, d))
-}
 
 use super::Solver;
 use super::trail::TrailOp;
@@ -263,9 +247,10 @@ impl Solver {
             return cached.clone();
         }
 
-        // Accumulate in `Ratio<i128>` so an intermediate `i64` overflow widens
-        // the bail point (see `narrow_r128`); the result is narrowed to the
-        // simplex's `Rational64` at the boundary below.
+        // Accumulate in `Ratio<i128>` (= `oxiz_theories::ArithRat`, the LRA/LIA
+        // core's rational). The accumulated value flows straight into the simplex
+        // with NO narrowing: the whole arithmetic core is now `i128`, so the
+        // `i64::MIN`-class literals whose negation overflowed `i64` are exact.
         let mut terms: SmallVec<[(TermId, Ratio<i128>); 4]> = SmallVec::new();
         let mut constant: Ratio<i128> = Ratio::zero();
 
@@ -292,30 +277,23 @@ impl Solver {
             *combined.entry(term).or_insert_with(Ratio::zero) += coef;
         }
 
-        // Remove zero coefficients and narrow each surviving coefficient back to
-        // `Rational64`. A final coefficient that does not fit `i64` makes the
-        // comparison opaque (the LRA core is `i64`) — identical to the old path.
-        let mut final_terms: SmallVec<[(TermId, Rational64); 4]> = SmallVec::new();
+        // Remove zero coefficients and keep each surviving coefficient as the
+        // `i128` rational it already is — no narrowing. (Zero terms are still
+        // dropped: a 0·x term carries no constraint, exactly as before.)
+        let mut final_terms: SmallVec<[(TermId, ArithRat); 4]> = SmallVec::new();
         for (term, coef) in combined {
             if coef.is_zero() {
                 continue;
             }
-            let Some(c64) = narrow_r128(coef) else {
-                self.arith_parse_cache.insert(reason, None);
-                return None;
-            };
-            final_terms.push((term, c64));
+            final_terms.push((term, coef));
         }
 
-        // Move constant to RHS, then narrow.
-        let Some(constant64) = narrow_r128(-constant) else {
-            self.arith_parse_cache.insert(reason, None);
-            return None;
-        };
+        // Move constant to RHS; pass the `i128` value straight through.
+        let constant128: ArithRat = -constant;
 
         let result = ParsedArithConstraint {
             terms: final_terms,
-            constant: constant64,
+            constant: constant128,
             constraint_type,
             reason_term: reason,
         };
@@ -345,9 +323,9 @@ impl Solver {
                     // comparison OPAQUE (return None), never silently wrap into
                     // a wrong coefficient — wrapping fabricates a spurious arith
                     // conflict (the prelude-scale `-V adsmt` false-`unsat`). The
-                    // accumulation is `i128` (#261) so the bail point is widened
-                    // from the old `i64`; the final coefficient is narrowed back
-                    // to `Rational64` in `parse_linear_comparison`.
+                    // whole LRA/LIA core is `i128` (`ArithRat`), so this value
+                    // flows straight into the simplex with NO narrowing; only a
+                    // genuine i128 overflow (astronomically large) bails here.
                     *constant =
                         constant.checked_add(&scale.checked_mul(&Ratio::from_integer(val))?)?;
                     Some(())
@@ -359,8 +337,9 @@ impl Solver {
 
             // Rational constant
             TermKind::RealConst(r) => {
-                // Widen the `Rational64` literal to `i128` (lossless) before the
-                // checked product/sum.
+                // The term-level `RealConst` is `Rational64` (oxiz-core); widen
+                // its numer/denom to the `i128` core rational (lossless) before
+                // the checked product/sum.
                 let r128 = Ratio::new(i128::from(*r.numer()), i128::from(*r.denom()));
                 *constant = constant.checked_add(&scale.checked_mul(&r128)?)?;
                 Some(())
@@ -370,7 +349,7 @@ impl Solver {
             TermKind::BitVecConst { value, .. } => {
                 if let Some(val) = value.to_i128() {
                     // Checked (see the `IntConst` note): `i128` accumulation,
-                    // narrowed back to `Rational64` at the boundary (#261).
+                    // flows straight into the `i128` LRA/LIA core, no narrowing.
                     *constant =
                         constant.checked_add(&scale.checked_mul(&Ratio::from_integer(val))?)?;
                     Some(())

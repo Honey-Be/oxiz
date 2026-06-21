@@ -2,7 +2,7 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use oxiz_theories::ArithRat;
 use oxiz_core::ast::{RoundingMode, TermId, TermKind, TermManager};
 use oxiz_sat::{Lit, RestartStrategy, Var};
 use smallvec::SmallVec;
@@ -183,10 +183,14 @@ pub(crate) enum ArithConstraintType {
 /// Represents: sum of (term, coefficient) <= constant OR < constant (if strict)
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedArithConstraint {
-    /// Linear terms: (variable_term, coefficient)
-    pub(crate) terms: SmallVec<[(TermId, Rational64); 4]>,
+    /// Linear terms: (variable_term, coefficient).
+    ///
+    /// Coefficients/constant are [`oxiz_theories::ArithRat`] (= `Ratio<i128>`),
+    /// the LRA/LIA core's widened rational — the value `extract_arith_constraint`
+    /// already accumulates flows straight into `ArithSolver` with no narrowing.
+    pub(crate) terms: SmallVec<[(TermId, ArithRat); 4]>,
     /// Constant bound (RHS)
-    pub(crate) constant: Rational64,
+    pub(crate) constant: ArithRat,
     /// Type of constraint
     pub(crate) constraint_type: ArithConstraintType,
     /// The original term (for conflict explanation)

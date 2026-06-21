@@ -1,4 +1,4 @@
-use num_rational::Rational64;
+use oxiz_theories::ArithRat;
 use oxiz_core::ast::TermId;
 use oxiz_theories::Theory;
 use oxiz_theories::arithmetic::ArithSolver;
@@ -18,22 +18,22 @@ fn test_gcd_infeasibility_cutting_planes() {
     // Add constraint: 2x + 2y = 7
     solver.assert_eq(
         &[
-            (x, Rational64::from_integer(2)),
-            (y, Rational64::from_integer(2)),
+            (x, ArithRat::from_integer(2)),
+            (y, ArithRat::from_integer(2)),
         ],
-        Rational64::from_integer(7),
+        ArithRat::from_integer(7),
         reason,
     );
 
     // Add constraints: x >= 0, y >= 0
     solver.assert_ge(
-        &[(x, Rational64::from_integer(1))],
-        Rational64::from_integer(0),
+        &[(x, ArithRat::from_integer(1))],
+        ArithRat::from_integer(0),
         reason,
     );
     solver.assert_ge(
-        &[(y, Rational64::from_integer(1))],
-        Rational64::from_integer(0),
+        &[(y, ArithRat::from_integer(1))],
+        ArithRat::from_integer(0),
         reason,
     );
 

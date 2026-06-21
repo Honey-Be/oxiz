@@ -24,9 +24,12 @@ impl LiaSolver {
     ///
     /// Example: 2x + 2y = 7 is infeasible because gcd(2,2) = 2 doesn't divide 7.
     pub fn add_eq(&mut self, expr: LinExpr, reason: u32) {
-        // Check for GCD-based infeasibility before adding the constraint
-        // Extract integer coefficients from the expression
-        let coeffs: Vec<i64> = expr
+        // Check for GCD-based infeasibility before adding the constraint.
+        // Extract integer coefficients from the expression. `c.numer()` is now
+        // `i128` (the `ArithRat` numerator); kept i128 so a coefficient outside
+        // `i64` is never silently truncated before the GCD-infeasibility test
+        // (truncation could miss or fabricate an integer infeasibility → unsound).
+        let coeffs: Vec<i128> = expr
             .terms
             .iter()
             .filter_map(|(_, c)| {
@@ -42,18 +45,18 @@ impl LiaSolver {
         // Extract the constant term (negated RHS)
         // expr = 0 means sum(a_i * x_i) + constant = 0
         // which is sum(a_i * x_i) = -constant
-        let rhs = if expr.constant.denom() == &1 {
+        let rhs: i128 = if expr.constant.denom() == &1 {
             -*expr.constant.numer()
         } else {
             // Non-integer constant in equality - can't be satisfied by integers
             // Mark as infeasible by adding a contradictory constraint
             // x >= 1 and x <= 0 for some variable (if any exists)
             if let Some(&(var, _)) = expr.terms.first() {
-                use num_rational::Rational64;
+                use crate::ArithRat;
                 self.simplex
-                    .set_lower(var, Rational64::from_integer(1), reason);
+                    .set_lower(var, ArithRat::from_integer(1), reason);
                 self.simplex
-                    .set_upper(var, Rational64::from_integer(0), reason);
+                    .set_upper(var, ArithRat::from_integer(0), reason);
             }
             return;
         };
@@ -67,12 +70,12 @@ impl LiaSolver {
             // Add contradictory constraints to make the problem infeasible
             // This is the standard way to signal infeasibility in incremental solvers
             if let Some(&(var, _)) = expr.terms.first() {
-                use num_rational::Rational64;
+                use crate::ArithRat;
                 // Add x >= 1 and x <= 0, which is clearly infeasible
                 self.simplex
-                    .set_lower(var, Rational64::from_integer(1), reason);
+                    .set_lower(var, ArithRat::from_integer(1), reason);
                 self.simplex
-                    .set_upper(var, Rational64::from_integer(0), reason);
+                    .set_upper(var, ArithRat::from_integer(0), reason);
             }
             return;
         }

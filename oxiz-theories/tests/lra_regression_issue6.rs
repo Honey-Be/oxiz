@@ -15,7 +15,7 @@
 //! the equality forces x1 = -0.25, but the inequality requires x1 <= -1.0,
 //! which -0.25 violates. Therefore the problem is UNSAT.
 
-use num_rational::Rational64;
+use oxiz_theories::ArithRat;
 use oxiz_core::ast::TermId;
 use oxiz_theories::Theory;
 use oxiz_theories::TheoryCheckResult;
@@ -35,16 +35,16 @@ fn test_issue_6_lra_unsat() {
     // Constraint 1: x1 <= -1.0
     // SMT-LIB2: (<= x1 (- 1.0))
     solver.assert_le(
-        &[(x1, Rational64::from_integer(1))],
-        Rational64::new(-1, 1), // -1.0
+        &[(x1, ArithRat::from_integer(1))],
+        ArithRat::new(-1, 1), // -1.0
         reason,
     );
 
     // Constraint 2: x1 = -0.25
     // SMT-LIB2: (= x1 (- 0.25)) where -0.25 = -1/4
     solver.assert_eq(
-        &[(x1, Rational64::from_integer(1))],
-        Rational64::new(-1, 4), // -0.25
+        &[(x1, ArithRat::from_integer(1))],
+        ArithRat::new(-1, 4), // -0.25
         reason,
     );
 
@@ -82,15 +82,15 @@ fn test_issue_6_lra_unsat_reversed_order() {
 
     // Constraint 1 (asserted first): x1 = -0.25
     solver.assert_eq(
-        &[(x1, Rational64::from_integer(1))],
-        Rational64::new(-1, 4),
+        &[(x1, ArithRat::from_integer(1))],
+        ArithRat::new(-1, 4),
         reason,
     );
 
     // Constraint 2 (asserted second): x1 <= -1.0
     solver.assert_le(
-        &[(x1, Rational64::from_integer(1))],
-        Rational64::new(-1, 1),
+        &[(x1, ArithRat::from_integer(1))],
+        ArithRat::new(-1, 1),
         reason,
     );
 
@@ -125,15 +125,15 @@ fn test_issue_6_lra_sat_sanity() {
 
     // x1 <= -1.0
     solver.assert_le(
-        &[(x1, Rational64::from_integer(1))],
-        Rational64::new(-1, 1),
+        &[(x1, ArithRat::from_integer(1))],
+        ArithRat::new(-1, 1),
         reason,
     );
 
     // x1 = -2.0  (satisfies x1 <= -1.0 because -2 < -1)
     solver.assert_eq(
-        &[(x1, Rational64::from_integer(1))],
-        Rational64::new(-2, 1),
+        &[(x1, ArithRat::from_integer(1))],
+        ArithRat::new(-2, 1),
         reason,
     );
 

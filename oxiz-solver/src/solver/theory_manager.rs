@@ -2,10 +2,10 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
 use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_sat::{Lit, TheoryCallback, TheoryCheckResult, TheoryHooks, TheoryReason, TheoryStep, Var};
+use oxiz_theories::ArithRat;
 use oxiz_theories::arithmetic::ArithSolver;
 use oxiz_theories::bv::BvSolver;
 use oxiz_theories::euf::EufSolver;
@@ -722,10 +722,10 @@ impl TheoryManager {
                     let reason = t1;
                     self.arith.assert_eq(
                         &[
-                            (t1, Rational64::from_integer(1)),
-                            (t2, Rational64::from_integer(-1)),
+                            (t1, ArithRat::from_integer(1)),
+                            (t2, ArithRat::from_integer(-1)),
                         ],
-                        Rational64::from_integer(0),
+                        ArithRat::from_integer(0),
                         reason,
                     );
 
@@ -786,7 +786,15 @@ impl TheoryManager {
                 if !v.is_integer() {
                     continue;
                 }
-                let iv = v.to_integer();
+                // `v.to_integer()` is i128 (the LRA/LIA core's `ArithRat`).
+                // `interned_int_constants` is keyed by i64 (its constants come
+                // from `IntConst.to_i64()`), so a fixed value outside i64 cannot
+                // match any interned constant — `try_from` failure ⇒ skip the
+                // merge. This is sound: no EUF congruence is fired for a value
+                // the integer-constant index does not (and cannot) hold.
+                let Ok(iv) = i64::try_from(v.to_integer()) else {
+                    continue;
+                };
                 let Some(&const_node) = self.interned_int_constants.get(&iv) else {
                     continue;
                 };
@@ -1277,7 +1285,7 @@ impl TheoryManager {
                     // For arithmetic equalities, also send to ArithSolver
                     // Use pre-parsed constraint if available
                     if let Some(parsed) = self.var_to_parsed_arith.get(&var) {
-                        let terms: Vec<(TermId, Rational64)> =
+                        let terms: Vec<(TermId, ArithRat)> =
                             parsed.terms.iter().copied().collect();
                         let constant = parsed.constant;
                         let reason = parsed.reason_term;
@@ -1642,7 +1650,7 @@ impl TheoryManager {
                 // Look up the pre-parsed linear constraint for arithmetic
                 if let Some(parsed) = self.var_to_parsed_arith.get(&var) {
                     // Add constraint to ArithSolver
-                    let terms: Vec<(TermId, Rational64)> = parsed.terms.iter().copied().collect();
+                    let terms: Vec<(TermId, ArithRat)> = parsed.terms.iter().copied().collect();
                     let reason = parsed.reason_term;
                     let constant = parsed.constant;
 

@@ -37,7 +37,7 @@ mod tests {
     use super::helpers::{extended_gcd, gcd, lcm};
     use super::*;
     use crate::arithmetic::simplex::LinExpr;
-    use num_rational::Rational64;
+    use crate::ArithRat;
     use num_traits::{One, Zero};
 
     #[test]
@@ -90,19 +90,19 @@ mod tests {
 
         // x + y <= 10
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(-Rational64::from_integer(10));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(-ArithRat::from_integer(10));
         solver.add_le(expr, 0);
 
         // x >= 0
         let mut expr2 = LinExpr::new();
-        expr2.add_term(x, Rational64::one());
+        expr2.add_term(x, ArithRat::one());
         solver.add_ge(expr2, 0);
 
         // y >= 0
         let mut expr3 = LinExpr::new();
-        expr3.add_term(y, Rational64::one());
+        expr3.add_term(y, ArithRat::one());
         solver.add_ge(expr3, 0);
 
         // This should be feasible
@@ -131,18 +131,18 @@ mod tests {
     fn test_normalize_constraint() {
         // 6x + 9y + 12z <= 30 should normalize to 2x + 3y + 4z <= 10
         let mut expr = LinExpr::new();
-        expr.add_term(0, Rational64::from_integer(6));
-        expr.add_term(1, Rational64::from_integer(9));
-        expr.add_term(2, Rational64::from_integer(12));
-        expr.add_constant(-Rational64::from_integer(30));
+        expr.add_term(0, ArithRat::from_integer(6));
+        expr.add_term(1, ArithRat::from_integer(9));
+        expr.add_term(2, ArithRat::from_integer(12));
+        expr.add_constant(-ArithRat::from_integer(30));
 
         LiaSolver::normalize_constraint(&mut expr);
 
         // Check normalized coefficients
-        assert_eq!(expr.terms[0].1, Rational64::from_integer(2));
-        assert_eq!(expr.terms[1].1, Rational64::from_integer(3));
-        assert_eq!(expr.terms[2].1, Rational64::from_integer(4));
-        assert_eq!(expr.constant, -Rational64::from_integer(10));
+        assert_eq!(expr.terms[0].1, ArithRat::from_integer(2));
+        assert_eq!(expr.terms[1].1, ArithRat::from_integer(3));
+        assert_eq!(expr.terms[2].1, ArithRat::from_integer(4));
+        assert_eq!(expr.constant, -ArithRat::from_integer(10));
     }
 
     #[test]
@@ -154,9 +154,9 @@ mod tests {
         let y = solver.new_var();
 
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(-Rational64::from_integer(10));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(-ArithRat::from_integer(10));
         solver.add_le(expr, 0);
 
         // Presolve should succeed (no infeasibility detected)
@@ -171,7 +171,7 @@ mod tests {
 
         // Test disjunctive cut generation for fractional value
         let var = 0;
-        let value = Rational64::new(5, 2); // 2.5
+        let value = ArithRat::new(5, 2); // 2.5
 
         let cut = solver.generate_disjunctive_cut(var, value);
         assert!(cut.is_some());
@@ -180,7 +180,7 @@ mod tests {
         assert!(!cut.terms.is_empty());
 
         // Should not generate cut for integer value
-        let int_value = Rational64::from_integer(3);
+        let int_value = ArithRat::from_integer(3);
         let no_cut = solver.generate_disjunctive_cut(var, int_value);
         assert!(no_cut.is_none());
     }
@@ -194,12 +194,12 @@ mod tests {
 
         // Set tight bounds on x: 2.3 <= x <= 2.7
         // Only integer value is 3, but let's use a range that forces x = 2
-        solver.simplex.set_lower(x, Rational64::new(19, 10), 0); // 1.9
-        solver.simplex.set_upper(x, Rational64::new(21, 10), 1); // 2.1
+        solver.simplex.set_lower(x, ArithRat::new(19, 10), 0); // 1.9
+        solver.simplex.set_upper(x, ArithRat::new(21, 10), 1); // 2.1
 
         // Set loose bounds on y: 0 <= y <= 10
-        solver.simplex.set_lower(y, Rational64::zero(), 2);
-        solver.simplex.set_upper(y, Rational64::from_integer(10), 3);
+        solver.simplex.set_lower(y, ArithRat::zero(), 2);
+        solver.simplex.set_upper(y, ArithRat::from_integer(10), 3);
 
         // Fix tight bounds should fix x to 2, but not y
         let result = solver.fix_tight_bounds();
@@ -216,8 +216,8 @@ mod tests {
             .simplex
             .get_upper(x)
             .expect("test operation should succeed");
-        assert_eq!(x_lower.value.real, Rational64::from_integer(2));
-        assert_eq!(x_upper.value.real, Rational64::from_integer(2));
+        assert_eq!(x_lower.value.real, ArithRat::from_integer(2));
+        assert_eq!(x_upper.value.real, ArithRat::from_integer(2));
 
         // y should still have loose bounds
         let y_lower = solver
@@ -228,8 +228,8 @@ mod tests {
             .simplex
             .get_upper(y)
             .expect("test operation should succeed");
-        assert_eq!(y_lower.value.real, Rational64::zero());
-        assert_eq!(y_upper.value.real, Rational64::from_integer(10));
+        assert_eq!(y_lower.value.real, ArithRat::zero());
+        assert_eq!(y_upper.value.real, ArithRat::from_integer(10));
     }
 
     #[test]
@@ -240,13 +240,13 @@ mod tests {
         let y = solver.new_var();
 
         // Add constraints: x >= 0, y >= 0, x + y <= 10
-        solver.simplex.set_lower(x, Rational64::zero(), 0);
-        solver.simplex.set_lower(y, Rational64::zero(), 1);
+        solver.simplex.set_lower(x, ArithRat::zero(), 0);
+        solver.simplex.set_lower(y, ArithRat::zero(), 1);
 
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(-Rational64::from_integer(10));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(-ArithRat::from_integer(10));
         solver.add_le(expr, 2);
 
         // Try feasibility pump
@@ -272,16 +272,16 @@ mod tests {
         let y = solver.new_var();
 
         // Set initial loose bounds: 0 <= x <= 10, 0 <= y <= 10
-        solver.simplex.set_lower(x, Rational64::zero(), 0);
-        solver.simplex.set_upper(x, Rational64::from_integer(10), 1);
-        solver.simplex.set_lower(y, Rational64::zero(), 2);
-        solver.simplex.set_upper(y, Rational64::from_integer(10), 3);
+        solver.simplex.set_lower(x, ArithRat::zero(), 0);
+        solver.simplex.set_upper(x, ArithRat::from_integer(10), 1);
+        solver.simplex.set_lower(y, ArithRat::zero(), 2);
+        solver.simplex.set_upper(y, ArithRat::from_integer(10), 3);
 
         // Add constraint: x + y >= 15 (forces x and y to be larger)
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(-Rational64::from_integer(15));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(-ArithRat::from_integer(15));
         solver.add_ge(expr, 4);
 
         // Solve LP to get basis

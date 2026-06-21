@@ -1,11 +1,11 @@
 //\! Presolve optimizations for LIA solver
 
 use super::super::simplex::{LinExpr, VarId};
-use super::helpers::gcd;
+use super::helpers::gcd_i128;
 use super::types::{IntBound, LiaSolver};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use oxiz_core::error::Result;
 impl LiaSolver {
     /// Apply presolve optimizations to simplify constraints before solving
@@ -34,10 +34,11 @@ impl LiaSolver {
                 IntBound::Lower(lb) => {
                     // Integer variables have integer lower bounds
                     // If the current relaxation value is fractional, we can learn something
-                    if !current_val.is_integer() && current_val > Rational64::from_integer(*lb) {
+                    // (`IntBound` is i64; widen losslessly to the i128 `ArithRat`.)
+                    if !current_val.is_integer() && current_val > ArithRat::from_integer(i128::from(*lb)) {
                         // The integer value must be at least ceil(current_val)
                         let ceil_val = current_val.ceil();
-                        if ceil_val > Rational64::from_integer(*lb) {
+                        if ceil_val > ArithRat::from_integer(i128::from(*lb)) {
                             // Could tighten the lower bound
                             // (In production, would update bounds here)
                         }
@@ -45,10 +46,10 @@ impl LiaSolver {
                 }
                 IntBound::Upper(ub) => {
                     // Integer variables have integer upper bounds
-                    if !current_val.is_integer() && current_val < Rational64::from_integer(*ub) {
+                    if !current_val.is_integer() && current_val < ArithRat::from_integer(i128::from(*ub)) {
                         // The integer value must be at most floor(current_val)
                         let floor_val = current_val.floor();
-                        if floor_val < Rational64::from_integer(*ub) {
+                        if floor_val < ArithRat::from_integer(i128::from(*ub)) {
                             // Could tighten the upper bound
                             // (In production, would update bounds here)
                         }
@@ -100,8 +101,10 @@ impl LiaSolver {
             return;
         }
 
-        // Extract integer coefficients (assuming they are actually integers)
-        let coeffs: Vec<i64> = expr
+        // Extract integer coefficients (assuming they are actually integers).
+        // `c.numer()` is `i128` (the `ArithRat` numerator), kept i128 here so a
+        // coefficient outside `i64` is never silently truncated before the GCD.
+        let coeffs: Vec<i128> = expr
             .terms
             .iter()
             .filter_map(|(_, c)| {
@@ -117,14 +120,14 @@ impl LiaSolver {
             return; // Not all coefficients are integers, can't normalize
         }
 
-        let g = coeffs.iter().fold(0i64, |acc, &c| gcd(acc, c.abs()));
+        let g = coeffs.iter().fold(0i128, |acc, &c| gcd_i128(acc, c.abs()));
 
         if g <= 1 {
             return; // Already normalized or GCD is 1
         }
 
         // Divide all coefficients and constant by GCD
-        let g_rat = Rational64::from_integer(g);
+        let g_rat = ArithRat::from_integer(g);
         for (_, c) in &mut expr.terms {
             *c /= g_rat;
         }
@@ -202,7 +205,7 @@ impl LiaSolver {
 
         // Now apply the fixes
         for (var, fixed_int, lb_reason, ub_reason) in to_fix {
-            let fixed_value = Rational64::from_integer(fixed_int);
+            let fixed_value = ArithRat::from_integer(fixed_int);
 
             // Set both bounds to the fixed value (x = fixed_value)
             self.simplex.set_lower(var, fixed_value, lb_reason);

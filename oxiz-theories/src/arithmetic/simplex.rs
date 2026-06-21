@@ -4,7 +4,7 @@ use super::delta::DeltaRational;
 use crate::config::{PivotingRule, SimplexConfig};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::{One, Signed, Zero};
 #[cfg(feature = "profiling")]
 use oxiz_core::profiling::{ProfilingCategory, ScopedTimer};
@@ -17,9 +17,9 @@ pub type VarId = u32;
 #[derive(Debug, Clone, Default)]
 pub struct LinExpr {
     /// Terms: (variable, coefficient)
-    pub terms: SmallVec<[(VarId, Rational64); 4]>,
+    pub terms: SmallVec<[(VarId, ArithRat); 4]>,
     /// Constant term
-    pub constant: Rational64,
+    pub constant: ArithRat,
 }
 
 impl LinExpr {
@@ -31,7 +31,7 @@ impl LinExpr {
 
     /// Create a constant expression
     #[must_use]
-    pub fn constant(c: Rational64) -> Self {
+    pub fn constant(c: ArithRat) -> Self {
         Self {
             terms: SmallVec::new(),
             constant: c,
@@ -42,13 +42,13 @@ impl LinExpr {
     #[must_use]
     pub fn var(v: VarId) -> Self {
         Self {
-            terms: smallvec::smallvec![(v, Rational64::one())],
-            constant: Rational64::zero(),
+            terms: smallvec::smallvec![(v, ArithRat::one())],
+            constant: ArithRat::zero(),
         }
     }
 
     /// Add a term
-    pub fn add_term(&mut self, var: VarId, coef: Rational64) {
+    pub fn add_term(&mut self, var: VarId, coef: ArithRat) {
         if !coef.is_zero() {
             // Check if variable already exists
             for (v, c) in &mut self.terms {
@@ -65,7 +65,7 @@ impl LinExpr {
     }
 
     /// Add a constant
-    pub fn add_constant(&mut self, c: Rational64) {
+    pub fn add_constant(&mut self, c: ArithRat) {
         self.constant += c;
     }
 
@@ -78,7 +78,7 @@ impl LinExpr {
     }
 
     /// Multiply by a constant
-    pub fn scale(&mut self, factor: Rational64) {
+    pub fn scale(&mut self, factor: ArithRat) {
         for (_, c) in &mut self.terms {
             *c *= factor;
         }
@@ -306,7 +306,7 @@ impl Simplex {
     /// Get the current value of a variable (returns the real part)
     #[inline]
     #[must_use]
-    pub fn value(&self, var: VarId) -> Rational64 {
+    pub fn value(&self, var: VarId) -> ArithRat {
         self.assignment
             .get(var as usize)
             .map(|d| d.real)
@@ -324,7 +324,7 @@ impl Simplex {
     }
 
     /// Set a lower bound (x >= value)
-    pub fn set_lower(&mut self, var: VarId, value: Rational64, reason: u32) {
+    pub fn set_lower(&mut self, var: VarId, value: ArithRat, reason: u32) {
         let idx = var as usize;
         if idx < self.lower.len() {
             // Track the old value for undo
@@ -341,7 +341,7 @@ impl Simplex {
     }
 
     /// Set a strict lower bound (x > value), represented as x >= value + δ
-    pub fn set_strict_lower(&mut self, var: VarId, value: Rational64, reason: u32) {
+    pub fn set_strict_lower(&mut self, var: VarId, value: ArithRat, reason: u32) {
         let idx = var as usize;
         if idx < self.lower.len() {
             // Track the old value for undo
@@ -351,14 +351,14 @@ impl Simplex {
             }
             self.lower[idx] = Some(Bound {
                 kind: BoundType::Lower,
-                value: DeltaRational::new(value, Rational64::one()),
+                value: DeltaRational::new(value, ArithRat::one()),
                 reason,
             });
         }
     }
 
     /// Set an upper bound (x <= value)
-    pub fn set_upper(&mut self, var: VarId, value: Rational64, reason: u32) {
+    pub fn set_upper(&mut self, var: VarId, value: ArithRat, reason: u32) {
         let idx = var as usize;
         if idx < self.upper.len() {
             // Track the old value for undo
@@ -375,7 +375,7 @@ impl Simplex {
     }
 
     /// Set a strict upper bound (x < value), represented as x <= value - δ
-    pub fn set_strict_upper(&mut self, var: VarId, value: Rational64, reason: u32) {
+    pub fn set_strict_upper(&mut self, var: VarId, value: ArithRat, reason: u32) {
         let idx = var as usize;
         if idx < self.upper.len() {
             // Track the old value for undo
@@ -385,7 +385,7 @@ impl Simplex {
             }
             self.upper[idx] = Some(Bound {
                 kind: BoundType::Upper,
-                value: DeltaRational::new(value, -Rational64::one()),
+                value: DeltaRational::new(value, -ArithRat::one()),
                 reason,
             });
         }
@@ -413,7 +413,7 @@ impl Simplex {
 
         // Introduce slack variable: expr + s = 0, s >= 0
         let slack = self.new_slack();
-        expr.add_term(slack, Rational64::one());
+        expr.add_term(slack, ArithRat::one());
 
         // slack is basic, express it in terms of non-basic
         let mut slack_expr = LinExpr::constant(-expr.constant);
@@ -431,7 +431,7 @@ impl Simplex {
         self.basic[slack as usize] = true;
 
         // Set slack >= 0
-        self.set_lower(slack, Rational64::zero(), reason);
+        self.set_lower(slack, ArithRat::zero(), reason);
     }
 
     /// Add a constraint: expr >= 0
@@ -470,7 +470,7 @@ impl Simplex {
 
         // Introduce slack variable: expr + s = 0, s > 0 (strict)
         let slack = self.new_slack();
-        expr.add_term(slack, Rational64::one());
+        expr.add_term(slack, ArithRat::one());
 
         // slack is basic, express it in terms of non-basic
         let mut slack_expr = LinExpr::constant(-expr.constant);
@@ -482,7 +482,7 @@ impl Simplex {
         self.tableau.insert(slack, slack_expr);
 
         // Set slack > 0 (strict lower bound: slack >= 0 + δ)
-        self.set_strict_lower(slack, Rational64::zero(), reason);
+        self.set_strict_lower(slack, ArithRat::zero(), reason);
     }
 
     /// Add a strict constraint: expr > 0
@@ -692,15 +692,15 @@ impl Simplex {
                     // leaving_var < lower_bound, need to increase it
                     // If coef > 0: increasing var increases leaving_var ✓
                     // If coef < 0: decreasing var increases leaving_var ✓
-                    (*coef > Rational64::zero() && can_increase)
-                        || (*coef < Rational64::zero() && can_decrease)
+                    (*coef > ArithRat::zero() && can_increase)
+                        || (*coef < ArithRat::zero() && can_decrease)
                 }
                 BoundType::Upper => {
                     // leaving_var > upper_bound, need to decrease it
                     // If coef < 0: increasing var decreases leaving_var ✓
                     // If coef > 0: decreasing var decreases leaving_var ✓
-                    (*coef < Rational64::zero() && can_increase)
-                        || (*coef > Rational64::zero() && can_decrease)
+                    (*coef < ArithRat::zero() && can_increase)
+                        || (*coef > ArithRat::zero() && can_decrease)
                 }
                 _ => false,
             };
@@ -754,12 +754,12 @@ impl Simplex {
                     let can_decrease = self.can_decrease(*var);
                     let is_eligible = match bound.kind {
                         BoundType::Lower => {
-                            (*coef > Rational64::zero() && can_increase)
-                                || (*coef < Rational64::zero() && can_decrease)
+                            (*coef > ArithRat::zero() && can_increase)
+                                || (*coef < ArithRat::zero() && can_decrease)
                         }
                         BoundType::Upper => {
-                            (*coef < Rational64::zero() && can_increase)
-                                || (*coef > Rational64::zero() && can_decrease)
+                            (*coef < ArithRat::zero() && can_increase)
+                                || (*coef > ArithRat::zero() && can_decrease)
                         }
                         _ => false,
                     };
@@ -777,26 +777,26 @@ impl Simplex {
             PivotingRule::Dantzig => {
                 // Dantzig's rule: choose variable with largest improvement
                 let mut best_var = None;
-                let mut best_improvement = Rational64::zero();
+                let mut best_improvement = ArithRat::zero();
 
                 for (var, coef) in &expr.terms {
                     let can_increase = self.can_increase(*var);
                     let can_decrease = self.can_decrease(*var);
 
                     let improvement = match bound.kind {
-                        BoundType::Lower if *coef > Rational64::zero() && can_increase => {
+                        BoundType::Lower if *coef > ArithRat::zero() && can_increase => {
                             coef.abs()
                         }
-                        BoundType::Lower if *coef < Rational64::zero() && can_decrease => {
+                        BoundType::Lower if *coef < ArithRat::zero() && can_decrease => {
                             coef.abs()
                         }
-                        BoundType::Upper if *coef < Rational64::zero() && can_increase => {
+                        BoundType::Upper if *coef < ArithRat::zero() && can_increase => {
                             coef.abs()
                         }
-                        BoundType::Upper if *coef > Rational64::zero() && can_decrease => {
+                        BoundType::Upper if *coef > ArithRat::zero() && can_decrease => {
                             coef.abs()
                         }
-                        _ => Rational64::zero(),
+                        _ => ArithRat::zero(),
                     };
 
                     if improvement > best_improvement {
@@ -811,26 +811,26 @@ impl Simplex {
                 // For simplicity, fall back to Dantzig's rule
                 // A full implementation would maintain edge weights
                 let mut best_var = None;
-                let mut best_score = Rational64::zero();
+                let mut best_score = ArithRat::zero();
 
                 for (var, coef) in &expr.terms {
                     let can_increase = self.can_increase(*var);
                     let can_decrease = self.can_decrease(*var);
 
                     let score = match bound.kind {
-                        BoundType::Lower if *coef > Rational64::zero() && can_increase => {
+                        BoundType::Lower if *coef > ArithRat::zero() && can_increase => {
                             coef.abs()
                         }
-                        BoundType::Lower if *coef < Rational64::zero() && can_decrease => {
+                        BoundType::Lower if *coef < ArithRat::zero() && can_decrease => {
                             coef.abs()
                         }
-                        BoundType::Upper if *coef < Rational64::zero() && can_increase => {
+                        BoundType::Upper if *coef < ArithRat::zero() && can_increase => {
                             coef.abs()
                         }
-                        BoundType::Upper if *coef > Rational64::zero() && can_decrease => {
+                        BoundType::Upper if *coef > ArithRat::zero() && can_decrease => {
                             coef.abs()
                         }
-                        _ => Rational64::zero(),
+                        _ => ArithRat::zero(),
                     };
 
                     if score > best_score {
@@ -849,7 +849,7 @@ impl Simplex {
                 const SAMPLE_RATE: usize = 4; // Check every 4th variable
 
                 let mut best_var = None;
-                let mut best_improvement = Rational64::zero();
+                let mut best_improvement = ArithRat::zero();
                 let mut count = 0;
 
                 for (var, coef) in &expr.terms {
@@ -863,19 +863,19 @@ impl Simplex {
                     let can_decrease = self.can_decrease(*var);
 
                     let improvement = match bound.kind {
-                        BoundType::Lower if *coef > Rational64::zero() && can_increase => {
+                        BoundType::Lower if *coef > ArithRat::zero() && can_increase => {
                             coef.abs()
                         }
-                        BoundType::Lower if *coef < Rational64::zero() && can_decrease => {
+                        BoundType::Lower if *coef < ArithRat::zero() && can_decrease => {
                             coef.abs()
                         }
-                        BoundType::Upper if *coef < Rational64::zero() && can_increase => {
+                        BoundType::Upper if *coef < ArithRat::zero() && can_increase => {
                             coef.abs()
                         }
-                        BoundType::Upper if *coef > Rational64::zero() && can_decrease => {
+                        BoundType::Upper if *coef > ArithRat::zero() && can_decrease => {
                             coef.abs()
                         }
-                        _ => Rational64::zero(),
+                        _ => ArithRat::zero(),
                     };
 
                     if improvement > best_improvement {
@@ -891,12 +891,12 @@ impl Simplex {
                         let can_decrease = self.can_decrease(*var);
                         let is_eligible = match bound.kind {
                             BoundType::Lower => {
-                                (*coef > Rational64::zero() && can_increase)
-                                    || (*coef < Rational64::zero() && can_decrease)
+                                (*coef > ArithRat::zero() && can_increase)
+                                    || (*coef < ArithRat::zero() && can_decrease)
                             }
                             BoundType::Upper => {
-                                (*coef < Rational64::zero() && can_increase)
-                                    || (*coef > Rational64::zero() && can_decrease)
+                                (*coef < ArithRat::zero() && can_increase)
+                                    || (*coef > ArithRat::zero() && can_decrease)
                             }
                             _ => false,
                         };
@@ -957,7 +957,7 @@ impl Simplex {
 
         // Express nonbasic in terms of basic
         let mut new_expr = LinExpr::new();
-        new_expr.add_term(basic_var, Rational64::one() / coef);
+        new_expr.add_term(basic_var, ArithRat::one() / coef);
         new_expr.add_constant(-expr.constant / coef);
 
         for (var, c) in &expr.terms {
@@ -1065,12 +1065,12 @@ impl Simplex {
                     // For each non-basic variable:
                     // - If coef > 0, we need to increase it, so its upper bound blocks us
                     // - If coef < 0, we need to decrease it, so its lower bound blocks us
-                    if *coef > Rational64::zero()
+                    if *coef > ArithRat::zero()
                         && let Some(hi) = &self.upper[var_idx]
                         && !reasons.contains(&hi.reason)
                     {
                         reasons.push(hi.reason);
-                    } else if *coef < Rational64::zero()
+                    } else if *coef < ArithRat::zero()
                         && let Some(lo) = &self.lower[var_idx]
                         && !reasons.contains(&lo.reason)
                     {
@@ -1082,12 +1082,12 @@ impl Simplex {
                     // For each non-basic variable:
                     // - If coef > 0, we need to decrease it, so its lower bound blocks us
                     // - If coef < 0, we need to increase it, so its upper bound blocks us
-                    if *coef > Rational64::zero()
+                    if *coef > ArithRat::zero()
                         && let Some(lo) = &self.lower[var_idx]
                         && !reasons.contains(&lo.reason)
                     {
                         reasons.push(lo.reason);
-                    } else if *coef < Rational64::zero()
+                    } else if *coef < ArithRat::zero()
                         && let Some(hi) = &self.upper[var_idx]
                         && !reasons.contains(&hi.reason)
                     {
@@ -1168,7 +1168,7 @@ impl Simplex {
 
         for (var, coef) in &expr.terms {
             let var_idx = *var as usize;
-            if *coef > Rational64::zero() {
+            if *coef > ArithRat::zero() {
                 // Positive coefficient: need lower bound
                 if let Some(lo) = &self.lower[var_idx] {
                     lower_sum += lo.value * *coef;
@@ -1212,7 +1212,7 @@ impl Simplex {
 
         for (var, coef) in &expr.terms {
             let var_idx = *var as usize;
-            if *coef > Rational64::zero() {
+            if *coef > ArithRat::zero() {
                 // Positive coefficient: need upper bound
                 if let Some(hi) = &self.upper[var_idx] {
                     upper_sum += hi.value * *coef;
@@ -1471,13 +1471,13 @@ impl Simplex {
 
     /// Real-part of the assignment at index `idx`.
     #[inline]
-    pub(super) fn assignment_real_at(&self, idx: usize) -> Rational64 {
+    pub(super) fn assignment_real_at(&self, idx: usize) -> ArithRat {
         self.assignment[idx].real
     }
 
     /// Full `DeltaRational` assignment at index `idx`.
     #[inline]
-    pub(super) fn assignment_at(&self, idx: usize) -> Rational64 {
+    pub(super) fn assignment_at(&self, idx: usize) -> ArithRat {
         self.assignment[idx].real
     }
 
@@ -1498,7 +1498,7 @@ impl Simplex {
     }
 
     /// Return the coefficient of `nonbasic` in the row of `basic`, or `None`.
-    pub(super) fn tableau_coef_of(&self, basic: VarId, nonbasic: VarId) -> Option<Rational64> {
+    pub(super) fn tableau_coef_of(&self, basic: VarId, nonbasic: VarId) -> Option<ArithRat> {
         self.tableau.get(&basic).and_then(|row| {
             row.terms
                 .iter()
@@ -1509,7 +1509,7 @@ impl Simplex {
 
     /// Real part of the upper bound for variable at `idx`, if any.
     #[inline]
-    pub(super) fn upper_real_at(&self, idx: usize) -> Option<Rational64> {
+    pub(super) fn upper_real_at(&self, idx: usize) -> Option<ArithRat> {
         self.upper
             .get(idx)
             .and_then(|b| b.as_ref().map(|b| b.value.real))
@@ -1517,7 +1517,7 @@ impl Simplex {
 
     /// Real part of the lower bound for variable at `idx`, if any.
     #[inline]
-    pub(super) fn lower_real_at(&self, idx: usize) -> Option<Rational64> {
+    pub(super) fn lower_real_at(&self, idx: usize) -> Option<ArithRat> {
         self.lower
             .get(idx)
             .and_then(|b| b.as_ref().map(|b| b.value.real))
@@ -1566,11 +1566,11 @@ mod tests {
         let y = simplex.new_var();
 
         // x >= 0, y >= 0
-        simplex.set_lower(x, Rational64::zero(), 0);
-        simplex.set_lower(y, Rational64::zero(), 1);
+        simplex.set_lower(x, ArithRat::zero(), 0);
+        simplex.set_lower(y, ArithRat::zero(), 1);
 
         // x <= 10
-        simplex.set_upper(x, Rational64::from_integer(10), 2);
+        simplex.set_upper(x, ArithRat::from_integer(10), 2);
 
         assert!(simplex.check().is_ok());
     }
@@ -1582,8 +1582,8 @@ mod tests {
         let x = simplex.new_var();
 
         // x >= 10 and x <= 5 is infeasible
-        simplex.set_lower(x, Rational64::from_integer(10), 0);
-        simplex.set_upper(x, Rational64::from_integer(5), 1);
+        simplex.set_lower(x, ArithRat::from_integer(10), 0);
+        simplex.set_upper(x, ArithRat::from_integer(5), 1);
 
         assert!(simplex.check().is_err());
     }
@@ -1595,10 +1595,10 @@ mod tests {
         let x = simplex.new_var();
 
         // x > 0 (strict lower bound)
-        simplex.set_strict_lower(x, Rational64::zero(), 0);
+        simplex.set_strict_lower(x, ArithRat::zero(), 0);
 
         // x < 10 (strict upper bound)
-        simplex.set_strict_upper(x, Rational64::from_integer(10), 1);
+        simplex.set_strict_upper(x, ArithRat::from_integer(10), 1);
 
         assert!(simplex.check().is_ok());
 
@@ -1615,8 +1615,8 @@ mod tests {
         let x = simplex.new_var();
 
         // x >= 5 and x < 5 is infeasible
-        simplex.set_lower(x, Rational64::from_integer(5), 0);
-        simplex.set_strict_upper(x, Rational64::from_integer(5), 1);
+        simplex.set_lower(x, ArithRat::from_integer(5), 0);
+        simplex.set_strict_upper(x, ArithRat::from_integer(5), 1);
 
         assert!(simplex.check().is_err());
     }
@@ -1628,8 +1628,8 @@ mod tests {
         let x = simplex.new_var();
 
         // x > 5 and x <= 6 is feasible
-        simplex.set_strict_lower(x, Rational64::from_integer(5), 0);
-        simplex.set_upper(x, Rational64::from_integer(6), 1);
+        simplex.set_strict_lower(x, ArithRat::from_integer(5), 0);
+        simplex.set_upper(x, ArithRat::from_integer(6), 1);
 
         assert!(simplex.check().is_ok());
 
@@ -1646,19 +1646,19 @@ mod tests {
         let y = simplex.new_var();
 
         // x >= 0, x <= 10
-        simplex.set_lower(x, Rational64::zero(), 0);
-        simplex.set_upper(x, Rational64::from_integer(10), 1);
+        simplex.set_lower(x, ArithRat::zero(), 0);
+        simplex.set_upper(x, ArithRat::from_integer(10), 1);
 
         // y >= 0, y <= 10
-        simplex.set_lower(y, Rational64::zero(), 2);
-        simplex.set_upper(y, Rational64::from_integer(10), 3);
+        simplex.set_lower(y, ArithRat::zero(), 2);
+        simplex.set_upper(y, ArithRat::from_integer(10), 3);
 
         // Add constraint: x + y <= 15
         // This introduces slack variable s, where s = 15 - x - y, s >= 0
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(-Rational64::from_integer(15));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(-ArithRat::from_integer(15));
         simplex.add_le(expr, 4);
 
         // Propagate bounds
@@ -1679,17 +1679,17 @@ mod tests {
         let x = simplex.new_var();
 
         // x >= 5
-        simplex.set_lower(x, Rational64::from_integer(5), 0);
+        simplex.set_lower(x, ArithRat::from_integer(5), 0);
 
         // x <= 15
-        simplex.set_upper(x, Rational64::from_integer(15), 1);
+        simplex.set_upper(x, ArithRat::from_integer(15), 1);
 
         // The accessor methods work
         let lo = simplex.get_lower(x).expect("test operation should succeed");
-        assert_eq!(lo.value.real, Rational64::from_integer(5));
+        assert_eq!(lo.value.real, ArithRat::from_integer(5));
 
         let hi = simplex.get_upper(x).expect("test operation should succeed");
-        assert_eq!(hi.value.real, Rational64::from_integer(15));
+        assert_eq!(hi.value.real, ArithRat::from_integer(15));
 
         assert!(simplex.check().is_ok());
     }
@@ -1704,16 +1704,16 @@ mod tests {
         // Constraint: x + y <= 5 (reason 0)
         // Which becomes: x + y - 5 <= 0, introduce slack s where s = 5 - x - y, s >= 0
         let mut expr1 = LinExpr::new();
-        expr1.add_term(x, Rational64::one());
-        expr1.add_term(y, Rational64::one());
-        expr1.add_constant(-Rational64::from_integer(5));
+        expr1.add_term(x, ArithRat::one());
+        expr1.add_term(y, ArithRat::one());
+        expr1.add_constant(-ArithRat::from_integer(5));
         simplex.add_le(expr1, 0);
 
         // x >= 3 (reason 1)
-        simplex.set_lower(x, Rational64::from_integer(3), 1);
+        simplex.set_lower(x, ArithRat::from_integer(3), 1);
 
         // y >= 3 (reason 2)
-        simplex.set_lower(y, Rational64::from_integer(3), 2);
+        simplex.set_lower(y, ArithRat::from_integer(3), 2);
 
         // This is infeasible: x >= 3, y >= 3 implies x + y >= 6, but x + y <= 5
         let result = simplex.check();
@@ -1735,20 +1735,20 @@ mod tests {
 
         // x + y + z <= 10 (reason 0)
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_term(z, Rational64::one());
-        expr.add_constant(-Rational64::from_integer(10));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_term(z, ArithRat::one());
+        expr.add_constant(-ArithRat::from_integer(10));
         simplex.add_le(expr, 0);
 
         // x >= 4 (reason 1)
-        simplex.set_lower(x, Rational64::from_integer(4), 1);
+        simplex.set_lower(x, ArithRat::from_integer(4), 1);
 
         // y >= 4 (reason 2)
-        simplex.set_lower(y, Rational64::from_integer(4), 2);
+        simplex.set_lower(y, ArithRat::from_integer(4), 2);
 
         // z >= 4 (reason 3)
-        simplex.set_lower(z, Rational64::from_integer(4), 3);
+        simplex.set_lower(z, ArithRat::from_integer(4), 3);
 
         // Infeasible: x + y + z >= 12 but x + y + z <= 10
         let result = simplex.check();
@@ -1766,8 +1766,8 @@ mod tests {
         let x = simplex.new_var();
 
         // Level 0: x >= 0, x <= 100
-        simplex.set_lower(x, Rational64::zero(), 0);
-        simplex.set_upper(x, Rational64::from_integer(100), 1);
+        simplex.set_lower(x, ArithRat::zero(), 0);
+        simplex.set_upper(x, ArithRat::from_integer(100), 1);
 
         assert!(simplex.check().is_ok());
 
@@ -1775,18 +1775,18 @@ mod tests {
         simplex.push();
 
         // Level 1: tighten to x >= 50, x <= 60
-        simplex.set_lower(x, Rational64::from_integer(50), 2);
-        simplex.set_upper(x, Rational64::from_integer(60), 3);
+        simplex.set_lower(x, ArithRat::from_integer(50), 2);
+        simplex.set_upper(x, ArithRat::from_integer(60), 3);
 
         assert!(simplex.check().is_ok());
         let lo = simplex.get_lower(x).expect("test operation should succeed");
-        assert_eq!(lo.value.real, Rational64::from_integer(50));
+        assert_eq!(lo.value.real, ArithRat::from_integer(50));
 
         // Push to level 2
         simplex.push();
 
         // Level 2: infeasible bounds x >= 70, x <= 60
-        simplex.set_lower(x, Rational64::from_integer(70), 4);
+        simplex.set_lower(x, ArithRat::from_integer(70), 4);
 
         assert!(simplex.check().is_err());
 
@@ -1795,9 +1795,9 @@ mod tests {
 
         // After pop, bounds should be back to x >= 50, x <= 60
         let lo = simplex.get_lower(x).expect("test operation should succeed");
-        assert_eq!(lo.value.real, Rational64::from_integer(50));
+        assert_eq!(lo.value.real, ArithRat::from_integer(50));
         let hi = simplex.get_upper(x).expect("test operation should succeed");
-        assert_eq!(hi.value.real, Rational64::from_integer(60));
+        assert_eq!(hi.value.real, ArithRat::from_integer(60));
 
         assert!(simplex.check().is_ok());
 
@@ -1806,9 +1806,9 @@ mod tests {
 
         // After pop, bounds should be back to x >= 0, x <= 100
         let lo = simplex.get_lower(x).expect("test operation should succeed");
-        assert_eq!(lo.value.real, Rational64::zero());
+        assert_eq!(lo.value.real, ArithRat::zero());
         let hi = simplex.get_upper(x).expect("test operation should succeed");
-        assert_eq!(hi.value.real, Rational64::from_integer(100));
+        assert_eq!(hi.value.real, ArithRat::from_integer(100));
 
         assert!(simplex.check().is_ok());
     }
@@ -1818,8 +1818,8 @@ mod tests {
         let mut simplex = Simplex::new();
 
         let x = simplex.new_var();
-        simplex.set_lower(x, Rational64::zero(), 0);
-        simplex.set_upper(x, Rational64::from_integer(10), 1);
+        simplex.set_lower(x, ArithRat::zero(), 0);
+        simplex.set_upper(x, ArithRat::from_integer(10), 1);
 
         assert_eq!(simplex.num_original_vars(), 1);
 
@@ -1827,8 +1827,8 @@ mod tests {
 
         // Add a new variable at level 1
         let y = simplex.new_var();
-        simplex.set_lower(y, Rational64::zero(), 2);
-        simplex.set_upper(y, Rational64::from_integer(20), 3);
+        simplex.set_lower(y, ArithRat::zero(), 2);
+        simplex.set_upper(y, ArithRat::from_integer(20), 3);
 
         assert_eq!(simplex.num_original_vars(), 2);
         assert!(simplex.check().is_ok());
@@ -1849,14 +1849,14 @@ mod tests {
         let y = simplex.new_var();
 
         // x, y >= 0
-        simplex.set_lower(x, Rational64::zero(), 0);
-        simplex.set_lower(y, Rational64::zero(), 1);
+        simplex.set_lower(x, ArithRat::zero(), 0);
+        simplex.set_lower(y, ArithRat::zero(), 1);
 
         // Add a constraint: x + y = 10 (using slack variable, becomes basic)
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(Rational64::from_integer(-10));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(ArithRat::from_integer(-10));
         simplex.add_eq(expr, 2);
 
         // dual_simplex should be able to find a feasible solution
@@ -1865,8 +1865,8 @@ mod tests {
         // Check values
         let x_val = simplex.value(x);
         let y_val = simplex.value(y);
-        assert!(x_val + y_val >= Rational64::from_integer(9)); // Allow some slack
-        assert!(x_val + y_val <= Rational64::from_integer(11));
+        assert!(x_val + y_val >= ArithRat::from_integer(9)); // Allow some slack
+        assert!(x_val + y_val <= ArithRat::from_integer(11));
     }
 
     #[test]
@@ -1878,18 +1878,18 @@ mod tests {
         let y = simplex.new_var();
 
         // x >= 0, y >= 0
-        simplex.set_lower(x, Rational64::zero(), 0);
-        simplex.set_lower(y, Rational64::zero(), 1);
+        simplex.set_lower(x, ArithRat::zero(), 0);
+        simplex.set_lower(y, ArithRat::zero(), 1);
 
         // x <= 10, y <= 10
-        simplex.set_upper(x, Rational64::from_integer(10), 2);
-        simplex.set_upper(y, Rational64::from_integer(10), 3);
+        simplex.set_upper(x, ArithRat::from_integer(10), 2);
+        simplex.set_upper(y, ArithRat::from_integer(10), 3);
 
         // Add constraint: x + y >= 5
         let mut expr = LinExpr::new();
-        expr.add_term(x, Rational64::one());
-        expr.add_term(y, Rational64::one());
-        expr.add_constant(Rational64::from_integer(-5));
+        expr.add_term(x, ArithRat::one());
+        expr.add_term(y, ArithRat::one());
+        expr.add_constant(ArithRat::from_integer(-5));
         simplex.add_ge(expr, 4);
 
         // Should be feasible
@@ -1899,9 +1899,9 @@ mod tests {
         let x_val = simplex.value(x);
         let y_val = simplex.value(y);
 
-        assert!(x_val >= Rational64::zero());
-        assert!(y_val >= Rational64::zero());
-        assert!(x_val + y_val >= Rational64::from_integer(5));
+        assert!(x_val >= ArithRat::zero());
+        assert!(y_val >= ArithRat::zero());
+        assert!(x_val + y_val >= ArithRat::from_integer(5));
     }
 
     /// Test that x<=y AND y<=x makes x<y infeasible (probe test).
@@ -1913,14 +1913,14 @@ mod tests {
 
         // x <= y  (x - y <= 0)
         let mut e1 = LinExpr::new();
-        e1.add_term(x, Rational64::one());
-        e1.add_term(y, -Rational64::one());
+        e1.add_term(x, ArithRat::one());
+        e1.add_term(y, -ArithRat::one());
         simplex.add_le(e1, 0);
 
         // y <= x  (y - x <= 0)
         let mut e2 = LinExpr::new();
-        e2.add_term(y, Rational64::one());
-        e2.add_term(x, -Rational64::one());
+        e2.add_term(y, ArithRat::one());
+        e2.add_term(x, -ArithRat::one());
         simplex.add_le(e2, 1);
 
         assert!(simplex.check().is_ok(), "x<=y AND y<=x should be SAT");
@@ -1929,8 +1929,8 @@ mod tests {
         {
             simplex.push();
             let mut e3 = LinExpr::new();
-            e3.add_term(x, Rational64::one());
-            e3.add_term(y, -Rational64::one());
+            e3.add_term(x, ArithRat::one());
+            e3.add_term(y, -ArithRat::one());
             simplex.add_strict_lt(e3, 99);
             let probe1 = simplex.check();
             simplex.pop();
@@ -1947,8 +1947,8 @@ mod tests {
         {
             simplex.push();
             let mut e4 = LinExpr::new();
-            e4.add_term(y, Rational64::one());
-            e4.add_term(x, -Rational64::one());
+            e4.add_term(y, ArithRat::one());
+            e4.add_term(x, -ArithRat::one());
             simplex.add_strict_lt(e4, 99);
             let probe2 = simplex.check();
             simplex.pop();

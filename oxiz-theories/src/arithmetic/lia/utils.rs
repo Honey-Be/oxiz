@@ -4,7 +4,7 @@ use super::super::simplex::{LinExpr, VarId};
 use super::types::{IntBound, LiaSolver};
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use oxiz_core::error::Result;
 
 impl LiaSolver {
@@ -37,8 +37,10 @@ impl LiaSolver {
                 // We could potentially update bounds here, but we need to be careful
                 // not to modify bounds during the solving process without proper tracking
                 if let Some(IntBound::Lower(lb)) = current_bound {
-                    // If lower bound allows, we know the value must be at least ceil
-                    if *lb <= floor_val {
+                    // If lower bound allows, we know the value must be at least ceil.
+                    // `IntBound` is i64; widen losslessly to compare with the i128
+                    // `floor_val` (from the `ArithRat` value's `to_integer()`).
+                    if i128::from(*lb) <= floor_val {
                         // Could propagate: var >= _ceil_val
                         // But this requires modifying the Simplex state
                     }
@@ -51,7 +53,7 @@ impl LiaSolver {
 
     /// Get the current value of a variable
     #[must_use]
-    pub fn value(&self, var: VarId) -> Rational64 {
+    pub fn value(&self, var: VarId) -> ArithRat {
         self.simplex.value(var)
     }
 
@@ -115,8 +117,8 @@ impl LiaSolver {
     ///
     /// Reference: "Conflict-Driven Cutting Planes" by Achterberg (2007)
     #[must_use]
-    pub fn select_var_for_cut(&self) -> Option<(VarId, Rational64)> {
-        let mut candidates: Vec<(VarId, Rational64, u32)> = Vec::new();
+    pub fn select_var_for_cut(&self) -> Option<(VarId, ArithRat)> {
+        let mut candidates: Vec<(VarId, ArithRat, u32)> = Vec::new();
 
         // Collect all fractional variables with their conflict scores
         for &var in self.int_vars.keys() {
@@ -144,8 +146,8 @@ impl LiaSolver {
             let frac_a = (a.1 - a.1.floor()).abs();
             let frac_b = (b.1 - b.1.floor()).abs();
 
-            let dist_a = (frac_a - Rational64::new(1, 2)).abs();
-            let dist_b = (frac_b - Rational64::new(1, 2)).abs();
+            let dist_a = (frac_a - ArithRat::new(1, 2)).abs();
+            let dist_b = (frac_b - ArithRat::new(1, 2)).abs();
 
             dist_a.cmp(&dist_b)
         });

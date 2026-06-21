@@ -1,14 +1,14 @@
 //\! Cut generation and management for LIA solver
 
 use super::super::simplex::{LinExpr, VarId};
-use super::helpers::gcd;
+use super::helpers::gcd_i128;
 use super::types::LiaSolver;
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::{One, Zero};
 impl LiaSolver {
-    pub(super) fn generate_gomory_cut(&self, _var: VarId, value: Rational64) -> Option<LinExpr> {
+    pub(super) fn generate_gomory_cut(&self, _var: VarId, value: ArithRat) -> Option<LinExpr> {
         if value.is_integer() {
             return None;
         }
@@ -43,7 +43,7 @@ impl LiaSolver {
     /// Reference: "Integer Programming" by Wolsey, Chapter 8
     pub fn lift_gomory_cut(&self, cut: &mut LinExpr, var: VarId) -> bool {
         // Find the current coefficient for the variable
-        let mut current_coeff = Rational64::zero();
+        let mut current_coeff = ArithRat::zero();
         let mut var_idx = None;
 
         for (idx, &(v, c)) in cut.terms.iter().enumerate() {
@@ -70,7 +70,7 @@ impl LiaSolver {
         let rhs = -cut.constant;
         let frac_rhs = rhs - rhs.floor();
 
-        if frac_rhs.is_zero() || frac_rhs == Rational64::one() {
+        if frac_rhs.is_zero() || frac_rhs == ArithRat::one() {
             return false; // Cannot lift
         }
 
@@ -81,7 +81,7 @@ impl LiaSolver {
         // 3. Update the cut with the lifted coefficient
 
         // For now, apply a conservative lift: multiply coefficient by (1 + frac_rhs)
-        let lift_factor = Rational64::one() + frac_rhs / Rational64::from_integer(2);
+        let lift_factor = ArithRat::one() + frac_rhs / ArithRat::from_integer(2);
         let lifted_coeff = current_coeff * lift_factor;
 
         // Update the coefficient in the cut
@@ -117,12 +117,15 @@ impl LiaSolver {
     /// For a constraint: a_1*x_1 + a_2*x_2 + ... + a_n*x_n <= b
     /// where all a_i and x_i are integers, if gcd(a_1, a_2, ..., a_n) does not divide b,
     /// then the constraint is infeasible over integers.
-    pub fn check_gcd_infeasibility(coeffs: &[i64], bound: i64) -> bool {
+    ///
+    /// Coefficients/bound are `i128` because they are `ArithRat`
+    /// (= `Ratio<i128>`) numerators ([`crate::ArithRat`]); see [`gcd_i128`].
+    pub fn check_gcd_infeasibility(coeffs: &[i128], bound: i128) -> bool {
         if coeffs.is_empty() {
             return false;
         }
 
-        let g = coeffs.iter().fold(0i64, |acc, &c| gcd(acc, c.abs()));
+        let g = coeffs.iter().fold(0i128, |acc, &c| gcd_i128(acc, c.abs()));
 
         if g == 0 {
             return false;
@@ -136,12 +139,12 @@ impl LiaSolver {
     ///
     /// For: a_1*x_1 + a_2*x_2 + ... + a_n*x_n <= b
     /// We can tighten to: a_1*x_1 + a_2*x_2 + ... + a_n*x_n <= floor(b / gcd) * gcd
-    pub fn tighten_bound(coeffs: &[i64], bound: i64) -> i64 {
+    pub fn tighten_bound(coeffs: &[i128], bound: i128) -> i128 {
         if coeffs.is_empty() {
             return bound;
         }
 
-        let g = coeffs.iter().fold(0i64, |acc, &c| gcd(acc, c.abs()));
+        let g = coeffs.iter().fold(0i128, |acc, &c| gcd_i128(acc, c.abs()));
 
         if g == 0 || g == 1 {
             return bound;
@@ -156,7 +159,7 @@ impl LiaSolver {
     /// MIR cuts are stronger than Gomory cuts and work well for mixed-integer problems.
     /// Given a constraint row: x_i = b + sum(a_j * x_j) where x_i is basic and integer,
     /// and b is fractional, we generate: sum(floor(a_j) * x_j) >= ceil(b)
-    pub fn generate_mir_cut(&self, var: VarId, value: Rational64) -> Option<LinExpr> {
+    pub fn generate_mir_cut(&self, var: VarId, value: ArithRat) -> Option<LinExpr> {
         if value.is_integer() {
             return None;
         }
@@ -185,7 +188,7 @@ impl LiaSolver {
         // 3. Generate the strengthened cut
 
         // Add a simple cut term based on the variable
-        cut.add_term(var, Rational64::one());
+        cut.add_term(var, ArithRat::one());
         cut.add_constant(-value.ceil());
 
         Some(cut)
@@ -196,7 +199,7 @@ impl LiaSolver {
     /// CG cuts are based on rounding the coefficients and constant term.
     /// For a constraint: sum(a_i * x_i) <= b with integer x_i,
     /// the CG cut is: sum(floor(a_i) * x_i) <= floor(b)
-    pub fn generate_cg_cut(&self, var: VarId, value: Rational64) -> Option<LinExpr> {
+    pub fn generate_cg_cut(&self, var: VarId, value: ArithRat) -> Option<LinExpr> {
         if value.is_integer() {
             return None;
         }
@@ -215,7 +218,7 @@ impl LiaSolver {
 
         // For now, generate a simple CG-like cut
         let floor_value = value.floor();
-        cut.add_term(var, Rational64::one());
+        cut.add_term(var, ArithRat::one());
         cut.add_constant(-floor_value);
 
         // The cut enforces: var >= ceil(value)
@@ -233,7 +236,7 @@ impl LiaSolver {
     /// They are derived from the split disjunction and can cut off the current fractional solution.
     ///
     /// Reference: "Disjunctive Programming" by Balas (1979), "On the Rank of Mixed 0-1 Polyhedra" by Balas et al. (1996)
-    pub fn generate_disjunctive_cut(&self, var: VarId, value: Rational64) -> Option<LinExpr> {
+    pub fn generate_disjunctive_cut(&self, var: VarId, value: ArithRat) -> Option<LinExpr> {
         if value.is_integer() {
             return None;
         }
@@ -255,19 +258,19 @@ impl LiaSolver {
 
         // The coefficient is chosen based on the fractional part
         // Closer to 0.5 means stronger cut
-        let coeff = if frac < Rational64::new(1, 2) {
+        let coeff = if frac < ArithRat::new(1, 2) {
             // Closer to floor - penalize being above floor
-            Rational64::one()
+            ArithRat::one()
         } else {
             // Closer to ceil - penalize being below ceil
-            -Rational64::one()
+            -ArithRat::one()
         };
 
         cut.add_term(var, coeff);
 
         // The RHS is the midpoint between floor and ceil, adjusted by fractional part
         // This makes the cut stronger than just enforcing floor or ceil
-        let rhs = if frac < Rational64::new(1, 2) {
+        let rhs = if frac < ArithRat::new(1, 2) {
             -floor_val
         } else {
             ceil_val
@@ -322,11 +325,11 @@ impl LiaSolver {
         let mut cut = LinExpr::new();
 
         for &idx in &cover {
-            cut.add_term(vars[idx], Rational64::one());
+            cut.add_term(vars[idx], ArithRat::one());
         }
 
         // RHS is |cover| - 1
-        cut.add_constant(-Rational64::from_integer((cover.len() as i64) - 1));
+        cut.add_constant(-ArithRat::from_integer((cover.len() as i128) - 1));
 
         Some(cut)
     }

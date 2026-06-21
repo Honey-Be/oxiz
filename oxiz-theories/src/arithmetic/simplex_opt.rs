@@ -5,14 +5,14 @@
 
 use super::delta::DeltaRational;
 use super::simplex::{LinExpr, Simplex, VarId};
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::Zero;
 
 /// Status of a simplex optimization call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimplexOptStatus {
     /// Optimal value found.
-    Optimal(Rational64),
+    Optimal(ArithRat),
     /// Objective is unbounded (can be improved without limit).
     Unbounded,
     /// The constraint set is infeasible.
@@ -23,7 +23,7 @@ pub enum SimplexOptStatus {
 
 impl Simplex {
     /// Evaluate a linear expression at the current assignment.
-    pub(super) fn eval_linexpr(&self, obj: &LinExpr) -> Rational64 {
+    pub(super) fn eval_linexpr(&self, obj: &LinExpr) -> ArithRat {
         let mut val = obj.constant;
         for (var, coef) in &obj.terms {
             let idx = *var as usize;
@@ -44,24 +44,24 @@ impl Simplex {
     ///
     ///   reduced_coef(v) = obj_coef(v)
     ///                   + Σ over basic b of (obj_coef(b) · tableau_coef(b, v))
-    pub(super) fn reduced_obj_coef(&self, obj: &LinExpr, nonbasic_var: VarId) -> Rational64 {
+    pub(super) fn reduced_obj_coef(&self, obj: &LinExpr, nonbasic_var: VarId) -> ArithRat {
         // Direct coefficient of this variable in obj.
         let direct = obj
             .terms
             .iter()
             .find(|(v, _)| *v == nonbasic_var)
             .map(|(_, c)| *c)
-            .unwrap_or_else(Rational64::zero);
+            .unwrap_or_else(ArithRat::zero);
 
         // Indirect contribution via basic variables.
-        let mut indirect = Rational64::zero();
+        let mut indirect = ArithRat::zero();
         for (basic_var, row) in self.tableau_iter() {
             let obj_coef = obj
                 .terms
                 .iter()
                 .find(|(v, _)| v == basic_var)
                 .map(|(_, c)| *c)
-                .unwrap_or_else(Rational64::zero);
+                .unwrap_or_else(ArithRat::zero);
             if obj_coef.is_zero() {
                 continue;
             }
@@ -70,7 +70,7 @@ impl Simplex {
                 .iter()
                 .find(|(v, _)| *v == nonbasic_var)
                 .map(|(_, c)| *c)
-                .unwrap_or_else(Rational64::zero);
+                .unwrap_or_else(ArithRat::zero);
             indirect += obj_coef * row_coef;
         }
 
@@ -129,11 +129,11 @@ impl Simplex {
                 let can_dec = self.can_decrease(v_id);
 
                 let is_entering =
-                    (rc < Rational64::zero() && can_inc) || (rc > Rational64::zero() && can_dec);
+                    (rc < ArithRat::zero() && can_inc) || (rc > ArithRat::zero() && can_dec);
 
                 if is_entering {
                     enter_var = Some(v_id);
-                    enter_decrease = rc > Rational64::zero();
+                    enter_decrease = rc > ArithRat::zero();
                     break;
                 }
             }
@@ -148,7 +148,7 @@ impl Simplex {
 
             // Ratio test: find the leaving variable.
             let mut leaving: Option<VarId> = None;
-            let mut best_ratio: Option<Rational64> = None;
+            let mut best_ratio: Option<ArithRat> = None;
 
             let basic_vars: Vec<VarId> = self.tableau_keys().collect();
 
@@ -162,22 +162,22 @@ impl Simplex {
                 let bv_val = self.assignment_real_at(bv_idx);
                 let eff = if decrease_it { -a } else { a };
 
-                let ratio = if eff > Rational64::zero() {
+                let ratio = if eff > ArithRat::zero() {
                     self.upper_real_at(bv_idx).map(|hi| {
                         let gap = hi - bv_val;
-                        if gap >= Rational64::zero() {
+                        if gap >= ArithRat::zero() {
                             gap / eff
                         } else {
-                            Rational64::zero()
+                            ArithRat::zero()
                         }
                     })
-                } else if eff < Rational64::zero() {
+                } else if eff < ArithRat::zero() {
                     self.lower_real_at(bv_idx).map(|lo| {
                         let gap = bv_val - lo;
-                        if gap >= Rational64::zero() {
+                        if gap >= ArithRat::zero() {
                             gap / (-eff)
                         } else {
-                            Rational64::zero()
+                            ArithRat::zero()
                         }
                     })
                 } else {
@@ -204,19 +204,19 @@ impl Simplex {
             let enter_own_limit = if decrease_it {
                 self.lower_real_at(enter_idx).map(|lo| {
                     let gap = enter_val - lo;
-                    if gap >= Rational64::zero() {
+                    if gap >= ArithRat::zero() {
                         gap
                     } else {
-                        Rational64::zero()
+                        ArithRat::zero()
                     }
                 })
             } else {
                 self.upper_real_at(enter_idx).map(|hi| {
                     let gap = hi - enter_val;
-                    if gap >= Rational64::zero() {
+                    if gap >= ArithRat::zero() {
                         gap
                     } else {
-                        Rational64::zero()
+                        ArithRat::zero()
                     }
                 })
             };

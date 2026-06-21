@@ -17,6 +17,26 @@ pub(super) fn gcd(a: i64, b: i64) -> i64 {
     a
 }
 
+/// Compute GCD of two `i128` integers using the Euclidean algorithm.
+///
+/// The `i128` analog of [`gcd`], used by the GCD-based integer-infeasibility
+/// path whose coefficients are now `ArithRat` (= `Ratio<i128>`) numerators
+/// ([`crate::ArithRat`]). Widening to `i128` keeps that soundness check exact:
+/// truncating a coefficient to `i64` could change the computed GCD and either
+/// miss a real infeasibility or fabricate a spurious one.
+pub(super) fn gcd_i128(a: i128, b: i128) -> i128 {
+    let mut a = a.abs();
+    let mut b = b.abs();
+
+    while b != 0 {
+        let temp = b;
+        b = a % b;
+        a = temp;
+    }
+
+    a
+}
+
 /// Compute LCM of two integers
 #[allow(dead_code)]
 pub(super) fn lcm(a: i64, b: i64) -> i64 {

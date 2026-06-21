@@ -5,7 +5,7 @@ use super::types::{BranchNode, LiaSolver};
 use crate::config::BranchingHeuristic;
 #[allow(unused_imports)]
 use crate::prelude::*;
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::One;
 use oxiz_core::error::{OxizError, Result};
 impl LiaSolver {
@@ -107,8 +107,8 @@ impl LiaSolver {
             // Try branch up: x >= ceil(value)
             let ceil_value = value.ceil().to_integer();
             let mut expr = LinExpr::new();
-            expr.add_term(var, Rational64::one());
-            expr.add_constant(-Rational64::from_integer(ceil_value));
+            expr.add_term(var, ArithRat::one());
+            expr.add_constant(-ArithRat::from_integer(ceil_value));
             self.simplex.add_ge(expr.clone(), 0);
 
             let up_cost = match self.simplex.check() {
@@ -135,8 +135,8 @@ impl LiaSolver {
             self.simplex.reset();
             let floor_value = value.floor().to_integer();
             let mut expr_down = LinExpr::new();
-            expr_down.add_term(var, Rational64::one());
-            expr_down.add_constant(-Rational64::from_integer(floor_value));
+            expr_down.add_term(var, ArithRat::one());
+            expr_down.add_constant(-ArithRat::from_integer(floor_value));
             self.simplex.add_le(expr_down, 0);
 
             let down_cost = match self.simplex.check() {
@@ -168,7 +168,7 @@ impl LiaSolver {
     }
 
     /// Find a variable with fractional value using the configured branching heuristic
-    pub(super) fn find_fractional_var(&self) -> Option<(VarId, Rational64)> {
+    pub(super) fn find_fractional_var(&self) -> Option<(VarId, ArithRat)> {
         match self.config.branching_heuristic {
             BranchingHeuristic::FirstFractional => self.find_first_fractional(),
             BranchingHeuristic::MostFractional => self.find_most_fractional(),
@@ -178,7 +178,7 @@ impl LiaSolver {
     }
 
     /// Find the first fractional variable (fastest, but may not be optimal)
-    pub fn find_first_fractional(&self) -> Option<(VarId, Rational64)> {
+    pub fn find_first_fractional(&self) -> Option<(VarId, ArithRat)> {
         for &var in self.int_vars.keys() {
             let value = self.simplex.value(var);
             if !value.is_integer() {
@@ -190,7 +190,7 @@ impl LiaSolver {
 
     /// Find the most fractional variable (closest to 0.5)
     /// This heuristic prefers variables that are "most uncertain"
-    pub fn find_most_fractional(&self) -> Option<(VarId, Rational64)> {
+    pub fn find_most_fractional(&self) -> Option<(VarId, ArithRat)> {
         let mut best_var = None;
         let mut best_fractionality = 0.0;
 
@@ -213,7 +213,7 @@ impl LiaSolver {
 
     /// Find variable using pseudo-cost heuristic
     /// Pseudo-cost estimates the expected objective change when branching on a variable
-    pub fn find_pseudo_cost_var(&self) -> Option<(VarId, Rational64)> {
+    pub fn find_pseudo_cost_var(&self) -> Option<(VarId, ArithRat)> {
         let mut best_var = None;
         let mut best_score = -1.0;
 
@@ -277,9 +277,9 @@ impl LiaSolver {
     /// branch-and-bound tree size by 20-50%, leading to faster overall solving.
     ///
     /// Reference: Achterberg (2007) "Constraint Integer Programming"
-    pub fn find_strong_branching_var(&self) -> Option<(VarId, Rational64)> {
+    pub fn find_strong_branching_var(&self) -> Option<(VarId, ArithRat)> {
         // Collect all fractional variables with their values
-        let mut candidates: Vec<(VarId, Rational64)> = self
+        let mut candidates: Vec<(VarId, ArithRat)> = self
             .int_vars
             .keys()
             .filter_map(|&var| {

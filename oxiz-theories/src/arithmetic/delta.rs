@@ -13,31 +13,31 @@
 use crate::prelude::*;
 use core::cmp::Ordering;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::{One, Zero};
 
 /// A delta-rational number: represents `real + delta * δ` where δ is infinitesimal
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeltaRational {
     /// The real part
-    pub real: Rational64,
+    pub real: ArithRat,
     /// The delta coefficient (multiplied by infinitesimal δ)
-    pub delta: Rational64,
+    pub delta: ArithRat,
 }
 
 impl DeltaRational {
     /// Create a new delta-rational from components
     #[must_use]
-    pub const fn new(real: Rational64, delta: Rational64) -> Self {
+    pub const fn new(real: ArithRat, delta: ArithRat) -> Self {
         Self { real, delta }
     }
 
     /// Create from a rational (delta = 0)
     #[must_use]
-    pub fn from_rational(r: Rational64) -> Self {
+    pub fn from_rational(r: ArithRat) -> Self {
         Self {
             real: r,
-            delta: Rational64::zero(),
+            delta: ArithRat::zero(),
         }
     }
 
@@ -45,8 +45,8 @@ impl DeltaRational {
     #[must_use]
     pub fn zero() -> Self {
         Self {
-            real: Rational64::zero(),
-            delta: Rational64::zero(),
+            real: ArithRat::zero(),
+            delta: ArithRat::zero(),
         }
     }
 
@@ -54,8 +54,8 @@ impl DeltaRational {
     #[must_use]
     pub fn epsilon() -> Self {
         Self {
-            real: Rational64::zero(),
-            delta: Rational64::one(),
+            real: ArithRat::zero(),
+            delta: ArithRat::one(),
         }
     }
 
@@ -63,8 +63,8 @@ impl DeltaRational {
     #[must_use]
     pub fn neg_epsilon() -> Self {
         Self {
-            real: Rational64::zero(),
-            delta: -Rational64::one(),
+            real: ArithRat::zero(),
+            delta: -ArithRat::one(),
         }
     }
 
@@ -77,20 +77,20 @@ impl DeltaRational {
     /// Check if this is positive (greater than zero)
     #[must_use]
     pub fn is_positive(&self) -> bool {
-        match self.real.cmp(&Rational64::zero()) {
+        match self.real.cmp(&ArithRat::zero()) {
             Ordering::Greater => true,
             Ordering::Less => false,
-            Ordering::Equal => self.delta > Rational64::zero(),
+            Ordering::Equal => self.delta > ArithRat::zero(),
         }
     }
 
     /// Check if this is negative (less than zero)
     #[must_use]
     pub fn is_negative(&self) -> bool {
-        match self.real.cmp(&Rational64::zero()) {
+        match self.real.cmp(&ArithRat::zero()) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => self.delta < Rational64::zero(),
+            Ordering::Equal => self.delta < ArithRat::zero(),
         }
     }
 
@@ -107,11 +107,15 @@ impl DeltaRational {
     }
 
     /// Get the floor (largest integer <= this value)
+    ///
+    /// Returns `i128` since the LRA/LIA core's rational is `Ratio<i128>`
+    /// ([`crate::ArithRat`]); the integer part of a value that needs more than
+    /// `i64` is preserved exactly instead of being silently truncated.
     #[must_use]
-    pub fn floor(&self) -> i64 {
+    pub fn floor(&self) -> i128 {
         let real_floor = self.real.floor().to_integer();
         // If real is exactly an integer and delta is negative, floor is real - 1
-        if self.real.fract().is_zero() && self.delta < Rational64::zero() {
+        if self.real.fract().is_zero() && self.delta < ArithRat::zero() {
             real_floor - 1
         } else {
             real_floor
@@ -119,11 +123,13 @@ impl DeltaRational {
     }
 
     /// Get the ceiling (smallest integer >= this value)
+    ///
+    /// Returns `i128` for the same reason as [`Self::floor`].
     #[must_use]
-    pub fn ceil(&self) -> i64 {
+    pub fn ceil(&self) -> i128 {
         let real_ceil = self.real.ceil().to_integer();
         // If real is exactly an integer and delta is positive, ceil is real + 1
-        if self.real.fract().is_zero() && self.delta > Rational64::zero() {
+        if self.real.fract().is_zero() && self.delta > ArithRat::zero() {
             real_ceil + 1
         } else {
             real_ceil
@@ -131,15 +137,16 @@ impl DeltaRational {
     }
 }
 
-impl From<Rational64> for DeltaRational {
-    fn from(r: Rational64) -> Self {
+impl From<ArithRat> for DeltaRational {
+    fn from(r: ArithRat) -> Self {
         Self::from_rational(r)
     }
 }
 
 impl From<i64> for DeltaRational {
     fn from(n: i64) -> Self {
-        Self::from_rational(Rational64::from_integer(n))
+        // Widen the i64 to i128 (lossless) to build the `ArithRat`.
+        Self::from_rational(ArithRat::from_integer(i128::from(n)))
     }
 }
 
@@ -213,10 +220,10 @@ impl SubAssign for DeltaRational {
     }
 }
 
-impl Mul<Rational64> for DeltaRational {
+impl Mul<ArithRat> for DeltaRational {
     type Output = Self;
 
-    fn mul(self, rhs: Rational64) -> Self::Output {
+    fn mul(self, rhs: ArithRat) -> Self::Output {
         Self {
             real: self.real * rhs,
             delta: self.delta * rhs,
@@ -224,8 +231,8 @@ impl Mul<Rational64> for DeltaRational {
     }
 }
 
-impl MulAssign<Rational64> for DeltaRational {
-    fn mul_assign(&mut self, rhs: Rational64) {
+impl MulAssign<ArithRat> for DeltaRational {
+    fn mul_assign(&mut self, rhs: ArithRat) {
         self.real *= rhs;
         self.delta *= rhs;
     }
@@ -237,8 +244,8 @@ mod tests {
 
     #[test]
     fn test_delta_rational_basic() {
-        let a = DeltaRational::from_rational(Rational64::from_integer(5));
-        let b = DeltaRational::from_rational(Rational64::from_integer(3));
+        let a = DeltaRational::from_rational(ArithRat::from_integer(5));
+        let b = DeltaRational::from_rational(ArithRat::from_integer(3));
 
         assert!(a > b);
         assert_eq!(a - b, DeltaRational::from(2));
@@ -247,8 +254,8 @@ mod tests {
     #[test]
     fn test_delta_rational_with_epsilon() {
         let five = DeltaRational::from(5);
-        let five_minus_eps = DeltaRational::new(Rational64::from_integer(5), -Rational64::one());
-        let five_plus_eps = DeltaRational::new(Rational64::from_integer(5), Rational64::one());
+        let five_minus_eps = DeltaRational::new(ArithRat::from_integer(5), -ArithRat::one());
+        let five_plus_eps = DeltaRational::new(ArithRat::from_integer(5), ArithRat::one());
 
         assert!(five_minus_eps < five);
         assert!(five < five_plus_eps);
@@ -275,39 +282,39 @@ mod tests {
     #[test]
     fn test_delta_floor_ceil() {
         // 5 - ε should have floor 4, ceil 5
-        let five_minus_eps = DeltaRational::new(Rational64::from_integer(5), -Rational64::one());
+        let five_minus_eps = DeltaRational::new(ArithRat::from_integer(5), -ArithRat::one());
         assert_eq!(five_minus_eps.floor(), 4);
         assert_eq!(five_minus_eps.ceil(), 5);
 
         // 5 + ε should have floor 5, ceil 6
-        let five_plus_eps = DeltaRational::new(Rational64::from_integer(5), Rational64::one());
+        let five_plus_eps = DeltaRational::new(ArithRat::from_integer(5), ArithRat::one());
         assert_eq!(five_plus_eps.floor(), 5);
         assert_eq!(five_plus_eps.ceil(), 6);
 
         // 5.5 should have floor 5, ceil 6 (delta doesn't matter)
-        let five_point_five = DeltaRational::from_rational(Rational64::new(11, 2));
+        let five_point_five = DeltaRational::from_rational(ArithRat::new(11, 2));
         assert_eq!(five_point_five.floor(), 5);
         assert_eq!(five_point_five.ceil(), 6);
     }
 
     #[test]
     fn test_delta_arithmetic() {
-        let a = DeltaRational::new(Rational64::from_integer(3), Rational64::one());
-        let b = DeltaRational::new(Rational64::from_integer(2), -Rational64::one());
+        let a = DeltaRational::new(ArithRat::from_integer(3), ArithRat::one());
+        let b = DeltaRational::new(ArithRat::from_integer(2), -ArithRat::one());
 
         // (3 + δ) + (2 - δ) = 5
         let sum = a + b;
-        assert_eq!(sum.real, Rational64::from_integer(5));
-        assert_eq!(sum.delta, Rational64::zero());
+        assert_eq!(sum.real, ArithRat::from_integer(5));
+        assert_eq!(sum.delta, ArithRat::zero());
 
         // (3 + δ) - (2 - δ) = 1 + 2δ
         let diff = a - b;
-        assert_eq!(diff.real, Rational64::from_integer(1));
-        assert_eq!(diff.delta, Rational64::from_integer(2));
+        assert_eq!(diff.real, ArithRat::from_integer(1));
+        assert_eq!(diff.delta, ArithRat::from_integer(2));
 
         // (3 + δ) * 2 = 6 + 2δ
-        let scaled = a * Rational64::from_integer(2);
-        assert_eq!(scaled.real, Rational64::from_integer(6));
-        assert_eq!(scaled.delta, Rational64::from_integer(2));
+        let scaled = a * ArithRat::from_integer(2);
+        assert_eq!(scaled.real, ArithRat::from_integer(6));
+        assert_eq!(scaled.delta, ArithRat::from_integer(2));
     }
 }

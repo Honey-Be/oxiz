@@ -63,6 +63,24 @@ extern crate alloc;
 
 mod prelude;
 
+/// The rational type used by the LRA/LIA arithmetic core (the Simplex,
+/// `ArithSolver`, and the `LiaSolver`) and the solver seam that feeds it.
+///
+/// Widened from `num_rational::Ratio<i64>` to `Ratio<i128>` (2026-06-21) so the
+/// verus prelude's `i64`-bound integer literals — e.g. `i64::MIN`
+/// (`-9223372036854775808`), whose *negation* overflows `i64` — are represented
+/// exactly end to end. The old `i64` core narrowed the boundary value back to
+/// `Rational64` and then computed `expr.add_constant(-rhs)` in `assert_eq`,
+/// where `-i64::MIN` overflowed (debug panic / release wrap). `i128` moves the
+/// overflow threshold far beyond any bound a 64-bit SMT-LIB literal can name, so
+/// no narrowing — and no spurious arith verdict — is possible at that boundary.
+///
+/// This is a PURE WIDENING: `i128`-rational arithmetic shares every operator and
+/// comparison with `i64`-rational arithmetic, so no semantics change. The
+/// SEPARATE difference-logic (`diff_logic`) and UTVPI (`utvpi`) theory solvers
+/// keep their own `Ratio<i64>` and are intentionally NOT migrated.
+pub type ArithRat = num_rational::Ratio<i128>;
+
 // === Always-available modules (no_std compatible) ===
 pub mod arithmetic;
 pub mod array;

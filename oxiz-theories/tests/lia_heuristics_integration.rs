@@ -10,32 +10,32 @@
 //! (`simplex`, `active_cuts`) are not accessible here; tests are structured
 //! to go through the public method surface only.
 
-use num_rational::Rational64;
+use oxiz_theories::ArithRat;
 use num_traits::One;
 use oxiz_theories::arithmetic::{LiaSolver, LinExpr, VarId};
 
 /// Helper: add `coeff * var + constant <= 0` as a less-than-or-equal constraint.
-fn add_le_single(solver: &mut LiaSolver, var: VarId, coeff: i64, rhs: i64, reason: u32) {
+fn add_le_single(solver: &mut LiaSolver, var: VarId, coeff: i128, rhs: i128, reason: u32) {
     let mut expr = LinExpr::new();
-    expr.add_term(var, Rational64::from_integer(coeff));
-    expr.add_constant(-Rational64::from_integer(rhs));
+    expr.add_term(var, ArithRat::from_integer(coeff));
+    expr.add_constant(-ArithRat::from_integer(rhs));
     solver.add_le(expr, reason);
 }
 
 /// Helper: add `coeff * var + constant >= 0` as a greater-than-or-equal constraint.
-fn add_ge_single(solver: &mut LiaSolver, var: VarId, coeff: i64, rhs: i64, reason: u32) {
+fn add_ge_single(solver: &mut LiaSolver, var: VarId, coeff: i128, rhs: i128, reason: u32) {
     let mut expr = LinExpr::new();
-    expr.add_term(var, Rational64::from_integer(coeff));
-    expr.add_constant(-Rational64::from_integer(rhs));
+    expr.add_term(var, ArithRat::from_integer(coeff));
+    expr.add_constant(-ArithRat::from_integer(rhs));
     solver.add_ge(expr, reason);
 }
 
 /// Helper: add `c1*v1 + c2*v2 <= rhs`.
-fn add_le2(solver: &mut LiaSolver, v1: VarId, c1: i64, v2: VarId, c2: i64, rhs: i64, reason: u32) {
+fn add_le2(solver: &mut LiaSolver, v1: VarId, c1: i128, v2: VarId, c2: i128, rhs: i128, reason: u32) {
     let mut expr = LinExpr::new();
-    expr.add_term(v1, Rational64::from_integer(c1));
-    expr.add_term(v2, Rational64::from_integer(c2));
-    expr.add_constant(-Rational64::from_integer(rhs));
+    expr.add_term(v1, ArithRat::from_integer(c1));
+    expr.add_term(v2, ArithRat::from_integer(c2));
+    expr.add_constant(-ArithRat::from_integer(rhs));
     solver.add_le(expr, reason);
 }
 
@@ -201,9 +201,9 @@ fn test_full_solve_path_with_heuristics() {
 
     // x + y <= 5
     let mut sum_expr = LinExpr::new();
-    sum_expr.add_term(x, Rational64::one());
-    sum_expr.add_term(y, Rational64::one());
-    sum_expr.add_constant(-Rational64::from_integer(5));
+    sum_expr.add_term(x, ArithRat::one());
+    sum_expr.add_term(y, ArithRat::one());
+    sum_expr.add_constant(-ArithRat::from_integer(5));
     solver.add_le(sum_expr, 3);
 
     // check() runs: probe_variables → feasibility_pump → branch_and_bound

@@ -5,14 +5,20 @@ use core::fmt;
 #[allow(unused_imports)]
 use crate::prelude::*;
 use crate::theory::{EqualityNotification, Theory, TheoryCombination, TheoryId, TheoryResult};
-use num_rational::Rational64;
+use crate::ArithRat;
 use num_traits::{One, Signed};
 use oxiz_core::ast::TermId;
 use oxiz_core::error::Result;
 use portable_bijectives::FlatRadixBimap;
 
-/// Compute GCD of two i64 values
-fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+/// Compute GCD of two `i128` values.
+///
+/// `i128` because all coefficients/constants flowing through here are now
+/// `ArithRat` (= `Ratio<i128>`) numerators ([`crate::ArithRat`]); the GCD-based
+/// integer-infeasibility check and the coefficient-reduction normalisation must
+/// run over the full `i128` value — truncating to `i64` could compute a wrong
+/// GCD and either miss a genuine LIA infeasibility or fabricate a spurious one.
+fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
     a = a.abs();
     b = b.abs();
     while b != 0 {
@@ -189,16 +195,16 @@ impl ArithSolver {
 
         // For integer arithmetic, reduce by GCD
         if self.is_integer {
-            // Find GCD of all coefficients
+            // Find GCD of all coefficients (i128 — see `gcd_i128`).
             let gcd = expr
                 .terms
                 .iter()
                 .map(|(_, c)| c.numer().abs())
-                .fold(0i64, |acc, n| if acc == 0 { n } else { gcd_i64(acc, n) });
+                .fold(0i128, |acc, n| if acc == 0 { n } else { gcd_i128(acc, n) });
 
             if gcd > 1 {
-                let divisor = Rational64::from_integer(gcd);
-                expr.scale(Rational64::one() / divisor);
+                let divisor = ArithRat::from_integer(gcd);
+                expr.scale(ArithRat::one() / divisor);
             }
         }
 
@@ -229,11 +235,11 @@ impl ArithSolver {
                 .terms
                 .iter()
                 .map(|(_, c)| c.numer().abs())
-                .fold(0i64, |acc, n| if acc == 0 { n } else { gcd_i64(acc, n) });
+                .fold(0i128, |acc, n| if acc == 0 { n } else { gcd_i128(acc, n) });
 
             if gcd > 1 {
-                let divisor = Rational64::from_integer(gcd);
-                expr.scale(Rational64::one() / divisor);
+                let divisor = ArithRat::from_integer(gcd);
+                expr.scale(ArithRat::one() / divisor);
             }
         }
 
@@ -246,7 +252,7 @@ impl ArithSolver {
     }
 
     /// Assert: lhs <= rhs
-    pub fn assert_le(&mut self, lhs: &[(TermId, Rational64)], rhs: Rational64, reason: TermId) {
+    pub fn assert_le(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
         let mut expr = LinExpr::new();
 
         for (term, coef) in lhs {
@@ -264,7 +270,7 @@ impl ArithSolver {
     }
 
     /// Assert: lhs >= rhs
-    pub fn assert_ge(&mut self, lhs: &[(TermId, Rational64)], rhs: Rational64, reason: TermId) {
+    pub fn assert_ge(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
         let mut expr = LinExpr::new();
 
         for (term, coef) in lhs {
@@ -287,7 +293,7 @@ impl ArithSolver {
     /// the constraint is infeasible over integers.
     ///
     /// Example: 2x + 2y = 7 is infeasible because gcd(2,2) = 2 doesn't divide 7.
-    pub fn assert_eq(&mut self, lhs: &[(TermId, Rational64)], rhs: Rational64, reason: TermId) {
+    pub fn assert_eq(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
         let mut expr = LinExpr::new();
 
         for (term, coef) in lhs {
@@ -299,8 +305,11 @@ impl ArithSolver {
         // For LIA, check GCD-based infeasibility BEFORE normalization
         // (normalization divides by GCD, which would lose the infeasibility signal)
         if self.is_integer {
-            // Extract integer coefficients
-            let coeffs: Vec<i64> = expr
+            // Extract integer coefficients. `c.numer()` is `i128` (the `ArithRat`
+            // numerator); kept i128 so a coefficient outside `i64` is never
+            // silently truncated before the GCD-infeasibility test (truncation
+            // could miss or fabricate an integer infeasibility → unsound).
+            let coeffs: Vec<i128> = expr
                 .terms
                 .iter()
                 .filter_map(|(_, c)| {
@@ -312,8 +321,10 @@ impl ArithSolver {
                 })
                 .collect();
 
-            // Extract the constant (which is -rhs in expr = 0 form)
-            let const_term = if expr.constant.denom() == &1 {
+            // Extract the constant (which is -rhs in expr = 0 form). i128 — the
+            // whole point of the widening: with `rhs: ArithRat` the earlier
+            // `expr.add_constant(-rhs)` can no longer overflow on `i64::MIN`.
+            let const_term: i128 = if expr.constant.denom() == &1 {
                 -*expr.constant.numer()
             } else {
                 // Non-integer constant in equality - infeasible for integers.
@@ -324,16 +335,16 @@ impl ArithSolver {
                 // satisfiable disjunct → spurious UNSAT).
                 if let Some(&(var, _)) = expr.terms.first() {
                     let reason_id = self.add_reason(reason);
-                    self.simplex.set_lower(var, Rational64::from_integer(1), reason_id);
-                    self.simplex.set_upper(var, Rational64::from_integer(0), reason_id);
+                    self.simplex.set_lower(var, ArithRat::from_integer(1), reason_id);
+                    self.simplex.set_upper(var, ArithRat::from_integer(0), reason_id);
                 }
                 return;
             };
 
             // Check GCD infeasibility if all coefficients are integers
             if !coeffs.is_empty() && coeffs.len() == expr.terms.len() {
-                // Compute GCD of all coefficients
-                let g = coeffs.iter().fold(0i64, |acc, &c| gcd_i64(acc, c.abs()));
+                // Compute GCD of all coefficients (i128 — see `gcd_i128`).
+                let g = coeffs.iter().fold(0i128, |acc, &c| gcd_i128(acc, c.abs()));
 
                 if g > 0 && const_term % g != 0 {
                     // GCD infeasibility detected (e.g. 2c = 3)!
@@ -343,8 +354,8 @@ impl ArithSolver {
                     // and the learned clause soundly blocks only this disjunct.
                     if let Some(&(var, _)) = expr.terms.first() {
                         let reason_id = self.add_reason(reason);
-                        self.simplex.set_lower(var, Rational64::from_integer(1), reason_id);
-                        self.simplex.set_upper(var, Rational64::from_integer(0), reason_id);
+                        self.simplex.set_lower(var, ArithRat::from_integer(1), reason_id);
+                        self.simplex.set_upper(var, ArithRat::from_integer(0), reason_id);
                     }
                     return;
                 }
@@ -361,12 +372,12 @@ impl ArithSolver {
     /// Assert: lhs < rhs (strict inequality)
     /// For LRA, uses infinitesimals: lhs <= rhs - δ
     /// For LIA, transforms to: lhs <= rhs - 1 (since no integer exists between k and k+1)
-    pub fn assert_lt(&mut self, lhs: &[(TermId, Rational64)], rhs: Rational64, reason: TermId) {
+    pub fn assert_lt(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
         // For integer arithmetic, x < k is equivalent to x <= k - 1
         // because there's no integer strictly between k-1 and k
         if self.is_integer {
             // Transform: lhs < rhs becomes lhs <= rhs - 1
-            self.assert_le(lhs, rhs - Rational64::one(), reason);
+            self.assert_le(lhs, rhs - ArithRat::one(), reason);
             return;
         }
 
@@ -391,12 +402,12 @@ impl ArithSolver {
     /// Assert: lhs > rhs (strict inequality)
     /// For LRA, uses infinitesimals: lhs >= rhs + δ
     /// For LIA, transforms to: lhs >= rhs + 1 (since no integer exists between k and k+1)
-    pub fn assert_gt(&mut self, lhs: &[(TermId, Rational64)], rhs: Rational64, reason: TermId) {
+    pub fn assert_gt(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
         // For integer arithmetic, x > k is equivalent to x >= k + 1
         // because there's no integer strictly between k and k+1
         if self.is_integer {
             // Transform: lhs > rhs becomes lhs >= rhs + 1
-            self.assert_ge(lhs, rhs + Rational64::one(), reason);
+            self.assert_ge(lhs, rhs + ArithRat::one(), reason);
             return;
         }
 
@@ -430,7 +441,7 @@ impl ArithSolver {
     /// - If value is `r + δ` (positive delta), return `ceil(r)` for integers
     /// - If value is `r - δ` (negative delta), return `floor(r)` for integers
     #[must_use]
-    pub fn value(&self, term: TermId) -> Option<Rational64> {
+    pub fn value(&self, term: TermId) -> Option<ArithRat> {
         self.interner.get(&term).map(|&var| {
             if self.is_integer {
                 // Get the full delta-rational value
@@ -447,18 +458,18 @@ impl ArithSolver {
                     // If r is already an integer, we need r + 1
                     let real_val = dval.real;
                     if real_val.is_integer() {
-                        Rational64::from_integer(real_val.to_integer() + 1)
+                        ArithRat::from_integer(real_val.to_integer() + 1)
                     } else {
-                        Rational64::from_integer(real_val.ceil().to_integer())
+                        ArithRat::from_integer(real_val.ceil().to_integer())
                     }
                 } else if dval.delta.is_negative() {
                     // x < r implies x <= floor(r) for integers
                     // If r is already an integer, we need r - 1
                     let real_val = dval.real;
                     if real_val.is_integer() {
-                        Rational64::from_integer(real_val.to_integer() - 1)
+                        ArithRat::from_integer(real_val.to_integer() - 1)
                     } else {
-                        Rational64::from_integer(real_val.floor().to_integer())
+                        ArithRat::from_integer(real_val.floor().to_integer())
                     }
                 } else {
                     // No strict bound, just return the value
@@ -491,9 +502,9 @@ impl ArithSolver {
     /// pushed and popped, so `reasons`/`reason_counter`/simplex are fully
     /// restored (the probe leaves NO residue — verified against `push`/`pop`).
     #[must_use]
-    pub fn fixed_value_with_reasons(&mut self, term: TermId) -> Option<(Rational64, Vec<TermId>)> {
+    pub fn fixed_value_with_reasons(&mut self, term: TermId) -> Option<(ArithRat, Vec<TermId>)> {
         let v = self.value(term)?;
-        let one = Rational64::from_integer(1);
+        let one = ArithRat::from_integer(1);
         let mut reasons: Vec<TermId> = Vec::new();
 
         // HIGH side: prove `term` cannot exceed `v`.
@@ -553,7 +564,7 @@ impl ArithSolver {
     /// - x < 5.0 becomes x <= 4
     /// - x > 2.0 becomes x >= 3
     #[allow(dead_code)]
-    fn tighten_bound(&self, bound: Rational64, is_upper: bool) -> Rational64 {
+    fn tighten_bound(&self, bound: ArithRat, is_upper: bool) -> ArithRat {
         if !self.is_integer {
             return bound;
         }
@@ -564,10 +575,10 @@ impl ArithSolver {
             bound
         } else if is_upper {
             // x <= 5.7 becomes x <= 5
-            Rational64::from_integer(bound.floor().to_integer())
+            ArithRat::from_integer(bound.floor().to_integer())
         } else {
             // x >= 2.3 becomes x >= 3
-            Rational64::from_integer(bound.ceil().to_integer())
+            ArithRat::from_integer(bound.ceil().to_integer())
         }
     }
 
@@ -717,15 +728,15 @@ impl TheoryCombination for ArithSolver {
 
             // Build expression: lhs - rhs
             let mut expr_le = LinExpr::new();
-            expr_le.add_term(lhs, Rational64::one());
-            expr_le.add_term(rhs, -Rational64::one());
+            expr_le.add_term(lhs, ArithRat::one());
+            expr_le.add_term(rhs, -ArithRat::one());
             // lhs - rhs <= 0
             self.simplex.add_le(expr_le, reason_id);
 
             // Build expression: rhs - lhs
             let mut expr_ge = LinExpr::new();
-            expr_ge.add_term(rhs, Rational64::one());
-            expr_ge.add_term(lhs, -Rational64::one());
+            expr_ge.add_term(rhs, ArithRat::one());
+            expr_ge.add_term(lhs, -ArithRat::one());
             // rhs - lhs <= 0  (i.e., lhs - rhs >= 0)
             self.simplex.add_le(expr_ge, reason_id);
 
@@ -830,8 +841,8 @@ impl ArithSolver {
                     self.simplex.push();
                     // Add strict x - y < 0
                     let mut expr = LinExpr::new();
-                    expr.add_term(var_x, Rational64::one());
-                    expr.add_term(var_y, -Rational64::one());
+                    expr.add_term(var_x, ArithRat::one());
+                    expr.add_term(var_y, -ArithRat::one());
                     self.simplex.add_strict_lt(expr, 0);
                     let infeasible = self.simplex.check().is_err();
                     self.simplex.pop();
@@ -844,8 +855,8 @@ impl ArithSolver {
                     self.simplex.push();
                     // Add strict y - x < 0
                     let mut expr = LinExpr::new();
-                    expr.add_term(var_y, Rational64::one());
-                    expr.add_term(var_x, -Rational64::one());
+                    expr.add_term(var_y, ArithRat::one());
+                    expr.add_term(var_x, -ArithRat::one());
                     self.simplex.add_strict_lt(expr, 0);
                     let infeasible = self.simplex.check().is_err();
                     self.simplex.pop();
@@ -889,22 +900,22 @@ mod tests {
 
         // x >= 0
         solver.assert_ge(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(0),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
 
         // y >= 0
         solver.assert_ge(
-            &[(y, Rational64::one())],
-            Rational64::from_integer(0),
+            &[(y, ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
 
         // x + y <= 10
         solver.assert_le(
-            &[(x, Rational64::one()), (y, Rational64::one())],
-            Rational64::from_integer(10),
+            &[(x, ArithRat::one()), (y, ArithRat::one())],
+            ArithRat::from_integer(10),
             reason,
         );
 
@@ -918,8 +929,8 @@ mod tests {
         let x = TermId::new(1);
         let ge = TermId::new(50); // reason atom for x >= 5
         let le = TermId::new(51); // reason atom for x <= 5
-        solver.assert_ge(&[(x, Rational64::one())], Rational64::from_integer(5), ge);
-        solver.assert_le(&[(x, Rational64::one())], Rational64::from_integer(5), le);
+        solver.assert_ge(&[(x, ArithRat::one())], ArithRat::from_integer(5), ge);
+        solver.assert_le(&[(x, ArithRat::one())], ArithRat::from_integer(5), le);
         assert!(matches!(solver.check().unwrap(), TheoryResult::Sat));
 
         // No-leak baseline.
@@ -928,7 +939,7 @@ mod tests {
         let fixed = solver.fixed_value_with_reasons(x);
         assert!(fixed.is_some(), "x is pinned to 5 by its two bounds");
         let (v, rs) = fixed.unwrap();
-        assert_eq!(v, Rational64::from_integer(5));
+        assert_eq!(v, ArithRat::from_integer(5));
         assert!(
             rs.contains(&ge) && rs.contains(&le),
             "both pinning bounds are reasons: {rs:?}"
@@ -949,7 +960,7 @@ mod tests {
         // A non-pinned term returns None.
         let y = TermId::new(2);
         let gy = TermId::new(60);
-        solver.assert_ge(&[(y, Rational64::one())], Rational64::from_integer(0), gy);
+        solver.assert_ge(&[(y, ArithRat::one())], ArithRat::from_integer(0), gy);
         assert!(
             solver.fixed_value_with_reasons(y).is_none(),
             "y has only a lower bound, not pinned"
@@ -965,15 +976,15 @@ mod tests {
 
         // x >= 10
         solver.assert_ge(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(10),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(10),
             reason,
         );
 
         // x <= 5
         solver.assert_le(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
 
@@ -990,15 +1001,15 @@ mod tests {
 
         // x > 0 (strict)
         solver.assert_gt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(0),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
 
         // x < 10 (strict)
         solver.assert_lt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(10),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(10),
             reason,
         );
 
@@ -1015,15 +1026,15 @@ mod tests {
 
         // x >= 5
         solver.assert_ge(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
 
         // x < 5 (strict) - should be unsatisfiable with x >= 5
         solver.assert_lt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
 
@@ -1042,10 +1053,10 @@ mod tests {
         // 2x + 4y <= 10 should be normalized to x + 2y <= 5 (GCD = 2)
         solver.assert_le(
             &[
-                (x, Rational64::from_integer(2)),
-                (y, Rational64::from_integer(4)),
+                (x, ArithRat::from_integer(2)),
+                (y, ArithRat::from_integer(4)),
             ],
-            Rational64::from_integer(10),
+            ArithRat::from_integer(10),
             reason,
         );
 
@@ -1063,26 +1074,75 @@ mod tests {
 
         // Test normalization ensures first coefficient is positive
         let mut expr = LinExpr::new();
-        expr.add_term(0, Rational64::from_integer(-3));
-        expr.add_term(1, Rational64::from_integer(2));
+        expr.add_term(0, ArithRat::from_integer(-3));
+        expr.add_term(1, ArithRat::from_integer(2));
 
         solver.normalize_expr(&mut expr);
 
         // After normalization, first coefficient should be positive
         if let Some((_, c)) = expr.terms.first() {
-            assert!(c > &Rational64::zero());
+            assert!(c > &ArithRat::zero());
         }
     }
 
     #[test]
     fn test_gcd_computation() {
-        assert_eq!(gcd_i64(12, 8), 4);
-        assert_eq!(gcd_i64(15, 25), 5);
-        assert_eq!(gcd_i64(7, 13), 1);
-        assert_eq!(gcd_i64(0, 5), 5);
-        assert_eq!(gcd_i64(5, 0), 5);
-        assert_eq!(gcd_i64(-12, 8), 4);
-        assert_eq!(gcd_i64(12, -8), 4);
+        assert_eq!(gcd_i128(12, 8), 4);
+        assert_eq!(gcd_i128(15, 25), 5);
+        assert_eq!(gcd_i128(7, 13), 1);
+        assert_eq!(gcd_i128(0, 5), 5);
+        assert_eq!(gcd_i128(5, 0), 5);
+        assert_eq!(gcd_i128(-12, 8), 4);
+        assert_eq!(gcd_i128(12, -8), 4);
+    }
+
+    /// Regression for the `i128` widening (2026-06-21): asserting `x = i64::MIN`
+    /// must NOT overflow. The old `Rational64` core computed
+    /// `expr.add_constant(-rhs)` in `assert_eq` with `rhs = i64::MIN`, whose
+    /// negation overflows `i64` (debug panic / release wrap → spurious arith
+    /// verdict). With the LRA/LIA core on `Ratio<i128>` the value is exact and
+    /// `-rhs` is representable, so `x = i64::MIN ∧ x = i64::MIN` is plain `Sat`.
+    /// The verus prelude legitimately contains `i64::MIN` as an integer bound.
+    #[test]
+    fn test_i64_min_rhs_no_overflow() {
+        let i64_min = i128::from(i64::MIN); // -9223372036854775808
+        let one = ArithRat::from_integer(1);
+        let rhs = ArithRat::from_integer(i64_min);
+
+        // LRA: x = i64::MIN (the `-rhs` inside assert_eq used to overflow).
+        let mut lra = ArithSolver::lra();
+        let x = TermId::new(1);
+        lra.assert_eq(&[(x, one)], rhs, TermId::new(100));
+        assert!(
+            matches!(lra.check().unwrap(), TheoryResult::Sat),
+            "x = i64::MIN must be SAT in LRA (no overflow)"
+        );
+        assert_eq!(lra.value(x), Some(rhs), "x must read back as i64::MIN");
+
+        // LIA: same equality, exercising the GCD-infeasibility branch's i128
+        // `const_term = -*expr.constant.numer()` (which is `i64::MIN`).
+        let mut lia = ArithSolver::lia();
+        let y = TermId::new(2);
+        lia.assert_eq(&[(y, one)], rhs, TermId::new(101));
+        assert!(
+            matches!(lia.check().unwrap(), TheoryResult::Sat),
+            "y = i64::MIN must be SAT in LIA (no overflow)"
+        );
+
+        // A genuine contradiction over i64::MIN bounds is still UNSAT (the
+        // widening must not weaken any comparison): x = i64::MIN ∧ x = i64::MIN+1.
+        let mut lia2 = ArithSolver::lia();
+        let z = TermId::new(3);
+        lia2.assert_eq(&[(z, one)], rhs, TermId::new(102));
+        lia2.assert_eq(
+            &[(z, one)],
+            ArithRat::from_integer(i64_min + 1),
+            TermId::new(103),
+        );
+        assert!(
+            matches!(lia2.check().unwrap(), TheoryResult::Unsat(_)),
+            "z = i64::MIN ∧ z = i64::MIN+1 must be UNSAT"
+        );
     }
 
     #[test]
@@ -1090,16 +1150,16 @@ mod tests {
         let solver = ArithSolver::lia();
 
         // Upper bound tightening: x <= 5.7 -> x <= 5
-        let tightened = solver.tighten_bound(Rational64::new(57, 10), true);
-        assert_eq!(tightened, Rational64::from_integer(5));
+        let tightened = solver.tighten_bound(ArithRat::new(57, 10), true);
+        assert_eq!(tightened, ArithRat::from_integer(5));
 
         // Lower bound tightening: x >= 2.3 -> x >= 3
-        let tightened = solver.tighten_bound(Rational64::new(23, 10), false);
-        assert_eq!(tightened, Rational64::from_integer(3));
+        let tightened = solver.tighten_bound(ArithRat::new(23, 10), false);
+        assert_eq!(tightened, ArithRat::from_integer(3));
 
         // Integer bounds don't change
-        let tightened = solver.tighten_bound(Rational64::from_integer(5), true);
-        assert_eq!(tightened, Rational64::from_integer(5));
+        let tightened = solver.tighten_bound(ArithRat::from_integer(5), true);
+        assert_eq!(tightened, ArithRat::from_integer(5));
     }
 
     #[test]
@@ -1107,7 +1167,7 @@ mod tests {
         let solver = ArithSolver::lra();
 
         // No tightening for real arithmetic
-        let bound = Rational64::new(57, 10);
+        let bound = ArithRat::new(57, 10);
         let tightened = solver.tighten_bound(bound, true);
         assert_eq!(tightened, bound);
     }
@@ -1133,15 +1193,15 @@ mod tests {
 
         // x > 5 (for integers, this becomes x >= 6)
         solver.assert_gt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
 
         // x < 6 (for integers, this becomes x <= 5)
         solver.assert_lt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(6),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(6),
             reason,
         );
 
@@ -1164,15 +1224,15 @@ mod tests {
 
         // x > 5
         solver.assert_gt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
 
         // x < 6
         solver.assert_lt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(6),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(6),
             reason,
         );
 
@@ -1195,15 +1255,15 @@ mod tests {
 
         // x >= 5
         solver.assert_ge(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
 
         // x < 6 (becomes x <= 5)
         solver.assert_lt(
-            &[(x, Rational64::one())],
-            Rational64::from_integer(6),
+            &[(x, ArithRat::one())],
+            ArithRat::from_integer(6),
             reason,
         );
 
@@ -1233,14 +1293,14 @@ mod tests {
 
         // x <= y
         solver.assert_le(
-            &[(x, Rational64::one()), (y, -Rational64::one())],
-            Rational64::from_integer(0),
+            &[(x, ArithRat::one()), (y, -ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
         // y <= x
         solver.assert_le(
-            &[(y, Rational64::one()), (x, -Rational64::one())],
-            Rational64::from_integer(0),
+            &[(y, ArithRat::one()), (x, -ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
 
@@ -1273,8 +1333,8 @@ mod tests {
 
         // x <= y only (one direction)
         solver.assert_le(
-            &[(x, Rational64::one()), (y, -Rational64::one())],
-            Rational64::from_integer(0),
+            &[(x, ArithRat::one()), (y, -ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
 
@@ -1318,8 +1378,8 @@ mod tests {
         // After asserting x=y, adding x < y should yield UNSAT.
         solver.push();
         solver.assert_lt(
-            &[(x, Rational64::one()), (y, -Rational64::one())],
-            Rational64::from_integer(0),
+            &[(x, ArithRat::one()), (y, -ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
         let result = solver.check().expect("check should not error");
@@ -1350,8 +1410,8 @@ mod tests {
         solver.push();
         let v1 = solver.intern(a);
         solver.assert_ge(
-            &[(a, Rational64::one())],
-            Rational64::from_integer(0),
+            &[(a, ArithRat::one())],
+            ArithRat::from_integer(0),
             reason,
         );
         assert!(matches!(
@@ -1371,8 +1431,8 @@ mod tests {
         solver.push();
         let v2 = solver.intern(a);
         solver.assert_le(
-            &[(a, Rational64::one())],
-            Rational64::from_integer(5),
+            &[(a, ArithRat::one())],
+            ArithRat::from_integer(5),
             reason,
         );
         let result = solver.check().expect("scope-2 check should not error");
