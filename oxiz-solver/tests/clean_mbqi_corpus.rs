@@ -78,6 +78,16 @@ fn solve_clean(path: &Path) -> Verdict {
     if std::env::var("OXIZ_CCFV_EMATCH").is_ok_and(|v| v != "0" && !v.is_empty()) {
         let _ = ctx.execute_script("(set-option :oxiz.ccfv-ematch true)");
     }
+    // CCFV (Phase P4) 0-spurious gate: set OXIZ_CCFV_MODEL_COMPL=1 to run the
+    // whole corpus with the model-completion verdict-flip ON. UNLIKE ccfv-ematch
+    // this is NOT byte-identical — it turns some sound `Unknown`s into `Sat`
+    // (the recovered trigger-free uninterpreted-sort axioms) — so the gate bar is
+    // not "matches unchanged" but the SOUNDNESS one already enforced below: ZERO
+    // spurious sat (z3=Unsat → OxiZ Sat). This env hook is how the default-flip of
+    // `SolverConfig::ccfv_model_compl` is validated before flipping it on.
+    if std::env::var("OXIZ_CCFV_MODEL_COMPL").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        let _ = ctx.execute_script("(set-option :oxiz.ccfv-model-compl true)");
+    }
     // Cap per-case wall-clock so the WHOLE corpus completes in CI-time. The
     // SOUNDNESS gate is unaffected — a spurious `unsat` is a wrong conclusion
     // reached fast, not a non-termination, so a short deadline cannot hide it;
