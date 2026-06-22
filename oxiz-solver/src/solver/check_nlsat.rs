@@ -17,6 +17,7 @@ use crate::prelude::*;
 use num_rational::Rational64;
 use num_traits::{One, ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
+use oxiz_core::interner::Spur;
 use oxiz_theories::nlsat::{NlDispatchResult, dispatch_nia_constraints, dispatch_nra_constraints};
 
 use super::Solver;
@@ -66,41 +67,148 @@ impl Solver {
     /// - `x * y`, `x * y * z` (products of distinct variables)
     /// - `x * x` (squares / higher powers via repeated multiplication)
     /// - `(x + 1) * (y - 2)` (products of linear expressions)
-    pub(super) fn dispatch_nl_solver(&self, manager: &TermManager) -> Option<SolverResult> {
-        let logic = self.logic.as_deref()?;
+    pub(super) fn dispatch_nl_solver(&self, manager: &mut TermManager) -> Option<SolverResult> {
+        // ── Path 1: explicit logic string (UNCHANGED) ──────────────────────
+        // When the benchmark declares its logic (`QF_NIA`/`QF_NRA`/`QF_NIRA`,
+        // possibly with a leading `QF_`), key on the string exactly as before.
+        // The z3-parity corpus hits this path and must stay byte-identical.
+        if let Some(logic) = self.logic.as_deref() {
+            let mut is_nia =
+                logic.contains("NIA") || (logic.contains("NIRA") && !logic.contains("NRA"));
+            // `NIRA` is MIXED integer+real. Routing it through the INTEGER nlsat
+            // (`dispatch_nia_constraints(.., true)`) INTEGERIZES every variable,
+            // including the real-sorted ones — so an independent real constraint
+            // with no integer solution (e.g. `1.0 < y < 2.0`) is reported as a
+            // SPURIOUS `unsat`. Only treat `NIRA` as pure-integer NIA when the
+            // problem has NO real-sorted term; otherwise fall through to CDCL(T)
+            // (sound: the linear-real part is handled there and the nonlinear
+            // part yields the sound `Unknown`).
+            if is_nia
+                && logic.contains("NIRA")
+                && self
+                    .assertions
+                    .iter()
+                    .any(|&a| term_mentions_real_sort(manager, a, 64))
+            {
+                is_nia = false;
+            }
+            let is_nra = logic.contains("NRA") && !is_nia;
 
-        let mut is_nia = logic.contains("NIA") || (logic.contains("NIRA") && !logic.contains("NRA"));
-        // `NIRA` is MIXED integer+real. Routing it through the INTEGER nlsat
-        // (`dispatch_nia_constraints(.., true)`) INTEGERIZES every variable,
-        // including the real-sorted ones — so an independent real constraint
-        // with no integer solution (e.g. `1.0 < y < 2.0`) is reported as a
-        // SPURIOUS `unsat`. Only treat `NIRA` as pure-integer NIA when the
-        // problem has NO real-sorted term; otherwise fall through to CDCL(T)
-        // (sound: the linear-real part is handled there and the nonlinear part
-        // yields the sound `Unknown`).
-        if is_nia
-            && logic.contains("NIRA")
-            && self
-                .assertions
-                .iter()
-                .any(|&a| term_mentions_real_sort(manager, a, 64))
-        {
-            is_nia = false;
+            if is_nia {
+                return dispatch_nia_constraints(&self.assertions, manager, true).map(|r| match r {
+                    NlDispatchResult::Sat => SolverResult::Sat,
+                    NlDispatchResult::Unsat => SolverResult::Unsat,
+                });
+            } else if is_nra {
+                return dispatch_nra_constraints(&self.assertions, manager).map(|r| match r {
+                    NlDispatchResult::Sat => SolverResult::Sat,
+                    NlDispatchResult::Unsat => SolverResult::Unsat,
+                });
+            }
+            // An explicit logic that is neither NIA/NRA/NIRA (e.g. `QF_LIA`,
+            // `QF_UF`) is a deliberate statement that the problem is linear /
+            // not nonlinear-arithmetic — do NOT second-guess it with the
+            // term-based path below. Fall through to CDCL(T).
+            return None;
         }
-        let is_nra = logic.contains("NRA") && !is_nia;
 
-        if is_nia {
-            dispatch_nia_constraints(&self.assertions, manager, true).map(|r| match r {
-                NlDispatchResult::Sat => SolverResult::Sat,
-                NlDispatchResult::Unsat => SolverResult::Unsat,
-            })
-        } else if is_nra {
-            dispatch_nra_constraints(&self.assertions, manager).map(|r| match r {
-                NlDispatchResult::Sat => SolverResult::Sat,
-                NlDispatchResult::Unsat => SolverResult::Unsat,
-            })
+        // ── Path 2: NO logic string — verus `by(nonlinear_arith)` shape ────
+        // Verus emits NO `(set-logic …)` and never asserts native `(* …)` in a
+        // goal. The nonlinear product is the UNINTERPRETED wrapper `Mul`/`RMul`
+        // (`Mul`→Int, `RMul`→Real), tied to native multiplication ONLY by the
+        // asserted bridge axioms `(forall ((x ..)(y ..)) (= (Mul x y) (* x y)))`.
+        // Detect that shape term-wise and route it to nlsat.
+        self.dispatch_nl_via_mul_bridge(manager)
+    }
+
+    /// Term-based nlsat activation for the verus `Mul`/`RMul`-encoded shape.
+    ///
+    /// SOUNDNESS — this only ever returns `Unsat`, never `Sat`. The focused
+    /// constraint set we build is a logical CONSEQUENCE of (a subset of) the
+    /// original assertions, so subset-UNSAT ⟹ full-UNSAT (sound). A `Sat`/model
+    /// over that focused subset says nothing about the full formula, so we drop
+    /// it to `None` (→ CDCL(T) → sound `Unknown`/`Sat`). See the per-step notes.
+    fn dispatch_nl_via_mul_bridge(&self, manager: &mut TermManager) -> Option<SolverResult> {
+        // (a) Scan the asserted set for `Mul`/`RMul` UF APPLICATIONS.
+        let mut has_mul = false; // integer `Mul`
+        let mut has_rmul = false; // real `RMul`
+        for &a in &self.assertions {
+            scan_mul_rmul_apps(a, manager, &mut has_mul, &mut has_rmul, 64);
+        }
+        if !has_mul && !has_rmul {
+            return None;
+        }
+
+        // (b) BRIDGE-AXIOM PRESENCE CHECK. We may only treat `(Mul a b)` as the
+        // product `(* a b)` because the bridge axiom `(= (Mul x y) (* x y))` is
+        // asserted (so `Mul` IS multiplication in the theory). Without it, `Mul`
+        // is a genuine uninterpreted function ⇒ leave it to EUF ⇒ never rewrite.
+        let mul_bridge = self
+            .assertions
+            .iter()
+            .any(|&a| assertion_is_bridge_axiom(a, manager, "Mul"));
+        let rmul_bridge = self
+            .assertions
+            .iter()
+            .any(|&a| assertion_is_bridge_axiom(a, manager, "RMul"));
+
+        // Only rewrite a symbol whose bridge axiom is present.
+        let rewrite_mul = has_mul && mul_bridge;
+        let rewrite_rmul = has_rmul && rmul_bridge;
+        if !rewrite_mul && !rewrite_rmul {
+            // A `Mul`/`RMul` with no bridge axiom is genuinely uninterpreted.
+            return None;
+        }
+
+        // (d) SYMBOL-BASED ROUTING with the never-integerize-a-real rule.
+        //   - any `RMul` (real) present and rewritable  ⇒ NRA (reals);
+        //   - `Mul`-only (integer)                       ⇒ NIA.
+        // A MIXED obligation (both `Mul` and `RMul` used) must NOT be sent to
+        // the INTEGER nlsat — it would integerize the real-sorted vars and could
+        // fabricate a spurious `unsat` (the NIRA hazard). We route mixed to NRA
+        // (which keeps reals real); but if the integer `Mul` would then be left
+        // un-rewritten (no real bridge to carry it) the integer part is dropped,
+        // which is fine for the `Unsat`-only trust we apply. When in doubt
+        // (e.g. we cannot rewrite the symbol that drives the routing) → `None`.
+        let route_real = rewrite_rmul;
+        // If reals are involved we never integerize: route to NRA. Otherwise the
+        // problem is pure-integer `Mul` and routes to NIA.
+        let integer_mode = !route_real;
+
+        // (c) Build the FOCUSED assertion set: walk each top-level assertion,
+        // peel `Not`/`Implies` polarity to surface the goal's comparison atoms,
+        // rewrite the `Mul`/`RMul` apps to native `*`, and collect ONLY the
+        // arithmetic comparison atoms we can model. Everything else (the prelude
+        // `Forall`/`Apply`/`Div`/`Mod` noise) is intentionally dropped — which is
+        // exactly why we trust UNSAT only.
+        let mut focused: Vec<TermId> = Vec::new();
+        for &a in &self.assertions {
+            collect_focused_nl_atoms(
+                a,
+                true, // positive polarity at the top level
+                manager,
+                rewrite_mul,
+                rewrite_rmul,
+                &mut focused,
+            );
+        }
+        if focused.is_empty() {
+            return None;
+        }
+
+        // Dispatch the focused, native-`*` set. `dispatch_n{ia,ra}_constraints`
+        // already return `None` when they cannot decide, and the focused set is
+        // a consequence of the originals — so a returned `Unsat` is sound for the
+        // full formula. We MAP AWAY any `Sat`: subset-sat ⊭ full-sat.
+        let result = if route_real {
+            dispatch_nra_constraints(&focused, manager)
         } else {
-            None
+            dispatch_nia_constraints(&focused, manager, integer_mode)
+        };
+        match result {
+            Some(NlDispatchResult::Unsat) => Some(SolverResult::Unsat),
+            // SOUNDNESS: never trust a focused-subset `Sat` for the full formula.
+            Some(NlDispatchResult::Sat) | None => None,
         }
     }
 
@@ -690,9 +798,321 @@ fn term_mentions_real_sort(manager: &TermManager, t: TermId, depth: u32) -> bool
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Term-based `Mul`/`RMul` nlsat activation (verus `by(nonlinear_arith)` shape)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve an `Apply` function symbol and test it against `name`.
+fn func_name_is(manager: &TermManager, func: Spur, name: &str) -> bool {
+    manager.resolve_str(func) == name
+}
+
+/// Recursively scan `t` for **ground** `(Mul ..)` / `(RMul ..)` UF
+/// **applications** (binary, the verus shape). Sets `has_mul` / `has_rmul`.
+/// Depth-bounded.
+///
+/// IMPORTANT: this does NOT descend into `Forall`/`Exists` bodies. The bridge
+/// axioms `(forall ((x ..)(y ..)) (= (Mul x y) (* x y)))` themselves contain an
+/// applied `(Mul x y)` / `(RMul x y)` at the head — counting those would make a
+/// pure-`Mul` (integer) goal look like it "uses `RMul`" (the real bridge axiom
+/// is always in the prelude), mis-routing it to the REAL nlsat. We only care
+/// whether the symbol is applied in the GROUND part (the goal), which is never
+/// under a quantifier in this shape.
+fn scan_mul_rmul_apps(
+    t: TermId,
+    manager: &TermManager,
+    has_mul: &mut bool,
+    has_rmul: &mut bool,
+    depth: u32,
+) {
+    if depth == 0 || (*has_mul && *has_rmul) {
+        return;
+    }
+    let Some(term) = manager.get(t) else {
+        return;
+    };
+    // Do not look inside quantifier bodies (see doc comment).
+    if matches!(
+        term.kind,
+        TermKind::Forall { .. } | TermKind::Exists { .. }
+    ) {
+        return;
+    }
+    if let TermKind::Apply { func, args } = &term.kind {
+        if args.len() == 2 {
+            if func_name_is(manager, *func, "Mul") {
+                *has_mul = true;
+            } else if func_name_is(manager, *func, "RMul") {
+                *has_rmul = true;
+            }
+        }
+    }
+    for child in term_children(&term.kind) {
+        scan_mul_rmul_apps(child, manager, has_mul, has_rmul, depth - 1);
+    }
+}
+
+/// Is `assertion` the bridge axiom for `sym` — a `forall` whose body equates
+/// `(sym x y)` with native `(* x y)`? Matches structurally (the `:qid`
+/// `prelude_mul`/`prelude_rmul` is metadata that is not retained on the term,
+/// so we verify the body shape directly). Accepts the body equality in either
+/// orientation. We require the two `(* …)` operands to be exactly the two
+/// bound-variable arguments of `(sym …)` (not just "some product"), so an
+/// unrelated `(= (sym a b) (* c d))` can never license the rewrite.
+fn assertion_is_bridge_axiom(assertion: TermId, manager: &TermManager, sym: &str) -> bool {
+    let Some(term) = manager.get(assertion) else {
+        return false;
+    };
+    let TermKind::Forall { body, .. } = &term.kind else {
+        return false;
+    };
+    let Some(body_term) = manager.get(*body) else {
+        return false;
+    };
+    let TermKind::Eq(lhs, rhs) = &body_term.kind else {
+        return false;
+    };
+    eq_sides_are_bridge(*lhs, *rhs, manager, sym) || eq_sides_are_bridge(*rhs, *lhs, manager, sym)
+}
+
+/// `apply_side` is `(sym a b)` and `mul_side` is `(* a b)` with the SAME two
+/// arguments, in order.
+fn eq_sides_are_bridge(
+    apply_side: TermId,
+    mul_side: TermId,
+    manager: &TermManager,
+    sym: &str,
+) -> bool {
+    let (Some(app), Some(mul)) = (manager.get(apply_side), manager.get(mul_side)) else {
+        return false;
+    };
+    let TermKind::Apply { func, args } = &app.kind else {
+        return false;
+    };
+    if !func_name_is(manager, *func, sym) || args.len() != 2 {
+        return false;
+    }
+    let TermKind::Mul(margs) = &mul.kind else {
+        return false;
+    };
+    // Native `*` may carry an explicit unit coefficient, but the prelude form is
+    // exactly two factors equal to the two application arguments in order.
+    margs.len() == 2 && margs[0] == args[0] && margs[1] == args[1]
+}
+
+/// Rewrite every `(Mul a b)` / `(RMul a b)` UF application (whose bridge axiom
+/// is present, per the `rewrite_mul`/`rewrite_rmul` flags) into the native
+/// product `(* a b)`, recursively. Returns the rewritten term id (interning new
+/// nodes as needed). Leaves all other structure unchanged. `None` only on a
+/// malformed/missing node.
+///
+/// This is sound: the bridge axiom `(= (sym x y) (* x y))` makes `(sym a b)`
+/// and `(* a b)` provably equal, so replacing one by the other inside an atom
+/// preserves the atom's truth value under every model of the bridge axiom.
+fn rewrite_mul_rmul(
+    t: TermId,
+    manager: &mut TermManager,
+    rewrite_mul: bool,
+    rewrite_rmul: bool,
+) -> Option<TermId> {
+    let term = manager.get(t)?;
+    match term.kind.clone() {
+        TermKind::Apply { func, args } if args.len() == 2 => {
+            let is_mul = rewrite_mul && func_name_is(manager, func, "Mul");
+            let is_rmul = rewrite_rmul && func_name_is(manager, func, "RMul");
+            if is_mul || is_rmul {
+                let a = rewrite_mul_rmul(args[0], manager, rewrite_mul, rewrite_rmul)?;
+                let b = rewrite_mul_rmul(args[1], manager, rewrite_mul, rewrite_rmul)?;
+                return Some(manager.mk_mul([a, b]));
+            }
+            // Unrelated application: rewrite inside its args (defensive — these
+            // are uninterpreted and won't translate to polynomials, but keep the
+            // structure consistent).
+            let new_args: Vec<TermId> = args
+                .iter()
+                .map(|&c| rewrite_mul_rmul(c, manager, rewrite_mul, rewrite_rmul))
+                .collect::<Option<Vec<_>>>()?;
+            let sort = manager.get(t).map(|x| x.sort)?;
+            let fname = manager.resolve_str(func).to_string();
+            Some(manager.mk_apply(&fname, new_args, sort))
+        }
+        TermKind::Add(args) => {
+            let new: Vec<TermId> = args
+                .iter()
+                .map(|&c| rewrite_mul_rmul(c, manager, rewrite_mul, rewrite_rmul))
+                .collect::<Option<Vec<_>>>()?;
+            Some(manager.mk_add(new))
+        }
+        TermKind::Mul(args) => {
+            let new: Vec<TermId> = args
+                .iter()
+                .map(|&c| rewrite_mul_rmul(c, manager, rewrite_mul, rewrite_rmul))
+                .collect::<Option<Vec<_>>>()?;
+            Some(manager.mk_mul(new))
+        }
+        TermKind::Sub(a, b) => {
+            let na = rewrite_mul_rmul(a, manager, rewrite_mul, rewrite_rmul)?;
+            let nb = rewrite_mul_rmul(b, manager, rewrite_mul, rewrite_rmul)?;
+            Some(manager.mk_sub(na, nb))
+        }
+        TermKind::Neg(a) => {
+            let na = rewrite_mul_rmul(a, manager, rewrite_mul, rewrite_rmul)?;
+            Some(manager.mk_neg(na))
+        }
+        // Leaves and everything else: unchanged.
+        _ => Some(t),
+    }
+}
+
+/// Walk a top-level assertion, peeling boolean structure to surface the goal's
+/// arithmetic COMPARISON atoms (`>=,>,<=,<,=`), rewriting `Mul`/`RMul` → native
+/// `*` inside them, and pushing the rewritten comparison into `out`.
+///
+/// `polarity` tracks negation: at the top level it is `true`; each `Not` flips
+/// it. A comparison reached under NEGATIVE polarity is emitted as its negation
+/// (`>=` ↦ `<`, etc.) so the emitted atom is a logical CONSEQUENCE of the
+/// (possibly negated) assertion — e.g. `(not (=> L (>= (Mul x x) 0)))` entails
+/// `(< (Mul x x) 0)` (P→Q false ⟹ Q false), which after rewrite is
+/// `(< (* x x) 0)`. We only descend the connectives where each surfaced atom is
+/// genuinely ENTAILED by the assertion:
+///   - `Not φ`            → flip polarity, descend (`¬¬a = a`);
+///   - positive `And`     → each conjunct is entailed; descend all;
+///   - negative `Or`      → `¬(a∨b)=¬a∧¬b`, each is entailed; descend all flipped;
+///   - `(not (=> a b))`   → `a ∧ ¬b`; the `¬b` consequent is entailed (so under
+///     the flip a positive `Implies` whose polarity is now negative descends
+///     into the consequent `b` with the flipped polarity).
+/// Anything else (positive `Or`, `Ite`, bare `Forall`/`Apply`, etc.) is NOT a
+/// per-disjunct entailment, so we stop — the atom would not be sound to assert.
+/// Because we only ever EMIT entailed atoms and trust UNSAT only, dropping the
+/// rest is sound.
+fn collect_focused_nl_atoms(
+    t: TermId,
+    polarity: bool,
+    manager: &mut TermManager,
+    rewrite_mul: bool,
+    rewrite_rmul: bool,
+    out: &mut Vec<TermId>,
+) {
+    let Some(term) = manager.get(t) else {
+        return;
+    };
+    match term.kind.clone() {
+        TermKind::Not(inner) => {
+            collect_focused_nl_atoms(inner, !polarity, manager, rewrite_mul, rewrite_rmul, out);
+        }
+        TermKind::And(args) if polarity => {
+            for a in args {
+                collect_focused_nl_atoms(a, true, manager, rewrite_mul, rewrite_rmul, out);
+            }
+        }
+        TermKind::Or(args) if !polarity => {
+            // ¬(a ∨ b ∨ …) = ¬a ∧ ¬b ∧ … — each ¬aᵢ is entailed.
+            for a in args {
+                collect_focused_nl_atoms(a, false, manager, rewrite_mul, rewrite_rmul, out);
+            }
+        }
+        TermKind::Implies(a, b) if !polarity => {
+            // ¬(a ⇒ b) = a ∧ ¬b — both the antecedent (positive) and the negated
+            // consequent are entailed.
+            collect_focused_nl_atoms(a, true, manager, rewrite_mul, rewrite_rmul, out);
+            collect_focused_nl_atoms(b, false, manager, rewrite_mul, rewrite_rmul, out);
+        }
+        TermKind::Eq(_, _)
+        | TermKind::Ge(_, _)
+        | TermKind::Gt(_, _)
+        | TermKind::Le(_, _)
+        | TermKind::Lt(_, _) => {
+            if let Some(atom) = build_polarized_comparison(
+                t,
+                polarity,
+                &term.kind.clone(),
+                manager,
+                rewrite_mul,
+                rewrite_rmul,
+            ) {
+                out.push(atom);
+            }
+        }
+        _ => {
+            // Not a per-component entailment (positive Or, Ite, Forall, Apply,
+            // arbitrary boolean glue, …) — stop; emitting here would be unsound.
+        }
+    }
+}
+
+/// Build the (possibly negated) comparison atom with `Mul`/`RMul` rewritten to
+/// native `*`. With `polarity == true` the comparison is emitted as-is; with
+/// `polarity == false` its NEGATION is emitted (`>=`↦`<`, `>`↦`<=`, `<=`↦`>`,
+/// `<`↦`>=`). An `=` under negative polarity is a disequality, which the
+/// polynomial path does not model as a single atom, so we drop it (returns
+/// `None` → fall through; sound because dropping only loses precision).
+fn build_polarized_comparison(
+    orig: TermId,
+    polarity: bool,
+    kind: &TermKind,
+    manager: &mut TermManager,
+    rewrite_mul: bool,
+    rewrite_rmul: bool,
+) -> Option<TermId> {
+    // Pull the two sides.
+    let (lhs, rhs) = match kind {
+        TermKind::Eq(a, b)
+        | TermKind::Ge(a, b)
+        | TermKind::Gt(a, b)
+        | TermKind::Le(a, b)
+        | TermKind::Lt(a, b) => (*a, *b),
+        _ => return None,
+    };
+    // Only bother when a `Mul`/`RMul` actually occurs in this atom (otherwise it
+    // is plain linear/EUF glue and adds nothing to the nonlinear sub-problem).
+    let mut hm = false;
+    let mut hr = false;
+    scan_mul_rmul_apps(orig, manager, &mut hm, &mut hr, 64);
+    if !(hm && rewrite_mul) && !(hr && rewrite_rmul) {
+        return None;
+    }
+    let l = rewrite_mul_rmul(lhs, manager, rewrite_mul, rewrite_rmul)?;
+    let r = rewrite_mul_rmul(rhs, manager, rewrite_mul, rewrite_rmul)?;
+    Some(match (kind, polarity) {
+        (TermKind::Eq(..), true) => manager.mk_eq(l, r),
+        (TermKind::Eq(..), false) => return None, // disequality — drop
+        (TermKind::Ge(..), true) | (TermKind::Lt(..), false) => manager.mk_ge(l, r),
+        (TermKind::Gt(..), true) | (TermKind::Le(..), false) => manager.mk_gt(l, r),
+        (TermKind::Le(..), true) | (TermKind::Gt(..), false) => manager.mk_le(l, r),
+        (TermKind::Lt(..), true) | (TermKind::Ge(..), false) => manager.mk_lt(l, r),
+        _ => return None,
+    })
+}
+
+/// Immediate sub-terms of `kind` (for the generic recursion in
+/// [`scan_mul_rmul_apps`]). Skips quantifier bodies' bound-variable plumbing —
+/// we still descend into a `Forall`/`Exists` body to find applied symbols.
+fn term_children(kind: &TermKind) -> Vec<TermId> {
+    match kind {
+        TermKind::Not(a) | TermKind::Neg(a) => vec![*a],
+        TermKind::And(a) | TermKind::Or(a) | TermKind::Add(a) | TermKind::Mul(a)
+        | TermKind::Distinct(a) => a.to_vec(),
+        TermKind::Xor(a, b)
+        | TermKind::Implies(a, b)
+        | TermKind::Eq(a, b)
+        | TermKind::Sub(a, b)
+        | TermKind::Div(a, b)
+        | TermKind::Mod(a, b)
+        | TermKind::Lt(a, b)
+        | TermKind::Le(a, b)
+        | TermKind::Gt(a, b)
+        | TermKind::Ge(a, b) => vec![*a, *b],
+        TermKind::Ite(a, b, c) => vec![*a, *b, *c],
+        TermKind::Apply { args, .. } => args.to_vec(),
+        TermKind::Forall { body, .. } | TermKind::Exists { body, .. } => vec![*body],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::Solver;
 
     #[test]
     fn test_is_perfect_square() {
@@ -708,5 +1128,160 @@ mod tests {
         assert!(!is_perfect_square(6));
         assert!(!is_perfect_square(7));
         assert!(!is_perfect_square(8));
+    }
+
+    // ── Term-based `Mul`/`RMul` nlsat auto-detect (verus shape) ───────────────
+    //
+    // These build the post-`:pattern` shape lu-smt actually sees: NO logic
+    // string, a `Mul`/`RMul` UF whose bridge axiom `(= (Mul x y) (* x y))` is
+    // asserted, and a NEGATED goal `(not (=> label (>= (Mul x! x!) 0)))`.
+
+    /// Build the integer `Mul` bridge axiom `∀ x y. (= (Mul x y) (* x y))`.
+    fn mul_bridge(m: &mut TermManager) -> TermId {
+        let int = m.sorts.int_sort;
+        let x = m.mk_var("x", int);
+        let y = m.mk_var("y", int);
+        let app = m.mk_apply("Mul", [x, y], int);
+        let native = m.mk_mul([x, y]);
+        let body = m.mk_eq(app, native);
+        m.mk_forall([("x", int), ("y", int)], body)
+    }
+
+    /// Build the real `RMul` bridge axiom `∀ x y. (= (RMul x y) (* x y))`.
+    fn rmul_bridge(m: &mut TermManager) -> TermId {
+        let real = m.sorts.real_sort;
+        let x = m.mk_var("x", real);
+        let y = m.mk_var("y", real);
+        let app = m.mk_apply("RMul", [x, y], real);
+        let native = m.mk_mul([x, y]);
+        let body = m.mk_eq(app, native);
+        m.mk_forall([("x", real), ("y", real)], body)
+    }
+
+    /// `(not (=> label cmp))` — verus's location-labelled negated goal.
+    fn negated_goal(m: &mut TermManager, cmp: TermId) -> TermId {
+        let boolsort = m.sorts.bool_sort;
+        let label = m.mk_var("loclabel", boolsort);
+        let imp = m.mk_implies(label, cmp);
+        m.mk_not(imp)
+    }
+
+    fn solve_no_logic(assertions: Vec<TermId>, m: &mut TermManager) -> Option<SolverResult> {
+        let mut s = Solver::new();
+        // No logic string → the term-based path.
+        s.logic = None;
+        s.assertions = assertions;
+        s.dispatch_nl_solver(m)
+    }
+
+    #[test]
+    fn nl_provable_mul_square_reaches_nlsat_and_decides_unsat() {
+        // `assert(x*x >= 0)` → negated goal `(not (=> L (>= (Mul x! x!) 0)))`.
+        // The focused atom is `(< (* x! x!) 0)`, univariate, UNSAT → provable.
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let bridge = mul_bridge(&mut m);
+        let mul = m.mk_apply("Mul", [xv, xv], int);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(mul, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        let r = solve_no_logic(vec![bridge, goal], &mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "x*x>=0 obligation must reach nlsat and decide UNSAT (provable)"
+        );
+    }
+
+    #[test]
+    fn nl_invalid_mul_product_is_not_false_unsat() {
+        // `assert(x*y >= 0)` → negated goal `(< (Mul x! y!) 0)` is SATISFIABLE
+        // (x=-1, y=1). The bivariate atom is not univariate, so subset-UNSAT is
+        // not trustworthy and subset-SAT is never trusted → sound `Unknown`
+        // (None), NEVER a false UNSAT.
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let yv = m.mk_var("y!", int);
+        let bridge = mul_bridge(&mut m);
+        let mul = m.mk_apply("Mul", [xv, yv], int);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(mul, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        let r = solve_no_logic(vec![bridge, goal], &mut m);
+        assert_ne!(
+            r,
+            Some(SolverResult::Unsat),
+            "x*y>=0 obligation is INVALID — must NOT be a false UNSAT"
+        );
+    }
+
+    #[test]
+    fn mul_without_bridge_axiom_is_not_rewritten() {
+        // Same `(Mul x! x!)` square goal but with NO bridge axiom asserted.
+        // `Mul` is then a genuine uninterpreted function — we must NOT rewrite
+        // it to `*`, so the nlsat path does not fire (sound Unknown / None).
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let mul = m.mk_apply("Mul", [xv, xv], int);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(mul, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        // Only the goal, no `(= (Mul x y) (* x y))` axiom.
+        let r = solve_no_logic(vec![goal], &mut m);
+        assert_eq!(
+            r, None,
+            "uninterpreted Mul (no bridge axiom) must not be rewritten → no nlsat verdict"
+        );
+    }
+
+    #[test]
+    fn rmul_real_square_routes_to_nra_not_nia() {
+        // `assert(rx*rx >= 0)` over REALS via `RMul`. Routes to NRA (reals); the
+        // focused atom `(< (* rx rx) 0)` is UNSAT (real squares ≥ 0) → provable.
+        // Critically it must NOT integerize the real var (NRA, not NIA).
+        let mut m = TermManager::new();
+        let real = m.sorts.real_sort;
+        let rx = m.mk_var("rx!", real);
+        let bridge = rmul_bridge(&mut m);
+        let mul = m.mk_apply("RMul", [rx, rx], real);
+        let zero = m.mk_real(num_rational::Rational64::new(0, 1));
+        let ge = m.mk_ge(mul, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        let r = solve_no_logic(vec![bridge, goal], &mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "rx*rx>=0 (RMul/real) must reach NRA and decide UNSAT (provable)"
+        );
+    }
+
+    #[test]
+    fn explicit_qf_nia_logic_path_unchanged() {
+        // With an explicit `QF_NIA` logic and a NATIVE `(* x x)` square, the
+        // UNCHANGED logic-string path must still fire (sanity that Path 1 stays
+        // live and is not shadowed by the new term-based Path 2).
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x", int);
+        let sq = m.mk_mul([xv, xv]);
+        let neg1 = m.mk_int(-1);
+        let eq = m.mk_eq(sq, neg1); // x*x = -1  → UNSAT
+
+        let mut s = Solver::new();
+        s.logic = Some("QF_NIA".to_string());
+        s.assertions = vec![eq];
+        let r = s.dispatch_nl_solver(&mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "explicit QF_NIA + (x*x = -1) must stay UNSAT on the unchanged logic path"
+        );
     }
 }
