@@ -119,7 +119,40 @@ fabricate SAT. UNSAT may only be concluded by the existing complete machinery,
 not by "no rule applied".
 
 ## Implementation status
-- **Foundation (this branch):** A0 linear-elimination + Sturm real-root test +
-  algebraic (`AlgebraicNumber`) model — discharges `test_solver_circle_and_line`.
-- **Follow-up Level-1+:** A1 resultant, A2 product-of-forms, A3 conic
-  parameterisations, B/C transcendental normalisation (tie into calculus.rs).
+- **Foundation:** A0 linear-elimination + Sturm real-root test + algebraic
+  (`AlgebraicNumber`) model — discharges `test_solver_circle_and_line`.
+- **Rule D — LANDED.** `reduction_kb::try_rule_d` un-gates the single-equation
+  case for a univariate `p = 0`: it isolates the real root via Sturm and returns
+  an exact `AlgebraicNumber`, but ONLY when the root is *irrational*. Soundness /
+  NIA safety: `reduction_kb::has_rational_root` (rational-root theorem) declines
+  every polynomial with a rational root — `x²-4` (±2), `x³-x` ({-1,0,1}), `x-1`,
+  `x-1/2` — leaving them to the base CDCL+CAD search (which represents rationals
+  exactly and, for NIA, owns the integer-domain branch-and-bound). Even-`k`/`a<0`
+  (`x²+1`) has no real root ⇒ falls back (the CAD path concludes the sound
+  real-UNSAT); the KB never returns Sat from a complex root and never returns
+  Unsat. Discharges `test_quadratic_roots` (`x²-2 ⇒ ±√2`). Regression tests:
+  `test_rule_d_*` in `reduction_kb.rs`.
+- **A1 resultant / A3 conic recogniser — LANDED.**
+  - `discriminant::recognize_conic` + `ConicForm`/`ConicKind` classify a degree-2
+    bivariate `A x²+B xy+C y²+D x+E y+F = 0` by `B²-4AC` (`<0` ellipse, `=0`
+    parabola, `>0` hyperbola). The circle is the `A=C, B=0` ellipse instance
+    (`ConicForm::is_circle`), recovered automatically — no separate circle rule.
+    Pure recogniser/normaliser; does NO solving. Tests:
+    `discriminant::tests::test_recognize_*`.
+  - The actual *solving* for pure-polynomial conic∩conic / conic∩line stays on the
+    exact algebraic path. `reduction_kb::augment_with_linear_combinations` adds the
+    sound radical-axis linear combination (`p − λ·r` that cancels the shared
+    quadratic part) so the Level-0 linear elimination handles two-conic systems
+    through the same Sturm + exact-verify machinery (a genuine conic∩conic becomes
+    the already-handled conic∩line). Two intersecting circles, ellipse∩line, and
+    the disjoint-circles fall-back are covered (`test_two_circles_*`,
+    `test_ellipse_and_line_sat` in `reduction_kb.rs`; `test_conic_*` +
+    `audit_conic_false_sat_with_inequality` end-to-end in `integration_tests.rs`).
+- **Still Level-1+ frontier (NOT implemented — unsound to fake):** A2
+  product-of-forms; the A3 **transcendental trig parameterisation**
+  `x = a·c·cos(t), y = b·c·sin(t)` (and the hyperbolic `cosh/sinh`), which needs
+  transcendental equation solving beyond Sturm; B/C transcendental normalisation.
+  These tie into `oxiz-solver/src/calculus.rs`'s sin/cos/exp/ln KB. The conic
+  classifier recognises these shapes but the algebraic path solves only the
+  polynomial fragment; a transcendental conic with no polynomial elimination
+  falls back (never a fabricated SAT).

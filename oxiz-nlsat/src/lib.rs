@@ -74,7 +74,10 @@ pub use chrono_bt::{
     BacktrackDecision, ChronoBacktracker, ChronoConfig, ChronoStats, ConflictAnalysisResult,
 };
 pub use clause_tiers::{ClauseTier, ClauseTierConfig, ClauseTierManager, ClauseTierStats};
-pub use discriminant::{DiscriminantAnalyzer, DiscriminantSign, DiscriminantStats, RootInfo};
+pub use discriminant::{
+    ConicForm, ConicKind, DiscriminantAnalyzer, DiscriminantSign, DiscriminantStats, RootInfo,
+    recognize_conic,
+};
 pub use eval_cache::{CachedSign, EvalCache, EvalCacheConfig, EvalCacheStats, SignPattern};
 pub use grobner_preprocess::{
     GroebnerConfig, GroebnerPreprocessor, GroebnerStats, PreprocessResult,

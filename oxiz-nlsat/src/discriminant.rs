@@ -321,6 +321,135 @@ impl DiscriminantAnalyzer {
     }
 }
 
+/// Classification of a degree-2 bivariate "conic" equality (catalog §A3).
+///
+/// A conic GENERALISES the circle: circle ⊂ ellipse ⊂ conic. The shape is decided
+/// by the discriminant `B² − 4AC` of `A·x² + B·xy + C·y² + D·x + E·y + F = 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConicKind {
+    /// `B² − 4AC < 0` — ellipse (the circle `A=C, B=0` is the `a=b` instance).
+    Ellipse,
+    /// `B² − 4AC = 0` — parabola.
+    Parabola,
+    /// `B² − 4AC > 0` — hyperbola.
+    Hyperbola,
+}
+
+/// The six coefficients of a degree-2 bivariate equality, plus the two variables.
+///
+/// `A·x² + B·xy + C·y² + D·x + E·y + F = 0`, with `x = var_x`, `y = var_y`.
+#[derive(Debug, Clone)]
+pub struct ConicForm {
+    /// First variable (the `x` of the normal form).
+    pub var_x: oxiz_math::polynomial::Var,
+    /// Second variable (the `y` of the normal form).
+    pub var_y: oxiz_math::polynomial::Var,
+    /// Coefficient of `x²`.
+    pub a: BigRational,
+    /// Coefficient of `xy`.
+    pub b: BigRational,
+    /// Coefficient of `y²`.
+    pub c: BigRational,
+    /// Coefficient of `x`.
+    pub d: BigRational,
+    /// Coefficient of `y`.
+    pub e: BigRational,
+    /// Constant term.
+    pub f: BigRational,
+}
+
+impl ConicForm {
+    /// The conic discriminant `B² − 4AC`.
+    pub fn discriminant(&self) -> BigRational {
+        &self.b * &self.b - BigRational::from_integer(4.into()) * &self.a * &self.c
+    }
+
+    /// Classify the conic by the sign of `B² − 4AC`.
+    pub fn classify(&self) -> ConicKind {
+        let disc = self.discriminant();
+        if disc.is_zero() {
+            ConicKind::Parabola
+        } else if disc.is_negative() {
+            ConicKind::Ellipse
+        } else {
+            ConicKind::Hyperbola
+        }
+    }
+
+    /// Is this the special *circle* case (`A = C ≠ 0`, `B = 0`)?
+    ///
+    /// The circle is the `a = b` specialisation of the ellipse; the classifier
+    /// recovers it automatically (it is reported as [`ConicKind::Ellipse`]). This
+    /// helper is for diagnostics only — there is no separate "circle" rule.
+    pub fn is_circle(&self) -> bool {
+        self.b.is_zero() && !self.a.is_zero() && self.a == self.c
+    }
+}
+
+/// Recognise a polynomial as a degree-2 bivariate conic `A x² + B xy + C y² +
+/// D x + E y + F = 0` (catalog §A3).
+///
+/// Returns `Some(ConicForm)` iff the polynomial mentions exactly two variables,
+/// has total degree exactly 2, and every monomial is one of `{x², xy, y², x, y,
+/// 1}` (so the normal form is exact and the discriminant classifier applies).
+/// Returns `None` otherwise (e.g. a line — degree 1, or a higher-degree / >2-var
+/// polynomial) so the caller routes it elsewhere.
+///
+/// This is a pure *recogniser/normaliser*: it does no solving. For a pure-
+/// polynomial conic∩conic or conic∩line system the actual solving is done by the
+/// algebraic reduction KB's exact Level-0 linear elimination / Level-1 resultant
+/// path; the classifier only identifies the shape and supplies the normalised
+/// coefficients. The transcendental trig parameterisation
+/// `x = a·c·cos(t), y = b·c·sin(t)` of catalog §A3 needs transcendental equation
+/// solving (beyond Sturm) and is the Level-1+ frontier — it is documented (and
+/// tied to `oxiz-solver/src/calculus.rs`'s sin/cos KB), NOT implemented here, so
+/// no unsound trig solver is introduced.
+pub fn recognize_conic(poly: &Polynomial) -> Option<ConicForm> {
+    let vars = poly.vars();
+    if vars.len() != 2 {
+        return None;
+    }
+    if poly.total_degree() != 2 {
+        return None;
+    }
+    let var_x = vars[0];
+    let var_y = vars[1];
+
+    let mut a = BigRational::zero();
+    let mut b = BigRational::zero();
+    let mut c = BigRational::zero();
+    let mut d = BigRational::zero();
+    let mut e = BigRational::zero();
+    let mut f = BigRational::zero();
+
+    for term in poly.terms() {
+        let dx = term.monomial.degree(var_x);
+        let dy = term.monomial.degree(var_y);
+        match (dx, dy) {
+            (2, 0) => a = term.coeff.clone(),
+            (1, 1) => b = term.coeff.clone(),
+            (0, 2) => c = term.coeff.clone(),
+            (1, 0) => d = term.coeff.clone(),
+            (0, 1) => e = term.coeff.clone(),
+            (0, 0) => f = term.coeff.clone(),
+            // Any other monomial (degree > 2 in one var, or a third variable
+            // sneaking in) means this is not a clean bivariate conic.
+            _ => return None,
+        }
+    }
+
+    Some(ConicForm {
+        var_x,
+        var_y,
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+    })
+}
+
 /// Compute the determinant of a square matrix over BigRational via Gaussian elimination.
 ///
 /// Uses partial pivoting to avoid division by zero. The determinant is computed
@@ -535,5 +664,100 @@ mod tests {
         ];
         let det = gaussian_elimination_det(mat);
         assert_eq!(det, BigRational::from_integer(BigInt::from(-2i64)));
+    }
+
+    // ---- Conic recognizer / classifier (catalog §A3). ----
+
+    fn rat(n: i64) -> BigRational {
+        BigRational::from_integer(BigInt::from(n))
+    }
+
+    /// Build `A x² + B xy + C y² + D x + E y + F` over vars (0=x, 1=y).
+    fn conic_poly(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> Polynomial {
+        let x = Polynomial::from_var(0);
+        let y = Polynomial::from_var(1);
+        let x2 = Polynomial::mul(&x, &x);
+        let y2 = Polynomial::mul(&y, &y);
+        let xy = Polynomial::mul(&x, &y);
+        let mut p = Polynomial::zero();
+        p = Polynomial::add(&p, &x2.scale(&rat(a)));
+        p = Polynomial::add(&p, &xy.scale(&rat(b)));
+        p = Polynomial::add(&p, &y2.scale(&rat(c)));
+        p = Polynomial::add(&p, &x.scale(&rat(d)));
+        p = Polynomial::add(&p, &y.scale(&rat(e)));
+        Polynomial::add(&p, &Polynomial::constant(rat(f)))
+    }
+
+    #[test]
+    fn test_recognize_circle_is_ellipse() {
+        // x² + y² - 25 = 0 : the circle is the A=C, B=0 ellipse instance.
+        let p = conic_poly(1, 0, 1, 0, 0, -25);
+        let form = recognize_conic(&p).expect("circle is a conic");
+        assert_eq!(form.classify(), ConicKind::Ellipse);
+        assert!(form.is_circle());
+        // discriminant B²-4AC = 0 - 4 = -4 < 0 (ellipse).
+        assert_eq!(form.discriminant(), rat(-4));
+    }
+
+    #[test]
+    fn test_recognize_proper_ellipse() {
+        // x² + 4y² - 100 = 0 : ellipse (A=1, C=4, B=0), NOT a circle.
+        let p = conic_poly(1, 0, 4, 0, 0, -100);
+        let form = recognize_conic(&p).expect("ellipse is a conic");
+        assert_eq!(form.classify(), ConicKind::Ellipse);
+        assert!(!form.is_circle());
+        assert_eq!(form.discriminant(), rat(-16)); // 0 - 16
+    }
+
+    #[test]
+    fn test_recognize_hyperbola() {
+        // x² - y² - 1 = 0 : hyperbola (B²-4AC = 0 - 4*1*(-1) = 4 > 0).
+        let p = conic_poly(1, 0, -1, 0, 0, -1);
+        let form = recognize_conic(&p).expect("hyperbola is a conic");
+        assert_eq!(form.classify(), ConicKind::Hyperbola);
+        assert_eq!(form.discriminant(), rat(4));
+    }
+
+    #[test]
+    fn test_recognize_parabola() {
+        // y - x² = 0 : parabola (A=1 on x², C=0, B=0 ⇒ disc = 0).
+        let p = conic_poly(-1, 0, 0, 0, 1, 0); // -x² + y
+        let form = recognize_conic(&p).expect("parabola is a conic");
+        assert_eq!(form.classify(), ConicKind::Parabola);
+        assert_eq!(form.discriminant(), rat(0));
+    }
+
+    #[test]
+    fn test_recognize_rotated_conic_xy_term() {
+        // xy - 1 = 0 : B=1, A=C=0 ⇒ disc = 1 > 0 ⇒ hyperbola (rotated).
+        let p = conic_poly(0, 1, 0, 0, 0, -1);
+        let form = recognize_conic(&p).expect("xy-1 is a conic");
+        assert_eq!(form.classify(), ConicKind::Hyperbola);
+        assert_eq!(form.discriminant(), rat(1));
+    }
+
+    #[test]
+    fn test_recognize_declines_line() {
+        // y - x = 0 : a LINE (total degree 1) is not a conic.
+        let x = Polynomial::from_var(0);
+        let y = Polynomial::from_var(1);
+        let line = Polynomial::sub(&y, &x);
+        assert!(recognize_conic(&line).is_none());
+    }
+
+    #[test]
+    fn test_recognize_declines_univariate_and_cubic() {
+        // x² - 2 (one variable) is not a *bivariate* conic.
+        let x = Polynomial::from_var(0);
+        let x2 = Polynomial::mul(&x, &x);
+        let uni = Polynomial::sub(&x2, &Polynomial::constant(rat(2)));
+        assert!(recognize_conic(&uni).is_none());
+
+        // x³ + y² (total degree 3) is not degree-2.
+        let y = Polynomial::from_var(1);
+        let x3 = Polynomial::mul(&x2, &x);
+        let y2 = Polynomial::mul(&y, &y);
+        let cubic = Polynomial::add(&x3, &y2);
+        assert!(recognize_conic(&cubic).is_none());
     }
 }
