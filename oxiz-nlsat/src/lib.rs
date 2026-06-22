@@ -42,6 +42,7 @@ pub mod monotonicity;
 pub mod nia;
 pub mod portfolio;
 pub mod proof;
+pub mod reduction_kb;
 pub mod restart;
 pub mod root_hints;
 pub mod simplify;

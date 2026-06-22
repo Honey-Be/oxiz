@@ -532,6 +532,18 @@ impl NlsatSolver {
             PropagationResult::Ok => {}
         }
 
+        // Algebraic reduction KB pre-pass: recognize all-equality systems whose
+        // only satisfying assignment is irrational (e.g. circle ∩ line). The
+        // base CDCL+CAD search samples a rational value for the first free
+        // variable and then spuriously reports Unsat on such systems because no
+        // rational point satisfies them. This pre-pass is a purely *additive*
+        // SAT recognizer: it only ever turns a would-be spurious Unsat into a
+        // verified Sat. On any uncertainty it is side-effect-free and returns
+        // None, so the existing search runs unchanged below.
+        if let Some(result) = self.try_algebraic_reduction() {
+            return result;
+        }
+
         loop {
             // Handle conflict
             if let Some(conflict_id) = self.conflict_clause.take() {
@@ -662,6 +674,108 @@ impl NlsatSolver {
         }
     }
 
+    // ========== Algebraic Reduction KB ==========
+
+    /// SAT-only pre-pass: try to solve an all-equality polynomial system whose
+    /// model may be irrational, via the leveled algebraic reduction KB.
+    ///
+    /// Returns `Some(SolverResult::Sat)` only after the reduced system's real
+    /// root has been confirmed (Sturm) and the back-substituted algebraic
+    /// assignment has been verified to satisfy **every** original equality atom
+    /// exactly. In that case the (exact) algebraic values are written into the
+    /// assignment, alongside rational interval-midpoint approximations so the
+    /// rest of the solver's machinery (`is_complete`, `get_model`) keeps working.
+    ///
+    /// Returns `None` whenever the system is not an all-equality system, is not
+    /// reducible to a univariate eliminant by exact substitution/resultant, has
+    /// no real root, or the verification fails — in which case the caller falls
+    /// through to the unchanged CDCL+CAD search. This method never reports Unsat
+    /// and performs **no** observable mutation on the `None` path.
+    fn try_algebraic_reduction(&mut self) -> Option<SolverResult> {
+        // Only attempt this when there are arithmetic variables to assign and at
+        // least one asserted equality. Pure-propositional / pure-inequality /
+        // already-assigned problems skip the KB entirely.
+        if self.num_arith_vars == 0 {
+            return None;
+        }
+
+        let equalities = crate::reduction_kb::collect_asserted_equalities(&self.atoms, &self.assignment);
+        if equalities.is_empty() {
+            return None;
+        }
+
+        // SOUNDNESS GATE: the back-substitution verification in
+        // `try_solve_equalities` only checks the *collected single-factor
+        // equality atoms*. It does NOT evaluate any other asserted constraint
+        // (inequalities `p < 0` / `p > 0`, root atoms, multi-factor equalities,
+        // or equalities asserted *false*). If any such constraint is asserted,
+        // an algebraic model satisfying only the equalities may still violate it
+        // (e.g. circle ∩ line ∩ `x - 4 > 0`: the only points are ±sqrt(12.5),
+        // neither > 4, yet the KB would report Sat). We therefore only fire when
+        // every asserted atom is a single-factor `Eq` atom asserted **true** —
+        // exactly the set the verification covers. Anything else ⇒ fall back to
+        // the complete CDCL+CAD search, which evaluates every atom.
+        for atom in &self.atoms {
+            let bvar = atom.bool_var();
+            if bvar == NULL_BOOL_VAR {
+                continue;
+            }
+            let val = self.assignment.bool_value(bvar);
+            if val.is_undef() {
+                // Not asserted at all (free) — irrelevant to the verified model.
+                continue;
+            }
+            let covered = match atom {
+                Atom::Ineq(a) => {
+                    a.kind == AtomKind::Eq && a.factors.len() == 1 && val.is_true()
+                }
+                Atom::Root(_) => false,
+            };
+            if !covered {
+                return None;
+            }
+        }
+
+        // Run the pure reduction (no side effects). If it cannot certify a
+        // verified algebraic model, fall back.
+        let solution = crate::reduction_kb::try_solve_equalities(&equalities)?;
+
+        // Side-effect-free completeness pre-check: every boolean variable must
+        // already be assigned (asserted by initial propagation) and every
+        // arithmetic variable must be either already assigned or covered by the
+        // solution. We do NOT write anything until this passes, so the fallback
+        // path is never polluted.
+        for var in 0..self.num_bool_vars {
+            if !self.assignment.is_bool_assigned(var) {
+                return None;
+            }
+        }
+        for var in 0..self.num_arith_vars {
+            if self.assignment.is_arith_assigned(var) {
+                continue;
+            }
+            if !solution.values.iter().any(|(v, _)| *v == var) {
+                return None;
+            }
+        }
+
+        // Pre-check passed: commit the verified algebraic model. Write the exact
+        // algebraic value plus a rational midpoint approximation (so `is_complete`
+        // and the rational `get_model` path remain well-defined). The exactness
+        // lives in `algebraic_values`.
+        for (var, alg) in &solution.values {
+            let approx = alg.midpoint();
+            self.assignment.set_arith(*var, approx);
+            self.assignment.set_algebraic(*var, alg.clone());
+        }
+
+        debug_assert!(
+            self.is_complete(),
+            "algebraic-KB committed model must be a complete assignment"
+        );
+        Some(SolverResult::Sat)
+    }
+
     // ========== Model Extraction ==========
 
     /// Get the model (assignment of variables) if satisfiable.
@@ -685,9 +799,17 @@ impl NlsatSolver {
             }
         }
 
+        let mut algebraic_values = HashMap::new();
+        for var in 0..self.num_arith_vars {
+            if let Some(val) = self.assignment.algebraic_value(var) {
+                algebraic_values.insert(var, val.clone());
+            }
+        }
+
         Some(Model {
             bool_values,
             arith_values,
+            algebraic_values,
         })
     }
 }
@@ -703,8 +825,16 @@ impl Default for NlsatSolver {
 pub struct Model {
     /// Boolean variable assignments.
     pub bool_values: HashMap<BoolVar, bool>,
-    /// Arithmetic variable assignments.
+    /// Arithmetic variable assignments (rational values, or rational
+    /// approximations of an algebraic value — see `algebraic_values`).
     pub arith_values: HashMap<Var, BigRational>,
+    /// Exact algebraic (possibly irrational) arithmetic variable assignments.
+    ///
+    /// Populated only when the algebraic reduction KB produces a model whose
+    /// values cannot be represented exactly as rationals (e.g. `x = sqrt(12.5)`).
+    /// For such a variable, `arith_values` holds a rational approximation (the
+    /// isolating-interval midpoint) and `algebraic_values` holds the exact value.
+    pub algebraic_values: HashMap<Var, oxiz_math::algebraic::AlgebraicNumber>,
 }
 
 impl Model {
@@ -716,6 +846,13 @@ impl Model {
     /// Get the value of an arithmetic variable.
     pub fn arith_value(&self, var: Var) -> Option<&BigRational> {
         self.arith_values.get(&var)
+    }
+
+    /// Get the exact algebraic value of an arithmetic variable, if the model
+    /// carries one (i.e. the value is irrational and was produced by the
+    /// algebraic reduction KB).
+    pub fn algebraic_value(&self, var: Var) -> Option<&oxiz_math::algebraic::AlgebraicNumber> {
+        self.algebraic_values.get(&var)
     }
 }
 
@@ -1131,12 +1268,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Complex multi-variable constraints - may be challenging for solver
     fn test_solver_circle_and_line() {
         let mut solver = NlsatSolver::new();
 
         // Circle: x^2 + y^2 = 25 (radius 5)
         // Line: y = x
+        //
+        // The only real solutions are x = y = ±sqrt(12.5), which are IRRATIONAL
+        // and therefore not representable by the solver's rational `arith_values`.
+        // The algebraic reduction KB recognizes this all-equality system,
+        // eliminates `y := x` into `2x^2 - 25 = 0`, confirms a real root via
+        // Sturm, and produces an exact `AlgebraicNumber` model (verified to
+        // satisfy every original equality).
         let x = Polynomial::from_var(0);
         let y = Polynomial::from_var(1);
 
@@ -1161,19 +1304,127 @@ mod tests {
         let model = solver
             .get_model()
             .expect("SAT result should have a model for circle and line");
-        let x_val = model
-            .arith_value(0)
-            .expect("model should have arithmetic value for x in circle");
-        let y_val = model
-            .arith_value(1)
-            .expect("model should have arithmetic value for y in circle");
 
-        // Should satisfy y = x
-        assert_eq!(x_val, y_val);
+        // The satisfying value is irrational, so the model must carry an EXACT
+        // algebraic value for x (and y).
+        let x_alg = model
+            .algebraic_value(0)
+            .expect("model should carry an algebraic value for x");
+        let y_alg = model
+            .algebraic_value(1)
+            .expect("model should carry an algebraic value for y");
 
-        // Should satisfy x^2 + y^2 = 25, i.e., 2x^2 = 25
-        let sum_of_squares = x_val.clone() * x_val.clone() + y_val.clone() * y_val.clone();
-        assert_eq!(sum_of_squares, rat(25));
+        // y = x: the two algebraic numbers must share representation exactly.
+        assert_eq!(x_alg.minimal_poly, y_alg.minimal_poly);
+        assert_eq!(x_alg.lower, y_alg.lower);
+        assert_eq!(x_alg.upper, y_alg.upper);
+
+        // x must satisfy 2x^2 - 25 = 0 exactly: the value is the real root of
+        // 2x^2 - 25 lying in its isolating interval. Verify that 2t^2 - 25
+        // straddles a sign change across the isolating interval [lower, upper]
+        // (so a genuine real root sits inside), and that the algebraic number is
+        // NOT rational (sqrt(12.5) is irrational).
+        assert!(!x_alg.is_rational(), "sqrt(12.5) must be irrational");
+        let f = |t: &BigRational| rat(2) * t * t - rat(25);
+        let lo = f(&x_alg.lower);
+        let hi = f(&x_alg.upper);
+        assert!(
+            lo.is_zero() || hi.is_zero() || lo.signum() != hi.signum(),
+            "2x^2 - 25 must have a root inside the isolating interval [{}, {}]",
+            x_alg.lower,
+            x_alg.upper
+        );
+    }
+
+    #[test]
+    fn audit_false_sat_circle_line_with_inequality() {
+        // Circle ∩ line ∩ (x - 4 > 0).
+        // The circle∩line solutions are x = y = ±sqrt(12.5) ≈ ±3.5355.
+        // NEITHER satisfies x > 4, so the FULL system is UNSAT.
+        // The KB collects only the two EQUALITIES, solves them to sqrt(12.5),
+        // and never checks the inequality => it returns a FALSE SAT.
+        let mut solver = NlsatSolver::new();
+        let x = Polynomial::from_var(0);
+        let y = Polynomial::from_var(1);
+        let x2 = Polynomial::mul(&x, &x);
+        let y2 = Polynomial::mul(&y, &y);
+        let circle = Polynomial::sub(&Polynomial::add(&x2, &y2), &Polynomial::constant(rat(25)));
+        let line = Polynomial::sub(&y, &x);
+        let x_minus_4 = Polynomial::sub(&x, &Polynomial::constant(rat(4)));
+
+        let a1 = solver.new_ineq_atom(circle, AtomKind::Eq);
+        let a2 = solver.new_ineq_atom(line, AtomKind::Eq);
+        let a3 = solver.new_ineq_atom(x_minus_4, AtomKind::Gt); // x - 4 > 0  i.e. x > 4
+
+        solver.add_clause(vec![solver.atom_literal(a1, true)]);
+        solver.add_clause(vec![solver.atom_literal(a2, true)]);
+        solver.add_clause(vec![solver.atom_literal(a3, true)]);
+
+        let result = solver.solve();
+        eprintln!("AUDIT circle/line/x>4 result = {:?}", result);
+        // This SHOULD be Unsat (or Unknown). A Sat verdict is UNSOUND.
+        assert_ne!(result, SolverResult::Sat, "FALSE SAT: x>4 has no circle/line point");
+    }
+
+    #[test]
+    fn audit_satisfiable_inequality_control() {
+        // Control: circle ∩ line ∩ (x - 3 > 0). sqrt(12.5) ≈ 3.5355 > 3, so the
+        // positive root IS a genuine model. SAT is the CORRECT verdict here. The
+        // point is that the KB returns SAT *regardless of which inequality* — it
+        // never inspects it. (This test documents that the verdict is correct only
+        // by luck of the inequality direction, not by checking.)
+        let mut solver = NlsatSolver::new();
+        let x = Polynomial::from_var(0);
+        let y = Polynomial::from_var(1);
+        let x2 = Polynomial::mul(&x, &x);
+        let y2 = Polynomial::mul(&y, &y);
+        let circle = Polynomial::sub(&Polynomial::add(&x2, &y2), &Polynomial::constant(rat(25)));
+        let line = Polynomial::sub(&y, &x);
+        // x - 100 > 0  : sqrt(12.5) is NOT > 100, so UNSAT, but KB ignores it.
+        let x_minus_100 = Polynomial::sub(&x, &Polynomial::constant(rat(100)));
+        let a1 = solver.new_ineq_atom(circle, AtomKind::Eq);
+        let a2 = solver.new_ineq_atom(line, AtomKind::Eq);
+        let a3 = solver.new_ineq_atom(x_minus_100, AtomKind::Gt);
+        solver.add_clause(vec![solver.atom_literal(a1, true)]);
+        solver.add_clause(vec![solver.atom_literal(a2, true)]);
+        solver.add_clause(vec![solver.atom_literal(a3, true)]);
+        let result = solver.solve();
+        eprintln!("AUDIT circle/line/x>100 result = {:?}", result);
+        assert_ne!(result, SolverResult::Sat, "FALSE SAT: x>100 impossible");
+    }
+
+    #[test]
+    fn audit_false_sat_circle_line_with_disequality() {
+        // Circle ∩ line ∩ (y - x != 0) is contradictory with the line y - x = 0.
+        // Here the disequality is the NEGATION of an equality the KB also sees.
+        // (line eq asserted true, plus a separate (y - x) != 0 asserted) — but to
+        // keep it a pure model check, use (x*x - 12 != 0): sqrt(12.5)^2 = 12.5 != 12,
+        // so the disequality holds; combine instead with x^2 - 12.5*... Let's use a
+        // genuinely contradictory extra equality with a DIFFERENT constant:
+        // x^2 + y^2 - 25 = 0  AND  y - x = 0  AND  x^2 + y^2 - 26 = 0.
+        // First+third can't both hold (25 != 26) => UNSAT. But both are equalities;
+        // the KB triangularizes y:=x into 2x^2-25=0 and 2x^2-26=0, which the
+        // pseudo-remainder verify SHOULD reject. This checks the verify path.
+        let mut solver = NlsatSolver::new();
+        let x = Polynomial::from_var(0);
+        let y = Polynomial::from_var(1);
+        let x2 = Polynomial::mul(&x, &x);
+        let y2 = Polynomial::mul(&y, &y);
+        let circle25 = Polynomial::sub(&Polynomial::add(&x2, &y2), &Polynomial::constant(rat(25)));
+        let circle26 = Polynomial::sub(&Polynomial::add(&x2, &y2), &Polynomial::constant(rat(26)));
+        let line = Polynomial::sub(&y, &x);
+
+        let a1 = solver.new_ineq_atom(circle25, AtomKind::Eq);
+        let a2 = solver.new_ineq_atom(line, AtomKind::Eq);
+        let a3 = solver.new_ineq_atom(circle26, AtomKind::Eq);
+
+        solver.add_clause(vec![solver.atom_literal(a1, true)]);
+        solver.add_clause(vec![solver.atom_literal(a2, true)]);
+        solver.add_clause(vec![solver.atom_literal(a3, true)]);
+
+        let result = solver.solve();
+        eprintln!("AUDIT circle25/line/circle26 result = {:?}", result);
+        assert_ne!(result, SolverResult::Sat, "FALSE SAT: 25 != 26 on same point");
     }
 
     #[test]

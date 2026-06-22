@@ -10,6 +10,7 @@
 use crate::interval_set::IntervalSet;
 use crate::types::{BoolVar, Lbool, Literal, NULL_BOOL_VAR};
 use num_rational::BigRational;
+use oxiz_math::algebraic::AlgebraicNumber;
 use oxiz_math::polynomial::Var;
 use rustc_hash::FxHashMap;
 
@@ -42,6 +43,13 @@ pub struct TrailEntry {
 pub struct Assignment {
     /// Values of arithmetic variables.
     arith_values: Vec<Option<BigRational>>,
+    /// Exact algebraic (possibly irrational) values of arithmetic variables.
+    ///
+    /// This is a *parallel* map alongside `arith_values`: it is populated only
+    /// by the algebraic reduction KB (see `reduction_kb.rs`) when a model
+    /// requires an irrational value (e.g. `x = sqrt(12.5)`). Every existing
+    /// rational decision path is byte-identical and never touches this map.
+    algebraic_values: FxHashMap<Var, AlgebraicNumber>,
     /// Feasible regions for each arithmetic variable.
     feasible: Vec<IntervalSet>,
     /// Values of boolean variables.
@@ -61,6 +69,7 @@ impl Assignment {
     pub fn new() -> Self {
         Self {
             arith_values: Vec::new(),
+            algebraic_values: FxHashMap::default(),
             feasible: Vec::new(),
             bool_values: Vec::new(),
             bool_levels: Vec::new(),
@@ -74,6 +83,7 @@ impl Assignment {
     pub fn with_capacity(num_arith: usize, num_bool: usize) -> Self {
         Self {
             arith_values: vec![None; num_arith],
+            algebraic_values: FxHashMap::default(),
             feasible: vec![IntervalSet::reals(); num_arith],
             bool_values: vec![Lbool::Undef; num_bool],
             bool_levels: vec![0; num_bool],
@@ -149,6 +159,20 @@ impl Assignment {
         if (var as usize) < self.arith_values.len() {
             self.arith_values[var as usize] = None;
         }
+        self.algebraic_values.remove(&var);
+    }
+
+    /// Set the exact algebraic value of an arithmetic variable.
+    ///
+    /// Used by the algebraic reduction KB to carry irrational model values.
+    pub fn set_algebraic(&mut self, var: Var, value: AlgebraicNumber) {
+        self.ensure_arith_var(var);
+        self.algebraic_values.insert(var, value);
+    }
+
+    /// Get the exact algebraic value of an arithmetic variable, if one was set.
+    pub fn algebraic_value(&self, var: Var) -> Option<&AlgebraicNumber> {
+        self.algebraic_values.get(&var)
     }
 
     /// Get the feasible region for an arithmetic variable.
@@ -293,6 +317,7 @@ impl Assignment {
     /// Clear all assignments and reset to level 0.
     pub fn clear(&mut self) {
         self.arith_values.fill(None);
+        self.algebraic_values.clear();
         self.feasible.fill(IntervalSet::reals());
         self.bool_values.fill(Lbool::Undef);
         self.bool_levels.fill(0);
