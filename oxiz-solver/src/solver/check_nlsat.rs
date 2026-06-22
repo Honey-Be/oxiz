@@ -143,19 +143,28 @@ impl Solver {
         // product `(* a b)` because the bridge axiom `(= (Mul x y) (* x y))` is
         // asserted (so `Mul` IS multiplication in the theory). Without it, `Mul`
         // is a genuine uninterpreted function ⇒ leave it to EUF ⇒ never rewrite.
-        let mul_bridge = self
-            .assertions
-            .iter()
-            .any(|&a| assertion_is_bridge_axiom(a, manager, "Mul"));
-        let rmul_bridge = self
-            .assertions
-            .iter()
-            .any(|&a| assertion_is_bridge_axiom(a, manager, "RMul"));
+        // The SAME gating applies to every spine symbol we fold (`Add`/`Sub` and
+        // the real analogs): a goal like `(Add (Sub (Mul x x) (Mul 2 x)) 1)`
+        // (= `x² − 2x + 1`) only reaches the reduction-KB once the additive
+        // wrappers are folded to native `+`/`-` too — but each only when ITS
+        // bridge axiom is present.
+        let has_bridge = |sym: &str| {
+            self.assertions
+                .iter()
+                .any(|&a| assertion_is_bridge_axiom(a, manager, sym))
+        };
+        let spine = SpineRewrite {
+            mul: has_mul && has_bridge("Mul"),
+            rmul: has_rmul && has_bridge("RMul"),
+            add: has_bridge("Add"),
+            sub: has_bridge("Sub"),
+            radd: has_bridge("RAdd"),
+            rsub: has_bridge("RSub"),
+        };
 
-        // Only rewrite a symbol whose bridge axiom is present.
-        let rewrite_mul = has_mul && mul_bridge;
-        let rewrite_rmul = has_rmul && rmul_bridge;
-        if !rewrite_mul && !rewrite_rmul {
+        // Only proceed when a rewritable nonlinear PRODUCT is present — the
+        // additive spine alone is linear and never needs nlsat.
+        if !spine.mul && !spine.rmul {
             // A `Mul`/`RMul` with no bridge axiom is genuinely uninterpreted.
             return None;
         }
@@ -170,25 +179,25 @@ impl Solver {
         // un-rewritten (no real bridge to carry it) the integer part is dropped,
         // which is fine for the `Unsat`-only trust we apply. When in doubt
         // (e.g. we cannot rewrite the symbol that drives the routing) → `None`.
-        let route_real = rewrite_rmul;
+        let route_real = spine.rmul;
         // If reals are involved we never integerize: route to NRA. Otherwise the
         // problem is pure-integer `Mul` and routes to NIA.
         let integer_mode = !route_real;
 
         // (c) Build the FOCUSED assertion set: walk each top-level assertion,
         // peel `Not`/`Implies` polarity to surface the goal's comparison atoms,
-        // rewrite the `Mul`/`RMul` apps to native `*`, and collect ONLY the
-        // arithmetic comparison atoms we can model. Everything else (the prelude
-        // `Forall`/`Apply`/`Div`/`Mod` noise) is intentionally dropped — which is
-        // exactly why we trust UNSAT only.
+        // fold the verus arithmetic-spine UFs (`Mul`/`Add`/`Sub`/…) to native
+        // operators inside them, and collect ONLY the arithmetic comparison atoms
+        // we can model. Everything else (the prelude `Forall`/`Apply`/`Div`/`Mod`
+        // noise) is intentionally dropped — which is exactly why we trust UNSAT
+        // only.
         let mut focused: Vec<TermId> = Vec::new();
         for &a in &self.assertions {
             collect_focused_nl_atoms(
                 a,
                 true, // positive polarity at the top level
                 manager,
-                rewrite_mul,
-                rewrite_rmul,
+                &spine,
                 &mut focused,
             );
         }
@@ -807,6 +816,68 @@ fn func_name_is(manager: &TermManager, func: Spur, name: &str) -> bool {
     manager.resolve_str(func) == name
 }
 
+/// The native arithmetic operator a verus arithmetic-spine UF symbol bridges to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeArith {
+    /// `Add`/`RAdd` → native `+`.
+    Add,
+    /// `Sub`/`RSub` → native `-`.
+    Sub,
+    /// `Mul`/`RMul` → native `*`.
+    Mul,
+}
+
+/// Map a verus arithmetic-spine UF symbol to the native operator it bridges to,
+/// or `None` if the symbol is not part of the POLYNOMIAL spine.
+///
+/// The polynomial spine is exactly the additive + multiplicative wrappers verus
+/// emits for nonlinear goals: `Add`/`Sub`/`Mul` (Int) and `RAdd`/`RSub`/`RMul`
+/// (Real). `EucDiv`/`EucMod`/`RDiv` are DELIBERATELY excluded — division and
+/// modulo are not polynomial, so they must stay uninterpreted (an atom carrying
+/// one then fails to translate to a polynomial and is soundly dropped).
+fn spine_native_op(sym: &str) -> Option<NativeArith> {
+    match sym {
+        "Add" | "RAdd" => Some(NativeArith::Add),
+        "Sub" | "RSub" => Some(NativeArith::Sub),
+        "Mul" | "RMul" => Some(NativeArith::Mul),
+        _ => None,
+    }
+}
+
+/// Which verus arithmetic-spine UF symbols may be folded to native operators.
+///
+/// A symbol is enabled ONLY when its bridge axiom `(= (sym x y) (nativeop x y))`
+/// is asserted, so `(sym a b)` is provably equal to `nativeop(a, b)` and the
+/// rewrite preserves the atom's truth under every model. `mul`/`rmul` are the
+/// nonlinear product (the nlsat trigger + sort routing); `add`/`sub`/`radd`/`rsub`
+/// are the additive spine that WRAPS a product in a multi-term goal such as
+/// `(Add (Sub (Mul x x) (Mul 2 x)) 1)` = `x² − 2x + 1`. Folding them is what lets
+/// the focused atom translate to a polynomial and reach the reduction-KB.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpineRewrite {
+    mul: bool,
+    rmul: bool,
+    add: bool,
+    sub: bool,
+    radd: bool,
+    rsub: bool,
+}
+
+impl SpineRewrite {
+    /// Is the 2-argument UF `sym` enabled for rewriting (its bridge axiom present)?
+    fn enabled(&self, sym: &str) -> bool {
+        match sym {
+            "Mul" => self.mul,
+            "RMul" => self.rmul,
+            "Add" => self.add,
+            "Sub" => self.sub,
+            "RAdd" => self.radd,
+            "RSub" => self.rsub,
+            _ => false,
+        }
+    }
+}
+
 /// Recursively scan `t` for **ground** `(Mul ..)` / `(RMul ..)` UF
 /// **applications** (binary, the verus shape). Sets `has_mul` / `has_rmul`.
 /// Depth-bounded.
@@ -853,12 +924,14 @@ fn scan_mul_rmul_apps(
 }
 
 /// Is `assertion` the bridge axiom for `sym` — a `forall` whose body equates
-/// `(sym x y)` with native `(* x y)`? Matches structurally (the `:qid`
-/// `prelude_mul`/`prelude_rmul` is metadata that is not retained on the term,
-/// so we verify the body shape directly). Accepts the body equality in either
-/// orientation. We require the two `(* …)` operands to be exactly the two
-/// bound-variable arguments of `(sym …)` (not just "some product"), so an
-/// unrelated `(= (sym a b) (* c d))` can never license the rewrite.
+/// `(sym x y)` with the native operator `sym` bridges to (`Mul`/`RMul`→`*`,
+/// `Add`/`RAdd`→`+`, `Sub`/`RSub`→`-`)? Matches structurally (the `:qid`
+/// `prelude_mul`/`prelude_add`/… is metadata not retained on the term, so we
+/// verify the body shape directly). Accepts the body equality in either
+/// orientation. We require the native operator's operands to be exactly the two
+/// bound-variable arguments of `(sym …)`, in order — so an unrelated
+/// `(= (sym a b) (op c d))` (or a wrong-operator `(= (Add a b) (* a b))`) can
+/// never license the rewrite.
 fn assertion_is_bridge_axiom(assertion: TermId, manager: &TermManager, sym: &str) -> bool {
     let Some(term) = manager.get(assertion) else {
         return false;
@@ -875,15 +948,18 @@ fn assertion_is_bridge_axiom(assertion: TermId, manager: &TermManager, sym: &str
     eq_sides_are_bridge(*lhs, *rhs, manager, sym) || eq_sides_are_bridge(*rhs, *lhs, manager, sym)
 }
 
-/// `apply_side` is `(sym a b)` and `mul_side` is `(* a b)` with the SAME two
-/// arguments, in order.
+/// `apply_side` is `(sym a b)` and `native_side` is `(nativeop a b)` — the native
+/// operator `sym` bridges to — with the SAME two arguments, in order.
 fn eq_sides_are_bridge(
     apply_side: TermId,
-    mul_side: TermId,
+    native_side: TermId,
     manager: &TermManager,
     sym: &str,
 ) -> bool {
-    let (Some(app), Some(mul)) = (manager.get(apply_side), manager.get(mul_side)) else {
+    let Some(native_op) = spine_native_op(sym) else {
+        return false;
+    };
+    let (Some(app), Some(nat)) = (manager.get(apply_side), manager.get(native_side)) else {
         return false;
     };
     let TermKind::Apply { func, args } = &app.kind else {
@@ -892,71 +968,80 @@ fn eq_sides_are_bridge(
     if !func_name_is(manager, *func, sym) || args.len() != 2 {
         return false;
     }
-    let TermKind::Mul(margs) = &mul.kind else {
-        return false;
-    };
-    // Native `*` may carry an explicit unit coefficient, but the prelude form is
-    // exactly two factors equal to the two application arguments in order.
-    margs.len() == 2 && margs[0] == args[0] && margs[1] == args[1]
+    // The native side must be EXACTLY the bridged operator applied to the two
+    // application arguments in order — not just "some product/sum".
+    match native_op {
+        NativeArith::Add => {
+            matches!(&nat.kind, TermKind::Add(a) if a.len() == 2 && a[0] == args[0] && a[1] == args[1])
+        }
+        NativeArith::Sub => {
+            matches!(&nat.kind, TermKind::Sub(x, y) if *x == args[0] && *y == args[1])
+        }
+        NativeArith::Mul => {
+            matches!(&nat.kind, TermKind::Mul(a) if a.len() == 2 && a[0] == args[0] && a[1] == args[1])
+        }
+    }
 }
 
-/// Rewrite every `(Mul a b)` / `(RMul a b)` UF application (whose bridge axiom
-/// is present, per the `rewrite_mul`/`rewrite_rmul` flags) into the native
-/// product `(* a b)`, recursively. Returns the rewritten term id (interning new
+/// Rewrite every enabled verus arithmetic-spine UF application — `(Mul a b)`,
+/// `(Add a b)`, `(Sub a b)` and the real analogs `(RMul/RAdd/RSub a b)`, each
+/// gated by its bridge axiom via `spine` — into the corresponding NATIVE operator
+/// (`*`, `+`, `-`), recursively. Returns the rewritten term id (interning new
 /// nodes as needed). Leaves all other structure unchanged. `None` only on a
 /// malformed/missing node.
 ///
-/// This is sound: the bridge axiom `(= (sym x y) (* x y))` makes `(sym a b)`
-/// and `(* a b)` provably equal, so replacing one by the other inside an atom
-/// preserves the atom's truth value under every model of the bridge axiom.
-fn rewrite_mul_rmul(
-    t: TermId,
-    manager: &mut TermManager,
-    rewrite_mul: bool,
-    rewrite_rmul: bool,
-) -> Option<TermId> {
+/// This is sound: the bridge axiom `(= (sym x y) (op x y))` makes `(sym a b)`
+/// and `(op a b)` provably equal, so replacing one by the other inside an atom
+/// preserves the atom's truth value under every model of the bridge axiom. A UF
+/// whose bridge is absent (or a non-spine UF like `EucDiv`) is NOT folded — it
+/// stays uninterpreted, so the atom then fails to translate to a polynomial and
+/// is soundly dropped rather than mis-decided.
+fn rewrite_spine(t: TermId, manager: &mut TermManager, spine: &SpineRewrite) -> Option<TermId> {
     let term = manager.get(t)?;
     match term.kind.clone() {
         TermKind::Apply { func, args } if args.len() == 2 => {
-            let is_mul = rewrite_mul && func_name_is(manager, func, "Mul");
-            let is_rmul = rewrite_rmul && func_name_is(manager, func, "RMul");
-            if is_mul || is_rmul {
-                let a = rewrite_mul_rmul(args[0], manager, rewrite_mul, rewrite_rmul)?;
-                let b = rewrite_mul_rmul(args[1], manager, rewrite_mul, rewrite_rmul)?;
-                return Some(manager.mk_mul([a, b]));
+            let fname = manager.resolve_str(func).to_string();
+            if spine.enabled(&fname) {
+                let a = rewrite_spine(args[0], manager, spine)?;
+                let b = rewrite_spine(args[1], manager, spine)?;
+                // `enabled` ⟹ the symbol is a spine symbol, so this is `Some`.
+                return Some(match spine_native_op(&fname)? {
+                    NativeArith::Add => manager.mk_add([a, b]),
+                    NativeArith::Sub => manager.mk_sub(a, b),
+                    NativeArith::Mul => manager.mk_mul([a, b]),
+                });
             }
-            // Unrelated application: rewrite inside its args (defensive — these
-            // are uninterpreted and won't translate to polynomials, but keep the
-            // structure consistent).
+            // Non-enabled / non-spine application: rewrite inside its args (a
+            // nested product may still be foldable), but keep the UF itself — it
+            // is genuinely uninterpreted here.
             let new_args: Vec<TermId> = args
                 .iter()
-                .map(|&c| rewrite_mul_rmul(c, manager, rewrite_mul, rewrite_rmul))
+                .map(|&c| rewrite_spine(c, manager, spine))
                 .collect::<Option<Vec<_>>>()?;
             let sort = manager.get(t).map(|x| x.sort)?;
-            let fname = manager.resolve_str(func).to_string();
             Some(manager.mk_apply(&fname, new_args, sort))
         }
         TermKind::Add(args) => {
             let new: Vec<TermId> = args
                 .iter()
-                .map(|&c| rewrite_mul_rmul(c, manager, rewrite_mul, rewrite_rmul))
+                .map(|&c| rewrite_spine(c, manager, spine))
                 .collect::<Option<Vec<_>>>()?;
             Some(manager.mk_add(new))
         }
         TermKind::Mul(args) => {
             let new: Vec<TermId> = args
                 .iter()
-                .map(|&c| rewrite_mul_rmul(c, manager, rewrite_mul, rewrite_rmul))
+                .map(|&c| rewrite_spine(c, manager, spine))
                 .collect::<Option<Vec<_>>>()?;
             Some(manager.mk_mul(new))
         }
         TermKind::Sub(a, b) => {
-            let na = rewrite_mul_rmul(a, manager, rewrite_mul, rewrite_rmul)?;
-            let nb = rewrite_mul_rmul(b, manager, rewrite_mul, rewrite_rmul)?;
+            let na = rewrite_spine(a, manager, spine)?;
+            let nb = rewrite_spine(b, manager, spine)?;
             Some(manager.mk_sub(na, nb))
         }
         TermKind::Neg(a) => {
-            let na = rewrite_mul_rmul(a, manager, rewrite_mul, rewrite_rmul)?;
+            let na = rewrite_spine(a, manager, spine)?;
             Some(manager.mk_neg(na))
         }
         // Leaves and everything else: unchanged.
@@ -989,8 +1074,7 @@ fn collect_focused_nl_atoms(
     t: TermId,
     polarity: bool,
     manager: &mut TermManager,
-    rewrite_mul: bool,
-    rewrite_rmul: bool,
+    spine: &SpineRewrite,
     out: &mut Vec<TermId>,
 ) {
     let Some(term) = manager.get(t) else {
@@ -998,38 +1082,33 @@ fn collect_focused_nl_atoms(
     };
     match term.kind.clone() {
         TermKind::Not(inner) => {
-            collect_focused_nl_atoms(inner, !polarity, manager, rewrite_mul, rewrite_rmul, out);
+            collect_focused_nl_atoms(inner, !polarity, manager, spine, out);
         }
         TermKind::And(args) if polarity => {
             for a in args {
-                collect_focused_nl_atoms(a, true, manager, rewrite_mul, rewrite_rmul, out);
+                collect_focused_nl_atoms(a, true, manager, spine, out);
             }
         }
         TermKind::Or(args) if !polarity => {
             // ¬(a ∨ b ∨ …) = ¬a ∧ ¬b ∧ … — each ¬aᵢ is entailed.
             for a in args {
-                collect_focused_nl_atoms(a, false, manager, rewrite_mul, rewrite_rmul, out);
+                collect_focused_nl_atoms(a, false, manager, spine, out);
             }
         }
         TermKind::Implies(a, b) if !polarity => {
             // ¬(a ⇒ b) = a ∧ ¬b — both the antecedent (positive) and the negated
             // consequent are entailed.
-            collect_focused_nl_atoms(a, true, manager, rewrite_mul, rewrite_rmul, out);
-            collect_focused_nl_atoms(b, false, manager, rewrite_mul, rewrite_rmul, out);
+            collect_focused_nl_atoms(a, true, manager, spine, out);
+            collect_focused_nl_atoms(b, false, manager, spine, out);
         }
         TermKind::Eq(_, _)
         | TermKind::Ge(_, _)
         | TermKind::Gt(_, _)
         | TermKind::Le(_, _)
         | TermKind::Lt(_, _) => {
-            if let Some(atom) = build_polarized_comparison(
-                t,
-                polarity,
-                &term.kind.clone(),
-                manager,
-                rewrite_mul,
-                rewrite_rmul,
-            ) {
+            if let Some(atom) =
+                build_polarized_comparison(t, polarity, &term.kind.clone(), manager, spine)
+            {
                 out.push(atom);
             }
         }
@@ -1051,8 +1130,7 @@ fn build_polarized_comparison(
     polarity: bool,
     kind: &TermKind,
     manager: &mut TermManager,
-    rewrite_mul: bool,
-    rewrite_rmul: bool,
+    spine: &SpineRewrite,
 ) -> Option<TermId> {
     // Pull the two sides.
     let (lhs, rhs) = match kind {
@@ -1063,16 +1141,18 @@ fn build_polarized_comparison(
         | TermKind::Lt(a, b) => (*a, *b),
         _ => return None,
     };
-    // Only bother when a `Mul`/`RMul` actually occurs in this atom (otherwise it
-    // is plain linear/EUF glue and adds nothing to the nonlinear sub-problem).
+    // Only bother when a rewritable `Mul`/`RMul` PRODUCT actually occurs in this
+    // atom (otherwise it is plain linear/EUF glue, or a purely additive atom, and
+    // adds nothing to the NONLINEAR sub-problem). The product may be nested under
+    // `Add`/`Sub` wrappers — `scan_mul_rmul_apps` recurses into them.
     let mut hm = false;
     let mut hr = false;
     scan_mul_rmul_apps(orig, manager, &mut hm, &mut hr, 64);
-    if !(hm && rewrite_mul) && !(hr && rewrite_rmul) {
+    if !(hm && spine.mul) && !(hr && spine.rmul) {
         return None;
     }
-    let l = rewrite_mul_rmul(lhs, manager, rewrite_mul, rewrite_rmul)?;
-    let r = rewrite_mul_rmul(rhs, manager, rewrite_mul, rewrite_rmul)?;
+    let l = rewrite_spine(lhs, manager, spine)?;
+    let r = rewrite_spine(rhs, manager, spine)?;
     Some(match (kind, polarity) {
         (TermKind::Eq(..), true) => manager.mk_eq(l, r),
         (TermKind::Eq(..), false) => return None, // disequality — drop
@@ -1259,6 +1339,116 @@ mod tests {
             r,
             Some(SolverResult::Unsat),
             "rx*rx>=0 (RMul/real) must reach NRA and decide UNSAT (provable)"
+        );
+    }
+
+    /// Build the integer `Add` bridge axiom `∀ x y. (= (Add x y) (+ x y))`.
+    fn add_bridge(m: &mut TermManager) -> TermId {
+        let int = m.sorts.int_sort;
+        let x = m.mk_var("x", int);
+        let y = m.mk_var("y", int);
+        let app = m.mk_apply("Add", [x, y], int);
+        let native = m.mk_add([x, y]);
+        let body = m.mk_eq(app, native);
+        m.mk_forall([("x", int), ("y", int)], body)
+    }
+
+    /// Build the integer `Sub` bridge axiom `∀ x y. (= (Sub x y) (- x y))`.
+    fn sub_bridge(m: &mut TermManager) -> TermId {
+        let int = m.sorts.int_sort;
+        let x = m.mk_var("x", int);
+        let y = m.mk_var("y", int);
+        let app = m.mk_apply("Sub", [x, y], int);
+        let native = m.mk_sub(x, y);
+        let body = m.mk_eq(app, native);
+        m.mk_forall([("x", int), ("y", int)], body)
+    }
+
+    /// The verus perfect-square goal body `(Add (Sub (Mul x x) (Mul 2 x)) 1)`
+    /// (= `x² − 2x + 1`) built entirely from the `Add`/`Sub`/`Mul` UF spine.
+    fn perfect_square_uf(m: &mut TermManager, xv: TermId) -> TermId {
+        let int = m.sorts.int_sort;
+        let xx = m.mk_apply("Mul", [xv, xv], int);
+        let two = m.mk_int(2);
+        let two_x = m.mk_apply("Mul", [two, xv], int);
+        let sub = m.mk_apply("Sub", [xx, two_x], int);
+        let one = m.mk_int(1);
+        m.mk_apply("Add", [sub, one], int)
+    }
+
+    #[test]
+    fn nl_perfect_square_additive_spine_reaches_kb_and_decides_unsat() {
+        // THE perfect-square completeness lead, end-to-end at the unit level:
+        // `(not (=> L (>= (Add (Sub (Mul x! x!) (Mul 2 x!)) 1) 0)))`. Only with the
+        // `Add`/`Sub` bridges folded too does the focused atom translate to the
+        // univariate quadratic `x²−2x+1 < 0`, which §G decides UNSAT (D=0, a>0).
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let mb = mul_bridge(&mut m);
+        let ab = add_bridge(&mut m);
+        let sb = sub_bridge(&mut m);
+        let f = perfect_square_uf(&mut m, xv);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(f, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        let r = solve_no_logic(vec![mb, ab, sb, goal], &mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "(x-1)^2 >= 0 obligation must reach the reduction-KB via the folded \
+             additive spine and decide UNSAT (provable)"
+        );
+    }
+
+    #[test]
+    fn additive_spine_without_add_bridge_is_not_rewritten() {
+        // SOUNDNESS / scope: the SAME perfect-square goal but with NO `Add` bridge
+        // asserted. `Add` is then a genuine uninterpreted function — the focused
+        // atom cannot translate to a polynomial, so the path declines (None). It
+        // must never fabricate a verdict from an un-folded spine.
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let mb = mul_bridge(&mut m);
+        let sb = sub_bridge(&mut m);
+        let f = perfect_square_uf(&mut m, xv);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(f, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        // Mul + Sub bridges present, but Add is NOT bridged.
+        let r = solve_no_logic(vec![mb, sb, goal], &mut m);
+        assert_ne!(
+            r,
+            Some(SolverResult::Unsat),
+            "an un-folded uninterpreted Add must not yield a verdict"
+        );
+    }
+
+    #[test]
+    fn nl_invalid_indefinite_quadratic_additive_spine_not_false_unsat() {
+        // SOUNDNESS: `x² − 1 >= 0` is INVALID (false at x=0). Negated goal
+        // `(< (Sub (Mul x! x!) 1) 0)` = `x²−1 < 0` is satisfiable (x=0) and has
+        // D=4>0 (indefinite) — §G must DECLINE, never a false UNSAT.
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let mb = mul_bridge(&mut m);
+        let sb = sub_bridge(&mut m);
+        let xx = m.mk_apply("Mul", [xv, xv], int);
+        let one = m.mk_int(1);
+        let body = m.mk_apply("Sub", [xx, one], int);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(body, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        let r = solve_no_logic(vec![mb, sb, goal], &mut m);
+        assert_ne!(
+            r,
+            Some(SolverResult::Unsat),
+            "x^2 - 1 >= 0 is INVALID — its negation must NOT be a false UNSAT"
         );
     }
 

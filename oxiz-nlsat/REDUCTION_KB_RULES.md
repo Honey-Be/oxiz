@@ -194,3 +194,57 @@ A wrong hint is merely unhelpful, never unsound; and an invertible transform of 
 hint that reduces to a solvable form yields a sound result when followed. This is
 **"abduction for the transformation"** — the same advisory philosophy as adsmt's
 `(abduce)` / `:abduct-theory` (abduct = advice; the user/downstream must justify).
+
+---
+
+## G. Definite sign by discriminant (univariate quadratic) — *the perfect-square completeness rule*
+For a UNIVARIATE quadratic `f(x) = a·x² + b·x + c` (`a ≠ 0`, exact rationals) with
+discriminant `D = b² − 4·a·c`, the sign of `f` over ALL real `x` is FIXED — it is the
+standard parabola sign analysis (a THEOREM, not a heuristic). Stated as the KB facts
+the user requested:
+
+- **`x² ≥ 0` for every real `x`** — the primitive (`a=1, b=0, c=0, D=0, a>0` instance,
+  exactly as "the circle is the `A=C, B=0` ellipse instance"). No grinding through
+  Sturm/CAD root isolation for it: a single `b²−4ac` decides.
+- `D = 0 ∧ a > 0  ⟺  f(x) ≥ 0 ∀x`   (perfect square `a·(x−r)²`)
+- `D = 0 ∧ a < 0  ⟺  f(x) ≤ 0 ∀x`
+- `D < 0 ∧ a > 0  ⟺  f(x) > 0 ∀x`
+- `D < 0 ∧ a < 0  ⟺  f(x) < 0 ∀x`
+- `D > 0`         ⟹  `f` changes sign (two real roots) — **indefinite, NOT decided here.**
+
+**As a solver rule (one-sided UNSAT recogniser).** Deciding a NEGATED goal: an asserted
+atom that claims a sign the parabola can never take is UNSATISFIABLE. From the table,
+`f` is `AllPositive/AllNegative/AllNonNegative/AllNonPositive`; the impossible atoms are:
+
+| definite sign of `f`        | atoms that are UNSAT                  |
+|-----------------------------|---------------------------------------|
+| `> 0 ∀x` (D<0, a>0)         | `f < 0`, `f ≤ 0`, `f = 0`             |
+| `< 0 ∀x` (D<0, a<0)         | `f > 0`, `f ≥ 0`, `f = 0`             |
+| `≥ 0 ∀x` (D=0, a>0)         | `f < 0` **only**                      |
+| `≤ 0 ∀x` (D=0, a<0)         | `f > 0` **only**                      |
+
+The perfect-square case is the verus completeness lead `x² − 2x + 1 ≥ 0` (= `(x−1)² ≥ 0`,
+valid): its negation `(x−1)² < 0` is the `≥0 ∀x` row's `f < 0` ⇒ **UNSAT** ⇒ the
+obligation is **provable**.
+
+**Implementation — LANDED.** `discriminant::recognize_univariate_quadratic` reads exact
+`a,b,c` (via `Polynomial::univ_coeff`) ONLY for a genuinely univariate degree-2 poly
+(`vars().len()==1`, `total_degree()==2`, `a≠0`); `discriminant::DefiniteSign::definite_sign`
+classifies by `(sign a, sign D)`; `discriminant::quadratic_atom_is_unsat(poly, AtomCmp)`
+returns the one-sided UNSAT verdict per the table above. It is wired as a pre-check in
+BOTH `oxiz-theories::nlsat::{dispatch_nia_constraints, dispatch_nra_constraints}` (over the
+already-built entailed `PolyAtom`s) — so it serves both the explicit `QF_NIA`/`QF_NRA`
+path and the term-based verus Mul/RMul path. To let MULTI-TERM verus goals reach it, the
+`check_nlsat.rs` bridge-rewrite was generalised from `Mul`/`RMul` to the whole polynomial
+spine `Add`/`Sub`/`Mul` + `RAdd`/`RSub`/`RMul` (each folded to native `+`/`-`/`*` ONLY when
+its bridge axiom `(= (Sym x y) (op x y))` is asserted; `EucDiv`/`EucMod`/`RDiv` stay
+uninterpreted). Tests: `discriminant::tests::test_quadratic_atom_*`,
+`nlsat::tests::g_*` (dispatch wiring), `check_nlsat::tests::nl_perfect_square_*` (e2e).
+
+**Soundness.** One-sided: returns ONLY UNSAT (never Sat). EXACT (rationals, no float).
+Fires ONLY on a genuine univariate degree-2 poly; `D > 0` / non-quadratic / multivariate
+DECLINE (fall through). Each `PolyAtom` is a top-level CONJUNCT (entailed), so a single
+individually-contradictory atom makes the whole conjunction UNSAT — valid even when other
+atoms were dropped (subset-UNSAT ⟹ full-UNSAT). And a real-domain UNSAT is a fortiori an
+integer-domain UNSAT (`∀ real x` ⟹ `∀ int x`), so the rule is sound for BOTH NRA and NIA.
+Verified by an adversarial soundness audit (2026-06-22): no false unsat / false sat.

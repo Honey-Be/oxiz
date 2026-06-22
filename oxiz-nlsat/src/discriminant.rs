@@ -450,6 +450,189 @@ pub fn recognize_conic(poly: &Polynomial) -> Option<ConicForm> {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// §G — Univariate-quadratic definite-sign by discriminant (catalog §G)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A recognised UNIVARIATE quadratic `f(x) = a·x² + b·x + c` with `a ≠ 0`.
+///
+/// The coefficients are EXACT rationals. `var` is the single variable the
+/// quadratic is in. The discriminant `D = b² − 4ac` and the sign of `a` together
+/// decide the definite sign of `f` over ALL real `x` — the whole point of §G is to
+/// settle these by ONE rational `b² − 4ac` (no Sturm/CAD root isolation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnivariateQuadratic {
+    /// The single variable.
+    pub var: oxiz_math::polynomial::Var,
+    /// Coefficient of `x²` (guaranteed non-zero).
+    pub a: BigRational,
+    /// Coefficient of `x`.
+    pub b: BigRational,
+    /// Constant term.
+    pub c: BigRational,
+}
+
+impl UnivariateQuadratic {
+    /// The discriminant `D = b² − 4ac` (exact rational).
+    pub fn discriminant(&self) -> BigRational {
+        &self.b * &self.b - BigRational::from_integer(4.into()) * &self.a * &self.c
+    }
+}
+
+/// The definite sign of a univariate quadratic over ALL real `x` (catalog §G).
+///
+/// The classification is a THEOREM (the standard sign analysis of a parabola):
+/// with `D = b² − 4ac`,
+/// - `D < 0, a > 0` ⇒ `f(x) > 0` for all `x`            ([`AllPositive`]);
+/// - `D < 0, a < 0` ⇒ `f(x) < 0` for all `x`            ([`AllNegative`]);
+/// - `D = 0, a > 0` ⇒ `f(x) ≥ 0` for all `x` (`=0` at the double root, the
+///   PERFECT-SQUARE case `(x−r)²`)                       ([`AllNonNegative`]);
+/// - `D = 0, a < 0` ⇒ `f(x) ≤ 0` for all `x`            ([`AllNonPositive`]);
+/// - `D > 0`        ⇒ `f` changes sign (two real roots) ([`Indefinite`]).
+///
+/// [`AllPositive`]: DefiniteSign::AllPositive
+/// [`AllNegative`]: DefiniteSign::AllNegative
+/// [`AllNonNegative`]: DefiniteSign::AllNonNegative
+/// [`AllNonPositive`]: DefiniteSign::AllNonPositive
+/// [`Indefinite`]: DefiniteSign::Indefinite
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefiniteSign {
+    /// `f(x) > 0` for all real `x` (`D < 0, a > 0`).
+    AllPositive,
+    /// `f(x) < 0` for all real `x` (`D < 0, a < 0`).
+    AllNegative,
+    /// `f(x) ≥ 0` for all real `x` (`D = 0, a > 0` — perfect square).
+    AllNonNegative,
+    /// `f(x) ≤ 0` for all real `x` (`D = 0, a < 0`).
+    AllNonPositive,
+    /// `f` changes sign — `D > 0`. Two distinct real roots; NOT decidable here.
+    Indefinite,
+}
+
+impl UnivariateQuadratic {
+    /// Classify the definite sign of this quadratic over ALL real `x`.
+    ///
+    /// Pure function of `(sign a, sign D)`; see [`DefiniteSign`] for the theorem.
+    pub fn definite_sign(&self) -> DefiniteSign {
+        let d = self.discriminant();
+        let a_pos = self.a.is_positive();
+        // `a ≠ 0` is an invariant of construction, so `!a_pos` ⇒ `a < 0`.
+        if d.is_negative() {
+            if a_pos {
+                DefiniteSign::AllPositive
+            } else {
+                DefiniteSign::AllNegative
+            }
+        } else if d.is_zero() {
+            if a_pos {
+                DefiniteSign::AllNonNegative
+            } else {
+                DefiniteSign::AllNonPositive
+            }
+        } else {
+            DefiniteSign::Indefinite
+        }
+    }
+}
+
+/// Recognise a polynomial as a UNIVARIATE quadratic `a·x² + b·x + c` with `a ≠ 0`
+/// (catalog §G).
+///
+/// Returns `Some(UnivariateQuadratic)` iff the polynomial:
+/// - mentions EXACTLY ONE variable (it is genuinely univariate — a quadratic with
+///   a second variable present is NOT univariate and must fall through), and
+/// - has total degree EXACTLY 2 (the `x²` coefficient `a` is non-zero).
+///
+/// Returns `None` otherwise (constant, linear, multivariate, or degree ≠ 2). The
+/// coefficients are read EXACTLY via [`Polynomial::univ_coeff`]; no float.
+pub fn recognize_univariate_quadratic(poly: &Polynomial) -> Option<UnivariateQuadratic> {
+    let vars = poly.vars();
+    if vars.len() != 1 {
+        // Constant (0 vars) or genuinely multivariate (≥2 vars): not a
+        // *univariate* quadratic ⇒ fall through.
+        return None;
+    }
+    let var = vars[0];
+    // `total_degree == 2` over a single-variable polynomial means the leading term
+    // is `x²` with a non-zero coefficient — exactly the `a ≠ 0` quadratic shape.
+    // (`degree(var)` would coincide here, but `total_degree` also rejects a stray
+    // mixed monomial were one ever present.)
+    if poly.total_degree() != 2 || poly.degree(var) != 2 {
+        return None;
+    }
+
+    let a = poly.univ_coeff(var, 2);
+    let b = poly.univ_coeff(var, 1);
+    let c = poly.univ_coeff(var, 0);
+
+    // Defensive: `total_degree == 2` already guarantees `a ≠ 0`, but never apply
+    // the rule with a zero leading coefficient (it would be linear, not quadratic).
+    if a.is_zero() {
+        return None;
+    }
+
+    Some(UnivariateQuadratic { var, a, b, c })
+}
+
+/// Decide whether a single sign-constraint atom `q OP 0` on a UNIVARIATE quadratic
+/// `q` is UNSATISFIABLE over the reals, by the definite-sign discriminant rule
+/// (catalog §G).
+///
+/// `op` is the comparison the atom asserts on `q` (the polynomial in canonical
+/// `q OP 0` form). Returns `true` ONLY when `q OP 0` can NEVER hold for any real
+/// `x` — a SOUND `UNSAT` witness for the whole conjunction (one unsatisfiable
+/// conjunct ⇒ the conjunction is UNSAT). Returns `false` (decline) when `q` is not
+/// a univariate quadratic, when `D > 0` (indefinite), or when the atom IS
+/// satisfiable. NEVER asserts satisfiability — this is a one-sided UNSAT
+/// recogniser.
+///
+/// Soundness rests on two facts: (1) the [`DefiniteSign`] classification is exact
+/// over ℝ; (2) "for all real `x`" ⟹ "for all integer `x`", so a real-domain
+/// `UNSAT` is a fortiori an integer-domain `UNSAT` — the rule is sound for BOTH
+/// QF_NRA and QF_NIA atoms.
+pub fn quadratic_atom_is_unsat(poly: &Polynomial, op: AtomCmp) -> bool {
+    let Some(q) = recognize_univariate_quadratic(poly) else {
+        return false;
+    };
+    match q.definite_sign() {
+        // q > 0 everywhere ⇒ `q < 0`, `q ≤ 0`, `q = 0` are all impossible.
+        DefiniteSign::AllPositive => {
+            matches!(op, AtomCmp::Lt | AtomCmp::Le | AtomCmp::Eq)
+        }
+        // q < 0 everywhere ⇒ `q > 0`, `q ≥ 0`, `q = 0` are all impossible.
+        DefiniteSign::AllNegative => {
+            matches!(op, AtomCmp::Gt | AtomCmp::Ge | AtomCmp::Eq)
+        }
+        // q ≥ 0 everywhere (=0 at the double root) ⇒ ONLY `q < 0` is impossible.
+        // `q ≤ 0`, `q = 0`, `q ≥ 0`, `q > 0` are all SATISFIABLE (some at the
+        // root, some away from it) ⇒ must NOT be reported UNSAT.
+        DefiniteSign::AllNonNegative => matches!(op, AtomCmp::Lt),
+        // q ≤ 0 everywhere ⇒ ONLY `q > 0` is impossible.
+        DefiniteSign::AllNonPositive => matches!(op, AtomCmp::Gt),
+        // D > 0: q changes sign ⇒ every single inequality is satisfiable
+        // somewhere ⇒ decline (fall through to the existing nlsat/CAD path).
+        DefiniteSign::Indefinite => false,
+    }
+}
+
+/// The comparison a polynomial atom asserts on its (canonical `q OP 0`) polynomial.
+///
+/// This mirrors the atom shape the nlsat dispatch builds; it is the input to
+/// [`quadratic_atom_is_unsat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomCmp {
+    /// `q < 0`.
+    Lt,
+    /// `q ≤ 0`.
+    Le,
+    /// `q > 0`.
+    Gt,
+    /// `q ≥ 0`.
+    Ge,
+    /// `q = 0`.
+    Eq,
+}
+
 /// Compute the determinant of a square matrix over BigRational via Gaussian elimination.
 ///
 /// Uses partial pivoting to avoid division by zero. The determinant is computed
@@ -759,5 +942,145 @@ mod tests {
         let y2 = Polynomial::mul(&y, &y);
         let cubic = Polynomial::add(&x3, &y2);
         assert!(recognize_conic(&cubic).is_none());
+    }
+
+    // ---- §G univariate-quadratic definite-sign by discriminant. ----
+
+    /// Build `a·x² + b·x + c` over variable 0.
+    fn quad(a: i64, b: i64, c: i64) -> Polynomial {
+        Polynomial::univariate(0, &[rat(c), rat(b), rat(a)])
+    }
+
+    #[test]
+    fn test_recognize_univariate_quadratic_basic() {
+        // x² − 2x + 1 = (x−1)², a=1, b=−2, c=1, D = 4 − 4 = 0.
+        let q = recognize_univariate_quadratic(&quad(1, -2, 1)).expect("is a quadratic");
+        assert_eq!(q.a, rat(1));
+        assert_eq!(q.b, rat(-2));
+        assert_eq!(q.c, rat(1));
+        assert_eq!(q.discriminant(), rat(0));
+        assert_eq!(q.definite_sign(), DefiniteSign::AllNonNegative);
+    }
+
+    #[test]
+    fn test_recognize_declines_non_quadratic() {
+        // Linear x + 1 (degree 1): NOT a quadratic.
+        let lin = Polynomial::add(&Polynomial::from_var(0), &Polynomial::constant(rat(1)));
+        assert!(recognize_univariate_quadratic(&lin).is_none());
+        // Constant 5: NOT a quadratic.
+        assert!(recognize_univariate_quadratic(&Polynomial::constant(rat(5))).is_none());
+        // Cubic x³: degree 3, NOT a quadratic.
+        let x = Polynomial::from_var(0);
+        let x3 = Polynomial::mul(&Polynomial::mul(&x, &x), &x);
+        assert!(recognize_univariate_quadratic(&x3).is_none());
+    }
+
+    #[test]
+    fn test_recognize_declines_multivariate() {
+        // x² + y (two variables): NOT *univariate*.
+        let x = Polynomial::from_var(0);
+        let y = Polynomial::from_var(1);
+        let x2 = Polynomial::mul(&x, &x);
+        let bivar = Polynomial::add(&x2, &y);
+        assert!(recognize_univariate_quadratic(&bivar).is_none());
+    }
+
+    #[test]
+    fn test_definite_sign_classification() {
+        // x² + 1: a=1, D = 0 − 4 = −4 < 0 ⇒ AllPositive.
+        assert_eq!(quad(1, 0, 1).pipe_definite(), DefiniteSign::AllPositive);
+        // −x² − 1: a=−1, D = 0 − 4·(−1)(−1) = −4 < 0 ⇒ AllNegative.
+        assert_eq!(quad(-1, 0, -1).pipe_definite(), DefiniteSign::AllNegative);
+        // x²: a=1, D = 0 ⇒ AllNonNegative (perfect square at root 0).
+        assert_eq!(quad(1, 0, 0).pipe_definite(), DefiniteSign::AllNonNegative);
+        // −x²: a=−1, D = 0 ⇒ AllNonPositive.
+        assert_eq!(quad(-1, 0, 0).pipe_definite(), DefiniteSign::AllNonPositive);
+        // x² − 1: a=1, D = 0 − 4·(−1) = 4 > 0 ⇒ Indefinite (roots ±1).
+        assert_eq!(quad(1, 0, -1).pipe_definite(), DefiniteSign::Indefinite);
+    }
+
+    // tiny helper for the test above
+    trait PipeDefinite {
+        fn pipe_definite(&self) -> DefiniteSign;
+    }
+    impl PipeDefinite for Polynomial {
+        fn pipe_definite(&self) -> DefiniteSign {
+            recognize_univariate_quadratic(self)
+                .expect("quadratic")
+                .definite_sign()
+        }
+    }
+
+    #[test]
+    fn test_quadratic_atom_unsat_perfect_square() {
+        // (x−1)² = x²−2x+1, perfect square ≥ 0. Atom `q < 0` is UNSAT; the
+        // negated goal of the perfect-square repro.
+        let q = quad(1, -2, 1);
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Lt));
+        // But `q ≤ 0`, `q = 0`, `q > 0`, `q ≥ 0` are all SATISFIABLE (root x=1)
+        // ⇒ must NOT be reported UNSAT.
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Le));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Eq));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Gt));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Ge));
+    }
+
+    #[test]
+    fn test_quadratic_atom_unsat_strictly_positive() {
+        // x² + 1 > 0 everywhere (D < 0, a > 0). `< 0`, `≤ 0`, `= 0` impossible.
+        let q = quad(1, 0, 1);
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Lt));
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Le));
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Eq));
+        // `> 0`, `≥ 0` are valid ⇒ satisfiable ⇒ not UNSAT.
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Gt));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Ge));
+    }
+
+    #[test]
+    fn test_quadratic_atom_unsat_strictly_negative() {
+        // −x² − 1 < 0 everywhere (D < 0, a < 0). `> 0`, `≥ 0`, `= 0` impossible.
+        let q = quad(-1, 0, -1);
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Gt));
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Ge));
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Eq));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Lt));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Le));
+    }
+
+    #[test]
+    fn test_quadratic_atom_x_squared_gt_zero_is_satisfiable() {
+        // x² > 0 is FALSE at x=0 ⇒ `x² > 0` is satisfiable (not valid) and its
+        // atom must NOT be a false UNSAT. (a>0, D=0 ⇒ AllNonNegative; only `<0`
+        // is unsat.)
+        let q = quad(1, 0, 0);
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Gt));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Ge));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Eq));
+        assert!(!quadratic_atom_is_unsat(&q, AtomCmp::Le));
+        // Only `x² < 0` is impossible.
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Lt));
+    }
+
+    #[test]
+    fn test_quadratic_atom_indefinite_never_unsat() {
+        // x² − 1 (D = 4 > 0) changes sign ⇒ EVERY comparison is satisfiable ⇒
+        // the rule must DECLINE all of them (never a false UNSAT).
+        let q = quad(1, 0, -1);
+        for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
+            assert!(
+                !quadratic_atom_is_unsat(&q, op),
+                "indefinite quadratic must not be decided UNSAT for {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quadratic_atom_declines_non_quadratic() {
+        // A linear polynomial is not a quadratic ⇒ decline for every op.
+        let lin = Polynomial::add(&Polynomial::from_var(0), &Polynomial::constant(rat(1)));
+        for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
+            assert!(!quadratic_atom_is_unsat(&lin, op));
+        }
     }
 }
