@@ -156,3 +156,41 @@ not by "no rule applied".
   classifier recognises these shapes but the algebraic path solves only the
   polynomial fragment; a transcendental conic with no polynomial elimination
   falls back (never a fabricated SAT).
+
+---
+
+## E. Range-intersection search bound (parameterized conic∩conic) — *suggestion 2*
+Parameterise each side: `conic₁ = {(e(u), f(u))}`, `conic₂ = {(g(v), h(v))}`. A
+common point needs `e(u)=g(v) ∧ f(u)=h(v)`, so its **x-coordinate ∈ range(e) ∩
+range(g)** and its **y-coordinate ∈ range(f) ∩ range(h)** — solutions live only in
+the product box `[range(e)∩range(g)] × [range(f)∩range(h)]`. Bounding the `(u,v)`
+search to that box is a **necessary-condition PRUNE**: it discards no solution
+(completeness-preserving) and it is a bound, not a verdict, so it is sound in both
+directions. Most effective on BOUNDED conics (ellipse: range is a finite interval
+`[−ac, ac]`); a hyperbola's coordinate range is all of ℝ ⇒ no pruning.
+
+**Applicability to what we built.** The current conic∩conic SOLVE is the *algebraic*
+radical-axis path (rule A1/A0 + Sturm), NOT the parameterised form rule E assumes —
+Sturm already isolates finitely many real roots, so the parameterised range search
+does not exist to be bounded. Rule E therefore lands in two places: (E-light, now-
+applicable) restrict the resultant eliminant's **root isolation to the feasible
+x-interval** `range₁(x) ∩ range₂(x)` (each conic's x-extent from its bounding box),
+pruning roots outside it — a sound, modest speedup; (E-full) the genuine `(u,v)`
+range-box belongs to the transcendental parameterisation frontier (A3 full + B/C),
+where it is the key tractability lever.
+
+## F. `unknown` → invertible-transformation hint engine (advisory) — *suggestion 3*
+When the solver/KB cannot reduce or decide a system (verdict `unknown`), do not
+just give up: GUESS **invertible space transformations** that would map it into a
+KB-recognisable form, and surface them as ADVISORY hints. Candidates:
+- **Rotation** `θ = ½·atan2(B, A−C)` to kill a `B·xy` cross-term ⇒ the A3 conic
+  classifier recognises the result.
+- **Translation** (complete the square) to centre a conic; **scaling**; **shear**;
+  **variable substitution** `u = φ(x,y)` (e.g. the A2 `t = a·x+b·y+c`).
+**Soundness:** hints are advisory and DO NOT change the verdict — `unknown` stays
+`unknown` until a hint is actually applied and the reduced problem solved+verified.
+A wrong hint is merely unhelpful, never unsound; and an invertible transform of ℝⁿ
+(rotation/translation/scaling) is a bijection that PRESERVES the solution set, so a
+hint that reduces to a solvable form yields a sound result when followed. This is
+**"abduction for the transformation"** — the same advisory philosophy as adsmt's
+`(abduce)` / `:abduct-theory` (abduct = advice; the user/downstream must justify).
