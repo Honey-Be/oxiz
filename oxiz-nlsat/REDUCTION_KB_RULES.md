@@ -248,3 +248,33 @@ individually-contradictory atom makes the whole conjunction UNSAT — valid even
 atoms were dropped (subset-UNSAT ⟹ full-UNSAT). And a real-domain UNSAT is a fortiori an
 integer-domain UNSAT (`∀ real x` ⟹ `∀ int x`), so the rule is sound for BOTH NRA and NIA.
 Verified by an adversarial soundness audit (2026-06-22): no false unsat / false sat.
+
+### G-SOS — the MULTIVARIATE generalisation (PSD / sum-of-squares)
+§G's univariate `(sign a, sign D)` test generalises to a multivariate quadratic FORM
+`f(x) = xᵀ A x + bᵀ x + c` via the symmetric **Gram (bordered) matrix**
+`M = [[A, b/2], [(b/2)ᵀ, c]]`, so that `f(x) = [x; 1]ᵀ M [x; 1]` and `[x; 1] ≠ 0`:
+
+- `M` POSITIVE DEFINITE ⟹ `f > 0 ∀x`            (`AllPositive`);
+- `M` POSITIVE SEMIDEFINITE (not PD) ⟹ `f ≥ 0 ∀x` (`AllNonNegative` — the SOS case);
+- `−M` PD / PSD ⟹ `f < 0` / `f ≤ 0 ∀x`           (`AllNegative` / `AllNonPositive`);
+- otherwise indefinite — NOT decided.
+
+The verus lead `(x − y)² ≥ 0` = `x² − 2xy + y² ≥ 0` is the canonical case: its Gram matrix
+`[[1, −1], [−1, 1]]` is PSD (a sum of squares), so the form is `≥ 0` everywhere and its
+negation `(x − y)² < 0` is UNSAT. §G is exactly the `1×1`-variable instance of this
+(`M = [[a, b/2], [b/2, c]]`, `det M = −D/4`). Implemented in `discriminant.rs`:
+`recognize_quadratic_form` builds `M` (cross term `xᵢxⱼ` split symmetrically `M[i][j] =
+M[j][i] = k/2`); `matrix_is_pd` (Sylvester — all LEADING principal minors `> 0`) and
+`matrix_is_psd` (ALL principal minors `≥ 0` — the non-leading ones are required, e.g.
+`diag(0,−1)` is not PSD); `quadratic_form_definite_sign` + `quadratic_form_is_unsat` reuse
+the same `DefiniteSign` verdict table. Wired into the same `definite_sign_unsat` pre-check
+(`quadratic_atom_is_unsat || quadratic_form_is_unsat`). Determinants are EXACT over
+`BigRational`. The variable count is capped (`MAX_FORM_VARS = 6`) since the PSD test
+enumerates `2^(n+1)` principal minors; a wider form declines (sound — incomplete). The
+PD/PSD conditions are SUFFICIENT (`M` definite ⟹ `f` definite); a form non-negative only
+on the affine slice while `M` is indefinite is conservatively declined (never a false
+verdict). Adversarial-audited (2026-06-23): 7/7 probes PASS, the exact PSD classifier
+cross-checked against eigenvalues on 60 000 matrices (0 false positives). Tests:
+`discriminant::tests::test_form_*`, `nlsat::tests::g_sos_*`,
+`check_nlsat::tests::nl_multivariate_sos_*`. THE BAR: `multivariate-sos.smt2` goal →
+`unsat` via the OxiZ CLI.

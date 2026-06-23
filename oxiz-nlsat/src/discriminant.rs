@@ -633,6 +633,188 @@ pub enum AtomCmp {
     Eq,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// §G-SOS — definite sign of a MULTIVARIATE quadratic form (PSD recogniser)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Max number of distinct variables we build a Gram matrix for. The PSD test
+/// enumerates every principal minor (`2^(n+1)` of them), so we cap the dimension
+/// to keep it cheap; a larger form DECLINES (sound — just not decided here).
+const MAX_FORM_VARS: usize = 6;
+
+/// The symmetric Gram (bordered) matrix of a multivariate quadratic
+/// `f(x) = xᵀ A x + bᵀ x + c`:
+/// ```text
+///   M = [ A        b/2 ]      f(x) = [x; 1]ᵀ M [x; 1]
+///       [ (b/2)ᵀ    c  ]
+/// ```
+/// `n` distinct variables ⇒ `M` is `(n+1)×(n+1)`. The last row/column is the
+/// affine border (linear part `b/2`, constant `c`); the homogenising coordinate is
+/// always `1`, so `[x; 1]` is never the zero vector.
+pub struct QuadraticForm {
+    /// The `(n+1)×(n+1)` symmetric Gram matrix.
+    matrix: Vec<Vec<BigRational>>,
+}
+
+/// Recognise a polynomial as a multivariate quadratic form `xᵀ A x + bᵀ x + c`
+/// and build its symmetric Gram matrix `M` (catalog §G-SOS).
+///
+/// Returns `Some` iff total degree is EXACTLY 2 and the variable count is in
+/// `1..=MAX_FORM_VARS`. The cross-term `xᵢxⱼ` coefficient `k` is split symmetrically
+/// (`M[i][j] = M[j][i] = k/2`) so `M` is symmetric and `[x;1]ᵀ M [x;1]` reproduces
+/// `f` exactly. Coefficients are read EXACTLY (BigRational); no float. Returns
+/// `None` for a constant/linear poly (total degree ≠ 2), a too-wide form, or any
+/// monomial that is not `1`, `xᵢ`, `xᵢ²`, or `xᵢxⱼ`.
+pub fn recognize_quadratic_form(poly: &Polynomial) -> Option<QuadraticForm> {
+    if poly.total_degree() != 2 {
+        return None;
+    }
+    let vars = poly.vars();
+    let n = vars.len();
+    if n == 0 || n > MAX_FORM_VARS {
+        return None;
+    }
+    let dim = n + 1;
+    let half = BigRational::new(BigInt::from(1), BigInt::from(2));
+    let mut m = vec![vec![BigRational::zero(); dim]; dim];
+
+    for term in poly.terms() {
+        // Degree of this monomial in each of our variables (only the non-zero ones).
+        let degs: Vec<(usize, u32)> = vars
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                let d = term.monomial.degree(v);
+                if d > 0 { Some((i, d)) } else { None }
+            })
+            .collect();
+        // Guard: the degrees we collected must account for the whole monomial — a
+        // variable outside `poly.vars()` cannot exist, but never trust silently.
+        let collected: u32 = degs.iter().map(|&(_, d)| d).sum();
+        if collected != term.monomial.total_degree() {
+            return None;
+        }
+        match degs.as_slice() {
+            // constant c → border diagonal M[n][n]
+            [] => m[n][n] += term.coeff.clone(),
+            // linear bᵢ·xᵢ → border M[i][n] = M[n][i] = bᵢ/2
+            [(i, 1)] => {
+                let h = &term.coeff * &half;
+                m[*i][n] += h.clone();
+                m[n][*i] += h;
+            }
+            // xᵢ² → diagonal M[i][i]
+            [(i, 2)] => m[*i][*i] += term.coeff.clone(),
+            // xᵢ·xⱼ → off-diagonal M[i][j] = M[j][i] = k/2
+            [(i, 1), (j, 1)] => {
+                let h = &term.coeff * &half;
+                m[*i][*j] += h.clone();
+                m[*j][*i] += h;
+            }
+            // degree > 2 in one var, a 3-factor monomial, etc. — not a clean
+            // quadratic form (cannot occur at total_degree 2, but decline defensively).
+            _ => return None,
+        }
+    }
+
+    Some(QuadraticForm { matrix: m })
+}
+
+/// A symmetric `m` is POSITIVE DEFINITE ⟺ ALL its leading principal minors are
+/// strictly positive (Sylvester's criterion — exact over the rationals).
+fn matrix_is_pd(m: &[Vec<BigRational>]) -> bool {
+    let dim = m.len();
+    for k in 1..=dim {
+        let sub: Vec<Vec<BigRational>> = (0..k).map(|r| m[r][0..k].to_vec()).collect();
+        if !gaussian_elimination_det(sub).is_positive() {
+            return false;
+        }
+    }
+    true
+}
+
+/// A symmetric `m` is POSITIVE SEMIDEFINITE ⟺ EVERY principal minor (every index
+/// subset, not just the leading ones) is ≥ 0. Leading-minors-≥0 is NOT sufficient
+/// for PSD (e.g. `diag(0,−1)`), so we enumerate all `2^dim − 1` non-empty subsets.
+/// `dim = n+1 ≤ MAX_FORM_VARS+1`, so this is a small bounded enumeration.
+fn matrix_is_psd(m: &[Vec<BigRational>]) -> bool {
+    let dim = m.len();
+    for mask in 1u32..(1u32 << dim) {
+        let idxs: Vec<usize> = (0..dim).filter(|&b| mask & (1 << b) != 0).collect();
+        let sub: Vec<Vec<BigRational>> = idxs
+            .iter()
+            .map(|&r| idxs.iter().map(|&c| m[r][c].clone()).collect())
+            .collect();
+        if gaussian_elimination_det(sub).is_negative() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Classify the definite sign of a quadratic form over ALL of ℝⁿ from its Gram
+/// matrix `M` (the multivariate generalisation of [`UnivariateQuadratic::definite_sign`]).
+///
+/// `f(x) = [x;1]ᵀ M [x;1]` and `[x;1]` is never `0`, so:
+/// - `M` PD ⟹ `f > 0 ∀x`     ([`DefiniteSign::AllPositive`]);
+/// - `M` PSD (not PD) ⟹ `f ≥ 0 ∀x` ([`DefiniteSign::AllNonNegative`]);
+/// - `−M` PD ⟹ `f < 0 ∀x`    ([`DefiniteSign::AllNegative`]);
+/// - `−M` PSD (not PD) ⟹ `f ≤ 0 ∀x` ([`DefiniteSign::AllNonPositive`]);
+/// - otherwise indefinite — NOT decided.
+///
+/// These are SUFFICIENT conditions (definite `M` ⟹ definite `f`); a form that is
+/// non-negative only on the affine slice while `M` is indefinite is conservatively
+/// declined (sound — incompleteness, never a false verdict).
+fn quadratic_form_definite_sign(form: &QuadraticForm) -> DefiniteSign {
+    let m = &form.matrix;
+    if matrix_is_pd(m) {
+        return DefiniteSign::AllPositive;
+    }
+    if matrix_is_psd(m) {
+        return DefiniteSign::AllNonNegative;
+    }
+    let neg: Vec<Vec<BigRational>> = m
+        .iter()
+        .map(|row| row.iter().map(|e| -e.clone()).collect())
+        .collect();
+    if matrix_is_pd(&neg) {
+        return DefiniteSign::AllNegative;
+    }
+    if matrix_is_psd(&neg) {
+        return DefiniteSign::AllNonPositive;
+    }
+    DefiniteSign::Indefinite
+}
+
+/// Decide whether a single sign-constraint atom `q OP 0` on a MULTIVARIATE quadratic
+/// form `q` is UNSATISFIABLE over the reals, by the definite-sign / PSD rule
+/// (catalog §G-SOS). The multivariate generalisation of [`quadratic_atom_is_unsat`]
+/// — e.g. `(x−y)² < 0` (`x²−2xy+y² < 0`) is UNSAT because the Gram matrix
+/// `[[1,−1],[−1,1]]` is PSD ⇒ the form is `≥ 0` everywhere.
+///
+/// Returns `true` ONLY when `q OP 0` can NEVER hold for any real point — a SOUND
+/// `UNSAT` witness for the whole conjunction. Declines (returns `false`) for a
+/// non-quadratic / too-wide / indefinite form, and never asserts satisfiability.
+/// Same soundness footing as the univariate rule: the classification is exact over
+/// ℝ, and a real-domain `UNSAT` is a fortiori an integer-domain `UNSAT`.
+pub fn quadratic_form_is_unsat(poly: &Polynomial, op: AtomCmp) -> bool {
+    let Some(form) = recognize_quadratic_form(poly) else {
+        return false;
+    };
+    match quadratic_form_definite_sign(&form) {
+        // q > 0 everywhere ⇒ `q < 0`, `q ≤ 0`, `q = 0` impossible.
+        DefiniteSign::AllPositive => matches!(op, AtomCmp::Lt | AtomCmp::Le | AtomCmp::Eq),
+        // q < 0 everywhere ⇒ `q > 0`, `q ≥ 0`, `q = 0` impossible.
+        DefiniteSign::AllNegative => matches!(op, AtomCmp::Gt | AtomCmp::Ge | AtomCmp::Eq),
+        // q ≥ 0 everywhere (=0 somewhere) ⇒ ONLY `q < 0` impossible.
+        DefiniteSign::AllNonNegative => matches!(op, AtomCmp::Lt),
+        // q ≤ 0 everywhere ⇒ ONLY `q > 0` impossible.
+        DefiniteSign::AllNonPositive => matches!(op, AtomCmp::Gt),
+        // indefinite ⇒ decline (fall through to the existing nlsat/CAD path).
+        DefiniteSign::Indefinite => false,
+    }
+}
+
 /// Compute the determinant of a square matrix over BigRational via Gaussian elimination.
 ///
 /// Uses partial pivoting to avoid division by zero. The determinant is computed
@@ -1081,6 +1263,93 @@ mod tests {
         let lin = Polynomial::add(&Polynomial::from_var(0), &Polynomial::constant(rat(1)));
         for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
             assert!(!quadratic_atom_is_unsat(&lin, op));
+        }
+    }
+
+    // ---- §G-SOS multivariate quadratic-form definite sign (PSD). ----
+
+    #[test]
+    fn test_form_sos_perfect_square_psd() {
+        // (x − y)² = x² − 2xy + y² ⇒ Gram [[1,−1],[−1,1]] is PSD (eigenvalues 0,2),
+        // so the form is ≥ 0 ∀(x,y) — its negation `< 0` is UNSAT.
+        let p = conic_poly(1, -2, 1, 0, 0, 0);
+        assert!(quadratic_form_is_unsat(&p, AtomCmp::Lt), "(x-y)² < 0 is UNSAT");
+        // `≤ 0`, `= 0`, `> 0`, `≥ 0` are all SATISFIABLE (e.g. at x = y) ⇒ NOT unsat.
+        for op in [AtomCmp::Le, AtomCmp::Eq, AtomCmp::Gt, AtomCmp::Ge] {
+            assert!(
+                !quadratic_form_is_unsat(&p, op),
+                "(x-y)² is PSD-not-PD ⇒ only `< 0` is UNSAT, not {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_form_sum_of_squares_psd() {
+        // x² + y² ⇒ PSD (=0 only at origin) ⇒ `< 0` UNSAT, `≤ 0` satisfiable.
+        let p = conic_poly(1, 0, 1, 0, 0, 0);
+        assert!(quadratic_form_is_unsat(&p, AtomCmp::Lt));
+        assert!(!quadratic_form_is_unsat(&p, AtomCmp::Le));
+        assert!(!quadratic_form_is_unsat(&p, AtomCmp::Eq));
+    }
+
+    #[test]
+    fn test_form_positive_definite_with_constant() {
+        // x² + y² + 1 ⇒ Gram diag(1,1,1) is PD ⇒ form > 0 ∀ ⇒ `< 0`, `≤ 0`, `= 0`
+        // are ALL UNSAT.
+        let p = conic_poly(1, 0, 1, 0, 0, 1);
+        for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Eq] {
+            assert!(quadratic_form_is_unsat(&p, op), "x²+y²+1 > 0 ∀ ⇒ {op:?} UNSAT");
+        }
+        // But `> 0` / `≥ 0` are SAT (true everywhere) ⇒ NOT unsat.
+        assert!(!quadratic_form_is_unsat(&p, AtomCmp::Gt));
+        assert!(!quadratic_form_is_unsat(&p, AtomCmp::Ge));
+    }
+
+    #[test]
+    fn test_form_negative_definite() {
+        // −x² − y² − 1 ⇒ form < 0 ∀ ⇒ `> 0`, `≥ 0`, `= 0` UNSAT; `< 0` SAT.
+        let p = conic_poly(-1, 0, -1, 0, 0, -1);
+        for op in [AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
+            assert!(quadratic_form_is_unsat(&p, op), "−x²−y²−1 < 0 ∀ ⇒ {op:?} UNSAT");
+        }
+        assert!(!quadratic_form_is_unsat(&p, AtomCmp::Lt));
+    }
+
+    #[test]
+    fn test_form_indefinite_declines() {
+        // x² − y² (hyperbolic, indefinite) and 2xy (indefinite) change sign ⇒ the
+        // PSD rule must DECLINE every comparison (never a false UNSAT).
+        for p in [conic_poly(1, 0, -1, 0, 0, 0), conic_poly(0, 2, 0, 0, 0, 0)] {
+            for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
+                assert!(
+                    !quadratic_form_is_unsat(&p, op),
+                    "indefinite form must never be decided UNSAT for {op:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_form_agrees_with_univariate_on_perfect_square() {
+        // The matrix path must agree with the §G univariate path on a univariate
+        // input: x² − 2x + 1 = (x−1)², `< 0` UNSAT under BOTH recognisers.
+        let q = quad(1, -2, 1);
+        assert!(quadratic_atom_is_unsat(&q, AtomCmp::Lt));
+        assert!(quadratic_form_is_unsat(&q, AtomCmp::Lt));
+        // And both decline the indefinite x² − 1.
+        let ind = quad(1, 0, -1);
+        assert!(!quadratic_atom_is_unsat(&ind, AtomCmp::Lt));
+        assert!(!quadratic_form_is_unsat(&ind, AtomCmp::Lt));
+    }
+
+    #[test]
+    fn test_form_declines_non_quadratic() {
+        // Linear (degree 1) and constant are not quadratic FORMS ⇒ decline.
+        let lin = Polynomial::add(&Polynomial::from_var(0), &Polynomial::from_var(1));
+        let c = Polynomial::constant(rat(3));
+        for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
+            assert!(!quadratic_form_is_unsat(&lin, op));
+            assert!(!quadratic_form_is_unsat(&c, op));
         }
     }
 }

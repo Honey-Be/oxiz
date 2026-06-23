@@ -27,7 +27,7 @@ use num_traits::ToPrimitive;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::error::Result;
 use oxiz_math::polynomial::Polynomial;
-use oxiz_nlsat::discriminant::{AtomCmp, quadratic_atom_is_unsat};
+use oxiz_nlsat::discriminant::{AtomCmp, quadratic_atom_is_unsat, quadratic_form_is_unsat};
 use oxiz_nlsat::nia::{NiaConfig, NiaSolver, VarType};
 use oxiz_nlsat::solver::{NlsatSolver, SolverResult};
 use oxiz_nlsat::types::AtomKind;
@@ -356,28 +356,35 @@ fn poly_atom_cmp(atom: &PolyAtom) -> Option<AtomCmp> {
     }
 }
 
-/// Reduction-KB rule §G: definite-sign-by-discriminant completeness pre-check.
+/// Reduction-KB rule §G: definite-sign completeness pre-check.
 ///
 /// Every [`PolyAtom`] in `poly_atoms` is a TOP-LEVEL CONJUNCT of the (focused)
 /// assertion set — both `extract_poly_atoms` and `extract_real_poly_atoms` only
 /// descend into `And` and the comparison atoms (every other connective hits the
 /// dropped `_` arm), so every pushed atom is ENTAILED by the conjunction. If a
-/// single entailed atom is itself unsatisfiable over ℝ — a univariate quadratic
-/// whose asserted sign is impossible by its discriminant, e.g. `x²−2x+1 < 0`
-/// (a perfect square is never negative) — the whole conjunction is UNSAT. The
-/// primitive `x² ≥ 0` is the `a=1,b=0,c=0` instance.
+/// single entailed atom is itself unsatisfiable over ℝ — a quadratic whose asserted
+/// sign is impossible — the whole conjunction is UNSAT. Two recognisers, both exact
+/// and one-sided:
+/// - [`quadratic_atom_is_unsat`] — the UNIVARIATE quadratic by its discriminant
+///   `D = b²−4ac`, e.g. `x²−2x+1 < 0` (a perfect square is never negative); the
+///   primitive `x² ≥ 0` is the `a=1,b=0,c=0` instance.
+/// - [`quadratic_form_is_unsat`] — the MULTIVARIATE quadratic form by its Gram
+///   matrix (PSD / SOS), e.g. `(x−y)² < 0` (`x²−2xy+y² < 0`) is UNSAT because the
+///   Gram matrix `[[1,−1],[−1,1]]` is positive-semidefinite.
 ///
 /// SOUNDNESS: returns `true` ONLY for a genuine real-domain UNSAT atom (exact
-/// rationals; `D > 0` / non-quadratic / multivariate decline via
-/// [`quadratic_atom_is_unsat`]). A real-domain UNSAT is a fortiori an
-/// integer-domain UNSAT (`∀ real x` ⟹ `∀ int x`), so this is sound for BOTH the
-/// NRA and the NIA dispatch. It never reports Sat and never a wrong Unsat; being
-/// a single-conjunct witness, it stays valid even when other atoms were dropped
-/// (subset-unsat ⟹ full-unsat).
+/// rationals; indefinite / non-quadratic / too-wide forms decline). A real-domain
+/// UNSAT is a fortiori an integer-domain UNSAT (`∀ real x` ⟹ `∀ int x`), so this
+/// is sound for BOTH the NRA and the NIA dispatch. It never reports Sat and never a
+/// wrong Unsat; being a single-conjunct witness, it stays valid even when other
+/// atoms were dropped (subset-unsat ⟹ full-unsat).
 fn definite_sign_unsat(poly_atoms: &[PolyAtom]) -> bool {
     poly_atoms.iter().any(|atom| {
         poly_atom_cmp(atom)
-            .map(|op| quadratic_atom_is_unsat(&atom.poly, op))
+            .map(|op| {
+                quadratic_atom_is_unsat(&atom.poly, op)
+                    || quadratic_form_is_unsat(&atom.poly, op)
+            })
             .unwrap_or(false)
     })
 }
@@ -1296,8 +1303,10 @@ mod tests {
 
     #[test]
     fn g_does_not_fire_on_multivariate_quadratic() {
-        // SOUNDNESS: `x² + y < 0` is NOT univariate — §G must decline (recogniser
-        // returns None for ≥2 variables). Satisfiable (x=0, y=−1), so never unsat.
+        // SOUNDNESS: `x² + y < 0` is NOT a quadratic FORM (the `y` term is linear,
+        // degree-1) — but it IS satisfiable (x=0, y=−1), so neither §G recogniser
+        // may fire. (The form recogniser sees total_degree 2 but `x²+y` is
+        // indefinite as a form ⇒ declines.)
         let mut m = TermManager::new();
         let real_sort = m.sorts.real_sort;
         let x = m.mk_var("x", real_sort);
@@ -1311,7 +1320,97 @@ mod tests {
                 dispatch_nra_constraints(&[lt], &m),
                 Some(NlDispatchResult::Unsat)
             ),
-            "x^2 + y < 0 is satisfiable and multivariate — §G must not fire"
+            "x^2 + y < 0 is satisfiable — §G must not fire"
+        );
+    }
+
+    // ── Reduction-KB rule §G-SOS: multivariate quadratic form (PSD) ──────────
+    // `(x − y)² ≥ 0` is the verus SOS lead; its negation `(x − y)² < 0` =
+    // `x² − 2xy + y² < 0` is UNSAT because the Gram matrix `[[1,−1],[−1,1]]` is PSD.
+
+    /// Build `x² − 2xy + y²` (= `(x − y)²`) over `x`, `y`.
+    fn diff_of_squares_form(m: &mut TermManager, x: TermId, y: TermId) -> TermId {
+        let xx = m.mk_mul(vec![x, x]);
+        let yy = m.mk_mul(vec![y, y]);
+        let xy = m.mk_mul(vec![x, y]);
+        let two = m.mk_int(2);
+        let two_xy = m.mk_mul(vec![two, xy]);
+        let sum = m.mk_add(vec![xx, yy]);
+        m.mk_sub(sum, two_xy)
+    }
+
+    #[test]
+    fn g_sos_perfect_square_form_lt_zero_is_unsat_nra() {
+        // THE SOS BAR (verus `(x − y)² ≥ 0`, negated): `x² − 2xy + y² < 0` UNSAT.
+        let mut m = TermManager::new();
+        let real_sort = m.sorts.real_sort;
+        let x = m.mk_var("x", real_sort);
+        let y = m.mk_var("y", real_sort);
+        let f = diff_of_squares_form(&mut m, x, y);
+        let zero = m.mk_int(0);
+        let lt = m.mk_lt(f, zero);
+        assert_eq!(
+            dispatch_nra_constraints(&[lt], &m),
+            Some(NlDispatchResult::Unsat),
+            "(x-y)² < 0 is unsatisfiable — §G-SOS must decide it unsat"
+        );
+    }
+
+    #[test]
+    fn g_sos_perfect_square_form_lt_zero_is_unsat_nia() {
+        // Same over integers (real-PSD ⟹ integer-UNSAT).
+        let mut m = TermManager::new();
+        let int_sort = m.sorts.int_sort;
+        let x = m.mk_var("x", int_sort);
+        let y = m.mk_var("y", int_sort);
+        let f = diff_of_squares_form(&mut m, x, y);
+        let zero = m.mk_int(0);
+        let lt = m.mk_lt(f, zero);
+        assert_eq!(
+            dispatch_nia_constraints(&[lt], &m, true),
+            Some(NlDispatchResult::Unsat),
+            "(x-y)² < 0 over integers is unsatisfiable — §G-SOS must decide it unsat"
+        );
+    }
+
+    #[test]
+    fn g_sos_does_not_decide_indefinite_form() {
+        // SOUNDNESS: `x² − y² < 0` (indefinite Gram, satisfiable at x=0,y=1) must
+        // NOT be a false unsat — the PSD rule declines.
+        let mut m = TermManager::new();
+        let real_sort = m.sorts.real_sort;
+        let x = m.mk_var("x", real_sort);
+        let y = m.mk_var("y", real_sort);
+        let xx = m.mk_mul(vec![x, x]);
+        let yy = m.mk_mul(vec![y, y]);
+        let f = m.mk_sub(xx, yy);
+        let zero = m.mk_int(0);
+        let lt = m.mk_lt(f, zero);
+        assert!(
+            !matches!(
+                dispatch_nra_constraints(&[lt], &m),
+                Some(NlDispatchResult::Unsat)
+            ),
+            "x² − y² < 0 is satisfiable — §G-SOS must not report a false unsat"
+        );
+    }
+
+    #[test]
+    fn g_sos_does_not_decide_satisfiable_le_zero() {
+        // SOUNDNESS: `(x − y)² ≤ 0` is SATISFIABLE (at x = y) — must NOT be unsat.
+        let mut m = TermManager::new();
+        let real_sort = m.sorts.real_sort;
+        let x = m.mk_var("x", real_sort);
+        let y = m.mk_var("y", real_sort);
+        let f = diff_of_squares_form(&mut m, x, y);
+        let zero = m.mk_int(0);
+        let le = m.mk_le(f, zero);
+        assert!(
+            !matches!(
+                dispatch_nra_constraints(&[le], &m),
+                Some(NlDispatchResult::Unsat)
+            ),
+            "(x-y)² ≤ 0 is satisfiable (x=y) — §G-SOS must not report a false unsat"
         );
     }
 }

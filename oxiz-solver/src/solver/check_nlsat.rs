@@ -1453,6 +1453,39 @@ mod tests {
     }
 
     #[test]
+    fn nl_multivariate_sos_form_reaches_kb_and_decides_unsat() {
+        // The verus SOS lead end-to-end: `(x − y)² ≥ 0` as the UF spine
+        // `(Add (Sub (Mul x! x!) (Mul 2 (Mul x! y!))) (Mul y! y!))` (note the
+        // NESTED `(Mul 2 (Mul x! y!))`). The spine folds every `Mul`/`Add`/`Sub`,
+        // the focused atom becomes `x² − 2xy + y² < 0`, and §G-SOS decides it UNSAT
+        // (the Gram matrix `[[1,−1],[−1,1]]` is PSD).
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x!", int);
+        let yv = m.mk_var("y!", int);
+        let mb = mul_bridge(&mut m);
+        let ab = add_bridge(&mut m);
+        let sb = sub_bridge(&mut m);
+        let xx = m.mk_apply("Mul", [xv, xv], int);
+        let yy = m.mk_apply("Mul", [yv, yv], int);
+        let xy = m.mk_apply("Mul", [xv, yv], int);
+        let two = m.mk_int(2);
+        let two_xy = m.mk_apply("Mul", [two, xy], int);
+        let sub = m.mk_apply("Sub", [xx, two_xy], int);
+        let f = m.mk_apply("Add", [sub, yy], int);
+        let zero = m.mk_int(0);
+        let ge = m.mk_ge(f, zero);
+        let goal = negated_goal(&mut m, ge);
+
+        let r = solve_no_logic(vec![mb, ab, sb, goal], &mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "(x-y)² >= 0 obligation must reach §G-SOS and decide UNSAT (provable)"
+        );
+    }
+
+    #[test]
     fn explicit_qf_nia_logic_path_unchanged() {
         // With an explicit `QF_NIA` logic and a NATIVE `(* x x)` square, the
         // UNCHANGED logic-string path must still fire (sanity that Path 1 stays
