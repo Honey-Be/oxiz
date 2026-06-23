@@ -658,7 +658,18 @@ pub fn dispatch_nra_constraints(
         return Some(NlDispatchResult::Unsat);
     }
 
-    let unsat_is_trustworthy = poly_atoms.iter().all(|atom| atom.kind != AtomKind::Eq);
+    // An `Unsat` from the core real `NlsatSolver` is only trustworthy on the
+    // fragment it decides reliably: a single UNIVARIATE atom. It is UNSOUND on
+    // MULTIVARIATE nonlinear atoms — e.g. the satisfiable bilinear strict
+    // inequality `x*y > 5` (sat at x=10, y=½) is decided a spurious `unsat`. So,
+    // exactly like the NIA gate (`is_univariate()`), trust `Unsat` ONLY when every
+    // retained atom is univariate (and non-`Eq`, as before). Definite MULTIVARIATE
+    // forms that ARE genuinely unsat (`x²+y² = −1`, `(x−y)² < 0`, …) are already
+    // decided soundly up-front by §G / §G-SOS (`definite_sign_unsat`), so this
+    // gate's conservatism costs little completeness while closing the hole.
+    let unsat_is_trustworthy = poly_atoms
+        .iter()
+        .all(|atom| atom.kind != AtomKind::Eq && atom.poly.is_univariate());
     // `Sat` is only valid for the original formula when nothing was dropped (see
     // `extract_poly_atoms`). Otherwise fall back to `None` (Unknown) — never trust
     // a `Sat` over a retained SUBSET of the constraints.
@@ -1173,6 +1184,35 @@ mod tests {
         let diff = m.mk_sub(xx, two_x);
         let one = m.mk_int(1);
         m.mk_add(vec![diff, one])
+    }
+
+    #[test]
+    fn nra_bilinear_strict_inequality_not_false_unsat() {
+        // SOUNDNESS (the pre-existing core-NRA bilinear hole this gate closes):
+        // `x*y > 5` is SATISFIABLE (x=10, y=½) but the core real `NlsatSolver`
+        // decides it a spurious `unsat`. The `unsat_is_trustworthy` gate now
+        // requires every atom to be UNIVARIATE, so a bivariate atom's `unsat` is
+        // distrusted → `None` (sound Unknown), NEVER a false `unsat`.
+        let mut m = TermManager::new();
+        let real_sort = m.sorts.real_sort;
+        let x = m.mk_var("x", real_sort);
+        let y = m.mk_var("y", real_sort);
+        let xy = m.mk_mul(vec![x, y]);
+        let five = m.mk_int(5);
+        let gt = m.mk_gt(xy, five);
+        assert_ne!(
+            dispatch_nra_constraints(&[gt], &m),
+            Some(NlDispatchResult::Unsat),
+            "x*y > 5 is satisfiable — the NRA gate must not trust the core's spurious unsat"
+        );
+        // And `x*y < 0` (also satisfiable, x=1,y=−1) — same.
+        let zero = m.mk_int(0);
+        let lt = m.mk_lt(xy, zero);
+        assert_ne!(
+            dispatch_nra_constraints(&[lt], &m),
+            Some(NlDispatchResult::Unsat),
+            "x*y < 0 is satisfiable — must not be a false unsat"
+        );
     }
 
     #[test]
