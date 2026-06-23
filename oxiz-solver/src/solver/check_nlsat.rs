@@ -19,6 +19,7 @@ use num_traits::{One, ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_theories::nlsat::{NlDispatchResult, dispatch_nia_constraints, dispatch_nra_constraints};
+use std::collections::HashMap;
 
 use super::Solver;
 use super::types::SolverResult;
@@ -743,6 +744,147 @@ impl Solver {
             }
             _ => None,
         }
+    }
+
+    /// SOUND early-UNSAT for ANY term (linear, nonlinear, or uninterpreted): if
+    /// the asserted top-level conjuncts pin mutually-infeasible LITERAL bounds on
+    /// the SAME hash-consed `TermId`, the formula is UNSAT regardless of what the
+    /// term denotes. This is the TRICHOTOMY / total-order fact made operational —
+    /// no real value is both `> c` and `< c`, nor in two disjoint intervals, nor
+    /// equal to two distinct constants. It catches conjunctions like
+    /// `x*y > 0 ∧ x*y < 0` where the nonlinear product is carried opaquely (its
+    /// bounds never reach LRA as numeric bounds on a shared arith variable), which
+    /// the CDCL(T) relaxation would otherwise report a spurious `sat`.
+    ///
+    /// SOUNDNESS — can NEVER produce a false `unsat`: every recorded bound is a
+    /// DIRECTLY ASSERTED top-level conjunct `t OP c` with `c` a literal rational
+    /// and `t` one shared `TermId`. The walk descends ONLY positive `And` (every
+    /// conjunct of a top-level `∧` is asserted) and stops at `Not`/`Or`/`Implies`/
+    /// `Ite`/`Distinct`/quantifiers — so it never assumes an un-asserted sub-bound.
+    /// The emptiness tests are the trivial interval-emptiness of literal rationals;
+    /// the term's meaning is irrelevant. An empty bound set on `t` ⟹ no value of
+    /// `t` satisfies the asserted conjuncts ⟹ UNSAT.
+    pub(super) fn check_term_bound_infeasible(&self, manager: &TermManager) -> bool {
+        let mut bounds: HashMap<TermId, TermBounds> = HashMap::new();
+        for &a in &self.assertions {
+            self.collect_term_bounds(a, manager, &mut bounds);
+        }
+        bounds.values().any(TermBounds::is_infeasible)
+    }
+
+    /// Walk a top-level assertion, recording literal bounds per term. Descends
+    /// ONLY positive `And` conjuncts (see [`Self::check_term_bound_infeasible`]).
+    fn collect_term_bounds(
+        &self,
+        t: TermId,
+        manager: &TermManager,
+        bounds: &mut HashMap<TermId, TermBounds>,
+    ) {
+        let Some(term) = manager.get(t) else {
+            return;
+        };
+        match &term.kind {
+            TermKind::And(args) => {
+                for &a in args.iter() {
+                    self.collect_term_bounds(a, manager, bounds);
+                }
+            }
+            // `l > r` (strict) / `l >= r`: a lower bound on the non-const side, or
+            // a (flipped) upper bound when the const is on the left.
+            TermKind::Gt(l, r) => self.record_ineq(*l, *r, true, manager, bounds),
+            TermKind::Ge(l, r) => self.record_ineq(*l, *r, false, manager, bounds),
+            // `l < r` ≡ `r > l`; `l <= r` ≡ `r >= l`.
+            TermKind::Lt(l, r) => self.record_ineq(*r, *l, true, manager, bounds),
+            TermKind::Le(l, r) => self.record_ineq(*r, *l, false, manager, bounds),
+            TermKind::Eq(l, r) => {
+                if let Some(c) = self.extract_rational_const(*r, manager) {
+                    bounds.entry(*l).or_default().eqs.push(c);
+                } else if let Some(c) = self.extract_rational_const(*l, manager) {
+                    bounds.entry(*r).or_default().eqs.push(c);
+                }
+            }
+            // Not / Or / Implies / Ite / Distinct / Forall / Exists / … are NOT
+            // descended — their sub-atoms are not asserted conjuncts.
+            _ => {}
+        }
+    }
+
+    /// Record the atom `a OP b` (`OP` = `>` strict / `>=` non-strict) as a bound
+    /// when EXACTLY one side is a literal rational: `b = c` ⇒ lower bound on `a`
+    /// (`a > c` / `a >= c`); `a = c` ⇒ upper bound on `b` (`b < c` / `b <= c`).
+    fn record_ineq(
+        &self,
+        a: TermId,
+        b: TermId,
+        strict: bool,
+        manager: &TermManager,
+        bounds: &mut HashMap<TermId, TermBounds>,
+    ) {
+        if let Some(c) = self.extract_rational_const(b, manager) {
+            bounds.entry(a).or_default().add_lo(c, strict);
+        } else if let Some(c) = self.extract_rational_const(a, manager) {
+            bounds.entry(b).or_default().add_hi(c, strict);
+        }
+    }
+}
+
+/// Accumulated literal bounds on a single (shared) term, for
+/// [`Solver::check_term_bound_infeasible`]. `lo`/`hi` carry `(value, strict)`.
+#[derive(Default)]
+struct TermBounds {
+    lo: Option<(Rational64, bool)>,
+    hi: Option<(Rational64, bool)>,
+    eqs: Vec<Rational64>,
+}
+
+impl TermBounds {
+    /// Keep the tightest lower bound (larger value wins; at equal value a strict
+    /// bound beats a non-strict one).
+    fn add_lo(&mut self, v: Rational64, strict: bool) {
+        let tighter = self
+            .lo
+            .is_none_or(|(cv, cs)| v > cv || (v == cv && strict && !cs));
+        if tighter {
+            self.lo = Some((v, strict));
+        }
+    }
+    fn add_hi(&mut self, v: Rational64, strict: bool) {
+        let tighter = self
+            .hi
+            .is_none_or(|(cv, cs)| v < cv || (v == cv && strict && !cs));
+        if tighter {
+            self.hi = Some((v, strict));
+        }
+    }
+    /// Are these bounds jointly unsatisfiable for ANY real value of the term?
+    fn is_infeasible(&self) -> bool {
+        // Two distinct asserted equalities `t = a ∧ t = b`, a ≠ b.
+        if let Some(&first) = self.eqs.first() {
+            if self.eqs.iter().any(|&e| e != first) {
+                return true;
+            }
+        }
+        // An equality lying outside an asserted lo/hi (strict boundary counts).
+        for &e in &self.eqs {
+            if let Some((lo, strict)) = self.lo {
+                if e < lo || (e == lo && strict) {
+                    return true;
+                }
+            }
+            if let Some((hi, strict)) = self.hi {
+                if e > hi || (e == hi && strict) {
+                    return true;
+                }
+            }
+        }
+        // Empty interval: `lo > hi`, or `lo == hi` with EITHER side strict.
+        // (`lo == hi` with both non-strict is feasible at `t = lo`.)
+        if let (Some((lo, sl)), Some((hi, sh))) = (self.lo, self.hi) {
+            if lo > hi || (lo == hi && (sl || sh)) {
+                return true;
+            }
+        }
+        false
     }
 }
 

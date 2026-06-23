@@ -576,3 +576,96 @@ fn nira_pure_integer_nonlinear_unsat_still_caught() {
     });
     assert_eq!(verdict, Some("unsat"), "pure-int NIRA x*x=3 must stay Unsat, got {out:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trichotomy / total-order: a single term with mutually-infeasible literal
+// bounds is UNSAT regardless of the term (sound even for an opaque nonlinear
+// product). `Solver::check_term_bound_infeasible`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `script` and return the last verdict line, if any.
+fn nra_verdict(script: &str) -> Option<String> {
+    let mut ctx = Context::new();
+    let out = ctx.execute_script(script).expect("script runs");
+    out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat".to_string()),
+        "unsat" => Some("unsat".to_string()),
+        "unknown" => Some("unknown".to_string()),
+        _ => None,
+    })
+}
+
+#[test]
+fn test_term_bound_xy_strict_both_unsat() {
+    // x*y > 0 ∧ x*y < 0 — no value of the single term x*y is both >0 and <0.
+    assert_eq!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (and (> (* x y) 0) (< (* x y) 0)))(check-sat)"
+        ),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_term_bound_ge_le_disjoint_unsat() {
+    // x*y ≥ 5 ∧ x*y ≤ 3 — disjoint interval.
+    assert_eq!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (and (>= (* x y) 5) (<= (* x y) 3)))(check-sat)"
+        ),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_term_bound_strict_boundary_unsat() {
+    // x*y > 0 ∧ x*y ≤ 0 — lo == hi == 0 with the lower bound strict.
+    assert_eq!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (and (> (* x y) 0) (<= (* x y) 0)))(check-sat)"
+        ),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_term_bound_feasible_zero_sat() {
+    // x*y ≥ 0 ∧ x*y ≤ 0 — both NON-strict ⇒ feasible at x*y = 0 (x=0). The
+    // strict/non-strict boundary guard: must NOT be a false unsat.
+    assert_ne!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (and (>= (* x y) 0) (<= (* x y) 0)))(check-sat)"
+        ),
+        Some("unsat".to_string()),
+        "t≥0 ∧ t≤0 is satisfiable at t=0 — must not be a false unsat"
+    );
+}
+
+#[test]
+fn test_term_bound_eq_conflict_unsat() {
+    // x*y = 1 ∧ x*y = 2 — conflicting equalities on the shared term.
+    assert_eq!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (and (= (* x y) 1) (= (* x y) 2)))(check-sat)"
+        ),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_term_bound_single_bound_stays_sat() {
+    // x*y > 5 — one bound only, satisfiable (x=10, y=1) — must NOT fire.
+    assert_ne!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (> (* x y) 5))(check-sat)"
+        ),
+        Some("unsat".to_string()),
+        "x*y > 5 is satisfiable — the bound-infeasibility decider must not fire"
+    );
+}

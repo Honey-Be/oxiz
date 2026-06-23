@@ -464,6 +464,15 @@ impl Solver {
             return SolverResult::Unsat;
         }
 
+        // Trichotomy / total-order: a single term pinned to mutually-infeasible
+        // literal bounds (`t > c ∧ t < c`, disjoint intervals, conflicting
+        // equalities) is UNSAT regardless of what the term denotes — sound even
+        // for an opaque NONLINEAR product whose bounds the CDCL(T) relaxation
+        // would otherwise miss (e.g. `x*y > 0 ∧ x*y < 0`).
+        if self.check_term_bound_infeasible(manager) {
+            return SolverResult::Unsat;
+        }
+
         // For NIA/NRA logics: dispatch all assertions to the full polynomial
         // solver first (NiaSolver or NlsatSolver). This gives a definitive
         // SAT/UNSAT for most benchmark problems without the CDCL(T) loop.
