@@ -37,3 +37,6 @@ fuzz/artifacts/
 
 # Rustc ICE dumps
 rustc-ice-*.txt
+
+
+**/*DRAFT.md
