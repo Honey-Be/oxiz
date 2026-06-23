@@ -890,15 +890,26 @@ impl super::Polynomial {
         prs
     }
 
-    /// Resultant of two univariate polynomials with respect to a variable.
+    /// Resultant of `self` and `other` with respect to `var`, as the
+    /// **Sylvester-matrix determinant**.
+    ///
+    /// The determinant is computed by Laplace cofactor expansion along the
+    /// sparsest row (`+ - *` only — no division), so it is *exact* over the
+    /// polynomial ring `ℚ[other vars]` and inherits only the reliable basic
+    /// `Polynomial` arithmetic. The result is a polynomial in the remaining
+    /// variables, free of `var`, that vanishes exactly where `self` and `other`
+    /// share a root in `var`.
+    ///
+    /// (The previous subresultant-PRS implementation was an approximation — it
+    /// `primitive()`d multivariate pseudo-remainders, mangling the eliminated
+    /// variable, e.g. `res_x(x-y, x-2y)` returned `x` instead of `±y`. It is
+    /// removed entirely.)
     pub fn resultant(&self, other: &Polynomial, var: Var) -> Polynomial {
         if self.is_zero() || other.is_zero() {
             return Polynomial::zero();
         }
-
         let deg_p = self.degree(var);
         let deg_q = other.degree(var);
-
         if deg_p == 0 {
             return self.pow(deg_q);
         }
@@ -906,76 +917,79 @@ impl super::Polynomial {
             return other.pow(deg_p);
         }
 
-        // Use subresultant PRS for efficiency
-        let mut a = self.clone();
-        let mut b = other.clone();
-        let mut g = Polynomial::one();
-        let mut h = Polynomial::one();
-        let mut sign = if (deg_p & 1 == 1) && (deg_q & 1 == 1) {
-            -1i32
-        } else {
-            1i32
-        };
-
-        // Add iteration limit to prevent infinite loops when exact division is not available
-        let max_iters = (deg_p + deg_q) * 10;
-        let mut iter_count = 0;
-
-        while !b.is_zero() && iter_count < max_iters {
-            iter_count += 1;
-            let delta = a.degree(var) as i32 - b.degree(var) as i32;
-            if delta < 0 {
-                core::mem::swap(&mut a, &mut b);
-                if (a.degree(var) & 1 == 1) && (b.degree(var) & 1 == 1) {
-                    sign = -sign;
-                }
-                continue;
+        let (m, n) = (deg_p as usize, deg_q as usize);
+        let size = m + n;
+        // coefficients high→low (each a polynomial in the remaining variables)
+        let pa: Vec<Polynomial> = (0..=m).rev().map(|k| self.coeff(var, k as u32)).collect();
+        let qb: Vec<Polynomial> = (0..=n).rev().map(|k| other.coeff(var, k as u32)).collect();
+        let mut mat = vec![vec![Polynomial::zero(); size]; size];
+        for (i, row) in mat.iter_mut().enumerate().take(n) {
+            for (k, c) in pa.iter().enumerate() {
+                row[i + k] = c.clone();
             }
-
-            let (_, r) = a.pseudo_div_univariate(&b);
-
-            if r.is_zero() {
-                if b.degree(var) > 0 {
-                    return Polynomial::zero();
-                } else {
-                    let d = a.degree(var);
-                    return b.pow(d);
-                }
-            }
-
-            a = b;
-            let g_pow = g.pow((delta + 1) as u32);
-            let h_pow = h.pow(delta as u32);
-            b = r;
-
-            // Simplify b by dividing out common factors
-            // Since exact division is not implemented, use primitive() to prevent growth
-            if delta > 0 {
-                let denom = Polynomial::mul(&g_pow, &h_pow);
-                // Try to cancel common content by making primitive
-                b = b.primitive();
-                // Note: This is an approximation and may not give the exact mathematical resultant
-                let _ = denom; // Acknowledge we should divide by this
-            }
-
-            g = a.leading_coeff_wrt(var);
-            let g_delta = g.pow(delta as u32);
-            let h_new = if delta == 0 {
-                h.clone()
-            } else if delta == 1 {
-                g.clone()
-            } else {
-                g_delta
-            };
-            h = h_new;
         }
-
-        // The resultant is in b (last non-zero remainder)
-        if sign < 0 { a.neg() } else { a }
+        for i in 0..m {
+            for (k, c) in qb.iter().enumerate() {
+                mat[n + i][i + k] = c.clone();
+            }
+        }
+        Polynomial::poly_matrix_determinant(mat)
     }
 
-    /// Discriminant of a polynomial with respect to a variable.
-    /// discriminant(p) = resultant(p, dp/dx) / lc(p)
+    /// Determinant of a square matrix of polynomials, by Laplace cofactor
+    /// expansion along the sparsest row (`+ - *` only — exact, no division).
+    /// Zero cofactors are skipped, so the banded Sylvester matrices expand
+    /// efficiently in practice.
+    fn poly_matrix_determinant(mat: Vec<Vec<Polynomial>>) -> Polynomial {
+        let n = mat.len();
+        match n {
+            0 => Polynomial::one(),
+            1 => mat[0][0].clone(),
+            2 => &Polynomial::mul(&mat[0][0], &mat[1][1]) - &Polynomial::mul(&mat[0][1], &mat[1][0]),
+            _ => {
+                let row = (0..n)
+                    .max_by_key(|&i| mat[i].iter().filter(|c| c.is_zero()).count())
+                    .unwrap_or(0);
+                let mut acc = Polynomial::zero();
+                for j in 0..n {
+                    if mat[row][j].is_zero() {
+                        continue;
+                    }
+                    let minor = Polynomial::poly_matrix_minor(&mat, row, j);
+                    let cof = Polynomial::mul(&mat[row][j], &Polynomial::poly_matrix_determinant(minor));
+                    if (row + j) % 2 == 0 {
+                        acc = &acc + &cof;
+                    } else {
+                        acc = &acc - &cof;
+                    }
+                }
+                acc
+            }
+        }
+    }
+
+    /// The minor obtained by deleting `skip_row` and `skip_col`.
+    fn poly_matrix_minor(
+        mat: &[Vec<Polynomial>],
+        skip_row: usize,
+        skip_col: usize,
+    ) -> Vec<Vec<Polynomial>> {
+        mat.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip_row)
+            .map(|(_, r)| {
+                r.iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != skip_col)
+                    .map(|(_, c)| c.clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Discriminant factor of a polynomial with respect to a variable:
+    /// `resultant(p, dp/dvar)` (= `lc(p) · disc(p)`, up to sign), which vanishes
+    /// on the double-root locus (and where the leading coefficient vanishes).
     pub fn discriminant(&self, var: Var) -> Polynomial {
         let deriv = self.derivative(var);
         self.resultant(&deriv, var)
