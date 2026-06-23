@@ -23,13 +23,13 @@ use crate::prelude::*;
 use crate::theory::{Theory, TheoryId, TheoryResult};
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::ToPrimitive;
+use num_traits::{ToPrimitive, Zero};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::error::Result;
 use oxiz_math::polynomial::Polynomial;
 use oxiz_nlsat::discriminant::{AtomCmp, quadratic_atom_is_unsat, quadratic_form_is_unsat};
 use oxiz_nlsat::nia::{NiaConfig, NiaSolver, VarType};
-use oxiz_nlsat::solver::{NlsatSolver, SolverResult};
+use oxiz_nlsat::solver::{Model, NlsatSolver, SolverResult};
 use oxiz_nlsat::types::AtomKind;
 use std::collections::HashMap;
 
@@ -389,6 +389,52 @@ fn definite_sign_unsat(poly_atoms: &[PolyAtom]) -> bool {
     })
 }
 
+/// Evaluate `poly` at a model's rational assignment, mirroring
+/// [`Polynomial::eval`] but returning `None` (instead of panicking) when any
+/// variable of `poly` is UNASSIGNED in the model — an incomplete model that the
+/// caller must NOT trust.
+fn eval_poly_at_model(poly: &Polynomial, model: &Model) -> Option<BigRational> {
+    let mut acc = BigRational::zero();
+    for term in poly.terms() {
+        let mut v = term.coeff.clone();
+        for vp in term.monomial.vars() {
+            let val = model.arith_value(vp.var)?;
+            v *= val.pow(vp.power as i32);
+        }
+        acc += v;
+    }
+    Some(acc)
+}
+
+/// Does `model` actually satisfy EVERY retained atom? A SAT verdict from the core
+/// nlsat/nia solver is only trustworthy when its returned model genuinely makes
+/// each atom literal true — the core is known to over-report `Sat` on some
+/// multivariate strict-inequality / integer-infeasible shapes (e.g. it hands back
+/// a boundary point that violates a strict `<`/`>`, or a non-integer relaxation).
+/// This re-checks the model EXACTLY over the rationals; an incomplete model (a
+/// poly var unassigned), or an algebraic value only present as a rational
+/// APPROXIMATION (`arith_values` holds the interval midpoint — so an `Eq` may not
+/// hold exactly) conservatively fails the check → the caller downgrades the `Sat`
+/// to `None` (Unknown). This NEVER turns a `Sat` into `Unsat`, so it cannot
+/// introduce a false `unsat`; it only refuses to vouch for an unverified model.
+fn model_satisfies_atoms(model: &Model, atoms: &[PolyAtom]) -> bool {
+    atoms.iter().all(|atom| {
+        let Some(val) = eval_poly_at_model(&atom.poly, model) else {
+            return false;
+        };
+        let zero = BigRational::zero();
+        let holds = match atom.kind {
+            AtomKind::Eq => val == zero,
+            AtomKind::Lt => val < zero,
+            AtomKind::Gt => val > zero,
+            // Root atoms (RootEq/RootLt/RootGt) are not produced by the
+            // extractors and not modeled here — refuse to vouch.
+            _ => return false,
+        };
+        if atom.positive { holds } else { !holds }
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // NIA dispatch: public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -464,7 +510,17 @@ pub fn dispatch_nia_constraints(
 
     match translator.nlsat.solve() {
         SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
-        SolverResult::Sat if sat_is_trustworthy => Some(NlDispatchResult::Sat),
+        // Trust `Sat` only when the returned model genuinely satisfies every atom
+        // (the NIA branch-and-bound over-reports `Sat` on integer-infeasible
+        // shapes like `x²=3`). Unverified / incomplete model → `None` (Unknown).
+        SolverResult::Sat if sat_is_trustworthy => {
+            match translator.nlsat.nlsat().get_model() {
+                Some(m) if model_satisfies_atoms(&m, &poly_atoms) => {
+                    Some(NlDispatchResult::Sat)
+                }
+                _ => None,
+            }
+        }
         SolverResult::Sat | SolverResult::Unsat | SolverResult::Unknown => None,
     }
 }
@@ -683,7 +739,18 @@ pub fn dispatch_nra_constraints(
 
     match translator.nlsat.solve() {
         SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
-        SolverResult::Sat if sat_is_trustworthy => Some(NlDispatchResult::Sat),
+        // Trust `Sat` only when the returned model genuinely satisfies every atom
+        // (the core real nlsat over-reports `Sat` on some multivariate strict
+        // inequalities — e.g. a boundary point that violates a strict `<`/`>`).
+        // Unverified / incomplete model → `None` (Unknown).
+        SolverResult::Sat if sat_is_trustworthy => {
+            match translator.nlsat.get_model() {
+                Some(m) if model_satisfies_atoms(&m, &poly_atoms) => {
+                    Some(NlDispatchResult::Sat)
+                }
+                _ => None,
+            }
+        }
         SolverResult::Sat | SolverResult::Unsat | SolverResult::Unknown => None,
     }
 }
@@ -1212,6 +1279,46 @@ mod tests {
             dispatch_nra_constraints(&[lt], &m),
             Some(NlDispatchResult::Unsat),
             "x*y < 0 is satisfiable — must not be a false unsat"
+        );
+    }
+
+    #[test]
+    fn nia_integer_infeasible_square_not_false_sat() {
+        // SOUNDNESS (Sat-model backstop): `x*x = 3` over the integers is UNSAT (3
+        // is not a perfect square), but the NIA branch-and-bound over-reports
+        // `Sat`. The model-verification backstop re-checks the returned model and,
+        // finding it does not satisfy `x²=3` exactly, downgrades the `Sat` to
+        // `None` (Unknown) — never `Some(Sat)`.
+        let mut m = TermManager::new();
+        let int_sort = m.sorts.int_sort;
+        let x = m.mk_var("x", int_sort);
+        let xx = m.mk_mul(vec![x, x]);
+        let three = m.mk_int(3);
+        let eq = m.mk_eq(xx, three);
+        assert_ne!(
+            dispatch_nia_constraints(&[eq], &m, true),
+            Some(NlDispatchResult::Sat),
+            "x*x = 3 over integers is unsatisfiable — the backstop must not trust a \
+             spurious sat (its model does not satisfy x²=3)"
+        );
+    }
+
+    #[test]
+    fn nia_perfect_square_eq_still_sat() {
+        // POSITIVE control: `x*x = 4` IS sat (x=±2); the backstop must NOT
+        // over-block — the returned integer model satisfies `x²=4` exactly.
+        let mut m = TermManager::new();
+        let int_sort = m.sorts.int_sort;
+        let x = m.mk_var("x", int_sort);
+        let xx = m.mk_mul(vec![x, x]);
+        let four = m.mk_int(4);
+        let eq = m.mk_eq(xx, four);
+        // Sat (verified model) or None if the core is inconclusive — but NEVER a
+        // spurious Unsat, and the backstop must not suppress a genuine model.
+        assert_ne!(
+            dispatch_nia_constraints(&[eq], &m, true),
+            Some(NlDispatchResult::Unsat),
+            "x*x = 4 is sat (x=2) — must not be reported unsat"
         );
     }
 

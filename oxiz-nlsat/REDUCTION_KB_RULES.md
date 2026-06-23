@@ -269,7 +269,7 @@ M[j][i] = k/2`); `matrix_is_pd` (Sylvester — all LEADING principal minors `> 0
 `diag(0,−1)` is not PSD); `quadratic_form_definite_sign` + `quadratic_form_is_unsat` reuse
 the same `DefiniteSign` verdict table. Wired into the same `definite_sign_unsat` pre-check
 (`quadratic_atom_is_unsat || quadratic_form_is_unsat`). Determinants are EXACT over
-`BigRational`. The variable count is capped (`MAX_FORM_VARS = 6`) since the PSD test
+`BigRational`. The variable count is capped (`MAX_FORM_VARS = 10`) since the PSD test
 enumerates `2^(n+1)` principal minors; a wider form declines (sound — incomplete). The
 PD/PSD conditions are SUFFICIENT (`M` definite ⟹ `f` definite); a form non-negative only
 on the affine slice while `M` is indefinite is conservatively declined (never a false

@@ -638,9 +638,12 @@ pub enum AtomCmp {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Max number of distinct variables we build a Gram matrix for. The PSD test
-/// enumerates every principal minor (`2^(n+1)` of them), so we cap the dimension
-/// to keep it cheap; a larger form DECLINES (sound — just not decided here).
-const MAX_FORM_VARS: usize = 6;
+/// enumerates every principal minor (`2^(n+1)` of them — `2^11 = 2048` at the
+/// cap), so we bound the dimension to keep it cheap; a wider form DECLINES
+/// (sound — just not decided here). Sum-of-squares goals in real workloads are
+/// small, so 10 covers the common cases while staying well clear of the
+/// `1u32 << dim` shift limit.
+const MAX_FORM_VARS: usize = 10;
 
 /// The symmetric Gram (bordered) matrix of a multivariate quadratic
 /// `f(x) = xᵀ A x + bᵀ x + c`:
@@ -1350,6 +1353,36 @@ mod tests {
         for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
             assert!(!quadratic_form_is_unsat(&lin, op));
             assert!(!quadratic_form_is_unsat(&c, op));
+        }
+    }
+
+    /// Build the `k`-variable sum of squares `x₀² + x₁² + … + x_{k-1}²`.
+    fn sum_of_squares(k: u32) -> Polynomial {
+        let mut p = Polynomial::zero();
+        for v in 0..k {
+            let xv = Polynomial::from_var(v);
+            p = Polynomial::add(&p, &Polynomial::mul(&xv, &xv));
+        }
+        p
+    }
+
+    #[test]
+    fn test_form_high_dim_sum_of_squares_psd() {
+        // Σ x_i² (PSD) up to the MAX_FORM_VARS cap: `< 0` is UNSAT (the sum of
+        // squares is ≥ 0 everywhere). At and below the cap it decides; above it
+        // declines (sound — `MAX_FORM_VARS` bounds the 2^(n+1) minor enumeration).
+        for k in [3u32, 7, MAX_FORM_VARS as u32] {
+            assert!(
+                quadratic_form_is_unsat(&sum_of_squares(k), AtomCmp::Lt),
+                "Σ_{{{k}}} x_i² < 0 must be UNSAT (PSD form)"
+            );
+            // `≤ 0` is satisfiable (all-zero) ⇒ must NOT be unsat.
+            assert!(!quadratic_form_is_unsat(&sum_of_squares(k), AtomCmp::Le));
+        }
+        // Just above the cap: the recogniser declines (no false verdict either way).
+        let over = sum_of_squares(MAX_FORM_VARS as u32 + 1);
+        for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
+            assert!(!quadratic_form_is_unsat(&over, op));
         }
     }
 }
