@@ -486,8 +486,14 @@ pub fn dispatch_nia_constraints(
         return Some(NlDispatchResult::Unsat);
     }
 
+    // SOUNDNESS — like the NRA gate, trust the core's `Unsat` ONLY on the LINEAR
+    // fragment. A z3-differential exposed `NiaSolver` as broadly unsound on
+    // nonlinear `unsat` (58/400 false-`unsat`: `x⁴ > 4`, `3x² ≥ 25`, … decided a
+    // spurious `unsat`). Sound nonlinear `unsat` comes from §G/§G-SOS
+    // (`definite_sign_unsat`, above) and the trichotomy pre-check; integer-specific
+    // unsat (`x² = 3`, not a perfect square) from `check_nonlinear_constraints`.
     let unsat_is_trustworthy =
-        !has_unsupported_ops && poly_atoms.iter().all(|atom| atom.poly.is_univariate());
+        !has_unsupported_ops && poly_atoms.iter().all(|atom| atom.poly.total_degree() <= 1);
     // A `Sat` over the RETAINED atoms is only valid for the original formula when
     // every assertion was fully captured — no connective dropped, no operand
     // untranslatable. Otherwise a dropped constraint could be the one a
@@ -714,18 +720,19 @@ pub fn dispatch_nra_constraints(
         return Some(NlDispatchResult::Unsat);
     }
 
-    // An `Unsat` from the core real `NlsatSolver` is only trustworthy on the
-    // fragment it decides reliably: a single UNIVARIATE atom. It is UNSOUND on
-    // MULTIVARIATE nonlinear atoms — e.g. the satisfiable bilinear strict
-    // inequality `x*y > 5` (sat at x=10, y=½) is decided a spurious `unsat`. So,
-    // exactly like the NIA gate (`is_univariate()`), trust `Unsat` ONLY when every
-    // retained atom is univariate (and non-`Eq`, as before). Definite MULTIVARIATE
-    // forms that ARE genuinely unsat (`x²+y² = −1`, `(x−y)² < 0`, …) are already
-    // decided soundly up-front by §G / §G-SOS (`definite_sign_unsat`), so this
-    // gate's conservatism costs little completeness while closing the hole.
-    let unsat_is_trustworthy = poly_atoms
-        .iter()
-        .all(|atom| atom.kind != AtomKind::Eq && atom.poly.is_univariate());
+    // SOUNDNESS — an `Unsat` from the core real `NlsatSolver` is trustworthy ONLY
+    // when every retained atom is LINEAR. A z3-differential exposed the core as
+    // broadly UNSOUND on nonlinear `unsat` at EVERY degree (single-atom false-
+    // `unsat` rates: deg-2 13%, deg-3 32%, deg-4 16% — e.g. `3x² < 5` ⟺
+    // `x² < 5/3` is decided a spurious `unsat`), and on the bilinear `x*y > 5`.
+    // Only the linear fragment (where the verdict is LRA's) is reliable. The SOUND
+    // nonlinear `unsat` is supplied UP-FRONT, before this gate, by §G/§G-SOS
+    // (`definite_sign_unsat` — univariate-quadratic discriminant + multivariate
+    // PSD form) and by the trichotomy/bound-infeasibility pre-check
+    // (`check_term_bound_infeasible`). A nonlinear `unsat` the core alone would
+    // claim is DISTRUSTED → `None` → the sound `Unknown`/Sat fallback (never a
+    // false `unsat`; the verus-dangerous direction is closed).
+    let unsat_is_trustworthy = poly_atoms.iter().all(|atom| atom.poly.total_degree() <= 1);
     // `Sat` is only valid for the original formula when nothing was dropped (see
     // `extract_poly_atoms`). Otherwise fall back to `None` (Unknown) — never trust
     // a `Sat` over a retained SUBSET of the constraints.

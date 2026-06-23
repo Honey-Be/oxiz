@@ -669,3 +669,72 @@ fn test_term_bound_single_bound_stays_sat() {
         "x*y > 5 is satisfiable — the bound-infeasibility decider must not fire"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0 SOUNDNESS — the core nlsat/nia solvers are UNSOUND on nonlinear `unsat`
+// (a z3-differential exposed ~13–32% false-`unsat` per degree). The
+// `unsat_is_trustworthy` gates now trust the core's `Unsat` ONLY on the LINEAR
+// fragment; sound nonlinear `unsat` comes from §G/§G-SOS + the trichotomy
+// pre-check. These guard against the verus-DANGEROUS false-`unsat` direction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_nra_quadratic_inequality_not_false_unsat() {
+    // 3x² < 5  ⟺  x² < 5/3 — satisfiable (x=0). The core nlsat decided this a
+    // spurious `unsat`; the linear-only gate must not trust it.
+    assert_ne!(
+        nra_verdict("(set-logic QF_NRA)(declare-const x Real)(assert (< (* 3 (* x x)) 5))(check-sat)"),
+        Some("unsat".to_string()),
+        "3x² < 5 is satisfiable — must not be a false unsat"
+    );
+}
+
+#[test]
+fn test_nra_cubic_inequality_not_false_unsat() {
+    // x³ ≥ 3 — satisfiable (x large). Core spurious `unsat`.
+    assert_ne!(
+        nra_verdict("(set-logic QF_NRA)(declare-const x Real)(assert (>= (* x x x) 3))(check-sat)"),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_nra_separable_univariate_not_false_unsat() {
+    // x³ ≥ 3 ∧ −2y > 5 — separable, each satisfiable, different vars ⇒ SAT.
+    // Core decided spurious `unsat` (per-poly-univariate but coupled-conjunction).
+    assert_ne!(
+        nra_verdict(
+            "(set-logic QF_NRA)(declare-const x Real)(declare-const y Real)\
+             (assert (and (>= (* x x x) 3) (> (* -2 y) 5)))(check-sat)"
+        ),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_nia_quartic_inequality_not_false_unsat() {
+    // x⁴ > 4 over integers — satisfiable (x=2 ⇒ 16>4). NiaSolver spurious `unsat`.
+    assert_ne!(
+        nra_verdict("(set-logic QF_NIA)(declare-const x Int)(assert (> (* x x x x) 4))(check-sat)"),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_nia_quadratic_inequality_not_false_unsat() {
+    // 3x² ≥ 25 over integers — satisfiable (x=3 ⇒ 27≥25). NiaSolver spurious `unsat`.
+    assert_ne!(
+        nra_verdict("(set-logic QF_NIA)(declare-const x Int)(assert (>= (* 3 (* x x)) 25))(check-sat)"),
+        Some("unsat".to_string())
+    );
+}
+
+#[test]
+fn test_nra_definite_nonlinear_unsat_still_decided() {
+    // The SOUND nonlinear unsat (§G) must still fire: x² < 0 is UNSAT.
+    assert_eq!(
+        nra_verdict("(set-logic QF_NRA)(declare-const x Real)(assert (< (* x x) 0))(check-sat)"),
+        Some("unsat".to_string()),
+        "x² < 0 is genuinely UNSAT — §G must still decide it"
+    );
+}
