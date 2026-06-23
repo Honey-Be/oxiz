@@ -936,18 +936,104 @@ impl super::Polynomial {
         Polynomial::poly_matrix_determinant(mat)
     }
 
-    /// Determinant of a square matrix of polynomials, by Laplace cofactor
-    /// expansion (`+ - *` only — exact, no division). Expansion proceeds row by
-    /// row with the remaining columns tracked as an index list (no minor
-    /// matrices are rebuilt), and zero entries are skipped — so the *banded*
-    /// Sylvester matrices expand cheaply despite the worst-case factorial bound.
+    /// Determinant of a square matrix of polynomials.
+    ///
+    /// Computed by **fraction-free Bareiss elimination** in `O(n³)` ring
+    /// operations with bounded intermediate growth — replacing the earlier
+    /// Laplace cofactor expansion, whose `O(n!)` path count *and* giant
+    /// intermediate-coefficient blowup made multivariate Sylvester matrices (the
+    /// resultants used by CDCAC's deeper projection levels) intractable (an 8×8
+    /// matrix of degree-8 entries took minutes). The exact cofactor expansion is
+    /// retained as a safety fallback if Bareiss's exact-division invariant ever
+    /// fails (a substrate-arithmetic inconsistency — never expected).
     fn poly_matrix_determinant(mat: Vec<Vec<Polynomial>>) -> Polynomial {
         let n = mat.len();
         if n == 0 {
             return Polynomial::one();
         }
+        if n == 1 {
+            return mat[0][0].clone();
+        }
+        if let Some(det) = Polynomial::bareiss_determinant(mat.clone()) {
+            return det;
+        }
+        // Exact-division invariant violated — fall back to the exact (slow)
+        // cofactor expansion so the result stays correct.
         let cols: Vec<usize> = (0..n).collect();
         Polynomial::poly_det_rec(&mat, 0, &cols)
+    }
+
+    /// Fraction-free Bareiss determinant. Each elimination step
+    /// `M[i][j] ← (M[i][j]·M[k][k] − M[i][k]·M[k][j]) / prev` divides *exactly*
+    /// over the polynomial integral domain (the Bareiss/Sylvester identity), so
+    /// it uses only the reliable basic `Polynomial` arithmetic (`mul`/`sub`) plus
+    /// exact division. A vanishing pivot is handled by row-swapping a nonzero row
+    /// up (with a sign flip); an all-zero column makes the determinant zero.
+    /// Returns `None` if any exact division leaves a remainder (should never
+    /// happen — signals a substrate-arithmetic bug, handled by the caller).
+    fn bareiss_determinant(mut m: Vec<Vec<Polynomial>>) -> Option<Polynomial> {
+        let n = m.len();
+        let mut prev = Polynomial::one();
+        let mut sign_neg = false;
+        for k in 0..n - 1 {
+            if m[k][k].is_zero() {
+                let mut pivot_row = None;
+                for (i, row) in m.iter().enumerate().skip(k + 1) {
+                    if !row[k].is_zero() {
+                        pivot_row = Some(i);
+                        break;
+                    }
+                }
+                match pivot_row {
+                    Some(i) => {
+                        m.swap(k, i);
+                        sign_neg = !sign_neg;
+                    }
+                    None => return Some(Polynomial::zero()), // singular column
+                }
+            }
+            let pivot = m[k][k].clone();
+            for i in (k + 1)..n {
+                for j in (k + 1)..n {
+                    let a = Polynomial::mul(&m[i][j], &pivot);
+                    let b = Polynomial::mul(&m[i][k], &m[k][j]);
+                    let num = a.sub(&b);
+                    m[i][j] = Polynomial::poly_exact_div(&num, &prev)?;
+                }
+                m[i][k] = Polynomial::zero();
+            }
+            prev = pivot;
+        }
+        let det = m[n - 1][n - 1].clone();
+        Some(if sign_neg { det.neg() } else { det })
+    }
+
+    /// Exact division `num / den` over the polynomial ring, assuming `den`
+    /// divides `num` exactly (`den ≠ 0`). Classical leading-term elimination
+    /// under the polynomial's admissible monomial order: at each step the
+    /// remainder's leading term is cancelled by `(LT(rem)/LT(den))·den`, which is
+    /// well-defined because an admissible order guarantees `LT(den) | LT(num)`
+    /// whenever `den | num`. Returns `None` if a leading term is not divisible
+    /// (a nonzero remainder ⇒ `den ∤ num`).
+    fn poly_exact_div(num: &Polynomial, den: &Polynomial) -> Option<Polynomial> {
+        if num.is_zero() {
+            return Some(Polynomial::zero());
+        }
+        let order = num.order;
+        let dlt = den.leading_term()?;
+        let dlt_mono = dlt.monomial.clone();
+        let dlt_coeff = dlt.coeff.clone();
+        let mut rem = num.clone();
+        let mut quo: Vec<Term> = Vec::new();
+        while let Some(rlt) = rem.leading_term() {
+            let qmono = rlt.monomial.div(&dlt_mono)?;
+            let qcoeff = &rlt.coeff / &dlt_coeff;
+            let qterm = Term::new(qcoeff, qmono);
+            let scaled = Polynomial::from_terms([qterm.clone()], order).mul(den);
+            rem = rem.sub(&scaled);
+            quo.push(qterm);
+        }
+        Some(Polynomial::from_terms(quo, order))
     }
 
     /// Determinant of the submatrix on rows `row..` and the columns in `cols`,
@@ -1404,5 +1490,88 @@ impl super::Polynomial {
             })
             .collect();
         Polynomial::from_terms(terms, order)
+    }
+}
+
+#[cfg(test)]
+mod bareiss_tests {
+    use super::*;
+
+    // A tiny deterministic LCG so the cross-check is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_i64(&mut self, lo: i64, hi: i64) -> i64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let span = (hi - lo + 1) as u64;
+            lo + ((self.0 >> 33) % span) as i64
+        }
+    }
+
+    fn poly_eq(a: &Polynomial, b: &Polynomial) -> bool {
+        a.sub(b).is_zero()
+    }
+
+    /// A random square matrix of bivariate polynomials (vars 0,1), each a sum of
+    /// a few low-degree terms with small integer coefficients.
+    fn random_matrix(rng: &mut Lcg, n: usize) -> Vec<Vec<Polynomial>> {
+        (0..n)
+            .map(|_| {
+                (0..n)
+                    .map(|_| {
+                        let nterms = rng.next_i64(1, 3) as usize;
+                        let mut terms = Vec::new();
+                        for _ in 0..nterms {
+                            let c = rng.next_i64(-3, 3);
+                            let e0 = rng.next_i64(0, 2) as u32;
+                            let e1 = rng.next_i64(0, 2) as u32;
+                            terms.push((c, [(0u32, e0), (1u32, e1)]));
+                        }
+                        let refs: Vec<(i64, &[(Var, u32)])> =
+                            terms.iter().map(|(c, m)| (*c, m.as_slice())).collect();
+                        Polynomial::from_coeffs_int(&refs)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bareiss_matches_cofactor_on_random_matrices() {
+        let mut rng = Lcg(0xC0FFEE_1234_5678);
+        for n in 2..=6usize {
+            for _ in 0..40 {
+                let mat = random_matrix(&mut rng, n);
+                let cols: Vec<usize> = (0..n).collect();
+                let cofactor = Polynomial::poly_det_rec(&mat, 0, &cols);
+                let bareiss = Polynomial::bareiss_determinant(mat.clone())
+                    .expect("Bareiss exact division must succeed on a polynomial matrix");
+                assert!(
+                    poly_eq(&cofactor, &bareiss),
+                    "Bareiss ≠ cofactor for a {n}×{n} matrix:\n cofactor = {cofactor}\n bareiss  = {bareiss}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resultant_eliminates_correctly() {
+        // res_x(x^2 - y, x - 2) = (x=2 ⇒ 4 - y); a degree-2/degree-1 Sylvester.
+        let x2_minus_y = Polynomial::from_coeffs_int(&[(1, &[(0, 2)]), (-1, &[(1, 1)])]);
+        let x_minus_2 = Polynomial::from_coeffs_int(&[(1, &[(0, 1)]), (-2, &[])]);
+        let res = x2_minus_y.resultant(&x_minus_2, 0);
+        let expect = Polynomial::from_coeffs_int(&[(4, &[]), (-1, &[(1, 1)])]); // 4 - y
+        assert!(res.sub(&expect).is_zero(), "res = {res}, expected 4 - y");
+    }
+
+    #[test]
+    fn discriminant_of_quadratic() {
+        // disc_x(x^2 + b·x + c) factor = resultant(p, p') = -(b^2 - 4c) up to sign;
+        // check it vanishes exactly on a perfect square (b=2, c=1 ⇒ (x+1)^2).
+        // p = x^2 + 2x + 1.
+        let p = Polynomial::from_coeffs_int(&[(1, &[(0, 2)]), (2, &[(0, 1)]), (1, &[])]);
+        assert!(p.discriminant(0).is_zero(), "disc of a perfect square must be 0");
+        // p = x^2 + 2x - 3 = (x+3)(x-1): distinct roots ⇒ nonzero discriminant.
+        let q = Polynomial::from_coeffs_int(&[(1, &[(0, 2)]), (2, &[(0, 1)]), (-3, &[])]);
+        assert!(!q.discriminant(0).is_zero(), "disc with distinct roots must be nonzero");
     }
 }
