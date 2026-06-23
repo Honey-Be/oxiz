@@ -637,13 +637,12 @@ pub enum AtomCmp {
 // §G-SOS — definite sign of a MULTIVARIATE quadratic form (PSD recogniser)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Max number of distinct variables we build a Gram matrix for. The PSD test
-/// enumerates every principal minor (`2^(n+1)` of them — `2^11 = 2048` at the
-/// cap), so we bound the dimension to keep it cheap; a wider form DECLINES
-/// (sound — just not decided here). Sum-of-squares goals in real workloads are
-/// small, so 10 covers the common cases while staying well clear of the
-/// `1u32 << dim` shift limit.
-const MAX_FORM_VARS: usize = 10;
+/// Max number of distinct variables we build a Gram matrix for. The PSD/PD test
+/// is now an `O(n³)` exact-rational LDLᵀ inertia classifier (no `2^n` blowup), so
+/// the cap is only a cheap recogniser bound, not a soundness/feasibility limit;
+/// a wider form DECLINES (sound — just not decided here). 128 comfortably covers
+/// real sum-of-squares / PSD-form goals.
+const MAX_FORM_VARS: usize = 128;
 
 /// The symmetric Gram (bordered) matrix of a multivariate quadratic
 /// `f(x) = xᵀ A x + bᵀ x + c`:
@@ -723,36 +722,89 @@ pub fn recognize_quadratic_form(poly: &Polynomial) -> Option<QuadraticForm> {
     Some(QuadraticForm { matrix: m })
 }
 
-/// A symmetric `m` is POSITIVE DEFINITE ⟺ ALL its leading principal minors are
-/// strictly positive (Sylvester's criterion — exact over the rationals).
-fn matrix_is_pd(m: &[Vec<BigRational>]) -> bool {
-    let dim = m.len();
-    for k in 1..=dim {
-        let sub: Vec<Vec<BigRational>> = (0..k).map(|r| m[r][0..k].to_vec()).collect();
-        if !gaussian_elimination_det(sub).is_positive() {
-            return false;
-        }
-    }
-    true
+/// The inertia class of a SYMMETRIC matrix over ℚ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inertia {
+    /// Positive definite (all eigenvalues > 0).
+    Pd,
+    /// Positive semidefinite, not definite (eigenvalues ≥ 0, at least one = 0).
+    Psd,
+    /// At least one negative eigenvalue.
+    Indefinite,
 }
 
-/// A symmetric `m` is POSITIVE SEMIDEFINITE ⟺ EVERY principal minor (every index
-/// subset, not just the leading ones) is ≥ 0. Leading-minors-≥0 is NOT sufficient
-/// for PSD (e.g. `diag(0,−1)`), so we enumerate all `2^dim − 1` non-empty subsets.
-/// `dim = n+1 ≤ MAX_FORM_VARS+1`, so this is a small bounded enumeration.
-fn matrix_is_psd(m: &[Vec<BigRational>]) -> bool {
-    let dim = m.len();
-    for mask in 1u32..(1u32 << dim) {
-        let idxs: Vec<usize> = (0..dim).filter(|&b| mask & (1 << b) != 0).collect();
-        let sub: Vec<Vec<BigRational>> = idxs
-            .iter()
-            .map(|&r| idxs.iter().map(|&c| m[r][c].clone()).collect())
-            .collect();
-        if gaussian_elimination_det(sub).is_negative() {
-            return false;
+/// Classify the inertia of a SYMMETRIC matrix exactly over ℚ via symmetric LDLᵀ
+/// (symmetric Gaussian elimination with diagonal pivoting) — `O(n³)`, no `2^n`
+/// blowup, so it lifts the variable cap that the old all-principal-minors PSD
+/// test imposed.
+///
+/// Sylvester's law of inertia: a symmetric (row AND column) permutation
+/// (`m ↦ PᵀmP`) and a symmetric Schur complement (`m ↦ LᵀmL`) are CONGRUENCES,
+/// which preserve the eigenvalue inertia. So the signs of the pivots we encounter
+/// classify `m` exactly: every pivot `> 0` ⇒ `Pd`; a pivot `< 0` ⇒ `Indefinite`;
+/// an exhausted trailing block whose diagonal is all-zero is the zero matrix iff
+/// every off-diagonal also vanishes (a symmetric PSD matrix with a zero diagonal
+/// forces an all-zero row/col — else the `[[0,b],[b,d]]` minor has det `−b² < 0`,
+/// a negative eigenvalue). Bit-exact: `BigRational` throughout, no float.
+fn matrix_inertia(mut a: Vec<Vec<BigRational>>) -> Inertia {
+    let n = a.len();
+    let mut k = 0;
+    while k < n {
+        match (k..n).find(|&i| !a[i][i].is_zero()) {
+            // No non-zero diagonal pivot remains in the trailing block.
+            None => {
+                for i in k..n {
+                    for j in k..n {
+                        if !a[i][j].is_zero() {
+                            // A surviving off-diagonal in an all-zero-diagonal
+                            // symmetric block ⇒ a negative eigenvalue.
+                            return Inertia::Indefinite;
+                        }
+                    }
+                }
+                // Trailing block is the zero matrix ⇒ zero eigenvalues ⇒ PSD.
+                return Inertia::Psd;
+            }
+            Some(p) => {
+                if p != k {
+                    // SYMMETRIC permutation: swap rows p,k AND columns p,k.
+                    a.swap(p, k);
+                    for row in &mut a {
+                        row.swap(p, k);
+                    }
+                }
+                let pivot = a[k][k].clone();
+                if pivot.is_negative() {
+                    return Inertia::Indefinite;
+                }
+                // Symmetric Schur elimination of column/row k below the pivot.
+                for i in (k + 1)..n {
+                    if a[i][k].is_zero() {
+                        continue;
+                    }
+                    let factor = &a[i][k] / &pivot;
+                    for j in k..n {
+                        let d = &factor * &a[k][j];
+                        a[i][j] -= d;
+                    }
+                }
+                k += 1;
+            }
         }
     }
-    true
+    // Every pivot was strictly positive.
+    Inertia::Pd
+}
+
+/// A symmetric `m` is POSITIVE DEFINITE ⟺ its inertia is `Pd` (Sylvester's law).
+fn matrix_is_pd(m: &[Vec<BigRational>]) -> bool {
+    matches!(matrix_inertia(m.to_vec()), Inertia::Pd)
+}
+
+/// A symmetric `m` is POSITIVE SEMIDEFINITE ⟺ it has no negative eigenvalue,
+/// i.e. its inertia is NOT `Indefinite`.
+fn matrix_is_psd(m: &[Vec<BigRational>]) -> bool {
+    !matches!(matrix_inertia(m.to_vec()), Inertia::Indefinite)
 }
 
 /// Classify the definite sign of a quadratic form over ALL of ℝⁿ from its Gram
@@ -1368,10 +1420,12 @@ mod tests {
 
     #[test]
     fn test_form_high_dim_sum_of_squares_psd() {
-        // Σ x_i² (PSD) up to the MAX_FORM_VARS cap: `< 0` is UNSAT (the sum of
-        // squares is ≥ 0 everywhere). At and below the cap it decides; above it
-        // declines (sound — `MAX_FORM_VARS` bounds the 2^(n+1) minor enumeration).
-        for k in [3u32, 7, MAX_FORM_VARS as u32] {
+        // Σ x_i² (PSD): `< 0` is UNSAT (the sum of squares is ≥ 0 everywhere).
+        // The O(n³) LDLᵀ inertia classifier decides this at ANY dimension up to
+        // the cap — including 11 and 20, which the old `2^(n+1)` enumeration (cap
+        // 10) declined → spurious `sat`. At/below the cap it decides; above it
+        // declines (sound — the cap is now only a recogniser-cost bound).
+        for k in [3u32, 7, 11, 20, MAX_FORM_VARS as u32] {
             assert!(
                 quadratic_form_is_unsat(&sum_of_squares(k), AtomCmp::Lt),
                 "Σ_{{{k}}} x_i² < 0 must be UNSAT (PSD form)"
@@ -1384,5 +1438,25 @@ mod tests {
         for op in [AtomCmp::Lt, AtomCmp::Le, AtomCmp::Gt, AtomCmp::Ge, AtomCmp::Eq] {
             assert!(!quadratic_form_is_unsat(&over, op));
         }
+    }
+
+    #[test]
+    fn test_matrix_inertia_classification() {
+        let r = |n: i64| BigRational::from_integer(BigInt::from(n));
+        let m = |rows: &[&[i64]]| -> Vec<Vec<BigRational>> {
+            rows.iter().map(|row| row.iter().map(|&v| r(v)).collect()).collect()
+        };
+        // PD: identity, and a dense PD.
+        assert_eq!(matrix_inertia(m(&[&[1, 0, 0], &[0, 1, 0], &[0, 0, 1]])), Inertia::Pd);
+        assert_eq!(matrix_inertia(m(&[&[2, 1, 1], &[1, 2, 1], &[1, 1, 2]])), Inertia::Pd);
+        // PSD-not-PD: rank-deficient.
+        assert_eq!(matrix_inertia(m(&[&[1, -1], &[-1, 1]])), Inertia::Psd);
+        assert_eq!(matrix_inertia(m(&[&[1, 1], &[1, 1]])), Inertia::Psd); // Schur-zero tail
+        assert_eq!(matrix_inertia(m(&[&[0, 0], &[0, 1]])), Inertia::Psd); // zero pivot first
+        // Indefinite (the traps).
+        assert_eq!(matrix_inertia(m(&[&[0, -1], &[-1, 0]])), Inertia::Indefinite);
+        assert_eq!(matrix_inertia(m(&[&[0, 1], &[1, 0]])), Inertia::Indefinite);
+        assert_eq!(matrix_inertia(m(&[&[1, 0], &[0, -1]])), Inertia::Indefinite); // diag(1,-1)
+        assert_eq!(matrix_inertia(m(&[&[0, 0], &[0, -1]])), Inertia::Indefinite); // diag(0,-1)
     }
 }
