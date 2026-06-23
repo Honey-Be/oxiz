@@ -937,54 +937,42 @@ impl super::Polynomial {
     }
 
     /// Determinant of a square matrix of polynomials, by Laplace cofactor
-    /// expansion along the sparsest row (`+ - *` only — exact, no division).
-    /// Zero cofactors are skipped, so the banded Sylvester matrices expand
-    /// efficiently in practice.
+    /// expansion (`+ - *` only — exact, no division). Expansion proceeds row by
+    /// row with the remaining columns tracked as an index list (no minor
+    /// matrices are rebuilt), and zero entries are skipped — so the *banded*
+    /// Sylvester matrices expand cheaply despite the worst-case factorial bound.
     fn poly_matrix_determinant(mat: Vec<Vec<Polynomial>>) -> Polynomial {
         let n = mat.len();
-        match n {
-            0 => Polynomial::one(),
-            1 => mat[0][0].clone(),
-            2 => &Polynomial::mul(&mat[0][0], &mat[1][1]) - &Polynomial::mul(&mat[0][1], &mat[1][0]),
-            _ => {
-                let row = (0..n)
-                    .max_by_key(|&i| mat[i].iter().filter(|c| c.is_zero()).count())
-                    .unwrap_or(0);
-                let mut acc = Polynomial::zero();
-                for j in 0..n {
-                    if mat[row][j].is_zero() {
-                        continue;
-                    }
-                    let minor = Polynomial::poly_matrix_minor(&mat, row, j);
-                    let cof = Polynomial::mul(&mat[row][j], &Polynomial::poly_matrix_determinant(minor));
-                    if (row + j) % 2 == 0 {
-                        acc = &acc + &cof;
-                    } else {
-                        acc = &acc - &cof;
-                    }
-                }
-                acc
-            }
+        if n == 0 {
+            return Polynomial::one();
         }
+        let cols: Vec<usize> = (0..n).collect();
+        Polynomial::poly_det_rec(&mat, 0, &cols)
     }
 
-    /// The minor obtained by deleting `skip_row` and `skip_col`.
-    fn poly_matrix_minor(
-        mat: &[Vec<Polynomial>],
-        skip_row: usize,
-        skip_col: usize,
-    ) -> Vec<Vec<Polynomial>> {
-        mat.iter()
-            .enumerate()
-            .filter(|(i, _)| *i != skip_row)
-            .map(|(_, r)| {
-                r.iter()
-                    .enumerate()
-                    .filter(|(j, _)| *j != skip_col)
-                    .map(|(_, c)| c.clone())
-                    .collect()
-            })
-            .collect()
+    /// Determinant of the submatrix on rows `row..` and the columns in `cols`,
+    /// by expansion along its first row (`mat[row]`).
+    fn poly_det_rec(mat: &[Vec<Polynomial>], row: usize, cols: &[usize]) -> Polynomial {
+        if cols.len() == 1 {
+            return mat[row][cols[0]].clone();
+        }
+        let mut acc = Polynomial::zero();
+        let mut rest: Vec<usize> = Vec::with_capacity(cols.len() - 1);
+        for (idx, &c) in cols.iter().enumerate() {
+            let entry = &mat[row][c];
+            if entry.is_zero() {
+                continue;
+            }
+            rest.clear();
+            rest.extend(cols.iter().enumerate().filter(|(k, _)| *k != idx).map(|(_, &x)| x));
+            let cof = Polynomial::mul(entry, &Polynomial::poly_det_rec(mat, row + 1, &rest));
+            if idx % 2 == 0 {
+                acc = &acc + &cof;
+            } else {
+                acc = &acc - &cof;
+            }
+        }
+        acc
     }
 
     /// Discriminant factor of a polynomial with respect to a variable:
