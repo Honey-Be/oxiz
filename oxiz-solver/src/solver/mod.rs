@@ -8,6 +8,7 @@ pub(super) mod check_nlsat;
 pub(super) mod check_string;
 pub(super) mod config;
 pub(super) mod encode;
+pub(super) mod fd_propagator;
 pub(super) mod model_builder;
 pub(super) mod theory_manager;
 pub(super) mod trail;

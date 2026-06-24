@@ -11,6 +11,7 @@ categories = ["algorithms"]
 
 [dependencies]
 oxiz-core = { workspace = true, default-features = false }
+oxiz-math = { workspace = true, default-features = false }
 oxiz-mbqi = { workspace = true }
 oxiz-sat = { workspace = true, default-features = false }
 oxiz-theories = { workspace = true, default-features = false }
