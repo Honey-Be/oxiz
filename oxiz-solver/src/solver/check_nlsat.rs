@@ -1680,4 +1680,31 @@ mod tests {
             "bounded x*x=3 has no integer root — the fd_core add-on must decide UNSAT"
         );
     }
+
+    #[test]
+    fn fd_core_addon_zero_absorbing_disequality_unsat() {
+        // `x = 0 ∧ x*x ≠ 0` is UNSAT by the zero-absorbing element (0·_ = 0 in any
+        // ring), but a disequality over a product was historically reported sat
+        // because the negated atom never reached the nonlinear engine. Now the
+        // disequality is surfaced and fd_core's interval evaluation folds the zero
+        // factor (`[0,0]·_ = [0,0]`), deciding UNSAT.
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x", int);
+        let zero = m.mk_int(0);
+        let xeq0 = m.mk_eq(xv, zero); // x = 0
+        let sq = m.mk_mul([xv, xv]);
+        let sq_ne_0 = m.mk_distinct([sq, zero]); // x*x ≠ 0
+        let conj = m.mk_and([xeq0, sq_ne_0]);
+
+        let mut s = Solver::new();
+        s.logic = Some("QF_NIA".to_string());
+        s.assertions = vec![conj];
+        let r = s.dispatch_nl_solver(&mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "x=0 ∧ x²≠0 is UNSAT by the zero-absorbing element"
+        );
+    }
 }

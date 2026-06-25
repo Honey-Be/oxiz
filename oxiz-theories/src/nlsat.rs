@@ -186,18 +186,31 @@ pub fn term_is_nonlinear(term_id: TermId, manager: &TermManager) -> bool {
             }
             args.iter().any(|&a| term_is_nonlinear(a, manager))
         }
-        TermKind::Add(args) | TermKind::And(args) => {
-            args.iter().any(|&a| term_is_nonlinear(a, manager))
-        }
+        TermKind::Add(args)
+        | TermKind::And(args)
+        | TermKind::Or(args)
+        // A `distinct`/`Or` (and a negated comparison, below) can carry a nonlinear
+        // arith atom too — they MUST be recursed so `has_nl` is set, else the
+        // dispatch returns before the (sound) fd_core consult ever sees the atom.
+        // This is what let `x=0 ∧ x²≠0` (= `0≠0` under the absorbing element) reach
+        // CDCL(T) and be wrongly reported sat.
+        | TermKind::Distinct(args) => args.iter().any(|&a| term_is_nonlinear(a, manager)),
         TermKind::Sub(lhs, rhs)
         | TermKind::Eq(lhs, rhs)
         | TermKind::Gt(lhs, rhs)
         | TermKind::Ge(lhs, rhs)
         | TermKind::Lt(lhs, rhs)
-        | TermKind::Le(lhs, rhs) => {
+        | TermKind::Le(lhs, rhs)
+        | TermKind::Implies(lhs, rhs)
+        | TermKind::Xor(lhs, rhs) => {
             term_is_nonlinear(*lhs, manager) || term_is_nonlinear(*rhs, manager)
         }
-        TermKind::Neg(inner) => term_is_nonlinear(*inner, manager),
+        TermKind::Neg(inner) | TermKind::Not(inner) => term_is_nonlinear(*inner, manager),
+        TermKind::Ite(c, t, e) => {
+            term_is_nonlinear(*c, manager)
+                || term_is_nonlinear(*t, manager)
+                || term_is_nonlinear(*e, manager)
+        }
         _ => false,
     }
 }
@@ -352,6 +365,56 @@ fn extract_poly_atoms(
             let mut dropped = false;
             for &arg in args.iter() {
                 dropped |= extract_poly_atoms(arg, manager, translator, out);
+            }
+            dropped
+        }
+        TermKind::Not(inner) => {
+            // A negated arith comparison surfaces as the polarity-FLIPPED atom, so
+            // disequalities `¬(=)` (and negated inequalities) REACH the engine — which
+            // then decides them via its zero-absorbing interval evaluation: a factor
+            // forced to 0 makes the whole product 0, refuting e.g. `x²≠0` under `x=0`
+            // (`0·_ = 0` in any ring). `¬(And/Or/…)` is not a single atom — drop it.
+            let is_cmp = matches!(
+                manager.get(*inner).map(|term| &term.kind),
+                Some(
+                    TermKind::Eq(_, _)
+                        | TermKind::Lt(_, _)
+                        | TermKind::Le(_, _)
+                        | TermKind::Gt(_, _)
+                        | TermKind::Ge(_, _)
+                )
+            );
+            if is_cmp {
+                let before = out.len();
+                let dropped = extract_poly_atoms(*inner, manager, translator, out);
+                for atom in out.iter_mut().skip(before) {
+                    atom.positive = !atom.positive;
+                }
+                dropped
+            } else {
+                true
+            }
+        }
+        TermKind::Distinct(args) => {
+            // `distinct(a₁..aₙ)` = pairwise `aᵢ ≠ aⱼ`; each is a `≠ 0` atom on
+            // `aᵢ − aⱼ` (the shape the simplifier's desugar also produces — handled
+            // here too in case an unsimplified `distinct` reaches the dispatch).
+            let args: Vec<TermId> = args.to_vec();
+            let mut dropped = false;
+            for i in 0..args.len() {
+                for j in (i + 1)..args.len() {
+                    if let (Some(lp), Some(rp)) =
+                        (translator.translate(args[i]), translator.translate(args[j]))
+                    {
+                        out.push(PolyAtom {
+                            poly: Polynomial::sub(&lp, &rp),
+                            kind: AtomKind::Eq,
+                            positive: false, // aᵢ ≠ aⱼ
+                        });
+                    } else {
+                        dropped = true;
+                    }
+                }
             }
             dropped
         }
