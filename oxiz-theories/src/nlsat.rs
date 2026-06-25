@@ -65,6 +65,14 @@ pub struct TermPolyTranslator<'a> {
     nlsat: &'a mut NiaSolver,
     var_cache: HashMap<TermId, u32>,
     integer_mode: bool,
+    /// Set the moment `integer_mode` integerizes a **real-sorted** variable (see
+    /// `get_or_create_var`). Integerizing a real var STRENGTHENS its constraint
+    /// (ℤ ⊂ ℝ), so a verdict over the integerized atoms is unsound for the real
+    /// problem — the `fd_core` add-on declines to trust its `Unsat`/`Sat` when this
+    /// is set. (The legacy `NiaSolver` path was incidentally protected by its
+    /// `total_degree ≤ 1` gate; `fd_core` removes that gate, so it needs this
+    /// explicit guard.)
+    integerized_real: bool,
 }
 
 impl<'a> TermPolyTranslator<'a> {
@@ -75,7 +83,15 @@ impl<'a> TermPolyTranslator<'a> {
             nlsat,
             var_cache: HashMap::new(),
             integer_mode,
+            integerized_real: false,
         }
+    }
+
+    /// Whether a real-sorted variable was integerized during translation (the
+    /// `fd_core` add-on must not trust its verdict if so).
+    #[must_use]
+    pub fn integerized_real(&self) -> bool {
+        self.integerized_real
     }
 
     /// Translate a term into a `Polynomial`.
@@ -136,6 +152,11 @@ impl<'a> TermPolyTranslator<'a> {
         let v = self.nlsat.nlsat_mut().new_arith_var();
         if self.integer_mode {
             self.nlsat.set_var_type(v, VarType::Integer);
+            // Flag the unsound case: integerizing a genuinely real-sorted variable
+            // (the fd_core add-on reads this and declines to trust its verdict).
+            if self.manager.get(term_id).map(|t| t.sort) == Some(self.manager.sorts.real_sort) {
+                self.integerized_real = true;
+            }
         }
         self.var_cache.insert(term_id, v);
         v
@@ -538,7 +559,14 @@ pub fn dispatch_nia_constraints(
     //   * `Sat` is trusted ONLY when the conjunction is the WHOLE problem
     //     (`sat_is_trustworthy` ∧ every poly atom mapped to fd) — a dropped
     //     constraint could be the one a subset-model violates.
-    if integer_mode {
+    //
+    // GUARD: skip fd entirely if the translator integerized a real-sorted variable
+    // — those integer atoms are a STRENGTHENING of the real constraints (ℤ ⊂ ℝ), so
+    // neither fd's `Unsat` (the strengthened system can be unsat while the real one
+    // is sat — a false UNSAT) nor its `Sat` would be sound. The legacy path below
+    // is incidentally protected by its `total_degree ≤ 1` trust gate; fd has none,
+    // so it needs this explicit check. (Found by an adversarial soundness review.)
+    if integer_mode && !translator.integerized_real() {
         let mut fd_atoms = Vec::with_capacity(poly_atoms.len());
         let mut fd_all_mapped = true;
         for atom in &poly_atoms {
@@ -959,6 +987,40 @@ mod tests {
 
     fn rat(n: i64) -> BigRational {
         BigRational::from_integer(n.into())
+    }
+
+    #[test]
+    fn fd_addon_skips_when_real_var_integerized() {
+        // `x*x = 4 ∧ 0 ≤ x ≤ 3 ∧ 1 < y < 2` with x:Int, y:Real is SAT (x=2, y=1.5).
+        // Translating with integer_mode=true integerizes the real var y, so the
+        // integer view `1 < y < 2` is empty — fd_core would refute the strengthened
+        // system, a FALSE UNSAT. The `integerized_real` guard must make the fd
+        // consult DECLINE (returning `None`/Unknown here), never a false `Unsat`.
+        // (Regression for the adversarial-review finding; without the guard this
+        // returns `Some(Unsat)`.)
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let real = m.sorts.real_sort;
+        let x = m.mk_var("x", int);
+        let y = m.mk_var("y", real);
+        let sq = m.mk_mul([x, x]);
+        let four = m.mk_int(4);
+        let eq = m.mk_eq(sq, four); // x*x = 4
+        let zero = m.mk_int(0);
+        let three = m.mk_int(3);
+        let xlo = m.mk_ge(x, zero);
+        let xhi = m.mk_le(x, three);
+        let one = m.mk_real(num_rational::Rational64::from_integer(1));
+        let two = m.mk_real(num_rational::Rational64::from_integer(2));
+        let ylo = m.mk_gt(y, one); // 1 < y
+        let yhi = m.mk_lt(y, two); // y < 2
+
+        let r = dispatch_nia_constraints(&[eq, xlo, xhi, ylo, yhi], &m, true);
+        assert_ne!(
+            r,
+            Some(NlDispatchResult::Unsat),
+            "integerizing a real var must NOT yield a false UNSAT (the fd guard must decline)"
+        );
     }
 
     // ── Theory trait tests ────────────────────────────────────────────────────
