@@ -10,7 +10,26 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
+use num_bigint::BigInt;
+use num_traits::Zero;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
+
+/// The value of `t` if it is an integer constant.
+fn arith_int_const(manager: &TermManager, t: TermId) -> Option<BigInt> {
+    match manager.get(t).map(|x| x.kind.clone()) {
+        Some(TermKind::IntConst(n)) => Some(n),
+        _ => None,
+    }
+}
+
+/// Whether `t` is the arithmetic constant zero (Int or Real).
+fn arith_is_zero(manager: &TermManager, t: TermId) -> bool {
+    match manager.get(t).map(|x| x.kind.clone()) {
+        Some(TermKind::IntConst(n)) => n.is_zero(),
+        Some(TermKind::RealConst(r)) => r.is_zero(),
+        _ => false,
+    }
+}
 
 /// Simplification statistics
 #[derive(Debug, Clone, Default)]
@@ -446,6 +465,147 @@ impl Simplifier {
                 } else {
                     manager.mk_eq(lhs_simplified, rhs_simplified)
                 }
+            }
+
+            TermKind::Mul(args) => {
+                // Constant-fold products. The load-bearing rule is `0 · _ = 0`: it
+                // folds e.g. `(* 0 x x)` to `0` so a disequality `(distinct (* 0 x x)
+                // 0)` = `0 ≠ 0` is decided UNSAT instead of the spurious sat (the
+                // nonlinear `≠` path never evaluated the zero product). Integer
+                // constant factors are also COMBINED (partial fold), so a residual
+                // constant part can cancel elsewhere. Sound throughout.
+                let orig: Vec<TermId> = args.to_vec();
+                let simp: Vec<TermId> = orig.iter().map(|&a| self.simplify(a, manager)).collect();
+                if simp.iter().copied().any(|a| arith_is_zero(manager, a)) {
+                    self.stats.contradictions_found += 1;
+                    return if t.sort == manager.sorts.real_sort {
+                        manager.mk_real(num_rational::Rational64::from_integer(0))
+                    } else {
+                        manager.mk_int(0)
+                    };
+                }
+                if t.sort == manager.sorts.int_sort {
+                    let mut prod = BigInt::from(1);
+                    let mut rest: Vec<TermId> = Vec::new();
+                    for &a in &simp {
+                        match arith_int_const(manager, a) {
+                            Some(n) => prod *= n,
+                            None => rest.push(a),
+                        }
+                    }
+                    if rest.is_empty() {
+                        return manager.mk_int(prod);
+                    }
+                    if prod == BigInt::from(1) {
+                        return if rest.len() == 1 { rest[0] } else { manager.mk_mul(rest) };
+                    }
+                    let mut all = Vec::with_capacity(rest.len() + 1);
+                    all.push(manager.mk_int(prod));
+                    all.extend(rest);
+                    return manager.mk_mul(all);
+                }
+                if simp == orig {
+                    term
+                } else {
+                    manager.mk_mul(simp)
+                }
+            }
+
+            TermKind::Add(args) => {
+                // Recurse into addends (so nested `0·_` products fold) + COMBINE
+                // integer constant addends (partial fold). Without recursion an
+                // unhandled `Add` hides nested folds (`(+ (* 0 x) 0 (* 0 x y))` would
+                // never reach `0`); without constant-combining, `(+ 2 (- 2) p)` keeps a
+                // dangling `2 + -2` that a disequality cannot cancel. Sound.
+                let orig: Vec<TermId> = args.to_vec();
+                let simp: Vec<TermId> = orig.iter().map(|&a| self.simplify(a, manager)).collect();
+                if t.sort == manager.sorts.int_sort {
+                    let mut sum = BigInt::from(0);
+                    let mut rest: Vec<TermId> = Vec::new();
+                    for &a in &simp {
+                        match arith_int_const(manager, a) {
+                            Some(n) => sum += n,
+                            None => rest.push(a),
+                        }
+                    }
+                    if rest.is_empty() {
+                        return manager.mk_int(sum);
+                    }
+                    if sum.is_zero() {
+                        return if rest.len() == 1 { rest[0] } else { manager.mk_add(rest) };
+                    }
+                    let mut all = Vec::with_capacity(rest.len() + 1);
+                    all.push(manager.mk_int(sum));
+                    all.extend(rest);
+                    return manager.mk_add(all);
+                }
+                let kept: Vec<TermId> =
+                    simp.iter().copied().filter(|&a| !arith_is_zero(manager, a)).collect();
+                if kept.is_empty() {
+                    return manager.mk_real(num_rational::Rational64::from_integer(0));
+                }
+                if kept.len() == 1 {
+                    return kept[0];
+                }
+                if kept == orig {
+                    term
+                } else {
+                    manager.mk_add(kept)
+                }
+            }
+
+            TermKind::Sub(a, b) => {
+                let sa = self.simplify(*a, manager);
+                let sb = self.simplify(*b, manager);
+                if let (Some(na), Some(nb)) =
+                    (arith_int_const(manager, sa), arith_int_const(manager, sb))
+                {
+                    return manager.mk_int(na - nb);
+                }
+                if arith_is_zero(manager, sb) {
+                    return sa; // a - 0 = a
+                }
+                if sa == *a && sb == *b {
+                    term
+                } else {
+                    manager.mk_sub(sa, sb)
+                }
+            }
+
+            TermKind::Neg(a) => {
+                let sa = self.simplify(*a, manager);
+                if let Some(n) = arith_int_const(manager, sa) {
+                    return manager.mk_int(-n);
+                }
+                if sa == *a {
+                    term
+                } else {
+                    manager.mk_neg(sa)
+                }
+            }
+
+            TermKind::Distinct(args) => {
+                // `distinct(a₁..aₙ) ≡ ⋀_{i<j} ¬(aᵢ = aⱼ)`. Desugar to the DEFINITIONAL
+                // pairwise-`(not (= ..))` form so it gets the SAME (correct) handling
+                // as an explicit `(not (= ..))`, rather than the bespoke
+                // result-variable encoding (`encode.rs`), which missed arith-equal
+                // but non-SYNTACTICALLY-equal terms — e.g. `(distinct (* 0 x) 0)` is
+                // `0 ≠ 0` (UNSAT) yet was reported sat. For uninterpreted sorts the
+                // pairwise `¬(=)` is exactly the EUF disequality, so SAT cases (e.g.
+                // `(distinct x y)`) are unchanged.
+                let args: Vec<TermId> = args.to_vec();
+                if args.len() <= 1 {
+                    return manager.mk_true(); // distinct of ≤1 term is trivially true
+                }
+                let mut conj = Vec::with_capacity(args.len() * (args.len() - 1) / 2);
+                for i in 0..args.len() {
+                    for j in (i + 1)..args.len() {
+                        let eq = manager.mk_eq(args[i], args[j]);
+                        conj.push(manager.mk_not(eq));
+                    }
+                }
+                let and = manager.mk_and(conj);
+                self.simplify(and, manager)
             }
 
             // For other term kinds, just return the original
@@ -888,6 +1048,42 @@ mod tests {
             manager.get(result).expect("key should exist in map").kind,
             TermKind::False
         ));
+    }
+
+    #[test]
+    fn test_simplify_arith_fold_and_distinct() {
+        // Regression for the constant-folding FALSE_SAT: `distinct`/arith atoms that
+        // fold to a constant (in)equality must be decided, not left for a theory path
+        // that missed them (e.g. `(distinct (* 0 x) 0)` was reported sat).
+        let mut manager = TermManager::new();
+        let mut simplifier = Simplifier::new();
+        let int = manager.sorts.int_sort;
+        let x = manager.mk_var("x", int);
+        let zero = manager.mk_int(0);
+        let f = manager.mk_false();
+
+        // 0 · _ = 0, including the NONLINEAR product `(* 0 x x)`.
+        let m = manager.mk_mul([zero, x]);
+        assert_eq!(simplifier.simplify(m, &mut manager), zero, "(* 0 x) => 0");
+        let m = manager.mk_mul([zero, x, x]);
+        assert_eq!(simplifier.simplify(m, &mut manager), zero, "(* 0 x x) => 0");
+
+        // Constant addends combine: (+ 2 (- 2) x) => x.
+        let two = manager.mk_int(2);
+        let neg2 = manager.mk_neg(two);
+        let a = manager.mk_add([two, neg2, x]);
+        assert_eq!(simplifier.simplify(a, &mut manager), x, "(+ 2 (- 2) x) => x");
+
+        // The bug case: `(distinct (* 0 x) 0)` = `0 ≠ 0` => false.
+        let m0 = manager.mk_mul([zero, x]);
+        let d = manager.mk_distinct([m0, zero]);
+        assert_eq!(simplifier.simplify(d, &mut manager), f, "(distinct (* 0 x) 0) => false");
+
+        // ...but a genuine disequality stays satisfiable (desugars to `(not (= x 0))`,
+        // NOT false) — no regression on the SAT direction.
+        let d = manager.mk_distinct([x, zero]);
+        let r = simplifier.simplify(d, &mut manager);
+        assert_ne!(r, f, "(distinct x 0) must not fold to false");
     }
 
     #[test]
