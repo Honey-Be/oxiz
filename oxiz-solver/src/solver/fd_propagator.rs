@@ -38,7 +38,7 @@
 use smallvec::SmallVec;
 
 use oxiz_math::polynomial::Polynomial;
-use oxiz_sat::{Lit, TheoryHooks, TheoryStep, Var};
+use oxiz_sat::{Lit, TheoryHooks, TheoryReason, TheoryStep, Var};
 use oxiz_theories::fd_core::{self, FdCmp, FdDecision};
 
 /// The theory's completeness verdict for the caller's `Open ⇒ Unknown` downgrade.
@@ -65,6 +65,9 @@ pub struct FdPropagator {
     atoms: Vec<(Polynomial, FdCmp)>,
     /// Boolean atom `Var` → index into `atoms`.
     var_to_atom: rustc_hash::FxHashMap<Var, usize>,
+    /// Index into `atoms` → its Boolean `Var` (the inverse of `var_to_atom`, for
+    /// building propagations).
+    atom_vars: Vec<Var>,
     /// Currently-asserted `(lit, atom index, polarity)`, in trail order.
     asserted: Vec<(Lit, usize, bool)>,
     /// `asserted.len()` checkpoints, one per live decision level (scoped rollback).
@@ -79,14 +82,17 @@ impl FdPropagator {
     #[must_use]
     pub fn new(atoms: Vec<(Polynomial, FdCmp, Var)>) -> Self {
         let mut polys = Vec::with_capacity(atoms.len());
+        let mut atom_vars = Vec::with_capacity(atoms.len());
         let mut var_to_atom = rustc_hash::FxHashMap::default();
         for (poly, cmp, var) in atoms {
             var_to_atom.insert(var, polys.len());
             polys.push((poly, cmp));
+            atom_vars.push(var);
         }
         FdPropagator {
             atoms: polys,
             var_to_atom,
+            atom_vars,
             asserted: Vec::new(),
             frame_marks: Vec::new(),
             verdict: FdVerdict::Trivial,
@@ -150,8 +156,34 @@ impl TheoryHooks for FdPropagator {
     fn final_check(&mut self) -> TheoryStep {
         // CHEAP per-fixpoint check: linear bound-propagation + interval conflict.
         let active = self.active_atoms();
+        if active.is_empty() {
+            return TheoryStep::Ok;
+        }
         if fd_core::cheap_refute(&active) {
             return TheoryStep::Conflict { explanation: self.explanation() };
+        }
+        // Theory PROPAGATION: emit a literal the asserted atoms FORCE, among the
+        // not-yet-asserted atoms — sound by the keystone
+        // `box_forced_lit_is_valid_propagation` (the literal holds on the whole box,
+        // which over-approximates the asserted feasible set). Prunes the SAT search
+        // exactly as the legacy eager theory path does.
+        let asserted_idx: rustc_hash::FxHashSet<usize> =
+            self.asserted.iter().map(|&(_, idx, _)| idx).collect();
+        let cand: Vec<(usize, (Polynomial, FdCmp))> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !asserted_idx.contains(i))
+            .map(|(i, (p, o))| (i, (p.clone(), *o)))
+            .collect();
+        if !cand.is_empty() {
+            let cand_atoms: Vec<(Polynomial, FdCmp)> = cand.iter().map(|(_, a)| a.clone()).collect();
+            if let Some(&(ci, truth)) = fd_core::forced_literals(&active, &cand_atoms).first() {
+                let var = self.atom_vars[cand[ci].0];
+                let lit = if truth { Lit::pos(var) } else { Lit::neg(var) };
+                let reason = TheoryReason { asserting: lit, explanation: self.explanation() };
+                return TheoryStep::Propagate { lit, reason };
+            }
         }
         TheoryStep::Ok
     }
@@ -262,5 +294,49 @@ mod tests {
         ]);
         let (result, _theory) = solver.solve_with_hooks(theory);
         assert_eq!(result, SolverResult::Unsat, "¬(x≤0) ∧ x<1 has no integer");
+    }
+
+    #[test]
+    fn fd_propagates_forced_true_literal() {
+        // a0 = (x - 5 ≥ 0)  [x≥5];  a1 = (x - 3 ≥ 0)  [x≥3]. Asserting a0 FORCES a1
+        // true ⇒ final_check must Propagate a1=true (sound by the keystone).
+        let mut solver = Solver::new();
+        let a0 = solver.new_var();
+        let a1 = solver.new_var();
+        let mut theory = FdPropagator::new(vec![
+            (poly(&[(1, &[(0, 1)]), (-5, &[])]), FdCmp::Ge, a0),
+            (poly(&[(1, &[(0, 1)]), (-3, &[])]), FdCmp::Ge, a1),
+        ]);
+        let _ = theory.assign_hook(Lit::pos(a0), 0); // trail asserts x≥5
+        match theory.final_check() {
+            TheoryStep::Propagate { lit, reason } => {
+                assert_eq!(lit, Lit::pos(a1), "x≥5 forces x≥3 true");
+                assert_eq!(reason.asserting, lit, "§4.3: reason.asserting == lit");
+            }
+            TheoryStep::Conflict { .. } => panic!("expected Propagate, got Conflict"),
+            TheoryStep::Ok => panic!("expected Propagate of a1, got Ok"),
+        }
+    }
+
+    #[test]
+    fn fd_propagates_forced_false_literal() {
+        // a0 = (x ≤ 2) via ¬(x-2 > 0) is awkward; use a0 = (x - 0 ≤ 0) i.e. x ≤ 0
+        // asserted true [x≤0]; a1 = (x - 3 ≥ 0) [x≥3]. x≤0 FORCES a1 FALSE ⇒
+        // Propagate a1=false.
+        let mut solver = Solver::new();
+        let a0 = solver.new_var();
+        let a1 = solver.new_var();
+        let mut theory = FdPropagator::new(vec![
+            (poly(&[(1, &[(0, 1)])]), FdCmp::Le, a0), // x ≤ 0
+            (poly(&[(1, &[(0, 1)]), (-3, &[])]), FdCmp::Ge, a1), // x ≥ 3
+        ]);
+        let _ = theory.assign_hook(Lit::pos(a0), 0); // trail asserts x≤0
+        match theory.final_check() {
+            TheoryStep::Propagate { lit, .. } => {
+                assert_eq!(lit, Lit::neg(a1), "x≤0 forces x≥3 false");
+            }
+            TheoryStep::Conflict { .. } => panic!("expected Propagate, got Conflict"),
+            TheoryStep::Ok => panic!("expected Propagate of ¬a1, got Ok"),
+        }
     }
 }

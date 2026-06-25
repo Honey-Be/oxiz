@@ -173,26 +173,74 @@ fn riv_add(a: &RatIv, b: &RatIv) -> RatIv {
     RatIv { lo, hi }
 }
 
-/// Sound interval multiplication, handling ±∞ conservatively.
+/// An extended-real interval endpoint (`±∞` first-class) for sound interval
+/// multiplication across unbounded domains.
+#[derive(Clone)]
+enum Ext {
+    NegInf,
+    Fin(BigRational),
+    PosInf,
+}
+
+fn ext_sign(e: &Ext) -> i32 {
+    match e {
+        Ext::NegInf => -1,
+        Ext::PosInf => 1,
+        Ext::Fin(r) => sign_of(r),
+    }
+}
+
+/// Extended-real product. `0 · ∞` is taken as `0` — sound for the corner-product
+/// min/max method (the other corners carry any genuine `±∞`).
+fn ext_mul(x: &Ext, y: &Ext) -> Ext {
+    match (x, y) {
+        (Ext::Fin(a), Ext::Fin(b)) => Ext::Fin(a * b),
+        _ => match ext_sign(x) * ext_sign(y) {
+            s if s > 0 => Ext::PosInf,
+            s if s < 0 => Ext::NegInf,
+            _ => Ext::Fin(BigRational::zero()),
+        },
+    }
+}
+
+fn ext_lt(a: &Ext, b: &Ext) -> bool {
+    match (a, b) {
+        (Ext::NegInf, Ext::NegInf) | (Ext::PosInf, Ext::PosInf) => false,
+        (Ext::NegInf, _) | (_, Ext::PosInf) => true,
+        (_, Ext::NegInf) | (Ext::PosInf, _) => false,
+        (Ext::Fin(x), Ext::Fin(y)) => x < y,
+    }
+}
+
+/// **Sound** interval multiplication with proper `±∞` handling (the four extended
+/// corner products, then min/max). Tighter than a blanket "unbounded ⇒ ⊤" bailout —
+/// e.g. `[1,1] · [5,∞) = [5,∞)` instead of `(−∞,∞)` — which is what lets the
+/// propagation forced-literal check (and conflict detection) see half-unbounded
+/// domains. Remains a sound OVER-approximation.
 fn riv_mul(a: &RatIv, b: &RatIv) -> RatIv {
-    let (Some(al), Some(ah), Some(bl), Some(bh)) = (&a.lo, &a.hi, &b.lo, &b.hi) else {
-        if is_zero_iv(a) || is_zero_iv(b) {
-            return RatIv::point(BigRational::zero());
+    if is_zero_iv(a) || is_zero_iv(b) {
+        return RatIv::point(BigRational::zero());
+    }
+    let al = a.lo.as_ref().map_or(Ext::NegInf, |r| Ext::Fin(r.clone()));
+    let ah = a.hi.as_ref().map_or(Ext::PosInf, |r| Ext::Fin(r.clone()));
+    let bl = b.lo.as_ref().map_or(Ext::NegInf, |r| Ext::Fin(r.clone()));
+    let bh = b.hi.as_ref().map_or(Ext::PosInf, |r| Ext::Fin(r.clone()));
+    let corners = [ext_mul(&al, &bl), ext_mul(&al, &bh), ext_mul(&ah, &bl), ext_mul(&ah, &bh)];
+    let mut lo = corners[0].clone();
+    let mut hi = corners[0].clone();
+    for c in &corners[1..] {
+        if ext_lt(c, &lo) {
+            lo = c.clone();
         }
-        return RatIv::full();
-    };
-    let prods = [al * bl, al * bh, ah * bl, ah * bh];
-    let mut lo = prods[0].clone();
-    let mut hi = prods[0].clone();
-    for p in &prods[1..] {
-        if *p < lo {
-            lo = p.clone();
-        }
-        if *p > hi {
-            hi = p.clone();
+        if ext_lt(&hi, c) {
+            hi = c.clone();
         }
     }
-    RatIv { lo: Some(lo), hi: Some(hi) }
+    let to_opt = |e: Ext| match e {
+        Ext::Fin(r) => Some(r),
+        _ => None, // ±∞
+    };
+    RatIv { lo: to_opt(lo), hi: to_opt(hi) }
 }
 
 fn is_zero_iv(a: &RatIv) -> bool {
@@ -254,6 +302,99 @@ fn sign_of(r: &BigRational) -> i32 {
     } else {
         1
     }
+}
+
+// ── univariate-root tier (open-tail completeness) ───────────────────────────
+
+/// Cauchy's bound `B ≥ 0`: every real root of the univariate polynomial with
+/// coefficients `coeffs` (low-degree-first) satisfies `|root| < B`. For a constant
+/// (or zero) polynomial there are no roots ⇒ `0` (the sign is constant on all of ℝ).
+/// `B = 1 + maxᵢ |cᵢ / c_d|` over `i < d`, `c_d` the leading (highest-degree
+/// nonzero) coefficient — the standard bound, sound by construction.
+fn cauchy_bound(coeffs: &[BigRational]) -> BigRational {
+    let mut deg = None;
+    for (i, c) in coeffs.iter().enumerate() {
+        if !c.is_zero() {
+            deg = Some(i);
+        }
+    }
+    let Some(d) = deg else { return BigRational::zero() }; // zero polynomial
+    if d == 0 {
+        return BigRational::zero(); // constant ⇒ no roots
+    }
+    let cd = coeffs[d].abs();
+    let mut maxr = BigRational::zero();
+    for c in &coeffs[..d] {
+        let r = c.abs() / &cd;
+        if r > maxr {
+            maxr = r;
+        }
+    }
+    BigRational::one() + maxr
+}
+
+/// Integer feasibility of one univariate atom `(coeffs) ⋈ 0` over `dom`.
+enum UniInt {
+    /// No integer in `dom` satisfies it — a sound conflict.
+    Unsat,
+    /// Some integer satisfies it, or an unbounded feasible tail exists — feasible.
+    SatOrOpen,
+    /// Could not conclude soundly (scan window too large) — treat as open.
+    Open,
+}
+
+/// Decide integer feasibility of a univariate atom over `dom`, EXACTLY where it
+/// can. **Sound on `Unsat`**: returned only when every integer that *could* satisfy
+/// the atom is exhausted — the real-feasible region restricted to `dom` is bounded
+/// (finite `dom`, or the feasible region ends before `dom`'s open side via the
+/// Cauchy bound) and contains no integer. This is the open-tail completeness tier
+/// the bounded branch-and-prune cannot reach. Ported from `oxiz-nl2`'s `fdlcg`.
+fn univ_int_status(coeffs: &[BigRational], op: FdCmp, dom: &IntDom) -> UniInt {
+    let sat_at = |n: &BigInt| -> bool {
+        let x = BigRational::from(n.clone());
+        let mut acc = BigRational::zero();
+        for c in coeffs.iter().rev() {
+            acc = acc * &x + c; // Horner
+        }
+        op.holds_for_sign(sign_of(&acc))
+    };
+    // Beyond ±B every real root is excluded, so the sign — and hence feasibility —
+    // is the constant leading-term behaviour. The only place the sign can vary is
+    // the window [-bi, bi]; `bi` rounds the bound up and adds 1 to enclose it.
+    let b = cauchy_bound(coeffs);
+    let bi = b.ceil().to_integer() + BigInt::one();
+    let lo = dom.lo.clone().unwrap_or_else(|| -bi.clone());
+    let hi = dom.hi.clone().unwrap_or_else(|| bi.clone());
+    let scan_lo = if lo < -bi.clone() { -bi.clone() } else { lo.clone() };
+    let scan_hi = if hi > bi { bi.clone() } else { hi.clone() };
+    match (&scan_hi - &scan_lo).to_i64() {
+        Some(diff) if diff <= MAX_ENUM => {}
+        _ => return UniInt::Open, // window too large to scan soundly
+    }
+    let mut k = scan_lo.clone();
+    while k <= scan_hi {
+        if sat_at(&k) {
+            return UniInt::SatOrOpen;
+        }
+        k += BigInt::one();
+    }
+    // The window has no solution. The only remaining integers of `dom` are those
+    // BEYOND ±bi, where the sign is the constant leading-term behaviour. `dom` may
+    // reach there whether its bound is OPEN (`None`) or merely FINITE-BUT-PAST-`bi`
+    // (e.g. `dom = [2,8]`, `bi = 6` leaves `{7,8}` un-scanned) — in BOTH cases the
+    // representative `±(bi+1)` (which then lies inside `dom`) decides the whole
+    // constant-sign tail. Testing only the `None` case is unsound (it drops the
+    // finite over-`bi` integers — a false UNSAT the differential caught).
+    let neg_bi = -bi.clone();
+    let extends_above = dom.hi.as_ref().is_none_or(|h| *h > bi);
+    let extends_below = dom.lo.as_ref().is_none_or(|l| *l < neg_bi);
+    let tail_above_sat = extends_above && sat_at(&(&bi + BigInt::one()));
+    let tail_below_sat = extends_below && sat_at(&(&neg_bi - BigInt::one()));
+    if tail_above_sat || tail_below_sat {
+        return UniInt::SatOrOpen;
+    }
+    // Bounded everywhere relevant and no integer satisfied ⇒ a genuine conflict.
+    UniInt::Unsat
 }
 
 // ── propagation + search ────────────────────────────────────────────────────
@@ -442,6 +583,22 @@ fn solve(
     if vars.iter().any(|v| box_.get(v).is_some_and(IntDom::is_empty)) {
         return BoxResult::Unsat;
     }
+    // Univariate-at-a-leaf: any atom whose ONLY free var is `v` (all others fixed)
+    // is decided EXACTLY over `v`'s domain — closing open-tail nonlinear univariate
+    // cases the finite branch-and-prune would otherwise leave Open (e.g. `x² > 4`
+    // over an unbounded axis). Sound on Unsat (an atom with no integer solution over
+    // its var's domain makes the whole conjunction unsat).
+    {
+        let fixed = singleton_map(box_);
+        for (poly, op) in atoms {
+            let Some(v) = lone_free_var(poly, &fixed) else { continue };
+            let Some(coeffs) = univ_coeffs_in(poly, v, &fixed) else { continue };
+            let dom = box_.get(&v).cloned().unwrap_or_else(IntDom::full);
+            if matches!(univ_int_status(&coeffs, *op, &dom), UniInt::Unsat) {
+                return BoxResult::Unsat;
+            }
+        }
+    }
     let frees = free_vars(vars, box_);
     if frees.is_empty() {
         let model = singleton_map(box_);
@@ -551,6 +708,43 @@ pub fn cheap_refute(atoms: &[(Polynomial, FdCmp)]) -> bool {
     !propagate(atoms, &mut box_) || atoms.iter().any(|(poly, op)| atom_conflicts(poly, *op, &box_))
 }
 
+/// For each `candidate` atom, whether the `asserted` conjunction FORCES its truth
+/// value over the cheap (propagate-derived) domain box. Returns `(candidate_index,
+/// forced_truth)` for each forced candidate.
+///
+/// **Sound** (the keystone `box_forced_lit_is_valid_propagation`): `propagate`
+/// yields a box that OVER-approximates the feasible set of `asserted` (every
+/// integer solution of `asserted` lies in it). If the candidate's atom holds on the
+/// WHOLE box (its negation is interval-refuted everywhere), it holds on every
+/// feasible point ⇒ `asserted` entails it (force TRUE); symmetrically for FALSE.
+/// So a `TheoryHooks` propagation built from this has a theory-valid reason. Used
+/// by the bus citizen's `final_check` to propagate forced literals. The check is a
+/// sound over-approximation, so it only ever MISSES forced literals (completeness),
+/// never reports a wrong one.
+#[must_use]
+pub fn forced_literals(
+    asserted: &[(Polynomial, FdCmp)],
+    candidates: &[(Polynomial, FdCmp)],
+) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    if asserted.is_empty() {
+        return out;
+    }
+    let vars = collect_vars(asserted);
+    let mut box_ = initial_box(&vars);
+    if !propagate(asserted, &mut box_) {
+        return out; // `asserted` is already conflicting — the conflict path owns it
+    }
+    for (i, (poly, op)) in candidates.iter().enumerate() {
+        if atom_conflicts(poly, *op, &box_) {
+            out.push((i, false)); // refuted everywhere ⇒ forced FALSE
+        } else if atom_conflicts(poly, op.negate(), &box_) {
+            out.push((i, true)); // negation refuted everywhere ⇒ forced TRUE
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,9 +796,107 @@ mod tests {
 
     #[test]
     fn open_axis_is_open_not_unsat() {
-        // x > 0 alone — satisfiable but unbounded ⇒ Open, NEVER Unsat.
+        // x > 0 alone — satisfiable but unbounded ⇒ NEVER Unsat (univ_int_status
+        // finds x=1 in the scan window ⇒ SatOrOpen).
         let d = decide(&[(poly(&[(1, &[(0, 1)])]), FdCmp::Gt)]);
         assert!(!is_unsat(&d));
+    }
+
+    #[test]
+    fn unbounded_x_squared_eq_2_is_unsat() {
+        // x² = 2 over the WHOLE integer axis (no bounds): real roots ±√2, beyond
+        // which x² > 2, so no integer anywhere satisfies it. The univariate-root
+        // tier decides this UNSAT where the finite branch-and-prune leaves it Open.
+        let d = decide(&[(poly(&[(1, &[(0, 2)]), (-2, &[])]), FdCmp::Eq)]);
+        assert!(is_unsat(&d), "x²=2 has no integer root (and is bounded-feasible-free)");
+    }
+
+    #[test]
+    fn unbounded_x_squared_ge_4_is_sat() {
+        // x² ≥ 4 over the whole axis — x=2 (or -2) satisfies it ⇒ NOT Unsat.
+        let d = decide(&[(poly(&[(1, &[(0, 2)]), (-4, &[])]), FdCmp::Ge)]);
+        assert!(!is_unsat(&d), "x²≥4 is satisfiable (x=2)");
+    }
+
+    #[test]
+    fn unbounded_x_cubed_eq_5_is_unsat() {
+        // x³ = 5 over the whole axis — 5 is not a perfect cube ⇒ no integer root.
+        let d = decide(&[(poly(&[(1, &[(0, 3)]), (-5, &[])]), FdCmp::Eq)]);
+        assert!(is_unsat(&d), "x³=5 has no integer root");
+    }
+
+    #[test]
+    fn unbounded_neg_quadratic_le_minus_one_is_unsat() {
+        // -x² ≥ 1  ⟺  x² ≤ -1 — no real (hence no integer) solution anywhere.
+        let d = decide(&[(poly(&[(-1, &[(0, 2)]), (-1, &[])]), FdCmp::Ge)]);
+        assert!(is_unsat(&d), "x² ≤ -1 is unsatisfiable");
+    }
+
+    #[test]
+    fn half_bounded_tail_sat_not_unsat() {
+        // x² ≥ 9 with x ≥ 0 (bounded BELOW only) — x=3 in the upper tail ⇒ NOT
+        // Unsat (exercises the finite-lo / open-hi tail path).
+        let d = decide(&[
+            (poly(&[(1, &[(0, 2)]), (-9, &[])]), FdCmp::Ge),
+            (poly(&[(1, &[(0, 1)])]), FdCmp::Ge),
+        ]);
+        assert!(!is_unsat(&d), "x²≥9 ∧ x≥0 is satisfiable (x=3)");
+    }
+
+    #[test]
+    fn riv_mul_is_sound_over_approximation_with_infinities() {
+        // riv_mul must NEVER under-approximate: for every a ∈ A, b ∈ B (including
+        // points in unbounded tails), a·b must lie in riv_mul(A, B). An
+        // under-approximation would let atom_conflicts fire wrongly ⇒ a false UNSAT.
+        // This exercises the new ±∞ corner-product path the bounded differential
+        // (all-finite domains) never reaches.
+        let vals = [Some(-3i64), Some(-1), Some(0), Some(1), Some(3), None];
+        let mk = |lo: Option<i64>, hi: Option<i64>| RatIv {
+            lo: lo.map(|x| BigRational::from(BigInt::from(x))),
+            hi: hi.map(|x| BigRational::from(BigInt::from(x))),
+        };
+        let inside = |iv: &RatIv, x: &BigRational| {
+            iv.lo.as_ref().is_none_or(|l| l <= x) && iv.hi.as_ref().is_none_or(|h| x <= h)
+        };
+        // Representative integer points of an interval, including beyond open ends.
+        let pts = |lo: Option<i64>, hi: Option<i64>| -> Vec<i64> {
+            match (lo, hi) {
+                (Some(l), Some(h)) => vec![l, h, (l + h) / 2],
+                (None, Some(h)) => vec![h, h - 1, h - 7, h - 60],
+                (Some(l), None) => vec![l, l + 1, l + 7, l + 60],
+                (None, None) => vec![-60, -1, 0, 1, 60],
+            }
+        };
+        for &alo in &vals {
+            for &ahi in &vals {
+                if let (Some(l), Some(h)) = (alo, ahi) {
+                    if l > h {
+                        continue;
+                    }
+                }
+                for &blo in &vals {
+                    for &bhi in &vals {
+                        if let (Some(l), Some(h)) = (blo, bhi) {
+                            if l > h {
+                                continue;
+                            }
+                        }
+                        let (a, b) = (mk(alo, ahi), mk(blo, bhi));
+                        let prod = riv_mul(&a, &b);
+                        for &pa in &pts(alo, ahi) {
+                            for &pb in &pts(blo, bhi) {
+                                let p = BigRational::from(BigInt::from(pa))
+                                    * BigRational::from(BigInt::from(pb));
+                                assert!(
+                                    inside(&prod, &p),
+                                    "riv_mul under-approximated: {alo:?}..{ahi:?} * {blo:?}..{bhi:?} ∌ {pa}*{pb}={p}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
