@@ -1649,4 +1649,35 @@ mod tests {
             "explicit QF_NIA + (x*x = -1) must stay UNSAT on the unchanged logic path"
         );
     }
+
+    #[test]
+    fn fd_core_addon_decides_nonperfect_square_unsat() {
+        // `x*x = 3` with `-3 ≤ x ≤ 3` is real-SAT (x = ±√3) but integer-UNSAT (3 is
+        // not a perfect square) — the fragment the legacy `NiaSolver` is unsound on
+        // (so its degree-2 `unsat` is NOT trusted) and §G's real-domain
+        // discriminant cannot refute (it IS real-sat). Only the bounded `fd_core`
+        // add-on decides it, soundly (interval over-approximation + G-UNSAT
+        // re-verify). Validates the live dispatch consults fd_core for nonlinear
+        // integer UNSAT.
+        let mut m = TermManager::new();
+        let int = m.sorts.int_sort;
+        let xv = m.mk_var("x", int);
+        let sq = m.mk_mul([xv, xv]);
+        let three = m.mk_int(3);
+        let eq = m.mk_eq(sq, three); // x*x = 3
+        let lo = m.mk_int(-3);
+        let hi = m.mk_int(3);
+        let lob = m.mk_ge(xv, lo); // -3 ≤ x
+        let hib = m.mk_le(xv, hi); //  x ≤ 3
+
+        let mut s = Solver::new();
+        s.logic = Some("QF_NIA".to_string());
+        s.assertions = vec![eq, lob, hib];
+        let r = s.dispatch_nl_solver(&mut m);
+        assert_eq!(
+            r,
+            Some(SolverResult::Unsat),
+            "bounded x*x=3 has no integer root — the fd_core add-on must decide UNSAT"
+        );
+    }
 }

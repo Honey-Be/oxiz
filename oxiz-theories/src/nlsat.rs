@@ -33,6 +33,8 @@ use oxiz_nlsat::solver::{Model, NlsatSolver, SolverResult};
 use oxiz_nlsat::types::AtomKind;
 use std::collections::HashMap;
 
+use crate::fd_core;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public result type for dispatch functions
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +358,26 @@ fn poly_atom_cmp(atom: &PolyAtom) -> Option<AtomCmp> {
     }
 }
 
+/// Map a built [`PolyAtom`] to the [`fd_core`](crate::fd_core) comparison on
+/// `atom.poly` in canonical `poly OP 0` form. Total over the kinds
+/// [`extract_poly_atoms`] produces (`Eq`/`Gt`/`Lt` × polarity, covering `≠` via
+/// `¬(=)`); `None` for any other kind (a `Root*` atom), which the caller treats as
+/// "fd cannot model this atom" (it drops that atom, weakening the conjunction —
+/// sound for `Unsat`, and forbidden for `Sat`).
+fn poly_atom_to_fd(atom: &PolyAtom) -> Option<(Polynomial, fd_core::FdCmp)> {
+    use fd_core::FdCmp;
+    let op = match (atom.kind, atom.positive) {
+        (AtomKind::Eq, true) => FdCmp::Eq,
+        (AtomKind::Eq, false) => FdCmp::Ne,
+        (AtomKind::Gt, true) => FdCmp::Gt,
+        (AtomKind::Gt, false) => FdCmp::Le,
+        (AtomKind::Lt, true) => FdCmp::Lt,
+        (AtomKind::Lt, false) => FdCmp::Ge,
+        _ => return None,
+    };
+    Some((atom.poly.clone(), op))
+}
+
 /// Reduction-KB rule §G: definite-sign completeness pre-check.
 ///
 /// Every [`PolyAtom`] in `poly_atoms` is a TOP-LEVEL CONJUNCT of the (focused)
@@ -501,6 +523,40 @@ pub fn dispatch_nia_constraints(
     // NOT trustworthy we return `None` (Unknown) and let the full CDCL(T) path
     // decide, rather than trusting nlsat's `Sat`.
     let sat_is_trustworthy = !dropped && !has_unsupported_ops;
+
+    // ── Sound nonlinear-integer add-on: fd_core (the oxiz-nl2 `fdlcg` engine) ──
+    // The legacy `NiaSolver` is broadly unsound on nonlinear `unsat`, so
+    // `unsat_is_trustworthy` blocks every total-degree ≥ 2 refutation above. The
+    // `fd_core` finite-domain engine decides nonlinear-integer `unsat` SOUNDLY
+    // (interval over-approximation + G-UNSAT re-verify), filling exactly that gap.
+    // It runs only in integer mode (fd_core is integer-only) and BEFORE the
+    // NiaSolver solve — a definitive verdict short-circuits it (like §G above).
+    //
+    //   * `Unsat` is trusted unconditionally: `fd_atoms ⊆ poly_atoms ⊆` the
+    //     original constraints, and subset-unsat ⟹ full-unsat (adding constraints
+    //     only shrinks feasibility) — the same argument `definite_sign_unsat` uses.
+    //   * `Sat` is trusted ONLY when the conjunction is the WHOLE problem
+    //     (`sat_is_trustworthy` ∧ every poly atom mapped to fd) — a dropped
+    //     constraint could be the one a subset-model violates.
+    if integer_mode {
+        let mut fd_atoms = Vec::with_capacity(poly_atoms.len());
+        let mut fd_all_mapped = true;
+        for atom in &poly_atoms {
+            match poly_atom_to_fd(atom) {
+                Some(fa) => fd_atoms.push(fa),
+                None => fd_all_mapped = false, // a Root* atom fd can't model
+            }
+        }
+        if !fd_atoms.is_empty() {
+            match fd_core::decide(&fd_atoms) {
+                fd_core::FdDecision::Unsat => return Some(NlDispatchResult::Unsat),
+                fd_core::FdDecision::Sat(_) if sat_is_trustworthy && fd_all_mapped => {
+                    return Some(NlDispatchResult::Sat);
+                }
+                _ => {} // Open / untrusted Sat → fall through to the NiaSolver path
+            }
+        }
+    }
 
     for atom in &poly_atoms {
         let atom_id = translator

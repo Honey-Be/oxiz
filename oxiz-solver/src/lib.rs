@@ -112,10 +112,11 @@ pub use oxiz_proof::replay::VerificationResult;
 pub use solver::{Model, Proof, ProofStep, Solver, SolverConfig, SolverResult, TheoryMode};
 
 // The finite-domain integer CP theory on the `TheoryHooks` bus (the bus-citizen
-// port of the `oxiz-nl2` `fdlcg` prototype; the multi-paradigm propagator-bus
-// slice). Install via `Solver::solve_with_hooks`; read `FdPropagator::verdict`
-// after a `Sat` to honour the `Open ⇒ Unknown` downgrade contract.
-pub use solver::fd_propagator::{FdCmp, FdPropagator, FdVerdict};
+// wrapper around the shared `oxiz_theories::fd_core` engine; the multi-paradigm
+// propagator-bus slice). Install via `Solver::solve_with_hooks`; read
+// `FdPropagator::verdict` after a `Sat` to honour the `Open ⇒ Unknown` contract.
+pub use oxiz_theories::fd_core::{self, FdCmp, FdDecision};
+pub use solver::fd_propagator::{FdPropagator, FdVerdict};
 
 // Re-export types from oxiz-sat
 pub use oxiz_sat::{RestartStrategy, SolverStats};
