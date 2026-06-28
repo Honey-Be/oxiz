@@ -445,8 +445,14 @@ where
     cache.get(&term_id).copied().unwrap_or(term_id)
 }
 
-/// Transform children of a term kind using a substitution cache
-fn transform_children(
+/// Transform children of a term kind using a substitution cache.
+///
+/// Exhaustive over `TermKind` (only the nullary / FP-literal arms clone
+/// unchanged — they have no children), so it is a faithful one-level structural
+/// rebuild. Used by [`map_terms`] and by the TOTAL capture-avoiding substitution
+/// in `manager::query` (for the capture-free structural kinds; binders are
+/// handled there with proper shadowing).
+pub(crate) fn transform_children(
     kind: &TermKind,
     cache: &crate::prelude::FxHashMap<TermId, TermId>,
 ) -> TermKind {

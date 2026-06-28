@@ -7,26 +7,27 @@
 //! engine change.
 //!
 //! Substitution note: `substitute` delegates to `TermManager::substitute`,
-//! which recurses through the full FO/UF/LIA fragment (uninterpreted
-//! applications, the boolean connectives, linear arithmetic) — the fragment
-//! the verus prelude's quantifier bodies live in, and the only fragment the
-//! clean engine is wired for today. (A latent OxiZ bug had `substitute`
-//! silently no-op on `Apply`, so `(P x)[x↦c]` stayed `(P x)` — an instance
-//! over the BOUND variable, vacuous; fixed in
-//! `oxiz-core/.../query.rs::substitute_cached`.)
+//! which is now a TOTAL capture-avoiding substitution — it recurses through
+//! EVERY `TermKind` (the FO/UF/LIA fragment, the four binders
+//! Forall/Exists/Let/Match with proper shadowing, and every capture-free
+//! structural kind: BV/string/FP/`Dt*`/…). (A latent OxiZ bug had `substitute`
+//! silently no-op on `Apply`, so `(P x)[x↦c]` stayed `(P x)` — an instance over
+//! the BOUND variable, vacuous; fixed in `query.rs::substitute_cached`. A second
+//! gap — a `Some(_) => id` drop arm that left Let/Match/BV/string/FP/`Dt*` bodies
+//! unsubstituted, the CCFV E/F leak — was closed by making the substitution
+//! total, #290.)
 //!
-//! LIMITATION (completeness, not soundness): a bound variable inside a
-//! BV/string node or a NESTED quantifier is still left unsubstituted by the
-//! host `substitute`, so the produced "instance" would retain a free variable.
-//! The wiring guards against this — `Solver::check` DROPS any instance whose
-//! body is not variable-free (`free_vars(phi)` non-empty) — so such a body
-//! simply yields no lemma (sound, just incomplete). Broadening
-//! `substitute_cached` to BV/string/nested-quantifier bodies (to RECOVER that
-//! completeness) is a follow-up.
+//! The `Solver::check` invariant-guard — DROP any instance whose body is not
+//! variable-free (`free_vars(phi)` non-empty) — remains as a defence-in-depth
+//! backstop, but with substitution now total it should never fire for a
+//! well-formed ground instantiation: the bound variable is always substituted
+//! away (verified: `oxiz-total-subst-verification`, the no-leak lemma).
 //!
-//! The `view`/`children` structural mapping may also be partial — an unmapped
-//! `TermKind` becomes `Opaque` (a leaf atom), a missed candidate at worst,
-//! never a spurious instance or spurious unsat.
+//! The `view`/`children` structural mapping may still be partial — an unmapped
+//! `TermKind` becomes `Opaque` (a leaf atom), a missed candidate at worst, never
+//! a spurious instance or spurious unsat. (This used to be coupled to the
+//! substitution drop set for soundness; total substitution removes that coupling,
+//! so adding a kind to `view`-App no longer requires touching `substitute_cached`.)
 
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;

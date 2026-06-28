@@ -1,7 +1,7 @@
 //! Term query, analysis, substitution and simplification for TermManager
 
-use super::super::term::{TermId, TermKind};
-use super::super::traversal::get_children;
+use super::super::term::{MatchCase, TermId, TermKind};
+use super::super::traversal::{get_children, transform_children};
 use crate::interner::Spur;
 use crate::sort::SortId;
 #[allow(unused_imports)]
@@ -537,29 +537,98 @@ impl TermManager {
                     )
                 }
             }
-            // For the remaining (BV/string/let/…) kinds, return as-is. NOTE: this
-            // is still a substitution gap for those theories — the FO/UF/LIA +
-            // quantifier fragment above covers the clean engine's needs;
-            // broadening the rest is a follow-up.
-            //
-            // ⚠ SOUNDNESS INVARIANT (clean-MBQI, audit 2026-06-20): returning a
-            // term UNCHANGED here means an instance body over a dropped kind can
-            // RETAIN a bound variable. That is contained today ONLY because every
-            // kind dropped here is also mapped to `TermView::Opaque` by
-            // `OxizHost::view` (clean_mbqi.rs) and registered by `GroundIndex` as a
-            // non-descended LEAF — so the retained bound var never becomes a
-            // standalone candidate, and the engine's `instantiate` ground gate plus
-            // the solver's per-quantifier `retains_bound` drop never see it.
-            // The coupling **`view`-Opaque set ≡ this drop set** is therefore
-            // soundness-critical and UNASSERTED: if a future `TermKind` is mapped to
-            // a structured `view` (App/…) but left in this `_` arm, `add_rec` would
-            // descend and register a bare bound-var `Var` as ground → the B/E
-            // self-match capture class reopens (and the solver's `retains_bound`
-            // only screens the CURRENT quantifier's bound names, so a SIBLING
-            // quantifier's bound var would slip through). The real fix is to make
-            // this substitution TOTAL (recurse through every kind); until then, do
-            // NOT add a kind to `view`-App without also handling it here.
-            Some(_) => id,
+            // `let`: a BINDER — substituted by INLINING (let-elimination). SMT-LIB
+            // `let` is parallel, so
+            //   `(let ((y_i v_i)) body)[σ]  ≡  body[ (σ minus the y_i) ∪ {y_i ↦ v_i[σ]} ]`.
+            // Inlining (rather than rebuilding a `Let` node) is deliberate: OxiZ's
+            // theory layer does NOT reduce a `Let` node — it treats it as an opaque
+            // value — so a substituted-in `Let` would be an instance the engine
+            // can't match/decide → a spurious `sat` (the let-normalization gap).
+            // Producing the let-FREE inlined body instead keeps the instance usable
+            // AND closes the leak. (OxiZ already inlines lets at PARSE time —
+            // `parse_symbol` resolves a let-bound name to its term — so a
+            // parser-built body has no `y_i` and the `y_i ↦ v_i[σ]` entries are
+            // inert; the full inline keeps it correct for any internally-built
+            // non-inlined `Let` as well.) Sound: `let` is definitional.
+            Some(TermKind::Let { bindings, body }) => {
+                let bound: FxHashSet<Spur> = bindings.iter().map(|&(n, _)| n).collect();
+                let mut combined: FxHashMap<TermId, TermId> = FxHashMap::default();
+                for (&k, &v) in subst {
+                    // drop a key the `let` shadows
+                    if let Some(TermKind::Var(s)) = self.get(k).map(|t| &t.kind) {
+                        if bound.contains(s) {
+                            continue;
+                        }
+                    }
+                    combined.insert(k, v);
+                }
+                for &(n, v) in &bindings {
+                    let v_sub = self.substitute_cached(v, subst, cache);
+                    let sort = self.get(v).map_or(self.sorts.bool_sort, |t| t.sort);
+                    let name = self.resolve_str(n).to_string();
+                    let y_var = self.mk_var(&name, sort);
+                    combined.insert(y_var, v_sub);
+                }
+                self.substitute_cached(body, &combined, &mut FxHashMap::default())
+            }
+            // `match`: a BINDER. The scrutinee is in scope; each case body binds
+            // that case's pattern variables, which are shadowed per case.
+            Some(TermKind::Match { scrutinee, cases }) => {
+                let new_scrut = self.substitute_cached(scrutinee, subst, cache);
+                let mut changed = new_scrut != scrutinee;
+                let mut new_cases: SmallVec<[MatchCase; 4]> = SmallVec::new();
+                for c in &cases {
+                    let bound: FxHashSet<Spur> = c.bindings.iter().copied().collect();
+                    let nb = self.subst_under_bound_names(&bound, c.body, subst);
+                    if nb != c.body {
+                        changed = true;
+                    }
+                    new_cases.push(MatchCase {
+                        constructor: c.constructor,
+                        bindings: c.bindings.clone(),
+                        body: nb,
+                    });
+                }
+                if !changed {
+                    id
+                } else {
+                    let sort = self.get(id).map(|t| t.sort).unwrap_or(self.sorts.bool_sort);
+                    self.intern(TermKind::Match { scrutinee: new_scrut, cases: new_cases }, sort)
+                }
+            }
+            // TOTAL substitution for every REMAINING kind — the capture-free
+            // structural ops (String / FP / BV / `Dt*` / …). Recurse into each
+            // direct child (`get_children`) and rebuild faithfully
+            // (`transform_children`, exhaustive). This closes the **CCFV E/F leak**:
+            // the former `Some(_) => id` drop arm returned these kinds UNCHANGED, so
+            // an instance body wrapping a bound variable under e.g. a bitvector or
+            // string op RETAINED that bound var. Soundness used to rest on the
+            // fragile, UNASSERTED coupling "`OxizHost::view`-Opaque set ≡ this drop
+            // set" (a dropped kind had to also be a non-descended `Opaque` leaf, or
+            // `GroundIndex` would register a bare bound `Var` as ground). With the
+            // substitution now TOTAL the bound var is always substituted away, so
+            // the coupling is no longer load-bearing and adding a kind to `view`-App
+            // is safe. (All four binders — Forall/Exists/Let/Match — are handled
+            // above with shadowing, so only capture-free kinds reach here.)
+            Some(other) => {
+                let children = get_children(&other);
+                let mut local: FxHashMap<TermId, TermId> = FxHashMap::default();
+                let mut changed = false;
+                for &c in &children {
+                    let nc = self.substitute_cached(c, subst, cache);
+                    if nc != c {
+                        changed = true;
+                    }
+                    local.insert(c, nc);
+                }
+                if !changed {
+                    id
+                } else {
+                    let sort = self.get(id).map(|t| t.sort).unwrap_or(self.sorts.bool_sort);
+                    let new_kind = transform_children(&other, &local);
+                    self.intern(new_kind, sort)
+                }
+            }
         };
 
         cache.insert(id, result);
@@ -579,6 +648,20 @@ impl TermManager {
         subst: &FxHashMap<TermId, TermId>,
     ) -> TermId {
         let bound: FxHashSet<Spur> = vars.iter().map(|(n, _)| *n).collect();
+        self.subst_under_bound_names(&bound, body, subst)
+    }
+
+    /// The capture-avoiding core of [`Self::subst_under_binder`], parameterised by
+    /// the set of `bound` names a binder introduces — shared by the quantifier,
+    /// `let`, and `match`-case arms of [`Self::substitute_cached`]. Drops keys the
+    /// binder shadows and BAILS (body unchanged) if any live replacement would be
+    /// captured, so the result is always capture-free.
+    fn subst_under_bound_names(
+        &mut self,
+        bound: &FxHashSet<Spur>,
+        body: TermId,
+        subst: &FxHashMap<TermId, TermId>,
+    ) -> TermId {
         let mentions_bound = |me: &Self, t: TermId| -> bool {
             me.free_vars(t).into_iter().any(|fv| {
                 matches!(me.get(fv).map(|x| &x.kind), Some(TermKind::Var(s)) if bound.contains(s))

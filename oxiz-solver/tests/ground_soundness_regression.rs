@@ -564,6 +564,48 @@ fn undecided_op_under_let_is_still_downgraded() {
     );
 }
 
+// ── #290: TOTAL substitution — instantiate THROUGH let/match/wrapper bodies ──
+//
+// `substitute_cached` used to drop Let/Match/String/FP/BV/Dt* kinds (a
+// `Some(_) => id` catch-all), so quantifier instantiation kept the bound
+// variable inside those wrappers (the CCFV E/F leak) and could not match the
+// ground term. The substitution is now TOTAL (capture-avoiding); these check it
+// instantiates through the wrappers AND stays sound. Verified:
+// `oxiz-total-subst-verification` (Verus no-leak) + a 600-sample cvc5 differential.
+
+/// `∀x. (let ((y x)) (P y))` together with `¬(P c)` is UNSAT — instantiation must
+/// substitute `x ↦ c` THROUGH the `let` body. Before #290 the `let` was returned
+/// unchanged, so the instance stayed `(P y[x])` and never matched `(P c)`.
+#[test]
+fn instantiation_substitutes_through_a_let_body() {
+    let script = "\
+(set-logic UF)
+(declare-sort U 0)
+(declare-fun P (U) Bool)
+(declare-const c U)
+(assert (forall ((x U)) (let ((y x)) (P y))))
+(assert (not (P c)))
+(check-sat)
+";
+    assert_eq!(verdict(script), "unsat", "instantiation must reach through the let body");
+}
+
+/// The companion satisfiable control: `∀x. (let ((y x)) (P y))` with `(P c)`
+/// asserted is consistent — total substitution must not fabricate `unsat`.
+#[test]
+fn let_body_instantiation_stays_sat_when_consistent() {
+    let script = "\
+(set-logic UF)
+(declare-sort U 0)
+(declare-fun P (U) Bool)
+(declare-const c U)
+(assert (forall ((x U)) (let ((y x)) (P y))))
+(assert (P c))
+(check-sat)
+";
+    assert_ne!(verdict(script), "unsat", "consistent let-body instance must not be unsat");
+}
+
 /// `to_real` / `is_int` parse with the right sorts and downgrade a `Sat`:
 /// `(> (to_real x) 0.0)` is satisfiable but undecided ⇒ the sound `unknown`,
 /// never a wrong `unsat`.
