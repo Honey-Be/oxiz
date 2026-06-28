@@ -220,6 +220,33 @@ impl<'a> Parser<'a> {
                 return Ok(self.manager.mk_dt_tester(constructor_name, arg));
             }
 
+            if name == "divisible" {
+                // SMT-LIB `((_ divisible n) x)` is DEFINED as `(= (mod x n) 0)`.
+                // Desugar to exactly that, reusing `TermKind::Mod` — so the
+                // existing div/mod Sat→Unknown downgrade ALREADY covers it
+                // (sound), and it becomes decided for free once `mod` is, with no
+                // new undecided-op marker to track.
+                if index_parts.len() != 1 {
+                    return Err(OxizError::ParseError {
+                        position: self.lexer.position(),
+                        message: format!(
+                            "(_ divisible n) requires exactly 1 index, got {}",
+                            index_parts.len()
+                        ),
+                    });
+                }
+                let n: BigInt = index_parts[0].parse().map_err(|_| OxizError::ParseError {
+                    position: self.lexer.position(),
+                    message: format!("invalid divisor in (_ divisible {}): not a numeral", index_parts[0]),
+                })?;
+                let arg = self.parse_term()?;
+                self.expect_rparen()?; // Close the outer application
+                let n_term = self.manager.mk_int(n);
+                let modv = self.manager.mk_mod(arg, n_term);
+                let zero = self.manager.mk_int(0);
+                return Ok(self.manager.mk_eq(modv, zero));
+            }
+
             // Now parse the arguments and closing paren
             // Build the indexed identifier name
             let indices_str = index_parts.join(" ");
@@ -485,17 +512,44 @@ impl<'a> Parser<'a> {
                 // see `Context::check_sat`'s div/mod Sat→Unknown downgrade).
                 self.manager.mk_div(lhs, rhs)
             }
-            // NOTE — `abs`, `to_real`, `to_int`, `is_int`, `(_ divisible n)` are
-            // NOT yet parsed here; they fall through to the uninterpreted `_` arm
-            // below. `abs` desugars exactly to `(ite (>= x 0) x (- x))`, but the
-            // ground ite/arith condition is not decided during solving (the same
-            // gap that makes constant `div`/`mod` undecided), so that path would
-            // still admit a spurious `sat` on a forced-unsat case — i.e. it needs
-            // the same Sat→Unknown trustworthiness downgrade as div/mod before it
-            // can be added soundly. Left as a noted follow-up rather than shipped
-            // as a "fix" that is still unsound. (`(/ a b)` above is sound: it
-            // routes to `TermKind::Div`, which `Context::check_sat`'s div/mod
-            // downgrade already covers.)
+            // `abs` / `to_real` / `to_int` / `is_int` — the SMT-LIB Int/Real ops
+            // the theory layer does NOT decide. Each is parsed as an UNINTERPRETED
+            // application with the CORRECT result sort (so type-checking + theory
+            // routing are right), and `Context::check_sat`'s undecided-op
+            // downgrade turns any `Sat` resting on one into the sound `Unknown`
+            // (an over-approximation can only fabricate `sat`; `unsat` stays
+            // sound). Desugaring `abs` to `(ite (>= x 0) x (- x))` was rejected:
+            // the ground `ite`/arith condition is itself undecided here, so that
+            // form fabricates a `sat` on a forced-`unsat` case (`(< (abs x) 0)`)
+            // WITHOUT a `div`/`mod` marker to trigger the downgrade — empirically
+            // confirmed. Keeping them uninterpreted keeps the marker. Completeness
+            // (Euclidean `to_int = floor`, `to_real` exactness, …) is the follow-up,
+            // exactly as for `div`/`mod`.
+            "abs" => {
+                let x = self.parse_term()?;
+                self.expect_rparen()?;
+                // `abs : τ → τ` — result sort follows the argument (Int or Real).
+                let sort = self.manager.get(x).map_or(self.manager.sorts.int_sort, |t| t.sort);
+                self.manager.mk_apply("abs", [x], sort)
+            }
+            "to_real" => {
+                let x = self.parse_term()?;
+                self.expect_rparen()?;
+                let sort = self.manager.sorts.real_sort;
+                self.manager.mk_apply("to_real", [x], sort)
+            }
+            "to_int" => {
+                let x = self.parse_term()?;
+                self.expect_rparen()?;
+                let sort = self.manager.sorts.int_sort;
+                self.manager.mk_apply("to_int", [x], sort)
+            }
+            "is_int" => {
+                let x = self.parse_term()?;
+                self.expect_rparen()?;
+                let sort = self.manager.sorts.bool_sort;
+                self.manager.mk_apply("is_int", [x], sort)
+            }
             "<" => {
                 let lhs = self.parse_term()?;
                 let rhs = self.parse_term()?;

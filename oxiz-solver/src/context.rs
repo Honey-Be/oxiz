@@ -19,11 +19,14 @@ use std::path::{Path, PathBuf};
 /// `oxiz_core::model` types into the public API of this file.
 pub type RawFuncInterp = (Vec<(Vec<String>, String)>, String, usize);
 
-/// Whether `t` (or any subterm, including under quantifiers) is an integer
-/// `div`/`mod` application. Used by [`Context::check_sat`] to downgrade an
-/// untrustworthy `Sat` (div/mod are not decided by the theory — see there).
+/// Whether `t` (or any subterm, including under quantifiers) contains an
+/// arithmetic operator the theory layer does NOT decide — integer `div`/`mod`,
+/// or one of the Int/Real conversion ops the parser keeps uninterpreted (`abs`,
+/// `to_real`, `to_int`, `is_int`). Each reaches EUF/arith as a free
+/// over-approximation, so a `Sat` resting on one is untrustworthy and
+/// [`Context::check_sat`] downgrades it to the sound `Unknown` (see there).
 /// `visited` dedups the hash-consed DAG so a shared subterm is walked once.
-fn term_contains_div_mod(
+fn term_contains_undecided_op(
     terms: &TermManager,
     t: TermId,
     visited: &mut std::collections::HashSet<TermId>,
@@ -31,14 +34,28 @@ fn term_contains_div_mod(
     if !visited.insert(t) {
         return false;
     }
-    if let Some(term) = terms.get(t) {
-        if matches!(term.kind, TermKind::Div(..) | TermKind::Mod(..)) {
+    let Some(term) = terms.get(t) else { return false };
+    match &term.kind {
+        TermKind::Div(..) | TermKind::Mod(..) => return true,
+        // `((_ divisible n) x)` desugars to `(= (mod x n) 0)`, so it is caught by
+        // the `Mod` arm above — only the non-desugarable conversion ops, parsed
+        // as uninterpreted applications, need a name check here.
+        TermKind::Apply { func, .. }
+            if matches!(terms.resolve_str(*func), "abs" | "to_real" | "to_int" | "is_int") =>
+        {
             return true;
         }
+        _ => {}
     }
-    crate::clean_mbqi::subterms(terms, t)
+    // Recurse through the CANONICAL complete child enumeration. (The earlier
+    // `clean_mbqi::subterms` walk skipped `Let`/String/FP/BV/`Dt*` kinds via its
+    // `_ => Vec::new()` catch-all, so an op hidden under e.g. a `let` escaped the
+    // downgrade and a `Sat` resting on it leaked — adversarially confirmed. The
+    // `get_children` enumeration descends into let bindings + body and every
+    // other wrapper, so the downgrade is now coverage-complete.)
+    oxiz_core::ast::get_children(&term.kind)
         .into_iter()
-        .any(|c| term_contains_div_mod(terms, c, visited))
+        .any(|c| term_contains_undecided_op(terms, c, visited))
 }
 
 /// A declared constant
@@ -278,25 +295,26 @@ impl Context {
     /// Check satisfiability
     pub fn check_sat(&mut self) -> SolverResult {
         let mut result = self.solver.check(&mut self.terms);
-        // SOUNDNESS — undecided `div`/`mod` downgrade. The integer `div`/`mod`
-        // operators are NOT decided by the theory layer (they reach EUF/arith as
-        // uninterpreted applications); a model is free to assign them arbitrary
-        // values, so the solved formula is an OVER-approximation of the real one.
-        // By the soundness asymmetry (dropping/weakening a constraint preserves
-        // `unsat` but can fabricate `sat`), an `Unsat` here is still sound, but a
-        // `Sat` is untrustworthy — it may rest on a div/mod value the Euclidean
-        // semantics forbid. Downgrade such a `Sat` to the sound `Unknown`. (The
-        // alternative placeholder — parsing div/mod as subtraction — was worse: a
-        // confidently-wrong value that fabricated `unsat`, a false proof.)
-        // Deciding constant/linear div/mod via the Euclidean axioms
-        // (`b≠0 → a = b·(div a b) + (mod a b)`, `0 ≤ mod a b < |b|`) is the
-        // completeness follow-up.
+        // SOUNDNESS — undecided-op downgrade. Integer `div`/`mod` and the Int/Real
+        // conversion ops `abs`/`to_real`/`to_int`/`is_int` are NOT decided by the
+        // theory layer (they reach EUF/arith as uninterpreted applications); a
+        // model is free to assign them arbitrary values, so the solved formula is
+        // an OVER-approximation of the real one. By the soundness asymmetry
+        // (dropping/weakening a constraint preserves `unsat` but can fabricate
+        // `sat`), an `Unsat` here is still sound, but a `Sat` is untrustworthy —
+        // it may rest on an op value the real semantics forbid. Downgrade such a
+        // `Sat` to the sound `Unknown`. (Verified: `oxiz-undecided-op-verification`
+        // — abstraction monotonicity ⇒ relaxed-UNSAT implies concrete-UNSAT, and
+        // the converse fails, e.g. `(< (abs x) 0)` is UNSAT yet its uninterpreted
+        // relaxation `r < 0` is SAT — exactly the case this downgrade catches.)
+        // Deciding constant/linear div/mod via the Euclidean axioms, `abs` via its
+        // `ite` definition, etc. is the completeness follow-up.
         if result == SolverResult::Sat {
             let mut visited = std::collections::HashSet::new();
             if self
                 .assertions
                 .iter()
-                .any(|&a| term_contains_div_mod(&self.terms, a, &mut visited))
+                .any(|&a| term_contains_undecided_op(&self.terms, a, &mut visited))
             {
                 result = SolverResult::Unknown;
             }

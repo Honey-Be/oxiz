@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### oxiz-core: parse `abs` / `to_real` / `to_int` / `is_int` / `(_ divisible n)`
+- The SMT-LIB Int/Real ops `abs`, `to_real`, `to_int`, `is_int` now parse with their correct result sorts (previously they fell through to the uninterpreted fallback as `Bool`-sorted apps — the wrong sort). They are kept theory-undecided (uninterpreted applications); deciding them is a separate completeness task.
+- `(_ divisible n) x` parses as its SMT-LIB definition `(= (mod x n) 0)`, reusing `TermKind::Mod`.
+
 ### Changed
 
 ### Fixed
+
+#### oxiz-solver: undecided-op `Sat`→`Unknown` downgrade extended to `abs`/conversion ops (soundness)
+- `Context::check_sat`'s div/mod soundness downgrade (`term_contains_undecided_op`, formerly `term_contains_div_mod`) now also flags `abs`/`to_real`/`to_int`/`is_int`. These reach EUF/arith as uninterpreted over-approximations, so a `Sat` resting on one was untrustworthy — e.g. `(< (abs x) 0)` (genuinely UNSAT) used to be a fabricated `sat`; it is now the sound `unknown`. `Unsat` is preserved (`(< (to_int r) (to_int r))` stays `unsat` via congruence on the shared term). Verified by `oxiz-undecided-op-verification` (Verus abstraction-monotonicity) + a 1200-sample cvc5 differential (0 violations on #291-op formulas).
 
 ## [0.2.3] - 2026-06-09
 

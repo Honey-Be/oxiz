@@ -492,3 +492,89 @@ fn incremental_genuine_contradiction_still_unsat() {
         "x!=0 ∧ x!!=0 is a genuine contradiction the frame re-base must not mask",
     );
 }
+
+// ── #291: undecided arithmetic ops (abs / to_real / to_int / is_int / divisible) ──
+//
+// These ops are parsed as theory-undecided (uninterpreted apps, or — for
+// `divisible` — a `(= (mod x n) 0)` desugar). The `check_sat` undecided-op
+// downgrade turns a `Sat` resting on one into the sound `Unknown`; `Unsat`
+// stays sound. See `term_contains_undecided_op` + the 선검증 in
+// `oxiz-undecided-op-verification` (abstraction monotonicity).
+
+/// THE headline fix: `(< (abs x) 0)` is UNSAT (abs is never negative), but
+/// before #291 `abs` fell through to an uninterpreted **Bool**-sorted app the
+/// theory ignored → a fabricated `sat`. Now it is an uninterpreted app the
+/// downgrade flags, so the verdict is the sound `unknown` — never `sat`.
+#[test]
+fn abs_lt_zero_is_never_sat() {
+    let v = verdict("(set-logic QF_LIA)\n(declare-const x Int)\n(assert (< (abs x) 0))\n(check-sat)\n");
+    assert_ne!(v, "sat", "(< (abs x) 0) must NOT be a fabricated sat");
+    assert_eq!(v, "unknown", "abs is undecided ⇒ the sound downgrade verdict");
+}
+
+/// The downgrade must NOT over-fire: a `Sat` is downgraded, but congruence can
+/// still derive `Unsat` through a shared uninterpreted op term. `(< (to_int r)
+/// (to_int r))` is `v < v` for the one value `v = to_int r`, i.e. UNSAT — and
+/// stays `unsat` (the downgrade only touches `Sat`).
+#[test]
+fn to_int_self_comparison_stays_unsat() {
+    let v = verdict(
+        "(set-logic QF_LIRA)\n(declare-const r Real)\n(assert (< (to_int r) (to_int r)))\n(check-sat)\n",
+    );
+    assert_eq!(v, "unsat", "v < v is unsat regardless of the undecided to_int value");
+}
+
+/// `((_ divisible n) x)` parses (desugars to `(= (mod x n) 0)`) and is covered
+/// by the div/mod downgrade: `x = 7 ∧ 3 | x` is genuinely UNSAT, reported as the
+/// sound `unknown` (never `sat`). Confirms the indexed-op parse path works.
+#[test]
+fn divisible_parses_and_is_sound() {
+    let v = verdict(
+        "(set-logic QF_LIA)\n(declare-const x Int)\n(assert (= x 7))\n(assert ((_ divisible 3) x))\n(check-sat)\n",
+    );
+    assert_ne!(v, "sat", "7 is not divisible by 3 — must not be sat");
+}
+
+/// COVERAGE-COMPLETENESS of the downgrade walk (adversarially found): an
+/// undecided op hidden under a `let` (binding RHS *or* body), or under a
+/// String/FP/BV/`Dt*` wrapper, must STILL be reached by `term_contains_undecided_op`.
+/// The earlier walk (`clean_mbqi::subterms`) skipped those kinds via a
+/// `_ => Vec::new()` catch-all, so `(let ((y (abs x))) (= y (- 1)))` — genuinely
+/// UNSAT — leaked a fabricated `sat`. The walk now uses the complete
+/// `get_children` enumeration.
+#[test]
+fn undecided_op_under_let_is_still_downgraded() {
+    // abs in the let BINDING (the original adversarial hole).
+    assert_ne!(
+        verdict("(set-logic QF_LIA)\n(declare-const x Int)\n(assert (let ((y (abs x))) (= y (- 1))))\n(check-sat)\n"),
+        "sat",
+        "abs under a let binding must not escape the downgrade",
+    );
+    // abs in the let BODY.
+    assert_ne!(
+        verdict("(set-logic QF_LIA)\n(declare-const x Int)\n(assert (let ((y x)) (= (abs y) (- 1))))\n(check-sat)\n"),
+        "sat",
+        "abs in a let body must not escape the downgrade",
+    );
+    // mod (from a divisible desugar) under a let.
+    assert_ne!(
+        verdict("(set-logic QF_LIA)\n(assert (let ((y 10)) ((_ divisible 3) y)))\n(check-sat)\n"),
+        "sat",
+        "let-bound divisible (mod) must not escape the downgrade",
+    );
+}
+
+/// `to_real` / `is_int` parse with the right sorts and downgrade a `Sat`:
+/// `(> (to_real x) 0.0)` is satisfiable but undecided ⇒ the sound `unknown`,
+/// never a wrong `unsat`.
+#[test]
+fn to_real_and_is_int_parse_and_downgrade() {
+    let tr = verdict(
+        "(set-logic QF_LIRA)\n(declare-const x Int)\n(assert (> (to_real x) 0.0))\n(check-sat)\n",
+    );
+    assert_ne!(tr, "unsat", "(> (to_real x) 0.0) is satisfiable — must not be a fabricated unsat");
+    let ii = verdict(
+        "(set-logic QF_LIRA)\n(declare-const r Real)\n(assert (is_int r))\n(check-sat)\n",
+    );
+    assert_ne!(ii, "unsat", "(is_int r) is satisfiable — must not be a fabricated unsat");
+}
