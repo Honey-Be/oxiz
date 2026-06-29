@@ -620,3 +620,44 @@ fn to_real_and_is_int_parse_and_downgrade() {
     );
     assert_ne!(ii, "unsat", "(is_int r) is satisfiable — must not be a fabricated unsat");
 }
+
+/// #345 — a *ground* `let` term used to reach the theory layer as an opaque,
+/// un-decomposable `Let` node (the encoder dropped the bindings outright), so a
+/// bound name acted as a fresh, unconstrained variable and a contradictory
+/// arithmetic identity was reported a spurious `sat`. Eager substitution during
+/// parsing now keeps the wrapper out of the solver entirely.
+#[test]
+fn ground_let_arith_contradiction_is_unsat() {
+    // `(let ((y (+ c c))) (+ y 1)) = (+ (+ c c) 2)` ⤳ `2c+1 = 2c+2` ⤳ `1 = 2`.
+    assert_eq!(
+        verdict(
+            "(set-logic ALL)\n(declare-const c Int)\n\
+             (assert (= (let ((y (+ c c))) (+ y 1)) (+ (+ c c) 2)))\n(check-sat)\n"
+        ),
+        "unsat",
+        "1 = 2 from a ground let must be unsat, not spurious sat",
+    );
+    // `(not (= (let ((y (+ c c))) (+ y c)) (+ (+ c c) c)))` ⤳ `not (3c = 3c)`.
+    assert_eq!(
+        verdict(
+            "(set-logic ALL)\n(declare-const c Int)\n\
+             (assert (not (= (let ((y (+ c c))) (+ y c)) (+ (+ c c) c))))\n(check-sat)\n"
+        ),
+        "unsat",
+        "negation of a ground-let tautology must be unsat",
+    );
+}
+
+/// #345 soundness control — a genuinely satisfiable ground `let` identity must
+/// still be `sat` (the fix must not over-rotate into spurious unsat).
+#[test]
+fn ground_let_arith_identity_stays_sat() {
+    assert_eq!(
+        verdict(
+            "(set-logic ALL)\n(declare-const c Int)\n\
+             (assert (= (let ((y (+ c c))) (+ y 1)) (+ (+ c c) 1)))\n(check-sat)\n"
+        ),
+        "sat",
+        "2c+1 = 2c+1 is a tautology — must stay sat",
+    );
+}

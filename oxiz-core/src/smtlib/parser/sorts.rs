@@ -73,9 +73,20 @@ impl<'a> Parser<'a> {
             self.bindings.insert(name, term);
         }
 
-        // Create let term
-        let bindings: Vec<_> = new_bindings.iter().map(|(n, t)| (n.as_str(), *t)).collect();
-        Ok(self.manager.mk_let(bindings, body))
+        // `let`-bound names were eagerly substituted into the body while it was
+        // parsed (every occurrence resolved through `self.bindings` in
+        // `parse_symbol`), so `body` is already fully expanded and the `Let`
+        // wrapper would carry no remaining binding occurrences. Returning it
+        // directly — instead of `mk_let(bindings, body)` — keeps the redundant
+        // wrapper out of the solver, where it otherwise made theory atoms
+        // opaque: a ground `(let ((y (+ c c))) (+ y 1))` reached arith parsing
+        // as an un-decomposable `Let` term and was treated as a fresh variable,
+        // so e.g. `(= (let ((y (+ c c))) (+ y 1)) (+ (+ c c) 2))` (`1 = 2`,
+        // unsat) was reported a spurious `sat` (#345). `let` is non-recursive —
+        // each binding value is parsed in the OUTER scope (above, before the
+        // names enter `self.bindings`) — so eager substitution is sound.
+        let _ = &new_bindings;
+        Ok(body)
     }
 
     /// Parse a forall binder: (forall ((name sort) ...) body)

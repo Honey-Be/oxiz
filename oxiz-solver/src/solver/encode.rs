@@ -1000,16 +1000,32 @@ impl Solver {
                 result
             }
             TermKind::Let { bindings, body } => {
-                // For encoding, we can substitute the bindings into the body
-                // This is a simplification - a more sophisticated approach would
-                // memoize the bindings
-                let substituted = *body;
-                for (name, value) in bindings.iter().rev() {
-                    // In a full implementation, we'd perform proper substitution
-                    // For now, just encode the body directly
-                    let _ = (name, value);
+                // SMT-LIB `let`-bound names are eagerly substituted into the body
+                // during parsing (see `parse_let`), so a *parsed* `Let` never
+                // reaches the encoder. A `Let` built directly through the typed
+                // API can still carry unsubstituted `Var(name)` occurrences in
+                // its body, so substitute them here before encoding — otherwise
+                // the bindings would be silently dropped (the old behaviour) and
+                // every bound name left a fresh, unconstrained variable, which is
+                // unsound: e.g. `(= (let ((y (+ c c))) (+ y 1)) (+ (+ c c) 2))`
+                // (`1 = 2`, unsat) would encode an opaque `y` and report `sat`
+                // (#345). `let` is non-recursive, so each value is substituted as
+                // a whole and there is no capture to avoid here.
+                let mut subst: FxHashMap<TermId, TermId> = FxHashMap::default();
+                for (name, value) in bindings.iter() {
+                    let sort = manager
+                        .get(*value)
+                        .map_or(manager.sorts.bool_sort, |v| v.sort);
+                    let name = manager.resolve_str(*name).to_string();
+                    let var = manager.mk_var(&name, sort);
+                    subst.insert(var, *value);
                 }
-                self.encode(substituted, manager)
+                let expanded = if subst.is_empty() {
+                    *body
+                } else {
+                    manager.substitute(*body, &subst)
+                };
+                self.encode(expanded, manager)
             }
             // Theory atoms (arithmetic, bitvec, arrays, UF)
             // These get fresh boolean variables - the theory solver handles the semantics
