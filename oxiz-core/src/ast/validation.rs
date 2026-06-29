@@ -96,7 +96,7 @@ pub fn eval_term(term_id: TermId, manager: &TermManager, model: &Model) -> Optio
         TermKind::Eq(lhs, rhs) => {
             let lhs_val = eval_term(*lhs, manager, model)?;
             let rhs_val = eval_term(*rhs, manager, model)?;
-            Some(ModelValue::Bool(lhs_val == rhs_val))
+            Some(ModelValue::Bool(values_equal(&lhs_val, &rhs_val)))
         }
 
         TermKind::Lt(lhs, rhs) => {
@@ -406,7 +406,7 @@ fn eval_term_internal(
         TermKind::Eq(lhs, rhs) => {
             let lhs_val = eval_term_internal(*lhs, manager, model, cache)?;
             let rhs_val = eval_term_internal(*rhs, manager, model, cache)?;
-            Some(ModelValue::Bool(lhs_val == rhs_val))
+            Some(ModelValue::Bool(values_equal(&lhs_val, &rhs_val)))
         }
 
         TermKind::Lt(lhs, rhs) => {
@@ -538,43 +538,62 @@ fn eval_term_internal(
 
 // Helper functions for arithmetic operations
 
+/// Coerce a numeric model value to a rational. SMT-LIB's Int/Real arithmetic
+/// mixes the two — a literal `1` parses as `IntConst` even in a Real context — so
+/// every numeric operator and comparison must promote `Int(n)` to `Real(n/1)`
+/// before combining; otherwise `(= real_expr 1)` reads `Real ≠ Int` and a VALID
+/// model is spuriously refuted. Returns `None` for non-numeric values (Bool,
+/// BitVec, Uninterpreted), which keeps those conservatively undecided.
+fn to_real(v: &ModelValue) -> Option<BigRational> {
+    match v {
+        ModelValue::Int(n) => Some(BigRational::from(n.clone())),
+        ModelValue::Real(r) => Some(r.clone()),
+        _ => None,
+    }
+}
+
+/// Numeric equality across the Int/Real boundary: `Int(2) = Real(2.0)` is TRUE.
+/// Falls back to structural `==` for non-numeric values (Bool / BitVec /
+/// Uninterpreted), where variant identity is the right notion.
+fn values_equal(lhs: &ModelValue, rhs: &ModelValue) -> bool {
+    match (to_real(lhs), to_real(rhs)) {
+        (Some(a), Some(b)) => a == b,
+        _ => lhs == rhs,
+    }
+}
+
 fn compare_lt(lhs: &ModelValue, rhs: &ModelValue) -> Option<bool> {
     match (lhs, rhs) {
         (ModelValue::Int(a), ModelValue::Int(b)) => Some(a < b),
-        (ModelValue::Real(a), ModelValue::Real(b)) => Some(a < b),
-        _ => None,
+        _ => Some(to_real(lhs)? < to_real(rhs)?),
     }
 }
 
 fn compare_le(lhs: &ModelValue, rhs: &ModelValue) -> Option<bool> {
     match (lhs, rhs) {
         (ModelValue::Int(a), ModelValue::Int(b)) => Some(a <= b),
-        (ModelValue::Real(a), ModelValue::Real(b)) => Some(a <= b),
-        _ => None,
+        _ => Some(to_real(lhs)? <= to_real(rhs)?),
     }
 }
 
 fn add_values(lhs: &ModelValue, rhs: &ModelValue) -> Option<ModelValue> {
     match (lhs, rhs) {
         (ModelValue::Int(a), ModelValue::Int(b)) => Some(ModelValue::Int(a + b)),
-        (ModelValue::Real(a), ModelValue::Real(b)) => Some(ModelValue::Real(a + b)),
-        _ => None,
+        _ => Some(ModelValue::Real(to_real(lhs)? + to_real(rhs)?)),
     }
 }
 
 fn mul_values(lhs: &ModelValue, rhs: &ModelValue) -> Option<ModelValue> {
     match (lhs, rhs) {
         (ModelValue::Int(a), ModelValue::Int(b)) => Some(ModelValue::Int(a * b)),
-        (ModelValue::Real(a), ModelValue::Real(b)) => Some(ModelValue::Real(a * b)),
-        _ => None,
+        _ => Some(ModelValue::Real(to_real(lhs)? * to_real(rhs)?)),
     }
 }
 
 fn sub_values(lhs: &ModelValue, rhs: &ModelValue) -> Option<ModelValue> {
     match (lhs, rhs) {
         (ModelValue::Int(a), ModelValue::Int(b)) => Some(ModelValue::Int(a - b)),
-        (ModelValue::Real(a), ModelValue::Real(b)) => Some(ModelValue::Real(a - b)),
-        _ => None,
+        _ => Some(ModelValue::Real(to_real(lhs)? - to_real(rhs)?)),
     }
 }
 
@@ -589,8 +608,14 @@ fn neg_value(val: &ModelValue) -> Option<ModelValue> {
 fn div_values(lhs: &ModelValue, rhs: &ModelValue) -> Option<ModelValue> {
     match (lhs, rhs) {
         (ModelValue::Int(a), ModelValue::Int(b)) if !b.is_zero() => Some(ModelValue::Int(a / b)),
-        (ModelValue::Real(a), ModelValue::Real(b)) if !b.is_zero() => Some(ModelValue::Real(a / b)),
-        _ => None,
+        _ => {
+            let (a, b) = (to_real(lhs)?, to_real(rhs)?);
+            if b.is_zero() {
+                None
+            } else {
+                Some(ModelValue::Real(a / b))
+            }
+        }
     }
 }
 
@@ -903,5 +928,48 @@ mod tests {
 
         // x_squared should only be evaluated once and cached
         assert!(evaluator.cache_size() >= 3); // At least x, x_squared, and sum
+    }
+
+    /// SMT-LIB mixes Int and Real — a literal `1` parses as `IntConst` even in a
+    /// Real equation — so model evaluation must coerce across the boundary.
+    /// `Int(2) = Real(2.0)` is TRUE and `Int(1) < Real(3/2)` holds; before the
+    /// coercion fix the Eq compared enum variants (`Int ≠ Real` ⇒ false) and the
+    /// comparisons returned `None`, so a VALID model was spuriously refuted.
+    #[test]
+    fn eval_coerces_int_and_real() {
+        let mut manager = TermManager::new();
+        let model = Model::new();
+
+        let i2 = manager.mk_int(2);
+        let r2 = manager.mk_real(num_rational::Rational64::new(2, 1));
+        let eq = manager.mk_eq(i2, r2);
+        assert_eq!(
+            eval_term(eq, &manager, &model),
+            Some(ModelValue::Bool(true)),
+            "Int(2) = Real(2.0) must be true"
+        );
+
+        // `(+ r 1) = 2` with r ↦ Real(1): the literal `1` is IntConst, the sum is
+        // Real — the equality must still hold.
+        let r = manager.mk_var("r", manager.sorts.real_sort);
+        let mut m2 = Model::new();
+        m2.assign_real(r, num_rational::BigRational::from(BigInt::from(1)));
+        let one = manager.mk_int(1);
+        let sum = manager.mk_add(vec![r, one]);
+        let two = manager.mk_int(2);
+        let eq2 = manager.mk_eq(sum, two);
+        assert_eq!(
+            eval_term(eq2, &manager, &m2),
+            Some(ModelValue::Bool(true)),
+            "(r + 1) = 2 with r = 1.0 must be true across Int/Real"
+        );
+
+        let half = manager.mk_real(num_rational::Rational64::new(3, 2));
+        let lt = manager.mk_lt(one, half);
+        assert_eq!(
+            eval_term(lt, &manager, &model),
+            Some(ModelValue::Bool(true)),
+            "Int(1) < Real(3/2) must be true"
+        );
     }
 }
