@@ -512,27 +512,34 @@ impl TermManager {
             // Omitting this silently left `(∀z. … x …)[x↦t]` unchanged — so a
             // nested-quantifier instantiation kept the bound variable, and
             // skolemizing `∀x.∃y.∀z. φ` leaked `y` into the inner `∀z` (the
-            // `nested_quantifiers` Unknown). `subst_under_binder` drops shadowed
-            // keys and BAILS (leaves the body untouched) on capture, so it is
-            // never unsound; patterns are preserved (triggers are advisory).
+            // `nested_quantifiers` Unknown). `subst_under_quantifier` drops
+            // shadowed keys and, when a replacement value would be captured by a
+            // binder variable, α-RENAMES that binder to a fresh name (in both
+            // `vars` and `body`) instead of bailing — so the substitution always
+            // goes through. Bailing left the outer-substituted variable free
+            // inside the binder (`∀x.(∀y.p x)` instantiated `x↦y` kept `x` free
+            // because the value `y` collided with the inner binder name), which
+            // dropped the instance and surfaced as a spurious `sat` (#346).
+            // Patterns are preserved verbatim (triggers are advisory; a stale
+            // post-rename trigger only costs a future match, never soundness).
             Some(TermKind::Forall { vars, body, patterns }) => {
-                let nb = self.subst_under_binder(&vars, body, subst);
-                if nb == body {
+                let (nvars, nb) = self.subst_under_quantifier(&vars, body, subst);
+                if nb == body && nvars == vars {
                     id
                 } else {
                     self.intern(
-                        TermKind::Forall { vars, body: nb, patterns },
+                        TermKind::Forall { vars: nvars, body: nb, patterns },
                         self.sorts.bool_sort,
                     )
                 }
             }
             Some(TermKind::Exists { vars, body, patterns }) => {
-                let nb = self.subst_under_binder(&vars, body, subst);
-                if nb == body {
+                let (nvars, nb) = self.subst_under_quantifier(&vars, body, subst);
+                if nb == body && nvars == vars {
                     id
                 } else {
                     self.intern(
-                        TermKind::Exists { vars, body: nb, patterns },
+                        TermKind::Exists { vars: nvars, body: nb, patterns },
                         self.sorts.bool_sort,
                     )
                 }
@@ -635,27 +642,109 @@ impl TermManager {
         result
     }
 
-    /// Substitute into a quantifier `body` whose own bound variables are `vars`.
-    /// Shadowed substitution keys (a `vars` variable) are dropped, and the whole
-    /// substitution is ABORTED (body returned unchanged) if any live replacement
-    /// would be captured by a bound variable — so the result is always
-    /// capture-free. Uses a fresh cache because the effective substitution
-    /// (after shadow-filtering) differs from the caller's.
-    fn subst_under_binder(
-        &mut self,
-        vars: &[(Spur, SortId)],
-        body: TermId,
-        subst: &FxHashMap<TermId, TermId>,
-    ) -> TermId {
-        let bound: FxHashSet<Spur> = vars.iter().map(|(n, _)| *n).collect();
-        self.subst_under_bound_names(&bound, body, subst)
+    /// A fresh bound-variable name derived from `base` that collides with no name
+    /// in `avoid`. Used by [`Self::subst_under_quantifier`] to α-rename a binder
+    /// whose variable would otherwise capture a substitution value.
+    fn fresh_bound_name(&mut self, base: Spur, avoid: &FxHashSet<Spur>) -> Spur {
+        let base = self.resolve_str(base).to_string();
+        let mut k = 0u32;
+        loop {
+            let cand = self.intern_str(&format!("{base}!q{k}"));
+            if !avoid.contains(&cand) {
+                return cand;
+            }
+            k += 1;
+        }
     }
 
-    /// The capture-avoiding core of [`Self::subst_under_binder`], parameterised by
-    /// the set of `bound` names a binder introduces — shared by the quantifier,
-    /// `let`, and `match`-case arms of [`Self::substitute_cached`]. Drops keys the
-    /// binder shadows and BAILS (body unchanged) if any live replacement would be
-    /// captured, so the result is always capture-free.
+    /// Capture-AVOIDING substitution into a quantifier `body` whose own bound
+    /// variables are `vars`. Shadowed keys (a `vars` name) are dropped; a binder
+    /// variable that would capture a live replacement value is α-RENAMED to a
+    /// fresh name — in both `vars` and `body` — BEFORE the substitution, so the
+    /// substitution always goes through. The predecessor `subst_under_binder`
+    /// instead BAILED (returned the body unchanged) on capture: that was never
+    /// unsound on its own, but it dropped the intended substitution and so could
+    /// leave an outer-instantiated variable free inside the binder, which the
+    /// engine then read as satisfiable (#346). Returns the (possibly renamed)
+    /// binder list and the new body. Uses fresh caches because the effective
+    /// substitutions (after shadow-filtering / renaming) differ from the caller's.
+    fn subst_under_quantifier(
+        &mut self,
+        vars: &SmallVec<[(Spur, SortId); 2]>,
+        body: TermId,
+        subst: &FxHashMap<TermId, TermId>,
+    ) -> (SmallVec<[(Spur, SortId); 2]>, TermId) {
+        let bound: FxHashSet<Spur> = vars.iter().map(|(n, _)| *n).collect();
+        // Drop keys this binder shadows.
+        let mut filtered: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for (&k, &v) in subst {
+            if let Some(TermKind::Var(s)) = self.get(k).map(|t| &t.kind) {
+                if bound.contains(s) {
+                    continue;
+                }
+            }
+            filtered.insert(k, v);
+        }
+        if filtered.is_empty() {
+            return (vars.clone(), body);
+        }
+        // Which binder names would a live replacement value capture?
+        let mut captured: FxHashSet<Spur> = FxHashSet::default();
+        for &v in filtered.values() {
+            for fv in self.free_vars(v) {
+                if let Some(TermKind::Var(s)) = self.get(fv).map(|t| &t.kind) {
+                    if bound.contains(s) {
+                        captured.insert(*s);
+                    }
+                }
+            }
+        }
+        let mut new_vars = vars.clone();
+        let mut work_body = body;
+        if !captured.is_empty() {
+            // Fresh names must avoid: the binder's own names, the body's free
+            // names, and every name a replacement value mentions.
+            let mut avoid = bound.clone();
+            for fv in self.free_vars(body) {
+                if let Some(TermKind::Var(s)) = self.get(fv).map(|t| &t.kind) {
+                    avoid.insert(*s);
+                }
+            }
+            for &v in filtered.values() {
+                for fv in self.free_vars(v) {
+                    if let Some(TermKind::Var(s)) = self.get(fv).map(|t| &t.kind) {
+                        avoid.insert(*s);
+                    }
+                }
+            }
+            let mut rename: FxHashMap<TermId, TermId> = FxHashMap::default();
+            for (n, sort) in new_vars.iter_mut() {
+                if captured.contains(n) {
+                    let fresh = self.fresh_bound_name(*n, &avoid);
+                    avoid.insert(fresh);
+                    let old_name = self.resolve_str(*n).to_string();
+                    let new_name = self.resolve_str(fresh).to_string();
+                    let old_var = self.mk_var(&old_name, *sort);
+                    let new_var = self.mk_var(&new_name, *sort);
+                    rename.insert(old_var, new_var);
+                    *n = fresh;
+                }
+            }
+            work_body = self.substitute_cached(body, &rename, &mut FxHashMap::default());
+        }
+        let nb = self.substitute_cached(work_body, &filtered, &mut FxHashMap::default());
+        (new_vars, nb)
+    }
+
+    /// Capture-avoiding substitution parameterised by the set of `bound` names a
+    /// binder introduces — used by the `match`-case arm of
+    /// [`Self::substitute_cached`] (whose pattern variables are names without an
+    /// in-hand sort, so they can't be α-renamed via a `Var` rewrite the way
+    /// [`Self::subst_under_quantifier`] renames quantifier binders). Drops keys
+    /// the binder shadows and BAILS (body unchanged) if any live replacement
+    /// would be captured, so the result is always capture-free — sound, but on
+    /// a name collision it leaves the body un-substituted (an incompleteness the
+    /// quantifier path no longer has).
     fn subst_under_bound_names(
         &mut self,
         bound: &FxHashSet<Spur>,

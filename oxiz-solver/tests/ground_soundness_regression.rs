@@ -661,3 +661,58 @@ fn ground_let_arith_identity_stays_sat() {
         "2c+1 = 2c+1 is a tautology — must stay sat",
     );
 }
+
+/// #346 — instantiating an outer `∀x` with a term that names an INNER binder
+/// used to BAIL the capture-avoiding substitution (body returned unchanged), so
+/// `x` stayed free inside the inner quantifier and the instance was dropped → a
+/// spurious `sat`. The substitution now α-renames the colliding inner binder to
+/// a fresh name instead of bailing, so the instance goes through. Here a
+/// constant `y` (sharing the inner `∀y`'s name) instantiates `x`, and the
+/// resulting `(p y)` contradicts `(not (p y))`.
+#[test]
+fn nested_quantifier_name_collision_instantiation_is_unsat() {
+    // ∀x. (p x ∧ ∀y. q(x,y)) — instantiate x := the constant y, exposing p(y).
+    let with_pred_body = "\
+(set-logic UF)
+(declare-sort U 0)
+(declare-fun p (U) Bool)
+(declare-fun q (U U) Bool)
+(declare-const y U)
+(assert (forall ((x U)) (and (p x) (forall ((y U)) (q x y)))))
+(assert (not (p y)))
+(check-sat)
+";
+    assert_eq!(
+        verdict(with_pred_body),
+        "unsat",
+        "p(y) from the x:=y instance must contradict ¬p(y) — not spurious sat",
+    );
+    // ∀x. (p x ∧ ∀y. (p y ∨ p x)) — same collision, disjunctive inner body.
+    let with_disjunction = "\
+(set-logic UF)
+(declare-sort U 0)
+(declare-fun p (U) Bool)
+(declare-const y U)
+(assert (forall ((x U)) (and (p x) (forall ((y U)) (or (p y) (p x))))))
+(assert (not (p y)))
+(check-sat)
+";
+    assert_eq!(verdict(with_disjunction), "unsat", "inner-collision instance must still close");
+}
+
+/// #346 soundness control — α-renaming is alpha-equivalence, so a genuinely
+/// satisfiable nested-quantifier query with a name collision must STAY sat
+/// (the rename must not fabricate a conflict).
+#[test]
+fn nested_quantifier_name_collision_satisfiable_stays_sat() {
+    let script = "\
+(set-logic UF)
+(declare-sort U 0)
+(declare-fun p (U) Bool)
+(declare-const y U)
+(assert (forall ((x U)) (forall ((y U)) (=> (p x) (p x)))))
+(assert (p y))
+(check-sat)
+";
+    assert_ne!(verdict(script), "unsat", "a tautological axiom + (p y) is satisfiable");
+}
