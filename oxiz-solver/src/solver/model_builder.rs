@@ -118,55 +118,46 @@ impl Solver {
             }
         }
 
-        // Get arithmetic values from theory solver
-        // Iterate over tracked arithmetic terms
+        // Get arithmetic values from theory solver.
+        // #353 — materialize the δ-rational model ONCE. The raw `value()` returns
+        // only the REAL part, which collapses a strict inequality `x > y` (encoded
+        // `x − y ≥ δ`, with the assignment sitting at `x − y = δ`) to `x = y`, so
+        // the extracted model VIOLATES a constraint the solver proved satisfiable.
+        // `materialize()` picks a single δ₀ > 0 keeping every bound satisfied and
+        // returns a concrete real value per simplex variable. An Int-sorted term
+        // instead takes the δ-aware integer rounding (its SORT — not the solver's
+        // LIA/LRA mode — decides its value must be integral); the
+        // sort-vs-denominator distinction below still holds: a Real-sorted term is
+        // always a RealConst even when its value is an integer ratio (e.g. 2/1),
+        // else mixed comparisons like `(f(c) <= 1.0)` go symbolic.
+        let materialized = self.arith.materialize();
         for &term in &self.arith_terms {
             // Don't overwrite if already set (e.g., from equality extraction above)
             if model.get(term).is_some() {
                 continue;
             }
 
-            if let Some(value) = self.arith.value(term) {
-                // Determine whether the term has Int or Real sort, and create the
-                // matching constant kind.  Using the term sort (rather than the
-                // denominator of the rational value) is essential: a Real-sorted
-                // term whose arith model value happens to be an integer ratio (e.g.
-                // 2/1) must be represented as RealConst(2), not IntConst(2).  If
-                // stored as IntConst, mixed-type comparisons like (f(c) <= 1.0)
-                // become symbolic because eval_le requires both sides to be the
-                // same constant kind, preventing counterexample detection.
-                let is_int_sort = manager
-                    .get(term)
-                    .map(|t| t.sort == manager.sorts.int_sort)
-                    .unwrap_or(true);
-                let value_term = if is_int_sort {
-                    // Integer-sorted term: the arith value is integral; its i128
-                    // numerator converts straight to BigInt (`mk_int` takes any
-                    // `Into<BigInt>`), so there is no narrowing here.
-                    manager.mk_int(*value.numer())
-                } else {
-                    // Real-sorted term: always use RealConst regardless of
-                    // denominator. `RealConst` is `Rational64`, so the i128 model
-                    // value is narrowed at this output boundary (see
-                    // `narrow_arith_to_real64` — post-verdict, never affects sat).
-                    manager.mk_real(narrow_arith_to_real64(value))
-                };
-                model.set(term, value_term);
-            } else {
-                // If no value from ArithSolver (e.g., unconstrained variable), use default
-                // Get the sort to determine if it's Int or Real
-                let is_int = manager
-                    .get(term)
-                    .map(|t| t.sort == manager.sorts.int_sort)
-                    .unwrap_or(true);
+            let is_int_sort = manager
+                .get(term)
+                .map(|t| t.sort == manager.sorts.int_sort)
+                .unwrap_or(true);
 
-                let value_term = if is_int {
-                    manager.mk_int(0i64)
-                } else {
-                    manager.mk_real(num_rational::Rational64::from_integer(0))
-                };
-                model.set(term, value_term);
-            }
+            let value_term = if is_int_sort {
+                match self.arith.rounded_int_value(term) {
+                    Some(n) => manager.mk_int(n),
+                    None => manager.mk_int(0i64),
+                }
+            } else {
+                match self
+                    .arith
+                    .var_index(term)
+                    .and_then(|i| materialized.get(i).copied())
+                {
+                    Some(r) => manager.mk_real(narrow_arith_to_real64(r)),
+                    None => manager.mk_real(num_rational::Rational64::from_integer(0)),
+                }
+            };
+            model.set(term, value_term);
         }
 
         // Get bitvector values - check ArithSolver first (for BV comparisons),

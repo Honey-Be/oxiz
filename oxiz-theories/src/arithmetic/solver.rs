@@ -483,6 +483,56 @@ impl ArithSolver {
         })
     }
 
+    /// #353 — δ-materialized CONCRETE value of every variable, indexed by `VarId`.
+    /// Delegates to [`Simplex::materialize`]; the model builder calls it ONCE per
+    /// `check_sat` and indexes it with [`Self::var_index`] so a strict inequality
+    /// `x > y` ships a model where `x` is concretely above `y` instead of the
+    /// real-part-only `x = y` that [`Self::value`] would return for a Real-sorted
+    /// term.
+    #[must_use]
+    pub fn materialize(&self) -> Vec<ArithRat> {
+        self.simplex.materialize()
+    }
+
+    /// The simplex `VarId` (as a `usize` index) a term is interned to, if any —
+    /// used to look a term up in the [`Self::materialize`] vector.
+    #[must_use]
+    pub fn var_index(&self, term: TermId) -> Option<usize> {
+        self.interner.get(&term).map(|&v| v as usize)
+    }
+
+    /// #353 — the delta-aware INTEGER value of an Int-sorted term, applied
+    /// regardless of the solver's `is_integer` mode. A term solved in real mode
+    /// (the mixed/`ALL` logic that falls to LRA) still has a δ-rational
+    /// assignment, and the SORT — not the solver mode — decides that its model
+    /// value must be an integer: round toward the side the δ part came from
+    /// (a strict lower `x > r` ⇒ `delta > 0` ⇒ round up, a strict upper ⇒ round
+    /// down, otherwise to nearest). For a genuinely integer-feasible problem this
+    /// reproduces the valid model the pure-LIA path already builds; for an
+    /// integer-INFEASIBLE one (`2x = 1`) the rounded value won't satisfy the
+    /// assertion — that residual is the #289 integrality gate's job, not this one.
+    #[must_use]
+    pub fn rounded_int_value(&self, term: TermId) -> Option<i128> {
+        let &var = self.interner.get(&term)?;
+        let dval = self.simplex.delta_value(var);
+        let v = if dval.delta.is_positive() {
+            if dval.real.is_integer() {
+                dval.real.to_integer() + 1
+            } else {
+                dval.real.ceil().to_integer()
+            }
+        } else if dval.delta.is_negative() {
+            if dval.real.is_integer() {
+                dval.real.to_integer() - 1
+            } else {
+                dval.real.floor().to_integer()
+            }
+        } else {
+            dval.real.round().to_integer()
+        };
+        Some(v)
+    }
+
     /// If `term` is FIXED to a single value by the current arithmetic bounds,
     /// return `(value, reason_atoms)` — `reason_atoms` being the currently
     /// asserted constraint atoms (TermIds) that pin the value. Returns `None`

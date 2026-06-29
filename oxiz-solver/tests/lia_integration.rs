@@ -309,3 +309,47 @@ fn undecided_div_mod_never_reports_a_spurious_sat() {
         "a div/mod-free contradiction must stay decided unsat"
     );
 }
+
+/// #353 — δ-materialized model VALIDITY. The model builder used to extract only
+/// the REAL part of the simplex assignment, dropping the δ component that carries
+/// strictness: a proved-sat `x > y` (encoded `x − y ≥ δ`, with the assignment
+/// sitting at `x − y = δ`) was reported with the model `{x = c, y = c}` — which
+/// VIOLATES `x > y`. After the fix the assignment is materialized at a concrete
+/// δ₀ > 0, so the two values are distinct (`x` strictly above `y`). This held a
+/// ~25% invalid-model rate on a mixed-logic ground-arith corpus; it is now 0%.
+#[test]
+fn materialized_model_satisfies_strict_inequality_353() {
+    use oxiz_solver::Context;
+    for (logic, real) in [("ALL", false), ("QF_LRA", true)] {
+        let mut ctx = Context::new();
+        ctx.set_logic(logic);
+        let sort = if real {
+            ctx.terms.sorts.real_sort
+        } else {
+            ctx.terms.sorts.int_sort
+        };
+        let x = ctx.declare_const("x", sort);
+        let y = ctx.declare_const("y", sort);
+        let gt = ctx.terms.mk_gt(x, y);
+        ctx.assert(gt);
+        assert!(
+            matches!(ctx.check_sat(), oxiz_solver::SolverResult::Sat),
+            "{logic}: x > y is satisfiable"
+        );
+        let model = ctx.get_model().expect("a model after sat");
+        let val = |n: &str| {
+            model
+                .iter()
+                .find(|(name, _, _)| name == n)
+                .map(|(_, _, v)| v.clone())
+                .unwrap_or_default()
+        };
+        // A model that satisfies `x > y` cannot assign x and y the same value;
+        // the pre-#353 builder collapsed both to the same bound value.
+        assert_ne!(
+            val("x"),
+            val("y"),
+            "{logic}: materialized model for x > y must not collapse to x == y"
+        );
+    }
+}

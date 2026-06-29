@@ -323,6 +323,54 @@ impl Simplex {
             .unwrap_or_default()
     }
 
+    /// Materialize a CONCRETE rational assignment from the current delta-rational
+    /// model: pick a single `δ₀ > 0` small enough that no variable bound is
+    /// crossed, then return `real(v) + δ₀·delta(v)` for every variable `v`
+    /// (de Moura & Bjørner, *A Fast Linear-Arithmetic Solver for DPLL(T)*, §5).
+    ///
+    /// The tableau rows balance in BOTH the real and the δ component (a basic
+    /// variable equals its row exactly in each), so they hold for ANY `δ₀` — only
+    /// the per-variable bounds constrain it. Dropping the δ part instead (as
+    /// [`Self::value`] does) collapses a strict inequality `x > y` — encoded
+    /// `x − y ≥ δ` with the assignment sitting at `x − y = δ` — to `x = y`, so the
+    /// extracted model VIOLATES the very constraint the solver proved satisfiable.
+    /// Materializing keeps it strict. The returned vector is indexed by `VarId`.
+    #[must_use]
+    pub fn materialize(&self) -> Vec<ArithRat> {
+        // δ₀ starts at 1 and is tightened to the smallest positive ratio at which
+        // the concrete value would reach a bound: for a bound `b` the assignment β
+        // satisfies in δ-arithmetic, `real(β) + δ₀·delta(β)` meets `real(b) +
+        // δ₀·delta(b)` exactly at δ₀ = (β.real − b.real)/(b.delta − β.delta), which
+        // matters only when that quantity is positive (β is real-strictly inside
+        // the bound but its δ part drifts toward it).
+        let mut delta0 = ArithRat::from_integer(1);
+        for i in 0..self.assignment.len() {
+            let beta = self.assignment[i];
+            if let Some(b) = self.lower[i]
+                && beta.real > b.value.real
+                && b.value.delta > beta.delta
+            {
+                let ratio = (beta.real - b.value.real) / (b.value.delta - beta.delta);
+                if ratio < delta0 {
+                    delta0 = ratio;
+                }
+            }
+            if let Some(b) = self.upper[i]
+                && b.value.real > beta.real
+                && beta.delta > b.value.delta
+            {
+                let ratio = (b.value.real - beta.real) / (beta.delta - b.value.delta);
+                if ratio < delta0 {
+                    delta0 = ratio;
+                }
+            }
+        }
+        self.assignment
+            .iter()
+            .map(|d| d.real + d.delta * delta0)
+            .collect()
+    }
+
     /// Set a lower bound (x >= value)
     pub fn set_lower(&mut self, var: VarId, value: ArithRat, reason: u32) {
         let idx = var as usize;
