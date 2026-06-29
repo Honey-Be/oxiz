@@ -1486,3 +1486,59 @@ fn array_unsorted_triangular_guard_is_not_spurious_sat() {
     ]);
     assert_ne!(r, SolverResult::Sat, "an unsorted array under the sortedness axiom must not be spurious sat");
 }
+
+#[test]
+fn guarded_contradictory_quantifier_is_sat_not_spurious_unsat() {
+    // #347 — a quantifier with an always-false body NESTED under a guard:
+    // `(=> (= b (f b)) (∀x. (p x ∧ ¬p x)))`. Since `∀x.false` is false over a
+    // non-empty sort, the implication is `¬(= b (f b))`, which IS satisfiable
+    // (pick `b ≠ f(b)`). The MBQI loop correctly derives `¬Q → ¬(= b (f b))` and
+    // the incremental solve is Sat — but the single-shot saturation verifier
+    // used to record the BARE instantiated body `⊥` (dropping the guard `Q`) and
+    // assert it unconditionally in a fresh ground solve → spurious `unsat`. The
+    // verifier now abstracts each quantifier to a shared Bool proposition, so the
+    // guard is preserved (`Q ⇒ ⊥` ⤳ `¬Q`) and the verdict is the sound `Sat`.
+    let r = solve_streamed(&[
+        "(declare-sort S 0)",
+        "(declare-const b S)",
+        "(declare-fun f (S) S)",
+        "(declare-fun p (S) Bool)",
+        "(assert (=> (= b (f b)) (forall ((x S)) (and (p x) (not (p x))))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Unsat, "a guarded contradictory ∀ must not be spurious unsat (the guard makes it sat)");
+}
+
+#[test]
+fn disjoined_contradictory_quantifier_is_sat_not_spurious_unsat() {
+    // #347 control — the same always-false `∀` body in a DISJUNCTION:
+    // `(or (p b) (∀x.(p x ∧ ¬p x)))` ≡ `(p b)`, satisfiable. The old
+    // guard-dropping verifier asserted the `⊥` body unconditionally → spurious
+    // unsat; the guard-preserving verifier keeps `(or (p b) p_Q) ∧ (p_Q ⇒ ⊥)`,
+    // forcing `¬p_Q` and leaving `(p b)` free → Sat.
+    let r = solve_streamed(&[
+        "(declare-sort S 0)",
+        "(declare-const b S)",
+        "(declare-fun p (S) Bool)",
+        "(assert (or (p b) (forall ((x S)) (and (p x) (not (p x))))))",
+        "(check-sat)",
+    ]);
+    assert_ne!(r, SolverResult::Unsat, "a disjoined contradictory ∀ must not be spurious unsat");
+}
+
+#[test]
+fn top_level_forall_ground_conflict_stays_unsat() {
+    // #347 soundness control: the guard-preservation must NOT lose a GENUINE
+    // conflict. `(∀x. p x) ∧ ¬(p b)` instantiates at `b` → `p b ∧ ¬p b` → unsat.
+    // The top-level `∀` is asserted (its abstraction `p_Q` is pinned true), so
+    // the instance fires and the verifier still resolves Unsat.
+    let r = solve_streamed(&[
+        "(declare-sort S 0)",
+        "(declare-const b S)",
+        "(declare-fun p (S) Bool)",
+        "(assert (forall ((x S)) (p x)))",
+        "(assert (not (p b)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "a real top-level ∀ conflict must stay unsat");
+}

@@ -39,6 +39,80 @@ use theory_manager::{TheoryManager, TheoryParts};
 use trail::{ContextState, TrailOp};
 use types::{Constraint, ParsedArithConstraint, Polarity};
 
+/// Replace every quantifier node reachable through the boolean spine of `t` with
+/// a FRESH Bool proposition — memoized per quantifier `TermId` in `map`, so the
+/// same quantifier maps to the SAME proposition across every call. Ground/theory
+/// atoms (and anything that is not a boolean connective) are returned verbatim —
+/// a quantifier is `Bool`-sorted, so it can only sit under a boolean connective.
+///
+/// Used by [`Solver::fresh_ground_resolve`] (#347): abstracting a quantifier `Q`
+/// to a free Bool `p_Q` shared between the original assertions and the guarded
+/// instances `Q ⇒ φ` preserves each instance's guard in the single-shot
+/// verifier, so a guarded `Q ⇒ ⊥` collapses to `¬p_Q` (sound `Sat`) instead of
+/// asserting `⊥` unconditionally (the old spurious `unsat`). Sound because a free
+/// Bool over-approximates the quantifier's truth value (`abstract-unsat ⇒
+/// real-unsat`).
+fn abstract_quants(
+    manager: &mut TermManager,
+    t: TermId,
+    map: &mut FxHashMap<TermId, TermId>,
+) -> TermId {
+    let Some(kind) = manager.get(t).map(|x| x.kind.clone()) else {
+        return t;
+    };
+    match kind {
+        TermKind::Forall { .. } | TermKind::Exists { .. } => {
+            if let Some(&v) = map.get(&t) {
+                return v;
+            }
+            let bool_sort = manager.sorts.bool_sort;
+            // `!` cannot start an SMT-LIB simple symbol, so this never collides
+            // with a user-declared constant.
+            let name = format!("!mbqi-qabs!{}", map.len());
+            let v = manager.mk_var(&name, bool_sort);
+            map.insert(t, v);
+            v
+        }
+        TermKind::Not(a) => {
+            let a2 = abstract_quants(manager, a, map);
+            manager.mk_not(a2)
+        }
+        TermKind::And(args) => {
+            let v: Vec<TermId> = args.iter().map(|&a| abstract_quants(manager, a, map)).collect();
+            manager.mk_and(v)
+        }
+        TermKind::Or(args) => {
+            let v: Vec<TermId> = args.iter().map(|&a| abstract_quants(manager, a, map)).collect();
+            manager.mk_or(v)
+        }
+        TermKind::Implies(a, b) => {
+            let a2 = abstract_quants(manager, a, map);
+            let b2 = abstract_quants(manager, b, map);
+            manager.mk_implies(a2, b2)
+        }
+        TermKind::Xor(a, b) => {
+            let a2 = abstract_quants(manager, a, map);
+            let b2 = abstract_quants(manager, b, map);
+            manager.mk_xor(a2, b2)
+        }
+        TermKind::Ite(c, a, b) => {
+            let c2 = abstract_quants(manager, c, map);
+            let a2 = abstract_quants(manager, a, map);
+            let b2 = abstract_quants(manager, b, map);
+            manager.mk_ite(c2, a2, b2)
+        }
+        TermKind::Eq(a, b) => {
+            // A `Bool`-sorted `=` (iff) may carry a quantifier → recurse. An
+            // arith/UF `=` has no quantifier operand, so both recursions are the
+            // identity and this rebuilds the same hash-consed term.
+            let a2 = abstract_quants(manager, a, map);
+            let b2 = abstract_quants(manager, b, map);
+            manager.mk_eq(a2, b2)
+        }
+        _ => t,
+    }
+}
+
 /// Default wall-clock budget (milliseconds) for the MBQI quantifier-
 /// instantiation loop when no explicit `timeout_ms` is configured.  A pure
 /// non-termination guard: quantifier reasoning over an infinite domain is
@@ -349,20 +423,31 @@ impl Solver {
         config.clean_mbqi = false;
         let mut verifier = Solver::with_config(config);
         verifier.set_logic(self.logic.as_deref().unwrap_or("ALL"));
+        // #347 — abstract every quantifier node (top-level OR nested in the
+        // boolean spine) to a FRESH Bool proposition, the SAME proposition per
+        // quantifier `TermId` shared across the re-asserted original assertions
+        // AND the guarded instances. This preserves each instance's guard:
+        //   - the original `(=> g Q)` ⤳ `(=> g p_Q)`,
+        //   - the guarded instance `(=> Q φ)` ⤳ `(=> p_Q φ)`,
+        // so a `(=> p_Q ⊥)` collapses to `¬p_Q` and `(or ¬g p_Q)` yields `¬g`
+        // → the sound `Sat` (the old code dropped the guard — asserting the
+        // instance body `φ` unconditionally AND skipping the quantifiers — so a
+        // guarded `Q ⇒ ⊥` became an unconditional `⊥` → spurious unsat).
+        // The abstraction is an OVER-approximation (a free Bool admits ≥ the
+        // quantifier's models), so `abstract-unsat ⇒ real-unsat`: a top-level
+        // forall is asserted (`p_Q` true) and a genuine cross-instance conflict
+        // (pigeonhole) still resolves `Unsat`. (For quantifiers under boolean
+        // shapes the abstraction does not descend, the raw quantifier survives
+        // and the verifier reports the sound `Unknown`.)
+        let mut qabs: FxHashMap<TermId, TermId> = FxHashMap::default();
         let assertions = self.assertions.clone();
         for a in assertions {
-            // Skip quantifiers — their ground instances stand in for them, so
-            // the verifier never instantiates (and so cannot itself fabricate).
-            if matches!(
-                manager.get(a).map(|t| &t.kind),
-                Some(TermKind::Forall { .. } | TermKind::Exists { .. })
-            ) {
-                continue;
-            }
-            verifier.assert(a, manager);
+            let aa = abstract_quants(manager, a, &mut qabs);
+            verifier.assert(aa, manager);
         }
         for &inst in instances {
-            verifier.assert(inst, manager);
+            let ia = abstract_quants(manager, inst, &mut qabs);
+            verifier.assert(ia, manager);
         }
         verifier.check(manager)
     }
@@ -726,10 +811,19 @@ impl Solver {
                                             if retains_bound {
                                                 continue;
                                             }
-                                            // Record the GROUND instance body (a
-                                            // sound consequence of `Q`) for the
-                                            // single-shot unsat verification.
-                                            clean_instances.push(phi);
+                                            // Record the GUARDED lemma `Q ⇒ φ`
+                                            // (NOT the bare body `φ`) for the
+                                            // single-shot verification. #347: `φ`
+                                            // is a consequence ONLY when `Q` holds;
+                                            // recording the bare `φ` let
+                                            // `fresh_ground_resolve` assert a
+                                            // guarded `Q ⇒ ⊥`'s body `⊥`
+                                            // unconditionally → spurious unsat on
+                                            // `(=> g (∀x. false-body))`. The
+                                            // verifier re-abstracts each `Q` to a
+                                            // shared Bool proposition, so the guard
+                                            // is preserved (`Q ⇒ ⊥` ⤳ `¬Q`).
+                                            clean_instances.push(l);
                                             // Reuse the quantifier's EXISTING literal — do NOT
                                             // `encode(q)`, which re-runs the `Forall` arm and
                                             // re-registers the quantifier with mbqi/ematch on
