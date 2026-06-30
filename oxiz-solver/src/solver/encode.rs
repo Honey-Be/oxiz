@@ -428,17 +428,28 @@ impl Solver {
             // Negation
             TermKind::Neg(arg) => self.extract_linear_terms(*arg, -scale, terms, constant, manager),
 
-            // Multiplication of linear terms.  A product is linear iff at most one
-            // factor is non-constant.  Each factor may itself be a nested
-            // expression that reduces to a pure constant (e.g. `(- 3.0)`,
-            // `(+ 1 2)`) or to a single scaled variable (e.g. `(- x)`).
+            // Multiplication of linear terms.  A product is linear iff AT MOST ONE
+            // factor is non-constant.  Every other factor must reduce to a pure
+            // constant (e.g. `(- 3.0)`, `(+ 1 2)`); their product is the scalar by
+            // which the single non-constant factor is multiplied.  Crucially, that
+            // non-constant factor may be ANY linear expression — a bare/scaled
+            // variable (`x`, `(- x)`), a multi-variable sum (`(+ x y)`), or a linear
+            // expression carrying a constant offset (`(- 3 i)` = `3 - i`).  Scaling
+            // a linear expression by a constant distributes exactly, so the whole
+            // product stays linear.  (Previously only the single-variable, no-offset
+            // case was accepted; `(* 4 (- 3 i))` and `(* -4 (- k k))` bailed to
+            // `None` ⇒ the whole comparison became an OPAQUE Boolean atom ⇒ the
+            // simplex never saw the constraint ⇒ spurious SAT — e.g. `0 = -6`.)
             TermKind::Mul(args) => {
                 let mut const_product: Ratio<i128> = Ratio::one();
-                // The single non-constant factor, if any, represented as a sum of
-                // (variable, coefficient) pairs.  The factor must be linear-as-a-whole
-                // (exactly one variable term, no additive constant) for the product
-                // to remain linear.
-                let mut var_factor: Option<(TermId, Ratio<i128>)> = None;
+                // The single non-constant factor, if any, captured as its FULL
+                // linear form: a sum of (variable, coefficient) pairs plus an
+                // additive constant.  Keeping the constant offset is what makes
+                // `(- 3 i)` survive instead of bailing to a nonlinear `None`.
+                let mut var_factor: Option<(
+                    SmallVec<[(TermId, Ratio<i128>); 4]>,
+                    Ratio<i128>,
+                )> = None;
 
                 for &arg in args {
                     let mut sub_terms: SmallVec<[(TermId, Ratio<i128>); 4]> = SmallVec::new();
@@ -454,27 +465,27 @@ impl Solver {
                     if sub_terms.is_empty() {
                         // Pure constant factor — absorb into product (checked).
                         const_product = const_product.checked_mul(&sub_constant)?;
-                    } else if sub_terms.len() == 1 && sub_constant.is_zero() {
-                        // Exactly one scaled variable with no additive constant,
-                        // e.g. `x`, `(- x)`, `(* 2 x)`.  Record as the variable
-                        // factor; if we already have one, the product is nonlinear.
-                        if var_factor.is_some() {
-                            return None;
-                        }
-                        var_factor = Some(sub_terms[0]);
+                    } else if var_factor.is_none() {
+                        // The (single allowed) non-constant factor — keep its full
+                        // linear form (terms + offset) so a constant offset like the
+                        // `3` in `(- 3 i)` is not lost.
+                        var_factor = Some((sub_terms, sub_constant));
                     } else {
-                        // Either multi-variable (e.g. `(+ x y)`), or a linear
-                        // expression with a constant offset (e.g. `(+ 1 x)`).
-                        // Multiplying such a factor by another variable yields a
-                        // nonlinear product.
+                        // A SECOND non-constant factor ⇒ a genuinely nonlinear
+                        // product (variable × variable); leave it opaque.
                         return None;
                     }
                 }
 
                 let new_scale = scale.checked_mul(&const_product)?;
                 match var_factor {
-                    Some((v, coef)) => {
-                        terms.push((v, new_scale.checked_mul(&coef)?));
+                    Some((sub_terms, sub_constant)) => {
+                        // Distribute `new_scale` over the captured linear factor.
+                        for (v, coef) in sub_terms {
+                            terms.push((v, new_scale.checked_mul(&coef)?));
+                        }
+                        *constant =
+                            constant.checked_add(&new_scale.checked_mul(&sub_constant)?)?;
                         Some(())
                     }
                     None => {

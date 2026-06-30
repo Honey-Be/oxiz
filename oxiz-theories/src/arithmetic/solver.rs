@@ -64,6 +64,29 @@ pub struct ArithSolver {
     /// re-decision the theory frame stack did not retract.
     last_conflict_distinct_ids: usize,
     last_conflict_distinct_terms: usize,
+    /// #289 — the VALID integer assignment recovered by branch-and-bound on the
+    /// most recent `Sat` integer `check()`. `value()`/`rounded_int_value()` read
+    /// it so the reported model satisfies coupled integer equalities, instead of
+    /// independently rounding the rational LP vertex (which produces models that
+    /// violate the constraints). `None` outside integer mode or when B&B did not
+    /// run / did not find one.
+    integer_model: Option<FxHashMap<VarId, ArithRat>>,
+}
+
+/// Node budget for the #289 integer branch-and-bound. Hit only by a genuinely
+/// hard integer search (most LP vertices are already integer or decide in a few
+/// branches); exhausting it yields the sound `Unknown`, never a fabricated sat.
+const INT_BNB_NODE_BUDGET: u32 = 4000;
+
+/// Outcome of [`ArithSolver::integer_branch_and_bound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntFeasibility {
+    /// An all-integer assignment exists; `integer_model` is populated.
+    Sat,
+    /// Every branch is LP-infeasible — no integer solution.
+    Infeasible,
+    /// The node budget was exhausted before deciding (sound: not a fabricated sat).
+    Unknown,
 }
 
 /// State for push/pop
@@ -109,6 +132,7 @@ impl ArithSolver {
             shared_equalities: Vec::new(),
             last_conflict_distinct_ids: 0,
             last_conflict_distinct_terms: 0,
+            integer_model: None,
         }
     }
 
@@ -514,6 +538,15 @@ impl ArithSolver {
     #[must_use]
     pub fn rounded_int_value(&self, term: TermId) -> Option<i128> {
         let &var = self.interner.get(&term)?;
+        // #289 — prefer the branch-and-bound integer model when present: it is a
+        // GENUINE integer assignment (satisfies coupled equalities), unlike the
+        // per-variable rounding of the rational vertex below, which can violate
+        // them (`j+2k=4 ∧ j≤-5` rounds to `{j=-5,k=5}`, j+2k=5≠4).
+        if let Some(model) = &self.integer_model
+            && let Some(v) = model.get(&var)
+        {
+            return Some(v.to_integer());
+        }
         let dval = self.simplex.delta_value(var);
         let v = if dval.delta.is_positive() {
             if dval.real.is_integer() {
@@ -531,6 +564,103 @@ impl ArithSolver {
             dval.real.round().to_integer()
         };
         Some(v)
+    }
+
+    /// #289 branch-and-bound — confirm integer feasibility of the (already
+    /// LP-feasible) constraints and record a VALID integer model. See
+    /// [`IntFeasibility`]. Resets `integer_model`, then explores from the current
+    /// LP vertex under a node budget.
+    fn integer_branch_and_bound(&mut self) -> IntFeasibility {
+        self.integer_model = None;
+        let mut budget: u32 = INT_BNB_NODE_BUDGET;
+        self.bnb_node(&mut budget)
+    }
+
+    /// One branch-and-bound node: the simplex is LP-feasible on entry. If every
+    /// interned variable already has an integer LP value, snapshot it as the
+    /// integer model and return `Sat`. Otherwise branch on the first fractional
+    /// variable `x` (value `v`): the `x ≤ ⌊v⌋` and `x ≥ ⌈v⌉` half-spaces partition
+    /// the search, and a leaf is integer-feasible iff one of them is.
+    fn bnb_node(&mut self, budget: &mut u32) -> IntFeasibility {
+        if *budget == 0 {
+            return IntFeasibility::Unknown;
+        }
+        *budget -= 1;
+
+        let mut fractional: Option<(TermId, ArithRat)> = None;
+        for (&term, &var) in self.interner.iter() {
+            let v = self.simplex.value(var);
+            if !v.is_integer() {
+                fractional = Some((term, v));
+                break;
+            }
+        }
+        let Some((term, val)) = fractional else {
+            // All interned variables are integer-valued. The constraints are
+            // integer linear combinations, so the slacks are integer too — this
+            // LP vertex IS a valid integer model. Snapshot it for the model builder.
+            let mut model: FxHashMap<VarId, ArithRat> = FxHashMap::default();
+            for (&_term, &var) in self.interner.iter() {
+                model.insert(var, self.simplex.value(var));
+            }
+            self.integer_model = Some(model);
+            return IntFeasibility::Sat;
+        };
+
+        let floor_v = ArithRat::from_integer(val.floor().to_integer());
+        let ceil_v = ArithRat::from_integer(val.ceil().to_integer());
+
+        // Branch down (`x ≤ ⌊v⌋`) then up (`x ≥ ⌈v⌉`); `Sat`/`Unknown` short-circuit.
+        match self.bnb_branch(term, false, floor_v, budget) {
+            IntFeasibility::Infeasible => {}
+            decided => return decided,
+        }
+        self.bnb_branch(term, true, ceil_v, budget)
+    }
+
+    /// Explore one B&B branch under a fresh context frame: tighten `term` by a
+    /// lower (`up = true` ⇒ `term ≥ bound`) or upper (`term ≤ bound`) bound,
+    /// re-solve, and recurse while LP-feasible. The frame is ALWAYS popped before
+    /// returning, so the caller's incremental state is left intact.
+    ///
+    /// The branch bound is asserted through the SAME fresh-slack path the SMT
+    /// `(assert (<= t k))` interface uses (`assert_le`/`assert_ge` → `add_le`/
+    /// `add_ge`), NOT a direct `simplex.set_lower/set_upper`. A direct bound on a
+    /// STRUCTURAL variable is not reliably repaired by the incremental `check()`:
+    /// `crash_basis` re-pins only NON-basic variables to their bounds, so a
+    /// structural variable pinned to a bound that contradicts a basic equality row
+    /// (e.g. `i ≤ -2` while `3j+4i = 0 ∧ j = 2` forces `i = -1.5`) was silently
+    /// accepted as feasible at the crash-basis point — a spurious integer model
+    /// (`{i = -2, j = 2}`, which violates the equality). Routing through a slack
+    /// constraint turns the new bound into a basic-row violation that
+    /// `find_violating` always detects, so an infeasible branch returns `Err`.
+    ///
+    /// `term` is interned, and `add_le`/`add_ge` only add a fresh simplex slack
+    /// (never a new interner entry), so the snapshot of interned variables in
+    /// `bnb_node` is unaffected. The reason is `term` itself; a B&B branch never
+    /// surfaces a conflict (`Err` → `Infeasible` → `Unknown`, never `Unsat`), so
+    /// the reason is never cited in a learned clause.
+    fn bnb_branch(
+        &mut self,
+        term: TermId,
+        up: bool,
+        bound: ArithRat,
+        budget: &mut u32,
+    ) -> IntFeasibility {
+        self.push();
+        let one = ArithRat::from_integer(1);
+        if up {
+            self.assert_ge(&[(term, one)], bound, term); // term >= ceil(v)
+        } else {
+            self.assert_le(&[(term, one)], bound, term); // term <= floor(v)
+        }
+        let result = match self.simplex.check() {
+            Ok(()) if self.simplex.last_check_incomplete() => IntFeasibility::Unknown,
+            Ok(()) => self.bnb_node(budget),
+            Err(_) => IntFeasibility::Infeasible,
+        };
+        self.pop();
+        result
     }
 
     /// If `term` is FIXED to a single value by the current arithmetic bounds,
@@ -686,7 +816,25 @@ impl Theory for ArithSolver {
             // spurious `Sat` (a cycling/large LP would otherwise be certified
             // satisfiable without proof).
             Ok(()) if self.simplex.last_check_incomplete() => Ok(TheoryResult::Unknown),
-            Ok(()) => Ok(TheoryResult::Sat),
+            Ok(()) => {
+                // #289 — the simplex only proved the LP RELAXATION feasible. In
+                // integer mode a fractional LP vertex (e.g. `j+2k=4 ∧ j≤-5` →
+                // `k=4.5`) has NO integer point without branching, so report `Sat`
+                // ONLY when branch-and-bound recovers a genuine integer assignment
+                // (recorded in `integer_model` for the model builder). A branch-
+                // exhausted infeasibility or the node budget yields the sound
+                // `Unknown` — never a fabricated integer `Sat`.
+                if self.is_integer {
+                    match self.integer_branch_and_bound() {
+                        IntFeasibility::Sat => Ok(TheoryResult::Sat),
+                        IntFeasibility::Infeasible | IntFeasibility::Unknown => {
+                            Ok(TheoryResult::Unknown)
+                        }
+                    }
+                } else {
+                    Ok(TheoryResult::Sat)
+                }
+            }
             Err(reasons) => {
                 // Record the conflict shape so the theory manager can recognise
                 // a stale-bound pseudo-conflict (see `last_conflict_is_stale_bound`).

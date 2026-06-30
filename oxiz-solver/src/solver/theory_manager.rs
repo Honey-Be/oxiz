@@ -164,6 +164,21 @@ pub(crate) struct TheoryManager {
     /// Stale entries for backtracked vars are never queried: a popped EUF
     /// merge/diseq no longer contributes its reason term to any live conflict.
     assigned_phase: FxHashMap<Var, bool>,
+    /// Soundness gate: did the MOST RECENT theory-consistency battery authorise
+    /// its `Sat` only because an underlying theory returned `Unknown`/errored
+    /// (rather than positively confirming the assignment)?  The SAT-facing
+    /// `oxiz_sat::TheoryCheckResult` has no `Unknown` channel, so an incomplete
+    /// theory (e.g. LIA branch-and-bound that exhausts its node budget, or proves
+    /// the LP-feasible vertex has NO integer point) is reported to the SAT core as
+    /// `Sat` ("no conflict, keep the assignment").  Without this flag that
+    /// non-trivial / unconfirmed `Sat` is indistinguishable from a theory-CONFIRMED
+    /// `Sat`, so the solver would emit a spurious `sat` verdict on an integer-
+    /// infeasible problem (z3 `unsat`).  Reset to `false` at the TOP of every
+    /// `theory_consistency_check` (so it reflects ONLY the last, authorising
+    /// battery) and set `true` whenever that battery falls back to `Sat` from an
+    /// `Unknown`/`Err` arm.  `Solver::solve` reads it after a `Sat` and DOWNGRADES
+    /// the final verdict to `Unknown` — the sound report for "could not confirm".
+    last_check_unconfirmed: bool,
 }
 
 /// Post-order, memoised BV term encoding.
@@ -579,6 +594,7 @@ impl TheoryManager {
             assigned_phase: FxHashMap::default(),
             bool_true_node: None,
             bool_false_node: None,
+            last_check_unconfirmed: false,
         }
     }
 
@@ -1957,6 +1973,12 @@ impl TheoryManager {
     /// eager, propagation-capturing drain). Self-contained — it never touches
     /// `pending_assignments`, so either drain discipline may precede it.
     fn theory_consistency_check(&mut self) -> TheoryCheckResult {
+        // Fresh battery: assume this check CONFIRMS its verdict until an
+        // `Unknown`/`Err` fallback below proves otherwise. Reset-at-top means the
+        // flag reflects ONLY this (the authorising) battery, never a stale
+        // partial-assignment `Unknown` the search has since moved past.
+        self.last_check_unconfirmed = false;
+
         // Check EUF for conflicts
         if let Some(conflict_terms) = self.euf.check_conflicts() {
             // Convert TermIds to Lits for the conflict clause
@@ -2020,17 +2042,37 @@ impl TheoryManager {
                         self.model_based_combination()
                     }
                     oxiz_theories::TheoryCheckResult::Unknown => {
-                        // Theory is incomplete, be conservative
+                        // Theory is incomplete: it could NOT confirm this
+                        // assignment is theory-consistent. The SAT-facing result
+                        // has no `Unknown`, so we still return `Sat` ("no
+                        // conflict, keep searching / accept"), but mark the verdict
+                        // UNCONFIRMED so a final `Sat` is soundly downgraded to
+                        // `Unknown` rather than emitted as a spurious model (e.g. a
+                        // LIA system with no integer solution: the LP relaxation is
+                        // feasible, branch-and-bound proves no integer point, arith
+                        // returns `Unknown` — reporting `sat` here would contradict
+                        // z3's `unsat`).
+                        self.last_check_unconfirmed = true;
                         TheoryCheckResult::Sat
                     }
                 }
             }
             Err(_error) => {
-                // Internal error in the arithmetic solver
-                // For now, be conservative and return Sat
+                // Internal error in the arithmetic solver: likewise unconfirmed —
+                // do not pass it off as a theory-CONFIRMED `Sat`.
+                self.last_check_unconfirmed = true;
                 TheoryCheckResult::Sat
             }
         }
+    }
+
+    /// Soundness gate accessor: `true` iff the most recent
+    /// [`theory_consistency_check`](Self::theory_consistency_check) authorised its
+    /// `Sat` only via an `Unknown`/`Err` fallback (an incomplete theory that could
+    /// not positively confirm the assignment). `Solver::solve` reads this after a
+    /// `Sat` verdict and downgrades it to `Unknown`. See `last_check_unconfirmed`.
+    pub(crate) fn last_check_unconfirmed(&self) -> bool {
+        self.last_check_unconfirmed
     }
 }
 

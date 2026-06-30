@@ -660,6 +660,13 @@ impl Solver {
                 // Legacy path: advisory `TheoryCallback`.
                 self.sat.solve_with_theory(&mut theory_manager)
             };
+            // Soundness gate: read whether the authorising theory battery confirmed
+            // its `Sat` or only fell back to it from an `Unknown`/`Err` (an
+            // incomplete theory — e.g. LIA branch-and-bound that proved the
+            // LP-feasible vertex has no integer point). A non-trivial, unconfirmed
+            // `Sat` MUST be reported as `Unknown`, never as a model. Capture it
+            // before `restore_theory_manager` consumes the owning manager.
+            let last_unconfirmed = theory_manager.last_check_unconfirmed();
             self.restore_theory_manager(manager, theory_manager);
             match sat_result {
                 SatResult::Unsat => {
@@ -681,6 +688,13 @@ impl Solver {
                 SatResult::Sat => {
                     // If no quantifiers, we're done
                     if !self.has_quantifiers {
+                        // Trivial vs non-trivial SAT: only a theory-CONFIRMED `Sat`
+                        // is a real model. If the authorising battery fell back to
+                        // `Sat` from an incomplete theory (`Unknown`/`Err`), report
+                        // the sound `Unknown` instead of a fabricated model.
+                        if last_unconfirmed {
+                            return SolverResult::Unknown;
+                        }
                         self.build_model(manager);
                         self.unsat_core = None;
                         return SolverResult::Sat;
@@ -866,6 +880,12 @@ impl Solver {
                                 if self.config.clean_mbqi && !clean_instances.is_empty() {
                                     return self
                                         .verify_clean_saturated(&clean_instances, manager);
+                                }
+                                // Same trivial-vs-non-trivial SAT gate as the
+                                // quantifier-free path: an incomplete theory in the
+                                // authorising battery means the model is unconfirmed.
+                                if last_unconfirmed {
+                                    return SolverResult::Unknown;
                                 }
                                 self.unsat_core = None;
                                 return SolverResult::Sat;
