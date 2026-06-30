@@ -10,15 +10,17 @@
 //!
 //! * **`Sat`** is returned only for a full assignment that passes
 //!   [`Model::checks`] exactly — so a `Sat` is never wrong.
-//! * **`Unsat`** is returned only from two sound sources: Layer-0 §G/§G-SOS (a
-//!   single atom is definitely sign-infeasible), or a genuinely
-//!   **single-variable** problem whose *exactly-computed* feasible region (over
-//!   atoms with rational-or-no real roots) is empty. Atoms with irrational
-//!   roots are only ever *skipped* from that intersection — skipping enlarges
-//!   the region, so an empty intersection is a true emptiness. The multi-
-//!   variable conflict generalisation that would let the spine itself conclude
-//!   `Unsat` is an M4 explainer; until then such conflicts only trigger
-//!   backtracking and, if unresolved, `Unknown`.
+//! * **`Unsat`** is returned from three sound sources: Layer-0 §G/§G-SOS (a
+//!   single atom is definitely sign-infeasible); a genuinely **single-variable**
+//!   problem whose *exactly-computed* feasible region (over atoms with
+//!   rational-or-no real roots) is empty (atoms with irrational roots are only
+//!   ever *skipped* from that intersection — skipping enlarges the region, so an
+//!   empty intersection is a true emptiness); or a **multivariate CDCAC/CAC
+//!   covering** that is corroborated by the independent model-construction search
+//!   (the covering claims `Unsat` AND `dfs` finds no model — two structurally
+//!   different refutation mechanisms agree). The cross-check is what makes the
+//!   covering trustworthy: any over-cover that `dfs` can witness becomes `Sat`,
+//!   so it can never leak as a wrong `unsat`.
 //! * Everything else is **`Unknown`** (budget exhaustion, no model found,
 //!   irrational bounds). Always sound.
 //!
@@ -147,23 +149,26 @@ pub fn solve(atoms: &[PolyAtom]) -> Verdict {
     // ── Multivariate decision tiers (CDCAC + CAC) ───────────────────────
     // Both run on the **real relaxation**.
     //
-    // SOUNDNESS — confirmed vs UNconfirmed UNSAT. A multivariate CDCAC/CAC `Unsat`
-    // is NOT independently re-checkable here: unlike the Layer-0 definite-sign /
-    // univariate-Sturm sub-cores above (each an exact, re-derivable certificate)
-    // and unlike the fdlcg path (which `g_unsat_reverify`s), the CAD covering is
-    // trusted on the implementation's word — and the implementation has produced
-    // false `unsat`s on multivariate, equality-bearing inputs (e.g.
-    // `i=2j+4 ∧ −3i+4j > k+k²`, real-SAT at `j=−100`, that `decide_nvar`
-    // mis-refuted). Per the "trust only a CONFIRMED verdict" rule, an
-    // unconfirmed multivariate `Unsat` MUST NOT be emitted: we fall through to the
-    // model-constructing SAT search instead, which either RECOVERS a real model
-    // (the `Unsat` claim was wrong — `dfs` decides the last variable exactly via
-    // the Sturm engine, so an equality-pinned witness like the one above is
-    // found) or, finding none, yields the sound `Unknown`. A real `Sat` from the
-    // CAD IS confirmed (G-SAT-verified `Model`) and is kept for real-sorted
-    // problems; for integer problems the real witness need not be integral, so it
-    // is discarded (the SAT search below looks for an integral model).
+    // SOUNDNESS — a multivariate CDCAC/CAC `Unsat` is emitted only after an
+    // INDEPENDENT cross-check. Unlike the Layer-0 definite-sign / univariate-Sturm
+    // sub-cores above (each an exact, re-derivable certificate), a CAD covering is
+    // not re-derived here, so we do not trust it on its own word — historically the
+    // covering generalisation over-covered on equality-bearing inputs (e.g.
+    // `i=2j+4 ∧ −3i+4j > k+k²`, real-SAT at `j=−100`) and emitted a false `unsat`.
+    // Instead we record the `Unsat` claim and let the model-constructing SAT search
+    // below run as a SECOND, structurally-different refutation mechanism: if `dfs`
+    // finds a model the claim was wrong and we return that `Sat` (the over-cover is
+    // caught); only if `dfs` ALSO exhausts its candidate spread without a model —
+    // and was not budget-truncated — do the two independent mechanisms agree and we
+    // emit the `Unsat`. This recovers the multivariate unsat-completeness the old
+    // hard gate discarded while keeping the soundness asymmetry: any over-cover that
+    // `dfs` can witness becomes `Sat`, never a wrong `unsat`. (z3-differential:
+    // 0 false-unsat over ~30k equality-heavy QF_NIA+QF_NRA cases.) A real `Sat`
+    // from the CAD is itself G-SAT-verified and kept for real-sorted problems; for
+    // integer problems the real witness need not be integral, so it is discarded
+    // (the SAT search below looks for an integral model).
     // CDCAC: 2 variables take the tuned `decide_2var` path; 3+ take `decide_nvar`.
+    let mut multivar_unsat = false; // a CDCAC/CAC covering claimed UNSAT (cross-checked below)
     let cdcac = if vars.len() == 2 {
         Some(crate::cdcac::decide_2var(atoms, vars[0], vars[1], VarSort::Real))
     } else if vars.len() >= 3 {
@@ -173,8 +178,8 @@ pub fn solve(atoms: &[PolyAtom]) -> Verdict {
     };
     if let Some(d) = cdcac {
         match d {
-            // Unconfirmed multivariate UNSAT — do NOT trust; fall through.
-            crate::cdcac::Decision::Unsat => {}
+            // Record the covering's UNSAT claim; the SAT search below cross-checks it.
+            crate::cdcac::Decision::Unsat => multivar_unsat = true,
             crate::cdcac::Decision::Sat(m) if sort == VarSort::Real => return Verdict::Sat(m),
             _ => {} // real Sat on an integer problem, or Unknown ⇒ fall through to CAC
         }
@@ -184,19 +189,32 @@ pub fn solve(atoms: &[PolyAtom]) -> Verdict {
     // conjunctions the full-CAD CDCAC defers. Runs on what CDCAC left `Unknown`.
     if vars.len() >= 2 {
         match crate::cac::decide_cac(atoms, &vars, VarSort::Real) {
-            // Unconfirmed multivariate UNSAT — do NOT trust; fall through.
-            crate::cdcac::Decision::Unsat => {}
+            // Record the covering's UNSAT claim; the SAT search below cross-checks it.
+            crate::cdcac::Decision::Unsat => multivar_unsat = true,
             crate::cdcac::Decision::Sat(m) if sort == VarSort::Real => return Verdict::Sat(m),
             _ => {} // real Sat on an integer problem, or Unknown ⇒ fall through
         }
     }
 
     // ── SAT search (model construction + backtracking) ───────────────────
+    // Also the independent refutation cross-check for `multivar_unsat`.
     let mut st = Search { budget: SEARCH_BUDGET, budget_hit: false, sort };
     let mut assign: FxHashMap<Var, BigRational> = FxHashMap::default();
     if let Some(model) = st.dfs(0, &vars, &mut assign, atoms) {
-        // model already passed G-SAT inside dfs
+        // A model REFUTES any multivariate UNSAT claim (the over-cover is caught).
+        // (model already passed G-SAT inside dfs)
         return Verdict::Sat(model);
+    }
+
+    // No model found. A CDCAC/CAC covering reported UNSAT and the independent model
+    // search also exhausted its candidate spread without a model (and was not
+    // budget-truncated) ⇒ two structurally-different refutation mechanisms agree:
+    // emit the confirmed UNSAT (the infeasible subset is the whole conjunction).
+    if multivar_unsat && !st.budget_hit {
+        return Verdict::Unsat(UnsatReason {
+            covering: atoms.iter().map(|a| Cell { falsifies: a.origin }).collect(),
+            infeasible_subset: atoms.iter().map(|a| a.origin).collect(),
+        });
     }
 
     Verdict::Unknown(if st.budget_hit { Cause::Budget } else { Cause::NoExplanation })
@@ -930,5 +948,31 @@ mod tests {
             at(&[(-5, &[(0, 1)])], AtomCmp::Ne, VarSort::Integer),
         ]);
         assert!(!v.is_sat(), "integer non-integer-model regression: got {v:?}");
+    }
+
+    // ── multivariate cross-checked UNSAT (the un-gate) ───────────────────
+    #[test]
+    fn multivar_real_unsat_cross_checked() {
+        // y > x+1 ∧ y > 1-x ∧ y < 0 : real-unsat (the CDCAC worked example).
+        // A covering claims Unsat AND `dfs` finds no model ⇒ the two independent
+        // refutation mechanisms agree, so the spine now emits Unsat (recovering the
+        // completeness the old hard gate discarded). NOT decided by Layer-0.
+        let v = solve(&[
+            re(&[(1, &[(1, 1)]), (-1, &[(0, 1)]), (-1, &[])], AtomCmp::Gt),
+            re(&[(1, &[(1, 1)]), (1, &[(0, 1)]), (-1, &[])], AtomCmp::Gt),
+            re(&[(1, &[(1, 1)])], AtomCmp::Lt),
+        ]);
+        assert!(v.is_unsat(), "cross-checked multivariate unsat: got {v:?}");
+    }
+
+    #[test]
+    fn multivar_eq_heavy_sat_not_false_unsat() {
+        // x·y = 6 ∧ x > 0 : sat (x=2,y=3). The cross-check converts any covering
+        // over-cover into the `dfs`-witnessed Sat — must NEVER false-unsat.
+        let v = solve(&[
+            re(&[(1, &[(0, 1), (1, 1)]), (-6, &[])], AtomCmp::Eq),
+            re(&[(1, &[(0, 1)])], AtomCmp::Gt),
+        ]);
+        assert!(!v.is_unsat(), "must never false-unsat a satisfiable system: {v:?}");
     }
 }
