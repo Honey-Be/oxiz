@@ -280,12 +280,91 @@ impl SatLevel {
             SolverResult::Unknown => SatLevel::Unknown,
         }
     }
+
+    /// Whether this is a confirmed pole — the only levels [`collapse`] turns into
+    /// a definite `sat`/`unsat`.
+    ///
+    /// [`collapse`]: SatLevel::collapse
+    #[must_use]
+    pub fn is_definite(self) -> bool {
+        matches!(self, SatLevel::DefiniteSat | SatLevel::DefiniteUnsat)
+    }
+
+    /// The **full-mode** output token — the un-collapsed 5-level verdict, emitted
+    /// verbatim when the output mode is `Full` (the internal lattice is NOT
+    /// reduced to the 3-valued `sat`/`unsat`/`unknown`). `Unknown` shares the
+    /// `unknown` token with the collapsed form (they denote the same thing).
+    #[must_use]
+    pub fn as_full_str(self) -> &'static str {
+        match self {
+            SatLevel::DefiniteSat => "definite-sat",
+            SatLevel::PossiblySat => "possibly-sat",
+            SatLevel::Unknown => "unknown",
+            SatLevel::PossiblyUnsat => "possibly-unsat",
+            SatLevel::DefiniteUnsat => "definite-unsat",
+        }
+    }
+
+    /// Combine two verdicts about the **same** formula into the most informative
+    /// SOUND verdict — the precision-meet of the confidence lattice (the AFT
+    /// `(under,over)`-style reconciliation the four ad-hoc `*_is_trustworthy`
+    /// gates expressed by hand).
+    ///
+    /// * `Unknown` is the identity: no information defers to the other engine.
+    /// * Same side ⇒ the higher-confidence level wins. A confirmed pole is ground
+    ///   truth — an actual model (`DefiniteSat`) or a refutation (`DefiniteUnsat`)
+    ///   — so it dominates an unconfirmed guess, *consistent with* [`collapse`]
+    ///   trusting only `Definite*`. Hence it also dominates the OPPOSITE
+    ///   unconfirmed guess (the `Possibly*` was heuristic and simply wrong).
+    /// * Two OPPOSING unconfirmed guesses (`PossiblySat` ⊓ `PossiblyUnsat`) — or
+    ///   two contradicting confirmed poles, which would be a solver bug — yield
+    ///   the sound `Unknown`. `meet` never *upgrades*: two `Possibly*` can never
+    ///   manufacture a `Definite*`.
+    ///
+    /// [`collapse`]: SatLevel::collapse
+    #[must_use]
+    pub fn meet(self, other: SatLevel) -> SatLevel {
+        use SatLevel::{DefiniteSat, DefiniteUnsat, PossiblySat, PossiblyUnsat, Unknown};
+        match (self, other) {
+            (Unknown, x) | (x, Unknown) => x,
+            (a, b) if a == b => a,
+            // confirmed pole dominates ANY unconfirmed guess (same or opposite side)
+            (DefiniteSat, PossiblySat | PossiblyUnsat)
+            | (PossiblySat | PossiblyUnsat, DefiniteSat) => DefiniteSat,
+            (DefiniteUnsat, PossiblySat | PossiblyUnsat)
+            | (PossiblySat | PossiblyUnsat, DefiniteUnsat) => DefiniteUnsat,
+            // opposing unconfirmed guesses ⇒ genuine uncertainty
+            (PossiblySat, PossiblyUnsat) | (PossiblyUnsat, PossiblySat) => Unknown,
+            // two contradicting confirmed poles would mean the solver is unsound
+            // somewhere — never trust either; the sound fallback is `Unknown`.
+            (DefiniteSat, DefiniteUnsat) | (DefiniteUnsat, DefiniteSat) => Unknown,
+            _ => unreachable!("all same-level pairs handled by the `a == b` arm"),
+        }
+    }
 }
 
 impl From<SatLevel> for SolverResult {
     fn from(s: SatLevel) -> Self {
         s.collapse()
     }
+}
+
+/// How a `(check-sat)` verdict is rendered at the final output boundary.
+///
+/// The solver always computes the full 5-level [`SatLevel`] internally and keeps
+/// it un-collapsed up to this one boundary; the mode decides whether to reduce it
+/// to the 3-valued SMT-LIB form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// **z3-compatible** (default): collapse the lattice to `sat`/`unsat`/
+    /// `unknown` (standard SMT-LIB output) via [`SatLevel::collapse`].
+    #[default]
+    Z3Compatible,
+    /// **Full**: emit the un-collapsed 5-level verdict verbatim
+    /// (`definite-sat` / `possibly-sat` / `unknown` / `possibly-unsat` /
+    /// `definite-unsat`) via [`SatLevel::as_full_str`] — no reduction to 3-valued
+    /// logic.
+    Full,
 }
 
 /// Theory checking mode
@@ -1144,5 +1223,67 @@ impl ModelCache {
     #[must_use]
     pub fn into_model(self) -> Model {
         self.model
+    }
+}
+
+#[cfg(test)]
+mod satlevel_tests {
+    use super::{SatLevel, SolverResult};
+    use SatLevel::{DefiniteSat, DefiniteUnsat, PossiblySat, PossiblyUnsat, Unknown};
+
+    #[test]
+    fn collapse_only_definite_poles_surface() {
+        assert_eq!(DefiniteSat.collapse(), SolverResult::Sat);
+        assert_eq!(DefiniteUnsat.collapse(), SolverResult::Unsat);
+        assert_eq!(PossiblySat.collapse(), SolverResult::Unknown);
+        assert_eq!(PossiblyUnsat.collapse(), SolverResult::Unknown);
+        assert_eq!(Unknown.collapse(), SolverResult::Unknown);
+    }
+
+    #[test]
+    fn full_str_is_uncollapsed() {
+        assert_eq!(DefiniteSat.as_full_str(), "definite-sat");
+        assert_eq!(PossiblySat.as_full_str(), "possibly-sat");
+        assert_eq!(Unknown.as_full_str(), "unknown");
+        assert_eq!(PossiblyUnsat.as_full_str(), "possibly-unsat");
+        assert_eq!(DefiniteUnsat.as_full_str(), "definite-unsat");
+    }
+
+    #[test]
+    fn meet_unknown_is_identity() {
+        for x in [DefiniteSat, PossiblySat, Unknown, PossiblyUnsat, DefiniteUnsat] {
+            assert_eq!(Unknown.meet(x), x);
+            assert_eq!(x.meet(Unknown), x);
+        }
+    }
+
+    #[test]
+    fn meet_is_commutative_and_idempotent() {
+        let all = [DefiniteSat, PossiblySat, Unknown, PossiblyUnsat, DefiniteUnsat];
+        for a in all {
+            assert_eq!(a.meet(a), a);
+            for b in all {
+                assert_eq!(a.meet(b), b.meet(a), "meet not commutative for {a:?},{b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn meet_confirmed_pole_dominates_any_guess() {
+        // a confirmed model is ground truth, even against the opposite guess
+        assert_eq!(DefiniteSat.meet(PossiblySat), DefiniteSat);
+        assert_eq!(DefiniteSat.meet(PossiblyUnsat), DefiniteSat);
+        assert_eq!(DefiniteUnsat.meet(PossiblyUnsat), DefiniteUnsat);
+        assert_eq!(DefiniteUnsat.meet(PossiblySat), DefiniteUnsat);
+    }
+
+    #[test]
+    fn meet_never_upgrades_two_guesses() {
+        // two unconfirmed guesses can never manufacture a Definite pole
+        assert_eq!(PossiblySat.meet(PossiblyUnsat), Unknown);
+        assert!(!PossiblySat.meet(PossiblySat).is_definite());
+        assert!(!PossiblyUnsat.meet(PossiblyUnsat).is_definite());
+        assert_eq!(PossiblySat.meet(PossiblySat), PossiblySat);
+        assert_eq!(PossiblyUnsat.meet(PossiblyUnsat), PossiblyUnsat);
     }
 }

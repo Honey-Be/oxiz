@@ -404,6 +404,12 @@ struct Args {
     #[arg(long)]
     preset: Option<String>,
 
+    /// `(check-sat)` output mode: `z3` (default — collapsed sat/unsat/unknown)
+    /// or `full` (the un-collapsed 5-level verdict: definite-sat / possibly-sat /
+    /// unknown / possibly-unsat / definite-unsat)
+    #[arg(long, default_value = "z3")]
+    output_mode: String,
+
     /// Analyze query complexity without solving (shows problem statistics and characteristics)
     #[arg(long)]
     analyze: bool,
@@ -796,6 +802,9 @@ pub(crate) fn apply_solver_options(ctx: &mut Context, args: &Args) {
     if let Some(ref log_path) = args.proof_log {
         ctx.set_proof_log_path(Some(log_path.clone()));
     }
+    // `(check-sat)` output mode (z3-compatible by default; `full` emits the
+    // un-collapsed 5-level verdict).
+    ctx.set_option("oxiz.output-mode", &args.output_mode);
     // Apply preset first if specified
     if let Some(ref preset) = args.preset {
         apply_preset(ctx, preset);

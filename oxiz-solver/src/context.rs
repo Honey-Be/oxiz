@@ -2,7 +2,7 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::solver::{Solver, SolverResult};
+use crate::solver::{OutputMode, SatLevel, Solver, SolverResult};
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 #[cfg(feature = "std")]
 use oxiz_core::error::Result;
@@ -148,8 +148,13 @@ pub struct Context {
     fun_stack: Vec<usize>,
     /// Mapping from function names to indices
     fun_name_to_index: crate::prelude::HashMap<String, usize>,
-    /// Last check-sat result
+    /// Last check-sat result (the collapsed 3-valued verdict).
     last_result: Option<SolverResult>,
+    /// Last check-sat verdict at full 5-level resolution (un-collapsed), used to
+    /// render the `Full` output mode and queryable via [`Context::last_level`].
+    last_level: Option<SatLevel>,
+    /// How `(check-sat)` renders its verdict (z3-compatible by default).
+    output_mode: OutputMode,
     /// Persistent parser symbol tables (declared funcs / consts / sorts /
     /// defined funcs / datatype constructors), carried across `execute_script`
     /// calls so that a function's declared sort is known on every command even
@@ -191,6 +196,8 @@ impl Context {
             fun_stack: Vec::new(),
             fun_name_to_index: crate::prelude::HashMap::new(),
             last_result: None,
+            last_level: None,
+            output_mode: OutputMode::default(),
             parser_env: ParserEnv::default(),
             options: crate::prelude::HashMap::new(),
             #[cfg(feature = "std")]
@@ -292,33 +299,53 @@ impl Context {
         self.solver.assert(term, &mut self.terms);
     }
 
-    /// Check satisfiability
+    /// Check satisfiability — the collapsed 3-valued verdict (z3-compatible). For
+    /// the un-collapsed 5-level verdict use [`check_sat_level`].
+    ///
+    /// [`check_sat_level`]: Context::check_sat_level
     pub fn check_sat(&mut self) -> SolverResult {
-        let mut result = self.solver.check(&mut self.terms);
+        self.check_sat_level().collapse()
+    }
+
+    /// Check satisfiability, returning the full internal [`SatLevel`] WITHOUT
+    /// collapsing to 3 values. The solver keeps the confirmed/unconfirmed grade
+    /// to this boundary; the only reduction to `sat`/`unsat`/`unknown` is the
+    /// caller's [`SatLevel::collapse`] (z3-compatible mode), or none at all
+    /// (`Full` mode). Also records [`last_level`] and the collapsed
+    /// [`last_result`].
+    ///
+    /// [`last_level`]: Context::last_level
+    /// [`last_result`]: Context::last_result
+    pub fn check_sat_level(&mut self) -> SatLevel {
+        let mut level = self.solver.check_level(&mut self.terms);
         // SOUNDNESS — undecided-op downgrade. Integer `div`/`mod` and the Int/Real
         // conversion ops `abs`/`to_real`/`to_int`/`is_int` are NOT decided by the
         // theory layer (they reach EUF/arith as uninterpreted applications); a
         // model is free to assign them arbitrary values, so the solved formula is
         // an OVER-approximation of the real one. By the soundness asymmetry
         // (dropping/weakening a constraint preserves `unsat` but can fabricate
-        // `sat`), an `Unsat` here is still sound, but a `Sat` is untrustworthy —
-        // it may rest on an op value the real semantics forbid. Downgrade such a
-        // `Sat` to the sound `Unknown`. (Verified: `oxiz-undecided-op-verification`
-        // — abstraction monotonicity ⇒ relaxed-UNSAT implies concrete-UNSAT, and
-        // the converse fails, e.g. `(< (abs x) 0)` is UNSAT yet its uninterpreted
-        // relaxation `r < 0` is SAT — exactly the case this downgrade catches.)
-        // Deciding constant/linear div/mod via the Euclidean axioms, `abs` via its
-        // `ite` definition, etc. is the completeness follow-up.
-        if result == SolverResult::Sat {
+        // `sat`), an `Unsat` here is still sound, but a confirmed `DefiniteSat` is
+        // untrustworthy — it may rest on an op value the real semantics forbid.
+        // Downgrade it to the unconfirmed `PossiblySat` (which collapses to the
+        // sound `unknown`, and surfaces as `possibly-sat` in full mode). (Verified:
+        // `oxiz-undecided-op-verification` — abstraction monotonicity ⇒
+        // relaxed-UNSAT implies concrete-UNSAT, and the converse fails, e.g.
+        // `(< (abs x) 0)` is UNSAT yet its uninterpreted relaxation `r < 0` is SAT
+        // — exactly the case this downgrade catches.) Deciding constant/linear
+        // div/mod via the Euclidean axioms, `abs` via its `ite` definition, etc. is
+        // the completeness follow-up.
+        if level == SatLevel::DefiniteSat {
             let mut visited = std::collections::HashSet::new();
             if self
                 .assertions
                 .iter()
                 .any(|&a| term_contains_undecided_op(&self.terms, a, &mut visited))
             {
-                result = SolverResult::Unknown;
+                level = SatLevel::PossiblySat;
             }
         }
+        self.last_level = Some(level);
+        let result = level.collapse();
         self.last_result = Some(result);
 
         // Write a binary proof log if a path is configured (std-only).
@@ -332,7 +359,49 @@ impl Context {
             }
         }
 
-        result
+        level
+    }
+
+    /// The collapsed result of the most recent `(check-sat)`, if any.
+    #[must_use]
+    pub fn last_result(&self) -> Option<SolverResult> {
+        self.last_result
+    }
+
+    /// The full un-collapsed [`SatLevel`] of the most recent `(check-sat)`, if
+    /// any — the verdict the `Full` output mode renders.
+    #[must_use]
+    pub fn last_level(&self) -> Option<SatLevel> {
+        self.last_level
+    }
+
+    /// Set how `(check-sat)` renders its verdict (the in-process control for the
+    /// output mode; the CLI exposes `--output-mode` and the
+    /// `:oxiz.output-mode` option).
+    pub fn set_output_mode(&mut self, mode: OutputMode) {
+        self.output_mode = mode;
+    }
+
+    /// The current output mode.
+    #[must_use]
+    pub fn output_mode(&self) -> OutputMode {
+        self.output_mode
+    }
+
+    /// Render a `(check-sat)` verdict per the active output mode: the collapsed
+    /// `sat`/`unsat`/`unknown` (z3-compatible) or the un-collapsed 5-level token
+    /// (`Full` — `definite-sat`/`possibly-sat`/`unknown`/`possibly-unsat`/
+    /// `definite-unsat`).
+    fn render_verdict(&self, level: SatLevel) -> String {
+        match self.output_mode {
+            OutputMode::Z3Compatible => match level.collapse() {
+                SolverResult::Sat => "sat",
+                SolverResult::Unsat => "unsat",
+                SolverResult::Unknown => "unknown",
+            }
+            .to_string(),
+            OutputMode::Full => level.as_full_str().to_string(),
+        }
     }
 
     /// Serialise a proof log entry for the given result.
@@ -849,6 +918,16 @@ impl Context {
                 config.ccfv_model_compl = value == "true";
                 self.solver.set_config(config);
             }
+            // Output mode for `(check-sat)`: `z3` (default, the collapsed 3-valued
+            // `sat`/`unsat`/`unknown`) or `full` (the un-collapsed 5-level verdict
+            // `definite-sat`/`possibly-sat`/`unknown`/`possibly-unsat`/
+            // `definite-unsat`). Accepts a few spellings for convenience.
+            "oxiz.output-mode" => {
+                self.output_mode = match value {
+                    "full" | "5" | "satlevel" => OutputMode::Full,
+                    _ => OutputMode::Z3Compatible,
+                };
+            }
             _ => {}
         }
     }
@@ -1034,12 +1113,8 @@ impl Context {
                     self.assert(term);
                 }
                 Command::CheckSat => {
-                    let result = self.check_sat();
-                    output.push(match result {
-                        SolverResult::Sat => "sat".to_string(),
-                        SolverResult::Unsat => "unsat".to_string(),
-                        SolverResult::Unknown => "unknown".to_string(),
-                    });
+                    let level = self.check_sat_level();
+                    output.push(self.render_verdict(level));
                 }
                 Command::Push(n) => {
                     for _ in 0..n {
@@ -1087,13 +1162,9 @@ impl Context {
                     for assumption in assumptions {
                         self.assert(assumption);
                     }
-                    let result = self.check_sat();
+                    let level = self.check_sat_level();
                     self.pop();
-                    output.push(match result {
-                        SolverResult::Sat => "sat".to_string(),
-                        SolverResult::Unsat => "unsat".to_string(),
-                        SolverResult::Unknown => "unknown".to_string(),
-                    });
+                    output.push(self.render_verdict(level));
                 }
                 Command::Simplify(term) => {
                     // Simplify and output the term

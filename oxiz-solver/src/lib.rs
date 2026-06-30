@@ -109,7 +109,9 @@ pub use nelson_oppen::{NelsonOppenCombiner, NelsonOppenStats, TheoryId};
 pub use optimization::{Objective, ObjectiveKind, OptimizationResult, Optimizer, ParetoPoint};
 #[cfg(feature = "std")]
 pub use oxiz_proof::replay::VerificationResult;
-pub use solver::{Model, Proof, ProofStep, Solver, SolverConfig, SolverResult, TheoryMode};
+pub use solver::{
+    Model, OutputMode, Proof, ProofStep, SatLevel, Solver, SolverConfig, SolverResult, TheoryMode,
+};
 
 // The finite-domain integer CP theory on the `TheoryHooks` bus (the bus-citizen
 // wrapper around the shared `oxiz_theories::fd_core` engine; the multi-paradigm

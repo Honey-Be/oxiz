@@ -15,7 +15,7 @@ pub(super) mod trail;
 pub(super) mod types;
 
 pub use types::{
-    FpConstraintData, Model, NamedAssertion, Proof, ProofStep, SatLevel, SolverConfig,
+    FpConstraintData, Model, NamedAssertion, OutputMode, Proof, ProofStep, SatLevel, SolverConfig,
     SolverResult, Statistics, TheoryMode, UnsatCore,
 };
 
@@ -513,41 +513,57 @@ impl Solver {
         self.statistics = parts.statistics;
     }
 
-    /// Get a SAT variable for a term, then check satisfiability
+    /// Get a SAT variable for a term, then check satisfiability — the
+    /// **z3-compatible** 3-valued verdict. This collapses the internal
+    /// [`SatLevel`] lattice at this single boundary; use [`check_level`] to read
+    /// the un-collapsed 5-level verdict (the "full" output mode).
+    ///
+    /// [`check_level`]: Solver::check_level
     pub fn check(&mut self, manager: &mut TermManager) -> SolverResult {
+        self.check_level(manager).collapse()
+    }
+
+    /// Check satisfiability, returning the full internal [`SatLevel`] verdict
+    /// WITHOUT collapsing to 3 values. Every engine keeps its confirmed/
+    /// unconfirmed grade all the way to this one boundary, so the lattice is
+    /// reduced to `sat`/`unsat`/`unknown` only by the caller — [`check`] in
+    /// z3-compatible mode, or not at all in "full" output mode.
+    ///
+    /// [`check`]: Solver::check
+    pub fn check_level(&mut self, manager: &mut TermManager) -> SatLevel {
         // Check for trivial unsat (false assertion)
         if self.has_false_assertion {
             self.build_unsat_core_trivial_false();
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         if self.assertions.is_empty() {
-            return SolverResult::Sat;
+            return SatLevel::DefiniteSat;
         }
 
         // Check string constraints for early conflict detection
         if self.check_string_constraints(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // Check floating-point constraints for early conflict detection
         if self.check_fp_constraints(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // Check datatype constraints for early conflict detection
         if self.check_dt_constraints(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // Check array constraints for early conflict detection
         if self.check_array_constraints(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // Check bitvector constraints for early conflict detection
         if self.check_bv_constraints(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // Trichotomy / total-order: a single term pinned to mutually-infeasible
@@ -556,7 +572,7 @@ impl Solver {
         // for an opaque NONLINEAR product whose bounds the CDCL(T) relaxation
         // would otherwise miss (e.g. `x*y > 0 ∧ x*y < 0`).
         if self.check_term_bound_infeasible(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // For NIA/NRA logics: dispatch all assertions to the full polynomial
@@ -565,8 +581,11 @@ impl Solver {
         let nl_dispatch = self.dispatch_nl_solver(manager);
         if let Some(nl_result) = nl_dispatch {
             match nl_result {
-                SolverResult::Sat => return SolverResult::Sat,
-                SolverResult::Unsat => return SolverResult::Unsat,
+                // The nonlinear dispatch only returns Sat/Unsat when CONFIRMED
+                // (G-SAT model / cross-checked covering / Layer-0), so these are
+                // Definite poles.
+                SolverResult::Sat => return SatLevel::DefiniteSat,
+                SolverResult::Unsat => return SatLevel::DefiniteUnsat,
                 SolverResult::Unknown => {}
             }
         }
@@ -595,15 +614,15 @@ impl Solver {
         // Check nonlinear arithmetic constraints for early conflict detection
         // (static pattern matching, complementary to the dispatch above).
         if self.check_nonlinear_constraints(manager) {
-            return SolverResult::Unsat;
+            return SatLevel::DefiniteUnsat;
         }
 
         // Check resource limits before starting
         if self.config.max_conflicts > 0 && self.statistics.conflicts >= self.config.max_conflicts {
-            return SolverResult::Unknown;
+            return SatLevel::Unknown;
         }
         if self.config.max_decisions > 0 && self.statistics.decisions >= self.config.max_decisions {
-            return SolverResult::Unknown;
+            return SatLevel::Unknown;
         }
 
         // MBQI loop for quantified formulas.
@@ -665,7 +684,7 @@ impl Solver {
             #[cfg(feature = "std")]
             if self.has_quantifiers && mbqi_deadline.is_some_and(|d| std::time::Instant::now() >= d)
             {
-                return SolverResult::Unknown;
+                return SatLevel::Unknown;
             }
             // Move the persistent theory state + the real term manager into an
             // owning theory manager for this solve, then move it all back out
@@ -699,13 +718,21 @@ impl Solver {
                     // engine has contributed lemmas, confirm the `unsat` with a
                     // single-shot ground solve before trusting it.
                     if self.config.clean_mbqi && !clean_instances.is_empty() {
-                        return self.verify_clean_unsat(&clean_instances, manager);
+                        // The incremental solve claimed `unsat`; `verify_clean_unsat`
+                        // re-solves the ground core single-shot. A confirming `Unsat`
+                        // is `DefiniteUnsat`; otherwise the claim is UNconfirmed —
+                        // `PossiblyUnsat` (collapses to the sound `unknown`, surfaces
+                        // as `possibly-unsat` in full mode).
+                        return match self.verify_clean_unsat(&clean_instances, manager) {
+                            SolverResult::Unsat => SatLevel::DefiniteUnsat,
+                            _ => SatLevel::PossiblyUnsat,
+                        };
                     }
                     self.build_unsat_core();
-                    return SolverResult::Unsat;
+                    return SatLevel::DefiniteUnsat;
                 }
                 SatResult::Unknown => {
-                    return SolverResult::Unknown;
+                    return SatLevel::Unknown;
                 }
                 SatResult::Sat => {
                     // If no quantifiers, we're done
@@ -725,7 +752,7 @@ impl Solver {
                             self.build_model(manager);
                             self.unsat_core = None;
                         }
-                        return level.collapse();
+                        return level;
                     }
 
                     // Build partial model for MBQI
@@ -906,12 +933,22 @@ impl Solver {
                                 // `sat`; with none (pure model-completion) the
                                 // `Saturated` is already sound.
                                 if self.config.clean_mbqi && !clean_instances.is_empty() {
-                                    return self
-                                        .verify_clean_saturated(&clean_instances, manager);
+                                    // The incremental solve saturated to `sat`; the
+                                    // single-shot ground re-solve adjudicates: a
+                                    // confirming `Sat` is `DefiniteSat`; a `Unsat`
+                                    // (a global conflict the incremental missed) is a
+                                    // confirmed `DefiniteUnsat`; an `Unknown` leaves the
+                                    // model UNconfirmed ⇒ `PossiblySat`.
+                                    return match self.verify_clean_saturated(&clean_instances, manager)
+                                    {
+                                        SolverResult::Sat => SatLevel::DefiniteSat,
+                                        SolverResult::Unsat => SatLevel::DefiniteUnsat,
+                                        SolverResult::Unknown => SatLevel::PossiblySat,
+                                    };
                                 }
                                 // Same `SatLevel` grade as the quantifier-free path:
                                 // an incomplete theory battery or an opaque nonlinear
-                                // term ⇒ `PossiblySat` → sound `unknown`.
+                                // term ⇒ `PossiblySat` (collapses to `unknown`).
                                 let level = if last_unconfirmed || nonlinear_opaque_sat {
                                     SatLevel::PossiblySat
                                 } else {
@@ -920,20 +957,20 @@ impl Solver {
                                 if level == SatLevel::DefiniteSat {
                                     self.unsat_core = None;
                                 }
-                                return level.collapse();
+                                return level;
                             }
                             CleanVerdict::Inconclusive | CleanVerdict::BudgetExhausted => {
                                 // A trigger-free axiom could not be verified, or
                                 // the budget was hit: the SOUND verdict is
                                 // `Unknown` (never a fabricated `unsat`/`sat`).
-                                return SolverResult::Unknown;
+                                return SatLevel::Unknown;
                             }
                         }
                     }
 
                     mbqi_iteration += 1;
                     if mbqi_iteration >= max_mbqi_iterations {
-                        return SolverResult::Unknown;
+                        return SatLevel::Unknown;
                     }
 
                     // The theory manager is rebuilt at the top of the next loop
