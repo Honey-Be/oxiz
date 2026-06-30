@@ -19,7 +19,12 @@ impl ModelEval<Toy> for ForallOracle {
     fn eval_bool(&self, _l: &Toy, _t: Tid) -> Option<bool> {
         None
     }
-    fn eval_forall(&self, _l: &Toy, _q: Tid) -> Option<bool> {
+    fn eval_forall<C: oxiz_mbqi::Congruence<ToySig>>(
+        &self,
+        _l: &Toy,
+        _c: &C,
+        _q: Tid,
+    ) -> Option<bool> {
         self.0
     }
 }

@@ -28,7 +28,12 @@ impl ModelEval<Toy> for Gated {
     fn eval_bool(&self, _l: &Toy, _t: Tid) -> Option<bool> {
         None
     }
-    fn eval_forall(&self, _l: &Toy, _q: Tid) -> Option<bool> {
+    fn eval_forall<C: oxiz_mbqi::Congruence<ToySig>>(
+        &self,
+        _l: &Toy,
+        _c: &C,
+        _q: Tid,
+    ) -> Option<bool> {
         if self.verifies { Some(true) } else { None }
     }
     fn is_active(&self, _l: &Toy, _q: Tid) -> bool {

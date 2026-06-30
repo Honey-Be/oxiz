@@ -264,7 +264,7 @@ impl<S: Sig> Engine<S> {
             //    certified — it falls through to enumeration, where the
             //    arithmetic theory refutes it. Skipping here is therefore sound:
             //    the completion's witness never crosses into the engine.
-            if model.eval_forall(lang, self.quants[qi].term) == Some(true) {
+            if model.eval_forall(lang, cong, self.quants[qi].term) == Some(true) {
                 continue;
             }
 
@@ -341,7 +341,7 @@ impl<S: Sig> Engine<S> {
             if !q.universal {
                 return Verdict::Inconclusive;
             }
-            match model.eval_forall(lang, q.term) {
+            match model.eval_forall(lang, cong, q.term) {
                 Some(true) => {}
                 Some(false) => return Verdict::Inconclusive,
                 None => {

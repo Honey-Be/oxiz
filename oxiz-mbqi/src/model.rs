@@ -32,9 +32,20 @@ pub trait ModelEval<L: TermLang> {
     /// definitional axiom is confirmed `Some(true)` and contributes to a
     /// `Sat` verdict with zero fabricated lemmas.
     ///
+    /// `cong` is the SAME congruence oracle the engine solves with this round, so
+    /// a recognizer can verify its completion against the LIVE ground congruence
+    /// `E` (e.g. a definitional axiom `∀x̄.f(x̄)=rhs` is only soundly `Some(true)`
+    /// once every ground `f`-point is already `≃` its definitional value — see the
+    /// host impl). Generic over `C` (never a trait object), zero-cost when unused.
+    ///
     /// Default `None` (engine then reports the quantifier unverified →
     /// `Unknown`, never a guess).
-    fn eval_forall(&self, _lang: &L, _quant: <L::Sig as Sig>::Term) -> Option<bool> {
+    fn eval_forall<C: Congruence<L::Sig>>(
+        &self,
+        _lang: &L,
+        _cong: &C,
+        _quant: <L::Sig as Sig>::Term,
+    ) -> Option<bool> {
         None
     }
 

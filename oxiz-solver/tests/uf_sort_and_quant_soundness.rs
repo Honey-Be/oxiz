@@ -1396,6 +1396,47 @@ fn real_fixed_point_skolem_witness_is_sat() {
 }
 
 #[test]
+fn identity_definition_feeding_ground_term_is_not_spurious_sat() {
+    // #350 — `∀x. f(x)=x` (a definitional/identity axiom) with `¬(g(f(a))=g(a))`
+    // is UNSAT: defining `f := id` gives `f(a)=a`, so by congruence
+    // `g(f(a))=g(a)` — contradicting the disequality. The clean-MBQI definitional
+    // recognizer wrongly certified `f := id` as a conservative extension because
+    // `collect_ground_apps` mis-classified `f(a)` (over the DECLARED constant `a`,
+    // which OxiZ models as a `Var`) as non-ground, so `f` looked unconstrained.
+    // Now `a` is correctly ground ⇒ the recognizer sees the `f(a)` constraint,
+    // declines the shortcut, and the engine instantiates `f(a)=a` → the ground
+    // core finds the congruence conflict. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UF)",
+        "(declare-sort U 0)",
+        "(declare-fun f (U) U)",
+        "(declare-fun g (U) U)",
+        "(declare-const a U)",
+        "(assert (forall ((x U)) (= (f x) x)))",
+        "(assert (not (= (g (f a)) (g a))))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "identity def feeding g(f(a)) must not be spurious sat");
+}
+
+#[test]
+fn identity_definition_unused_is_still_sat() {
+    // Completeness control for the #350 fix: `∀x. f(x)=x` with `f` used only
+    // CONSISTENTLY (an eq-pin `f(a)=a`) stays `sat` — the definitional shortcut
+    // still fires when every ground `f`-point agrees with the definition.
+    let r = solve_streamed(&[
+        "(set-logic UF)",
+        "(declare-sort U 0)",
+        "(declare-fun f (U) U)",
+        "(declare-const a U)",
+        "(assert (forall ((x U)) (= (f x) x)))",
+        "(assert (= (f a) a))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Sat, "identity def with an agreeing ground pin is sat");
+}
+
+#[test]
 fn skolem_fixed_point_out_of_range_is_not_spurious_sat() {
     // Soundness control: UNGUARDED `∀x. 0≤f(x)≤1` so f maps ALL reals into [0,1],
     // plus `∃x≥2. f(x)=x` → f(sk)=sk≥2 but f(sk)≤1 — UNSAT. The fixed-point fold

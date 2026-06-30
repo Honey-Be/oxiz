@@ -1303,22 +1303,74 @@ fn count_syms_under_quant(
 }
 
 /// Record every GROUND function application (one whose entire subtree contains
-/// no variable) under its `view`-style symbol, returning whether `t` itself is
-/// ground. Descends through quantifier bodies, but an application that mentions
-/// a bound variable (e.g. `(f x)` under `∀x`) is non-ground and therefore NOT
-/// recorded — exactly the pinned/free split the completion verify needs.
+/// no quantifier-BOUND variable) under its `view`-style symbol, returning whether
+/// `t` itself is ground. Descends through quantifier bodies, but an application
+/// that mentions a bound variable (e.g. `(f x)` under `∀x`) is non-ground and
+/// therefore NOT recorded — exactly the pinned/free split the completion verify
+/// needs. A FREE `Var` (a declared constant) is ground; see
+/// [`collect_ground_apps_scoped`] for why that distinction matters (#350).
 fn collect_ground_apps(m: &TermManager, t: TermId, out: &mut FxHashMap<u64, Vec<TermId>>) -> bool {
+    collect_ground_apps_scoped(m, t, &FxHashSet::default(), out)
+}
+
+/// `collect_ground_apps`, tracking the quantifier-BOUND variable names currently
+/// in scope so a free `Var` (a *declared constant* — OxiZ models those as `Var`
+/// too) is correctly counted as GROUND. The earlier blanket "any `Var` ⇒
+/// non-ground" mis-classified `(f a)` over a declared constant `a` as non-ground,
+/// so it was never recorded as a constraining `f`-point. That under-collection let
+/// `definitional_ground_consistent` (and the sibling completion verifiers) treat a
+/// defined `f` as unconstrained even when a ground `f`-application FEEDS another
+/// term — e.g. `∀x.f(x)=x` with `g(f(a))`, where defining `f := id` forces
+/// `g(f(a))=g(a)` and contradicts an asserted `¬(g(f(a))=g(a))` → a spurious `sat`
+/// (#350). Now only a TRULY bound variable (in `bound`) is non-ground; a declared
+/// constant is ground, so `f(a)` is recorded and the verifier sees the constraint
+/// (declines the unsound shortcut → the engine instantiates `f(a)=a` and the
+/// ground core finds the conflict). Mirrors the same declared-constant-is-`Var`
+/// care the lemma `retains_bound` guard already takes (see the MBQI loop).
+fn collect_ground_apps_scoped(
+    m: &TermManager,
+    t: TermId,
+    bound: &FxHashSet<Spur>,
+    out: &mut FxHashMap<u64, Vec<TermId>>,
+) -> bool {
     let Some(term) = m.get(t) else {
         return true; // a missing node carries no variable
     };
-    if let TermKind::Var(_) = &term.kind {
-        return false;
+    match &term.kind {
+        // A quantifier-BOUND variable is non-ground. A FREE `Var` is a declared
+        // constant (ground) — EXCEPT a fresh Skolem constant (name `sk!…`, minted
+        // by `skolemize_unbounded_existentials`), which the skolem/range
+        // recognizers treat as a free symbolic point, NOT a ground constraint;
+        // counting `f(sk)` as ground here would over-tighten their accounting and
+        // drop a sound `Sat` (`real_fixed_point_skolem_witness_is_sat`).
+        TermKind::Var(n) => {
+            if bound.contains(n) {
+                return false;
+            }
+            return !m.resolve_str(*n).starts_with("sk!");
+        }
+        // Descend under a nested quantifier with its bound names added to scope,
+        // so `(f x)` under `∀x` stays non-ground while `(f a)` over a constant
+        // does not. The quantifier itself is never an `Apply`, so its only role
+        // here is to report whether its (closed-over) body is ground.
+        TermKind::Forall { vars, .. } | TermKind::Exists { vars, .. } => {
+            let mut inner = bound.clone();
+            inner.extend(vars.iter().map(|(n, _)| *n));
+            let mut ground = true;
+            for c in subterms(m, t) {
+                if !collect_ground_apps_scoped(m, c, &inner, out) {
+                    ground = false;
+                }
+            }
+            return ground;
+        }
+        _ => {}
     }
     // Recurse into EVERY child (so nested ground apps are recorded even when the
     // parent is non-ground); `t` is ground iff all children are.
     let mut ground = true;
     for c in subterms(m, t) {
-        if !collect_ground_apps(m, c, out) {
+        if !collect_ground_apps_scoped(m, c, bound, out) {
             ground = false;
         }
     }
@@ -1506,6 +1558,61 @@ fn definitional_ground_consistent(
         match eq_pins.get(&app) {
             Some(vals) if vals.contains(&predicted) => {}
             _ => return false,
+        }
+    }
+    true
+}
+
+/// The LIVE-congruence twin of [`definitional_ground_consistent`] (#350
+/// completeness recovery): every ground `f`-application is `≃` its definitional
+/// value in the current ground congruence `E` (queried through `cong`), rather
+/// than statically eq-pinned. Sound to read as "`f := λx̄.rhs` satisfies every
+/// known `f`-point" — so, with `f` constrained by no other quantifier (the
+/// caller's `quant_count[f] == 1` guard), the definition is a model. Returns
+/// `false` the moment any ground point is not yet congruent (the engine then
+/// instantiates `f(t̄)=rhs[t̄]`; a sound merge makes a later round pass, an
+/// inconsistent one conflicts at the ground core first). No ground applications ⇒
+/// vacuously consistent (`f` constrains nothing ground).
+fn definitional_cong_consistent<C: Congruence<OxizSig>>(
+    m: &TermManager,
+    cong: &C,
+    lhs_args: &[TermId],
+    rhs: TermId,
+    fsym: u64,
+    ground_apps: &FxHashMap<u64, Vec<TermId>>,
+) -> bool {
+    let Some(apps) = ground_apps.get(&fsym) else {
+        return true; // no ground applications → the definition constrains nothing else
+    };
+    enum Rhs {
+        Proj(usize),
+        Const(TermId),
+        Other,
+    }
+    let rhs_class = if let Some(i) = lhs_args.iter().position(|&la| la == rhs) {
+        Rhs::Proj(i)
+    } else if matches!(
+        m.get(rhs).map(|t| &t.kind),
+        Some(TermKind::IntConst(_) | TermKind::RealConst(_))
+    ) {
+        Rhs::Const(rhs)
+    } else {
+        Rhs::Other
+    };
+    for &app in apps {
+        let Some(TermKind::Apply { args, .. }) = m.get(app).map(|t| &t.kind) else {
+            return false;
+        };
+        let predicted = match &rhs_class {
+            Rhs::Proj(i) => match args.get(*i) {
+                Some(&t) => t,
+                None => return false,
+            },
+            Rhs::Const(c) => *c,
+            Rhs::Other => return false,
+        };
+        if !cong.equal(app, predicted) {
+            return false;
         }
     }
     true
@@ -4080,7 +4187,12 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
     /// conservative `clean_mbqi` default on the trivially-valid cases (e.g.
     /// `∀x. f(x)=f(x)`, a reflexive-equality axiom) without admitting any
     /// model-sample-based (unsound) `sat`.
-    fn eval_forall(&self, lang: &OxizHost<'a>, quant: TermId) -> Option<bool> {
+    fn eval_forall<C: Congruence<OxizSig>>(
+        &self,
+        lang: &OxizHost<'a>,
+        cong: &C,
+        quant: TermId,
+    ) -> Option<bool> {
         let TermView::Quant { body, vars, .. } = lang.view(quant) else {
             return None;
         };
@@ -4099,9 +4211,39 @@ impl<'a> ModelEval<OxizHost<'a>> for SolverModel {
         };
         let bound: Vec<Spur> = vars.iter().map(|(n, _)| *n).collect();
         // (2) Definitional axiom `∀x̄. (= (f x̄) rhs)`, `f` fresh ⇒ conservative
-        // extension (define `f := λx̄. rhs`), always satisfiable.
+        // extension (define `f := λx̄. rhs`), always satisfiable. (Statically
+        // verified: Pass 1 = `f` occurs nowhere else; Pass 5 = every ground
+        // `f`-point is eq-pinned to the definition's value.)
         if facts.definitional_quants.contains(&quant) {
             return Some(true);
+        }
+        // (2a) #350 completeness recovery — a definitional axiom whose `f` feeds
+        // ground terms that are NOT statically eq-pinned (so Pass 5 declined), but
+        // whose every ground `f`-point is ALREADY `≃` its definitional value in
+        // the LIVE congruence `E`. Once the engine has instantiated `f(t̄)=rhs[t̄]`
+        // in a prior round the merge is reflected in `cong`, so certifying the
+        // definition adds nothing → sound `Some(true)`; before that merge a point
+        // is not yet congruent ⇒ fall through to `None`, the engine instantiates,
+        // and an INCONSISTENT definition (e.g. `∀x.f(x)=x` with `¬(g(f a)=g a)`)
+        // surfaces its conflict at the ground core instead of a spurious sat
+        // (#350). Sound only when `f` is constrained by no OTHER quantifier (the
+        // single-quantifier conservative-extension argument), so guard on
+        // `quant_count[f] == 1` (this axiom is its sole quantifier mention).
+        if let Some(fsym) = definitional_head(lang.m(), quant) {
+            if facts.quant_count.get(&fsym).copied() == Some(1) {
+                if let Some((lhs_args, rhs)) = definitional_lhs_rhs(lang.m(), quant) {
+                    if definitional_cong_consistent(
+                        lang.m(),
+                        cong,
+                        &lhs_args,
+                        rhs,
+                        fsym,
+                        &facts.ground_apps,
+                    ) {
+                        return Some(true);
+                    }
+                }
+            }
         }
         // (2b) §3.5 layered-bounds group member: the canonical model `f ≡ L`,
         // `g ≡ affine` (verified jointly in Pass 7 across all group members)
