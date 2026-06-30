@@ -668,14 +668,11 @@ pub fn dispatch_nia_constraints(
         return Some(v);
     }
 
-    // SOUNDNESS — like the NRA gate, trust the core's `Unsat` ONLY on the LINEAR
-    // fragment. A z3-differential exposed `NiaSolver` as broadly unsound on
-    // nonlinear `unsat` (58/400 false-`unsat`: `x⁴ > 4`, `3x² ≥ 25`, … decided a
-    // spurious `unsat`). Sound nonlinear `unsat` comes from §G/§G-SOS
-    // (`definite_sign_unsat`, above) and the trichotomy pre-check; integer-specific
-    // unsat (`x² = 3`, not a perfect square) from `check_nonlinear_constraints`.
-    let unsat_is_trustworthy =
-        !has_unsupported_ops && poly_atoms.iter().all(|atom| atom.poly.total_degree() <= 1);
+    // SOUNDNESS — the legacy `NiaSolver`'s `Unsat` is no longer trusted at all (the
+    // old `total_degree ≤ 1` linear-fragment band-aid was itself unsound — see the
+    // `solve()` match below). Sound integer `unsat` is provided by §G/§G-SOS
+    // (`definite_sign_unsat`, above), nl2, and fd_core; integer-specific unsat
+    // (`x² = 3`, not a perfect square) by `check_nonlinear_constraints`.
     // A `Sat` over the RETAINED atoms is only valid for the original formula when
     // every assertion was fully captured — no connective dropped, no operand
     // untranslatable. Otherwise a dropped constraint could be the one a
@@ -738,10 +735,19 @@ pub fn dispatch_nia_constraints(
     }
 
     match translator.nlsat.solve() {
-        SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
-        // Trust `Sat` only when the returned model genuinely satisfies every atom
-        // (the NIA branch-and-bound over-reports `Sat` on integer-infeasible
-        // shapes like `x²=3`). Unverified / incomplete model → `None` (Unknown).
+        // The legacy `NiaSolver`'s UNSAT is NEVER trusted. The old
+        // `unsat_is_trustworthy = total_degree ≤ 1` band-aid assumed it was sound
+        // at least on the LINEAR fragment, but it false-`unsat`s even there once a
+        // SYNTACTICALLY nonlinear problem cancels to linear (`x=y ∧ 2x=−5z ∧ y≥18`:
+        // the `y²` cancels, the poly set is degree 1, the term is routed here as
+        // nonlinear, and `NiaSolver` decided a spurious `unsat` the band-aid
+        // trusted). Sound integer `unsat` comes from §G (`definite_sign_unsat`),
+        // nl2, and fd_core (each above — exact / `g_unsat_reverify`'d); a legacy
+        // `unsat` falls through to `None` so the CDCL(T)/ArithSolver path decides.
+        // Only the model-verified `Sat` is taken from the legacy solver: trust it
+        // only when the returned model genuinely satisfies every atom (the NIA
+        // branch-and-bound over-reports `Sat` on integer-infeasible shapes like
+        // `x²=3`). Unverified / incomplete model → `None` (Unknown).
         SolverResult::Sat if sat_is_trustworthy => {
             match translator.nlsat.nlsat().get_model() {
                 Some(m) if model_satisfies_atoms(&m, &poly_atoms) => {
@@ -961,7 +967,6 @@ pub fn dispatch_nra_constraints(
     // (`check_term_bound_infeasible`). A nonlinear `unsat` the core alone would
     // claim is DISTRUSTED → `None` → the sound `Unknown`/Sat fallback (never a
     // false `unsat`; the verus-dangerous direction is closed).
-    let unsat_is_trustworthy = poly_atoms.iter().all(|atom| atom.poly.total_degree() <= 1);
     // `Sat` is only valid for the original formula when nothing was dropped (see
     // `extract_poly_atoms`). Otherwise fall back to `None` (Unknown) — never trust
     // a `Sat` over a retained SUBSET of the constraints.
@@ -974,11 +979,17 @@ pub fn dispatch_nra_constraints(
     }
 
     match translator.nlsat.solve() {
-        SolverResult::Unsat if unsat_is_trustworthy => Some(NlDispatchResult::Unsat),
-        // Trust `Sat` only when the returned model genuinely satisfies every atom
-        // (the core real nlsat over-reports `Sat` on some multivariate strict
-        // inequalities — e.g. a boundary point that violates a strict `<`/`>`).
-        // Unverified / incomplete model → `None` (Unknown).
+        // The core real `NlsatSolver`'s UNSAT is NEVER trusted: a z3-differential
+        // proved it broadly unsound on nonlinear `unsat` (every degree), and the
+        // old `total_degree ≤ 1` linear-fragment band-aid is unsound too (the NIA
+        // twin false-`unsat`s linear-after-cancellation systems). Sound nonlinear
+        // `unsat` is supplied UP-FRONT by §G/§G-SOS (`definite_sign_unsat`), nl2,
+        // and the trichotomy/bound pre-check; a core `unsat` falls through to `None`
+        // (the sound `Unknown`/Sat fallback). Only the model-verified `Sat` is
+        // taken: trust it only when the returned model genuinely satisfies every
+        // atom (the core over-reports `Sat` on some multivariate strict
+        // inequalities — a boundary point violating a strict `<`/`>`). Unverified /
+        // incomplete model → `None` (Unknown).
         SolverResult::Sat if sat_is_trustworthy => {
             match translator.nlsat.get_model() {
                 Some(m) if model_satisfies_atoms(&m, &poly_atoms) => {

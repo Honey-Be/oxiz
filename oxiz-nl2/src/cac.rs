@@ -353,28 +353,21 @@ fn generalize(
     i: usize,
     sp: &SamplePoint,
 ) -> Option<(Interval, Vec<Polynomial>)> {
-    let q = match sp {
-        // A section conflict holds *exactly* at the point — its constraint vanishes
-        // there, so moving off it changes that constraint's sign. Generalise to the
-        // single point: sound on its own (the child proved this exact point
-        // infeasible) and terminating (sections are finitely many). No projection
-        // is needed — and crucially none is *attempted*, so a nullifying resultant
-        // among the child polynomials cannot force `Unknown` here.
-        SamplePoint::Section(r) => {
-            return Some((
-                Interval { lo: Bound::At(r.clone()), hi: Bound::At(r.clone()), point: true },
-                Vec::new(),
-            ));
-        }
-        SamplePoint::Sector(q) => q,
-    };
-
-    // A sector conflict generalises to the open cell of `q` in the arrangement of
-    // the McCallum projection of the child covering's polynomials (Algorithms 4+5):
-    // over that cell every projection polynomial is sign-invariant, so the child's
-    // reasons — hence its infeasibility — persist across the whole interval.
     let xi = order[i];
     let elim = order[i + 1];
+
+    // McCallum-project the child covering's polynomials down past `elim`, so the
+    // PARENT sees the deeper conflict's REASON (Algorithms 4+5). This is needed for
+    // BOTH a sector and a section conflict — over the resulting arrangement every
+    // projection polynomial is sign-invariant, so the child's infeasibility
+    // persists.  Dropping it for a SECTION conflict (the old `Vec::new()`) was
+    // UNSOUND: when an equality section (e.g. `i=2j+4` pinning `j`) leads to a
+    // deeper conflict, the parent then re-projected ONLY this level's own
+    // constraint and LOST the breakpoint the deeper conflict induces — the root of
+    // `Res_j(equality, discriminant) = −31−4i` for the false-`unsat`
+    // `i=2j+4 ∧ −3i+4j > k+k²` — so it over-covered the whole `xᵢ` axis and
+    // reported a spurious `Unsat`. Now the section propagates `projected` too; a
+    // nullifying resultant among the child polynomials yields the sound `Unknown`.
     let projected = match mccallum_project(child_polys, elim, i + 1) {
         Some(p) => p,
         None => {
@@ -382,6 +375,27 @@ fn generalize(
             return None;
         }
     };
+
+    let q = match sp {
+        // A section conflict holds *exactly* at the point — its constraint vanishes
+        // there, so moving off it changes that constraint's sign. Generalise THIS
+        // level's interval to the single point `[r,r]` (sound on its own — the child
+        // proved this exact point infeasible — and terminating, sections being
+        // finitely many), but still propagate `projected` upward so the parent does
+        // not over-cover.
+        SamplePoint::Section(r) => {
+            return Some((
+                Interval { lo: Bound::At(r.clone()), hi: Bound::At(r.clone()), point: true },
+                projected,
+            ));
+        }
+        SamplePoint::Sector(q) => q,
+    };
+
+    // A sector conflict generalises to the open cell of `q` in the arrangement of
+    // the projection just computed: over that cell every projection polynomial is
+    // sign-invariant, so the child's reasons — hence its infeasibility — persist
+    // across the whole interval.
     let mut boundary_roots: Vec<RealRoot> = Vec::new();
     for p in &projected {
         if main_var_of(p, order) == Some(xi) {
