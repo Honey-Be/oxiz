@@ -208,7 +208,9 @@ pub(crate) enum Polarity {
     Both,
 }
 
-/// Result of SMT solving
+/// Result of SMT solving — the 3-valued SMT-LIB verdict (the `(check-sat)`
+/// output format). This is the PUBLIC type the CLI/bindings consume; the solver
+/// computes a finer-grained [`SatLevel`] internally and collapses it here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolverResult {
     /// Satisfiable
@@ -217,6 +219,73 @@ pub enum SolverResult {
     Unsat,
     /// Unknown (timeout, incomplete, etc.)
     Unknown,
+}
+
+/// The solver's INTERNAL 5-level verdict — a confidence lattice that sharply
+/// separates a CONFIRMED verdict from a merely heuristic one:
+///
+/// ```text
+///   DefiniteUnsat  — a sound refutation (conflict clause / G-UNSAT covering)
+///   PossiblyUnsat  — an UNconfirmed unsat (a tier that was not re-verified,
+///                    e.g. nl2's multivariate CDCAC covering)
+///   Unknown        — no information
+///   PossiblySat    — an UNconfirmed sat (a model the theories could not verify,
+///                    e.g. a CDCL(T) assignment over an opaque nonlinear term, or
+///                    an LP-feasible vertex with no integer-feasibility proof)
+///   DefiniteSat    — a CONFIRMED model (theory-verified / G-SAT)
+/// ```
+///
+/// Only the two `Definite*` poles may surface as `sat`/`unsat`; every `Possibly*`
+/// and `Unknown` collapses to the sound `unknown` at the SMT boundary
+/// ([`SatLevel::collapse`]). This makes a false `sat`/`unsat` structurally
+/// impossible from an unconfirmed source — the soundness discipline that the
+/// per-site `last_check_unconfirmed` / `sat_is_trustworthy` flags expressed
+/// ad-hoc is now one first-class type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SatLevel {
+    /// A confirmed, theory-/G-SAT-verified model exists.
+    DefiniteSat,
+    /// Heuristically satisfiable but NOT confirmed — must not be reported `sat`.
+    PossiblySat,
+    /// No information.
+    Unknown,
+    /// Heuristically unsatisfiable but NOT confirmed — must not be reported `unsat`.
+    PossiblyUnsat,
+    /// A confirmed refutation (conflict clause / re-verified covering).
+    DefiniteUnsat,
+}
+
+impl SatLevel {
+    /// Collapse to the 3-valued SMT verdict: only a `Definite*` pole is trusted;
+    /// every unconfirmed level becomes the sound `Unknown`.
+    #[must_use]
+    pub fn collapse(self) -> SolverResult {
+        match self {
+            SatLevel::DefiniteSat => SolverResult::Sat,
+            SatLevel::DefiniteUnsat => SolverResult::Unsat,
+            SatLevel::PossiblySat | SatLevel::Unknown | SatLevel::PossiblyUnsat => {
+                SolverResult::Unknown
+            }
+        }
+    }
+
+    /// Lift a CONFIRMED 3-valued result into the lattice (`Sat`→`DefiniteSat`,
+    /// `Unsat`→`DefiniteUnsat`, `Unknown`→`Unknown`). Use only when the source is
+    /// genuinely confirmed; an unconfirmed result must be built as `Possibly*`.
+    #[must_use]
+    pub fn from_definite(r: SolverResult) -> Self {
+        match r {
+            SolverResult::Sat => SatLevel::DefiniteSat,
+            SolverResult::Unsat => SatLevel::DefiniteUnsat,
+            SolverResult::Unknown => SatLevel::Unknown,
+        }
+    }
+}
+
+impl From<SatLevel> for SolverResult {
+    fn from(s: SatLevel) -> Self {
+        s.collapse()
+    }
 }
 
 /// Theory checking mode

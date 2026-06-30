@@ -542,6 +542,66 @@ fn model_satisfies_atoms(model: &Model, atoms: &[PolyAtom]) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Sound nonlinear oracle: oxiz-nl2
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Map a local `(AtomKind, positive)` literal to oxiz-nl2's `AtomCmp`.
+/// Returns `None` for the `Root*` kinds (which oxiz-nl2 does not model as a
+/// plain `p ⋈ 0` comparison, and which the extractors never produce anyway).
+fn nl2_atom_cmp(kind: AtomKind, positive: bool) -> Option<oxiz_nl2::AtomCmp> {
+    use oxiz_nl2::AtomCmp as C;
+    Some(match (kind, positive) {
+        (AtomKind::Eq, true) => C::Eq,
+        (AtomKind::Eq, false) => C::Ne,
+        (AtomKind::Lt, true) => C::Lt,
+        (AtomKind::Lt, false) => C::Ge,
+        (AtomKind::Gt, true) => C::Gt,
+        (AtomKind::Gt, false) => C::Le,
+        _ => return None, // Root* — never produced by the extractors
+    })
+}
+
+/// Consult **oxiz-nl2** (the clean-room sound nonlinear solver) on the
+/// conjunction `poly_atoms`. Both of nl2's verdicts are runtime-verified —
+/// `Sat` by **G-SAT** (an exact model re-check) and `Unsat` by **G-UNSAT** (a
+/// covering re-verify), giving `FALSE_SAT = FALSE_UNSAT = 0` by construction —
+/// so they are trusted directly, REPLACING the legacy `NlsatSolver`/`NiaSolver`
+/// nonlinear verdicts a z3-differential proved broadly unsound:
+///
+///   * `Unsat` ⇒ `Some(Unsat)` — sound for the full formula even if a subterm
+///     was `dropped` (a sub-core's unsat ⟹ full unsat).
+///   * `Sat`   ⇒ `Some(Sat)` ONLY when `!dropped`: G-SAT verifies the model
+///     against the RETAINED atoms, so a dropped constraint could be exactly the
+///     one a retained-subset model violates.
+///   * `Unknown` (or `Sat` with a dropped atom, or a `Root*` atom nl2 cannot
+///     model) ⇒ `None`: fall through to the caller's remaining logic.
+///
+/// `sort` is `Integer` on the NIA path and `Real` on the NRA path; the caller
+/// must NOT pass `Integer` when a real-sorted variable was integerized (the
+/// strengthened ℤ-system's verdict is unsound for the original ℝ-problem).
+fn nl2_dispatch(
+    poly_atoms: &[PolyAtom],
+    dropped: bool,
+    sort: oxiz_nl2::VarSort,
+) -> Option<NlDispatchResult> {
+    let mut atoms = Vec::with_capacity(poly_atoms.len());
+    for (i, a) in poly_atoms.iter().enumerate() {
+        let op = nl2_atom_cmp(a.kind, a.positive)?; // Root* ⇒ bail the oracle
+        atoms.push(oxiz_nl2::PolyAtom::new(
+            a.poly.clone(),
+            op,
+            sort,
+            oxiz_nl2::OriginId(i as u32),
+        ));
+    }
+    match oxiz_nl2::check(&atoms) {
+        oxiz_nl2::Verdict::Unsat(_) => Some(NlDispatchResult::Unsat),
+        oxiz_nl2::Verdict::Sat(_) if !dropped => Some(NlDispatchResult::Sat),
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // NIA dispatch: public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -590,6 +650,22 @@ pub fn dispatch_nia_constraints(
     // UNSAT, so this is sound on the NIA (integer) path.
     if definite_sign_unsat(&poly_atoms) {
         return Some(NlDispatchResult::Unsat);
+    }
+
+    // Sound nonlinear oracle (oxiz-nl2): trust both runtime-verified verdicts,
+    // replacing the legacy `NiaSolver` nonlinear `unsat`/`sat` below. On the
+    // integer path, skip when a real-sorted variable was integerized — the
+    // strengthened ℤ-system's verdict is unsound for the original ℝ-problem (same
+    // guard fd_core uses).
+    let nl2_sort = if integer_mode {
+        oxiz_nl2::VarSort::Integer
+    } else {
+        oxiz_nl2::VarSort::Real
+    };
+    if (!integer_mode || !translator.integerized_real())
+        && let Some(v) = nl2_dispatch(&poly_atoms, dropped, nl2_sort)
+    {
+        return Some(v);
     }
 
     // SOUNDNESS — like the NRA gate, trust the core's `Unsat` ONLY on the LINEAR
@@ -865,6 +941,12 @@ pub fn dispatch_nra_constraints(
     // whole conjunction UNSAT — decided exactly from `b²−4ac`, no root isolation.
     if definite_sign_unsat(&poly_atoms) {
         return Some(NlDispatchResult::Unsat);
+    }
+
+    // Sound nonlinear oracle (oxiz-nl2): trust both runtime-verified verdicts,
+    // replacing the legacy `NlsatSolver` nonlinear `unsat`/`sat` below.
+    if let Some(v) = nl2_dispatch(&poly_atoms, dropped, oxiz_nl2::VarSort::Real) {
+        return Some(v);
     }
 
     // SOUNDNESS — an `Unsat` from the core real `NlsatSolver` is trustworthy ONLY

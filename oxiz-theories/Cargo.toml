@@ -29,6 +29,9 @@ portable-bijectives = { workspace = true, default-features = false, features = [
 # Optional (std-only)
 egg = { workspace = true, optional = true }
 oxiz-nlsat = { workspace = true, optional = true }
+# Sound nonlinear oracle (G-SAT/G-UNSAT gated) consulted by the NIA/NRA dispatch
+# before the legacy NlsatSolver. std-only, like oxiz-nlsat.
+oxiz-nl2 = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
@@ -38,6 +41,7 @@ std = [
     "oxiz-math/std",
     "egg",
     "oxiz-nlsat",
+    "oxiz-nl2",
     "tracing",
     "tracing/std",
     "num-rational/std",

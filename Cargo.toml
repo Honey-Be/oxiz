@@ -6,6 +6,7 @@ members = [
     "oxiz-math",
     "oxiz-sat",
     "oxiz-nlsat",
+    "oxiz-nl2",
     "oxiz-theories",
     "oxiz-solver",
     "oxiz-mbqi",
@@ -29,6 +30,7 @@ default-members = [
     "oxiz-math",
     "oxiz-sat",
     "oxiz-nlsat",
+    "oxiz-nl2",
     "oxiz-theories",
     "oxiz-solver",
     "oxiz-mbqi",
@@ -72,6 +74,7 @@ oxiz-mbqi = { version = "0.2.4", path = "oxiz-mbqi" }
 oxiz-math = { version = "0.2.4", path = "oxiz-math", default-features = false }
 oxiz-sat = { version = "0.2.4", path = "oxiz-sat", default-features = false }
 oxiz-nlsat = { version = "0.2.4", path = "oxiz-nlsat" }
+oxiz-nl2 = { version = "0.2.4", path = "oxiz-nl2" }
 oxiz-theories = { version = "0.2.4", path = "oxiz-theories", default-features = false }
 oxiz-solver = { version = "0.2.4", path = "oxiz-solver", default-features = false }
 oxiz-opt = { version = "0.2.4", path = "oxiz-opt" }

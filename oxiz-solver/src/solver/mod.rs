@@ -15,8 +15,8 @@ pub(super) mod trail;
 pub(super) mod types;
 
 pub use types::{
-    FpConstraintData, Model, NamedAssertion, Proof, ProofStep, SolverConfig, SolverResult,
-    Statistics, TheoryMode, UnsatCore,
+    FpConstraintData, Model, NamedAssertion, Proof, ProofStep, SatLevel, SolverConfig,
+    SolverResult, Statistics, TheoryMode, UnsatCore,
 };
 
 use crate::clean_mbqi::{EufCongruence, OxizHost, OxizSig, SolverModel};
@@ -562,13 +562,35 @@ impl Solver {
         // For NIA/NRA logics: dispatch all assertions to the full polynomial
         // solver first (NiaSolver or NlsatSolver). This gives a definitive
         // SAT/UNSAT for most benchmark problems without the CDCL(T) loop.
-        if let Some(nl_result) = self.dispatch_nl_solver(manager) {
+        let nl_dispatch = self.dispatch_nl_solver(manager);
+        if let Some(nl_result) = nl_dispatch {
             match nl_result {
                 SolverResult::Sat => return SolverResult::Sat,
                 SolverResult::Unsat => return SolverResult::Unsat,
                 SolverResult::Unknown => {}
             }
         }
+
+        // Part B of the confirmed/unconfirmed verdict discipline (the `SatLevel`
+        // lattice). The sound nonlinear oracle above did NOT return a `Definite*`
+        // verdict, yet the formula carries a genuine nonlinear term (`(* x y)`,
+        // `x²`, …). The CDCL(T)/MBQI loop below treats such a term as an OPAQUE
+        // variable, so any `sat` it reaches is unconfirmed — it never checked the
+        // nonlinear semantics (e.g. `(= (* x y) 6) ∧ (= (* x y) 7)` is fine to the
+        // opaque view). Mark it so the final `sat` is graded `PossiblySat` and
+        // collapses to the sound `unknown`. A CDCL(T) `unsat` stays sound (it is a
+        // conflict-clause refutation, monotone over the opaque abstraction), so
+        // only the `sat` side is downgraded. Gated on an explicit NIA/NRA logic so
+        // the verus `Mul`/`RMul`-wrapper path (no logic string) is untouched.
+        let _ = &nl_dispatch; // (the definite verdicts already returned above)
+        let nonlinear_opaque_sat = self
+            .logic
+            .as_deref()
+            .is_some_and(|l| l.contains("NIA") || l.contains("NRA"))
+            && self
+                .assertions
+                .iter()
+                .any(|&a| oxiz_theories::nlsat::term_is_nonlinear(a, manager));
 
         // Check nonlinear arithmetic constraints for early conflict detection
         // (static pattern matching, complementary to the dispatch above).
@@ -688,16 +710,22 @@ impl Solver {
                 SatResult::Sat => {
                     // If no quantifiers, we're done
                     if !self.has_quantifiers {
-                        // Trivial vs non-trivial SAT: only a theory-CONFIRMED `Sat`
-                        // is a real model. If the authorising battery fell back to
-                        // `Sat` from an incomplete theory (`Unknown`/`Err`), report
-                        // the sound `Unknown` instead of a fabricated model.
-                        if last_unconfirmed {
-                            return SolverResult::Unknown;
+                        // Grade the `Sat` on the `SatLevel` lattice: it is a
+                        // CONFIRMED model (`DefiniteSat` → `sat`) ONLY when the
+                        // authorising theory battery verified it (`!last_unconfirmed`)
+                        // AND no opaque nonlinear term was left unchecked
+                        // (`!nonlinear_opaque_sat`); otherwise it is an unconfirmed
+                        // `PossiblySat`, which collapses to the sound `unknown`.
+                        let level = if last_unconfirmed || nonlinear_opaque_sat {
+                            SatLevel::PossiblySat
+                        } else {
+                            SatLevel::DefiniteSat
+                        };
+                        if level == SatLevel::DefiniteSat {
+                            self.build_model(manager);
+                            self.unsat_core = None;
                         }
-                        self.build_model(manager);
-                        self.unsat_core = None;
-                        return SolverResult::Sat;
+                        return level.collapse();
                     }
 
                     // Build partial model for MBQI
@@ -881,14 +909,18 @@ impl Solver {
                                     return self
                                         .verify_clean_saturated(&clean_instances, manager);
                                 }
-                                // Same trivial-vs-non-trivial SAT gate as the
-                                // quantifier-free path: an incomplete theory in the
-                                // authorising battery means the model is unconfirmed.
-                                if last_unconfirmed {
-                                    return SolverResult::Unknown;
+                                // Same `SatLevel` grade as the quantifier-free path:
+                                // an incomplete theory battery or an opaque nonlinear
+                                // term ⇒ `PossiblySat` → sound `unknown`.
+                                let level = if last_unconfirmed || nonlinear_opaque_sat {
+                                    SatLevel::PossiblySat
+                                } else {
+                                    SatLevel::DefiniteSat
+                                };
+                                if level == SatLevel::DefiniteSat {
+                                    self.unsat_core = None;
                                 }
-                                self.unsat_core = None;
-                                return SolverResult::Sat;
+                                return level.collapse();
                             }
                             CleanVerdict::Inconclusive | CleanVerdict::BudgetExhausted => {
                                 // A trigger-free axiom could not be verified, or

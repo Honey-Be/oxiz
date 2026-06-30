@@ -1,0 +1,23 @@
+[package]
+name = "oxiz-nl2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Clean-room nonlinear-arithmetic solver (QF_NRA + QF_NIA) for OxiZ: an MCSAT-trail spine with a monotone-strength explainer ladder and two runtime soundness gates (G-SAT model re-check, G-UNSAT covering re-verify). FALSE_UNSAT=0 / FALSE_SAT=0 by construction."
+keywords = ["smt", "nonlinear", "arithmetic", "mcsat", "cad"]
+categories = ["algorithms", "mathematics"]
+
+[dependencies]
+# Reused substrate (DESIGN.md §7): Polynomial/Var algebra, IntervalSet,
+# SturmSequence, and the §G/§G-SOS definite-sign deciders (`discriminant.rs`).
+# NOT the NlsatSolver/NiaSolver cores, which oxiz-nl2 replaces.
+oxiz-math = { workspace = true, features = ["std"] }
+oxiz-nlsat = { workspace = true }
+num-rational = { workspace = true, features = ["std", "num-bigint"] }
+num-bigint = { workspace = true, features = ["std"] }
+num-traits = { workspace = true, features = ["std"] }
+rustc-hash = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
