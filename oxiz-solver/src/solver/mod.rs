@@ -718,15 +718,17 @@ impl Solver {
                     // engine has contributed lemmas, confirm the `unsat` with a
                     // single-shot ground solve before trusting it.
                     if self.config.clean_mbqi && !clean_instances.is_empty() {
-                        // The incremental solve claimed `unsat`; `verify_clean_unsat`
-                        // re-solves the ground core single-shot. A confirming `Unsat`
-                        // is `DefiniteUnsat`; otherwise the claim is UNconfirmed —
-                        // `PossiblyUnsat` (collapses to the sound `unknown`, surfaces
-                        // as `possibly-unsat` in full mode).
-                        return match self.verify_clean_unsat(&clean_instances, manager) {
-                            SolverResult::Unsat => SatLevel::DefiniteUnsat,
-                            _ => SatLevel::PossiblyUnsat,
-                        };
+                        // Combine two verdicts about the same formula via the lattice
+                        // `meet`: the incremental solve's UNCONFIRMED `unsat` claim
+                        // (`PossiblyUnsat`) and the single-shot ground re-solve's
+                        // CONFIRMED verdict. meet adjudicates exactly right — confirm
+                        // (`⊓ DefiniteUnsat = DefiniteUnsat`), can't-confirm
+                        // (`⊓ Unknown = PossiblyUnsat`, collapses to sound `unknown`),
+                        // and even a re-solve that finds a MODEL
+                        // (`⊓ DefiniteSat = DefiniteSat`) refutes the stale claim.
+                        let reverify =
+                            SatLevel::from_definite(self.verify_clean_unsat(&clean_instances, manager));
+                        return SatLevel::PossiblyUnsat.meet(reverify);
                     }
                     self.build_unsat_core();
                     return SatLevel::DefiniteUnsat;
@@ -933,18 +935,17 @@ impl Solver {
                                 // `sat`; with none (pure model-completion) the
                                 // `Saturated` is already sound.
                                 if self.config.clean_mbqi && !clean_instances.is_empty() {
-                                    // The incremental solve saturated to `sat`; the
-                                    // single-shot ground re-solve adjudicates: a
-                                    // confirming `Sat` is `DefiniteSat`; a `Unsat`
-                                    // (a global conflict the incremental missed) is a
-                                    // confirmed `DefiniteUnsat`; an `Unknown` leaves the
-                                    // model UNconfirmed ⇒ `PossiblySat`.
-                                    return match self.verify_clean_saturated(&clean_instances, manager)
-                                    {
-                                        SolverResult::Sat => SatLevel::DefiniteSat,
-                                        SolverResult::Unsat => SatLevel::DefiniteUnsat,
-                                        SolverResult::Unknown => SatLevel::PossiblySat,
-                                    };
+                                    // Same lattice `meet` as the unsat path: the
+                                    // incremental's UNCONFIRMED `sat` claim
+                                    // (`PossiblySat`) met with the single-shot ground
+                                    // re-solve's CONFIRMED verdict — confirm
+                                    // (`⊓ DefiniteSat`), a global conflict the
+                                    // incremental missed (`⊓ DefiniteUnsat`), or
+                                    // can't-confirm (`⊓ Unknown = PossiblySat`).
+                                    let reverify = SatLevel::from_definite(
+                                        self.verify_clean_saturated(&clean_instances, manager),
+                                    );
+                                    return SatLevel::PossiblySat.meet(reverify);
                                 }
                                 // Same `SatLevel` grade as the quantifier-free path:
                                 // an incomplete theory battery or an opaque nonlinear
