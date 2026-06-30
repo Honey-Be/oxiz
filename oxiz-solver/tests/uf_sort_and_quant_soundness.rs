@@ -1420,6 +1420,29 @@ fn identity_definition_feeding_ground_term_is_not_spurious_sat() {
 }
 
 #[test]
+fn bound_var_colliding_with_declared_constant_is_not_spurious_sat() {
+    // #352 — a quantifier-bound `x` whose name collides with a DECLARED constant
+    // `x`. The parser bound `x` to `mk_var("x", U)` — the SAME hash-consed term
+    // as the constant — so the trigger `(f x)` became identical to the ground
+    // `(f x)` and the e-matcher read it as already-ground (no instantiation). The
+    // formula is UNSAT: pattern `(f x)` matches `(f x)` ⇒ `p(f(x))`; `f(x)=x` ⇒
+    // `p(x)`, contradicting `¬p(x)`. The fix alpha-renames the colliding bound
+    // var so it is structurally distinct. (z3: unsat.)
+    let r = solve_streamed(&[
+        "(set-logic UF)",
+        "(declare-sort U 0)",
+        "(declare-fun f (U) U)",
+        "(declare-fun p (U) Bool)",
+        "(declare-const x U)",
+        "(assert (forall ((x U)) (! (p (f x)) :pattern ((f x)))))",
+        "(assert (= (f x) x))",
+        "(assert (not (p x)))",
+        "(check-sat)",
+    ]);
+    assert_eq!(r, SolverResult::Unsat, "bound-var/constant name collision must not be spurious sat");
+}
+
+#[test]
 fn identity_definition_unused_is_still_sat() {
     // Completeness control for the #350 fix: `∀x. f(x)=x` with `f` used only
     // CONSISTENTLY (an eq-pin `f(a)=a`) stays `sat` — the definitional shortcut

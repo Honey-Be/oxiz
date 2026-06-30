@@ -108,12 +108,32 @@ impl<'a> Parser<'a> {
             .iter()
             .filter_map(|(name, _)| self.constants.get(name).map(|&s| (name.clone(), s)))
             .collect();
-        for (name, sort) in &vars {
-            let var_term = self.manager.mk_var(name, *sort);
-            self.bindings.insert(name.clone(), var_term);
-            // Remove from constants to avoid shadowing issues
-            self.constants.remove(name);
-        }
+        // #352: a bound var whose source name collides with a declared constant
+        // (or an outer binding) would be the SAME hash-consed `Var` term as that
+        // constant — so a trigger `(f x)` becomes identical to a GROUND `(f x)`
+        // and the e-matcher reads it as already-ground (no instantiation →
+        // spurious sat). Alpha-rename a colliding bound var to a fresh name so it
+        // is structurally distinct; the binding key stays the SOURCE name (so body
+        // references resolve), and the fresh name flows into the `Forall`'s var
+        // list. Non-colliding names are untouched (term identity preserved — the
+        // verus prelude / AOT bank are unaffected).
+        let effective: Vec<String> = vars
+            .iter()
+            .map(|(name, sort)| {
+                let eff = if self.constants.contains_key(name) || self.bindings.contains_key(name) {
+                    let f = format!("{name}!q{}", self.quant_counter);
+                    self.quant_counter += 1;
+                    f
+                } else {
+                    name.clone()
+                };
+                let var_term = self.manager.mk_var(&eff, *sort);
+                self.bindings.insert(name.clone(), var_term);
+                // Remove from constants to avoid shadowing issues
+                self.constants.remove(name);
+                eff
+            })
+            .collect();
 
         // Parse body (bound variables now resolve with the correct sort)
         let body = self.parse_term()?;
@@ -130,7 +150,8 @@ impl<'a> Parser<'a> {
             self.constants.insert(name, sort);
         }
 
-        let var_refs: Vec<_> = vars.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let var_refs: Vec<_> =
+            effective.iter().zip(vars.iter()).map(|(eff, (_, s))| (eff.as_str(), *s)).collect();
         // Thread the body's `:pattern` triggers (stored as annotations by the
         // `!` form) into the quantifier.  Without this the `Forall` carries no
         // patterns, so the model-based MBQI engine cannot tell a trigger-guided
@@ -188,11 +209,24 @@ impl<'a> Parser<'a> {
             .iter()
             .filter_map(|(name, _)| self.constants.get(name).map(|&s| (name.clone(), s)))
             .collect();
-        for (name, sort) in &vars {
-            let var_term = self.manager.mk_var(name, *sort);
-            self.bindings.insert(name.clone(), var_term);
-            self.constants.remove(name);
-        }
+        // #352: alpha-rename a bound var colliding with a declared constant /
+        // outer binding to a fresh name (same rationale as `parse_forall`).
+        let effective: Vec<String> = vars
+            .iter()
+            .map(|(name, sort)| {
+                let eff = if self.constants.contains_key(name) || self.bindings.contains_key(name) {
+                    let f = format!("{name}!q{}", self.quant_counter);
+                    self.quant_counter += 1;
+                    f
+                } else {
+                    name.clone()
+                };
+                let var_term = self.manager.mk_var(&eff, *sort);
+                self.bindings.insert(name.clone(), var_term);
+                self.constants.remove(name);
+                eff
+            })
+            .collect();
 
         // Parse body
         let body = self.parse_term()?;
@@ -209,7 +243,8 @@ impl<'a> Parser<'a> {
             self.constants.insert(name, sort);
         }
 
-        let var_refs: Vec<_> = vars.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let var_refs: Vec<_> =
+            effective.iter().zip(vars.iter()).map(|(eff, (_, s))| (eff.as_str(), *s)).collect();
         Ok(self.manager.mk_exists(var_refs, body))
     }
 

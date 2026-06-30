@@ -127,6 +127,9 @@ pub struct Parser<'a> {
     /// Datatype constructor names -> (datatype_sort, arity/selector_info)
     /// For nullary constructors (enums), the Vec is empty
     pub(super) dt_constructors: FxHashMap<String, SortId>,
+    /// Monotonic counter for alpha-renaming quantifier-bound variables whose
+    /// source name collides with a declared constant or an outer binding (#352).
+    pub(super) quant_counter: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -144,6 +147,7 @@ impl<'a> Parser<'a> {
             recovery_mode: false,
             errors: Vec::new(),
             dt_constructors: FxHashMap::default(),
+            quant_counter: 0,
         }
     }
 
@@ -162,6 +166,7 @@ impl<'a> Parser<'a> {
             recovery_mode: true,
             errors: Vec::new(),
             dt_constructors: FxHashMap::default(),
+            quant_counter: 0,
         }
     }
 
