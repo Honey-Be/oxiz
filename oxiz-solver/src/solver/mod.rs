@@ -599,17 +599,22 @@ impl Solver {
         // opaque view). Mark it so the final `sat` is graded `PossiblySat` and
         // collapses to the sound `unknown`. A CDCL(T) `unsat` stays sound (it is a
         // conflict-clause refutation, monotone over the opaque abstraction), so
-        // only the `sat` side is downgraded. Gated on an explicit NIA/NRA logic so
-        // the verus `Mul`/`RMul`-wrapper path (no logic string) is untouched.
+        // only the `sat` side is downgraded. Keyed on the PRESENCE of a native
+        // nonlinear term (`term_is_nonlinear`), NOT on the logic string: a problem
+        // submitted under `ALL`, under no `(set-logic)`, or under a mislabeled
+        // logic (e.g. the AD1 lu-smt delegation, which replays `QF_NIA` obligations
+        // under `ALL` semantics) is STILL nonlinear and must be downgraded — the
+        // old `logic.contains("NIA"|"NRA")` gate let exactly those bypass the net
+        // and report a spurious `sat` for `(= (* x x) 3)` / `(x−y)² < 0`. The verus
+        // `Mul`/`RMul`-wrapper path is UNAFFECTED: its products are uninterpreted
+        // `Apply`s and the only native `(* …)` lives inside `Forall` bridge axioms,
+        // both of which `term_is_nonlinear` returns `false` on (its `_ => false`
+        // arm does not recurse through `Apply`/`Forall`).
         let _ = &nl_dispatch; // (the definite verdicts already returned above)
         let nonlinear_opaque_sat = self
-            .logic
-            .as_deref()
-            .is_some_and(|l| l.contains("NIA") || l.contains("NRA"))
-            && self
-                .assertions
-                .iter()
-                .any(|&a| oxiz_theories::nlsat::term_is_nonlinear(a, manager));
+            .assertions
+            .iter()
+            .any(|&a| oxiz_theories::nlsat::term_is_nonlinear(a, manager));
 
         // Check nonlinear arithmetic constraints for early conflict detection
         // (static pattern matching, complementary to the dispatch above).

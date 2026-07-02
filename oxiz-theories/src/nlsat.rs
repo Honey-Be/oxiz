@@ -287,8 +287,31 @@ struct PolyAtom {
 /// constraint could be exactly the one a retained-subset model violates →
 /// spurious sat). `Unsat` over a subset stays sound regardless (subset-unsat ⟹
 /// full-unsat), which is why only the `Sat` side consults this.
+/// Push one comparison atom in canonical `poly OP 0` form. `base_pos` is the
+/// literal's polarity when asserted POSITIVELY; under `pol == false` (the
+/// sub-formula sits below an odd number of negations) it flips — `base_pos == pol`
+/// computes exactly that (`pol=true` ⇒ keep, `pol=false` ⇒ negate). Returns `true`
+/// (dropped) if either side is untranslatable.
+fn push_int_cmp(
+    lhs: TermId,
+    rhs: TermId,
+    kind: AtomKind,
+    base_pos: bool,
+    pol: bool,
+    translator: &mut TermPolyTranslator<'_>,
+    out: &mut Vec<PolyAtom>,
+) -> bool {
+    if let (Some(lp), Some(rp)) = (translator.translate(lhs), translator.translate(rhs)) {
+        out.push(PolyAtom { poly: Polynomial::sub(&lp, &rp), kind, positive: base_pos == pol });
+        false
+    } else {
+        true
+    }
+}
+
 fn extract_poly_atoms(
     term_id: TermId,
+    pol: bool,
     manager: &TermManager,
     translator: &mut TermPolyTranslator<'_>,
     out: &mut Vec<PolyAtom>,
@@ -297,108 +320,57 @@ fn extract_poly_atoms(
         return true;
     };
     match &term.kind.clone() {
-        TermKind::Eq(lhs, rhs) => {
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&lp, &rp),
-                    kind: AtomKind::Eq,
-                    positive: true,
-                });
-                false
-            } else {
-                true
-            }
-        }
-        TermKind::Lt(lhs, rhs) => {
-            // lhs < rhs → rhs - lhs > 0
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&rp, &lp),
-                    kind: AtomKind::Gt,
-                    positive: true,
-                });
-                false
-            } else {
-                true
-            }
-        }
-        TermKind::Le(lhs, rhs) => {
-            // lhs <= rhs → rhs - lhs >= 0 → NOT(rhs - lhs < 0)
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&rp, &lp),
-                    kind: AtomKind::Lt,
-                    positive: false,
-                });
-                false
-            } else {
-                true
-            }
-        }
-        TermKind::Gt(lhs, rhs) => {
-            // lhs > rhs → lhs - rhs > 0
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&lp, &rp),
-                    kind: AtomKind::Gt,
-                    positive: true,
-                });
-                false
-            } else {
-                true
-            }
-        }
-        TermKind::Ge(lhs, rhs) => {
-            // lhs >= rhs → NOT(lhs - rhs < 0)
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&lp, &rp),
-                    kind: AtomKind::Lt,
-                    positive: false,
-                });
-                false
-            } else {
-                true
-            }
-        }
-        TermKind::And(args) => {
+        // lhs = rhs → poly (lhs-rhs) = 0
+        TermKind::Eq(lhs, rhs) => push_int_cmp(*lhs, *rhs, AtomKind::Eq, true, pol, translator, out),
+        // lhs < rhs → rhs - lhs > 0
+        TermKind::Lt(lhs, rhs) => push_int_cmp(*rhs, *lhs, AtomKind::Gt, true, pol, translator, out),
+        // lhs <= rhs → rhs - lhs >= 0 → NOT(rhs - lhs < 0)
+        TermKind::Le(lhs, rhs) => push_int_cmp(*rhs, *lhs, AtomKind::Lt, false, pol, translator, out),
+        // lhs > rhs → lhs - rhs > 0
+        TermKind::Gt(lhs, rhs) => push_int_cmp(*lhs, *rhs, AtomKind::Gt, true, pol, translator, out),
+        // lhs >= rhs → NOT(lhs - rhs < 0)
+        TermKind::Ge(lhs, rhs) => push_int_cmp(*lhs, *rhs, AtomKind::Lt, false, pol, translator, out),
+        // `Not` toggles the polarity and recurses — this is the general mechanism
+        // that surfaces a negated comparison as the FLIPPED atom (so disequalities
+        // `¬(=)` and negated inequalities REACH the engine — which decides `x²≠0`
+        // under `x=0` via its zero-absorbing interval evaluation), AND that peels
+        // `¬(=>)` / `¬(or)` into the conjunction of literals below.
+        TermKind::Not(inner) => extract_poly_atoms(*inner, !pol, manager, translator, out),
+        // A conjunction under positive polarity is a set of conjuncts — recurse each.
+        // Under negation it is `¬(a∧b) = ¬a ∨ ¬b`, a DISJUNCTION we cannot represent
+        // as a conjunction of literals, so it drops (the `_` arm).
+        TermKind::And(args) if pol => {
             let mut dropped = false;
             for &arg in args.iter() {
-                dropped |= extract_poly_atoms(arg, manager, translator, out);
+                dropped |= extract_poly_atoms(arg, pol, manager, translator, out);
             }
             dropped
         }
-        TermKind::Not(inner) => {
-            // A negated arith comparison surfaces as the polarity-FLIPPED atom, so
-            // disequalities `¬(=)` (and negated inequalities) REACH the engine — which
-            // then decides them via its zero-absorbing interval evaluation: a factor
-            // forced to 0 makes the whole product 0, refuting e.g. `x²≠0` under `x=0`
-            // (`0·_ = 0` in any ring). `¬(And/Or/…)` is not a single atom — drop it.
-            let is_cmp = matches!(
-                manager.get(*inner).map(|term| &term.kind),
-                Some(
-                    TermKind::Eq(_, _)
-                        | TermKind::Lt(_, _)
-                        | TermKind::Le(_, _)
-                        | TermKind::Gt(_, _)
-                        | TermKind::Ge(_, _)
-                )
-            );
-            if is_cmp {
-                let before = out.len();
-                let dropped = extract_poly_atoms(*inner, manager, translator, out);
-                for atom in out.iter_mut().skip(before) {
-                    atom.positive = !atom.positive;
-                }
-                dropped
-            } else {
-                true
+        // `¬(a∨…) = ¬a ∧ …` (De Morgan) IS a conjunction of literals — recurse each
+        // disjunct with the flipped polarity. A positive `Or` is a disjunction ⇒ drops.
+        TermKind::Or(args) if !pol => {
+            let mut dropped = false;
+            for &arg in args.iter() {
+                dropped |= extract_poly_atoms(arg, pol, manager, translator, out);
             }
+            dropped
         }
-        TermKind::Distinct(args) => {
-            // `distinct(a₁..aₙ)` = pairwise `aᵢ ≠ aⱼ`; each is a `≠ 0` atom on
-            // `aᵢ − aⱼ` (the shape the simplifier's desugar also produces — handled
-            // here too in case an unsimplified `distinct` reaches the dispatch).
+        // `¬(a ⇒ b) = a ∧ ¬b` IS a conjunction of literals — assert `a` and `¬b`.
+        // This is the shape the lu-kb driver renders for a sequent `H ⊢ G` folded
+        // into `¬(H ⇒ G)`, so this arm is what lets the folded nonlinear obligation
+        // reach the sound NIA/NRA dispatch instead of dropping to CDCL(T)/Unknown.
+        // A positive `a ⇒ b = ¬a ∨ b` is a disjunction ⇒ drops.
+        TermKind::Implies(a, b) if !pol => {
+            let da = extract_poly_atoms(*a, true, manager, translator, out);
+            let db = extract_poly_atoms(*b, false, manager, translator, out);
+            da || db
+        }
+        // `distinct(a₁..aₙ)` = pairwise `aᵢ ≠ aⱼ`; each is a `≠ 0` atom on `aᵢ − aⱼ`
+        // (the shape the simplifier's desugar also produces — handled here too in
+        // case an unsimplified `distinct` reaches the dispatch). Only a POSITIVE
+        // `distinct` is a conjunction of disequalities; `¬distinct` (some pair equal)
+        // is a disjunction ⇒ drops.
+        TermKind::Distinct(args) if pol => {
             let args: Vec<TermId> = args.to_vec();
             let mut dropped = false;
             for i in 0..args.len() {
@@ -466,9 +438,11 @@ fn poly_atom_to_fd(atom: &PolyAtom) -> Option<(Polynomial, fd_core::FdCmp)> {
 ///
 /// Every [`PolyAtom`] in `poly_atoms` is a TOP-LEVEL CONJUNCT of the (focused)
 /// assertion set — both `extract_poly_atoms` and `extract_real_poly_atoms` only
-/// descend into `And` and the comparison atoms (every other connective hits the
-/// dropped `_` arm), so every pushed atom is ENTAILED by the conjunction. If a
-/// single entailed atom is itself unsatisfiable over ℝ — a quadratic whose asserted
+/// descend through the CONJUNCTION-PRESERVING structure of the assertion (the
+/// comparison atoms, positive `And`, and the negated forms `¬(a⇒b)=a∧¬b` /
+/// `¬(a∨…)=¬a∧…` / `¬¬x=x` via the polarity flag); every disjunctive connective
+/// hits the dropped `_` arm. So every pushed atom is ENTAILED by the conjunction.
+/// If a single entailed atom is itself unsatisfiable over ℝ — a quadratic whose asserted
 /// sign is impossible — the whole conjunction is UNSAT. Two recognisers, both exact
 /// and one-sided:
 /// - [`quadratic_atom_is_unsat`] — the UNIVARIATE quadratic by its discriminant
@@ -636,7 +610,7 @@ pub fn dispatch_nia_constraints(
     let mut poly_atoms: Vec<PolyAtom> = Vec::new();
     let mut dropped = false;
     for &assertion in assertions {
-        dropped |= extract_poly_atoms(assertion, manager, &mut translator, &mut poly_atoms);
+        dropped |= extract_poly_atoms(assertion, true, manager, &mut translator, &mut poly_atoms);
     }
 
     if poly_atoms.is_empty() {
@@ -835,11 +809,27 @@ impl<'a> RealPolyTranslator<'a> {
     }
 }
 
-/// Real-arithmetic twin of [`extract_poly_atoms`]; **returns `true` if any
-/// subterm was DROPPED** (unmodeled connective or untranslatable operand). See
-/// that function for why the `Sat` side must consult it.
+/// Real-arithmetic twin of [`push_int_cmp`] (same `base_pos == pol` polarity rule).
+fn push_real_cmp(
+    lhs: TermId,
+    rhs: TermId,
+    kind: AtomKind,
+    base_pos: bool,
+    pol: bool,
+    translator: &mut RealPolyTranslator<'_>,
+    out: &mut Vec<PolyAtom>,
+) -> bool {
+    if let (Some(lp), Some(rp)) = (translator.translate(lhs), translator.translate(rhs)) {
+        out.push(PolyAtom { poly: Polynomial::sub(&lp, &rp), kind, positive: base_pos == pol });
+        false
+    } else {
+        true
+    }
+}
+
 fn extract_real_poly_atoms(
     term_id: TermId,
+    pol: bool,
     manager: &TermManager,
     translator: &mut RealPolyTranslator<'_>,
     out: &mut Vec<PolyAtom>,
@@ -847,71 +837,56 @@ fn extract_real_poly_atoms(
     let Some(term) = manager.get(term_id) else {
         return true;
     };
+    // Polarity threading mirrors `extract_poly_atoms` exactly (see its arm docs):
+    // negation distributes soundly (`¬(a⇒b)=a∧¬b`, `¬(a∨b)=¬a∧¬b`, `¬¬x=x`), so the
+    // lu-kb driver's folded `¬(H ⇒ G)` real obligation reaches the NRA dispatch.
     match &term.kind.clone() {
-        TermKind::Eq(lhs, rhs) => {
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&lp, &rp),
-                    kind: AtomKind::Eq,
-                    positive: true,
-                });
-                false
-            } else {
-                true
-            }
-        }
-        TermKind::Lt(lhs, rhs) => {
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&rp, &lp),
-                    kind: AtomKind::Gt,
-                    positive: true,
-                });
-                false
-            } else {
-                true
-            }
-        }
+        TermKind::Eq(lhs, rhs) => push_real_cmp(*lhs, *rhs, AtomKind::Eq, true, pol, translator, out),
+        TermKind::Lt(lhs, rhs) => push_real_cmp(*rhs, *lhs, AtomKind::Gt, true, pol, translator, out),
         TermKind::Le(lhs, rhs) => {
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&rp, &lp),
-                    kind: AtomKind::Lt,
-                    positive: false,
-                });
-                false
-            } else {
-                true
-            }
+            push_real_cmp(*rhs, *lhs, AtomKind::Lt, false, pol, translator, out)
         }
-        TermKind::Gt(lhs, rhs) => {
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&lp, &rp),
-                    kind: AtomKind::Gt,
-                    positive: true,
-                });
-                false
-            } else {
-                true
-            }
-        }
+        TermKind::Gt(lhs, rhs) => push_real_cmp(*lhs, *rhs, AtomKind::Gt, true, pol, translator, out),
         TermKind::Ge(lhs, rhs) => {
-            if let (Some(lp), Some(rp)) = (translator.translate(*lhs), translator.translate(*rhs)) {
-                out.push(PolyAtom {
-                    poly: Polynomial::sub(&lp, &rp),
-                    kind: AtomKind::Lt,
-                    positive: false,
-                });
-                false
-            } else {
-                true
-            }
+            push_real_cmp(*lhs, *rhs, AtomKind::Lt, false, pol, translator, out)
         }
-        TermKind::And(args) => {
+        TermKind::Not(inner) => extract_real_poly_atoms(*inner, !pol, manager, translator, out),
+        TermKind::And(args) if pol => {
             let mut dropped = false;
             for &arg in args.iter() {
-                dropped |= extract_real_poly_atoms(arg, manager, translator, out);
+                dropped |= extract_real_poly_atoms(arg, pol, manager, translator, out);
+            }
+            dropped
+        }
+        TermKind::Or(args) if !pol => {
+            let mut dropped = false;
+            for &arg in args.iter() {
+                dropped |= extract_real_poly_atoms(arg, pol, manager, translator, out);
+            }
+            dropped
+        }
+        TermKind::Implies(a, b) if !pol => {
+            let da = extract_real_poly_atoms(*a, true, manager, translator, out);
+            let db = extract_real_poly_atoms(*b, false, manager, translator, out);
+            da || db
+        }
+        TermKind::Distinct(args) if pol => {
+            let args: Vec<TermId> = args.to_vec();
+            let mut dropped = false;
+            for i in 0..args.len() {
+                for j in (i + 1)..args.len() {
+                    if let (Some(lp), Some(rp)) =
+                        (translator.translate(args[i]), translator.translate(args[j]))
+                    {
+                        out.push(PolyAtom {
+                            poly: Polynomial::sub(&lp, &rp),
+                            kind: AtomKind::Eq,
+                            positive: false, // aᵢ ≠ aⱼ
+                        });
+                    } else {
+                        dropped = true;
+                    }
+                }
             }
             dropped
         }
@@ -935,7 +910,7 @@ pub fn dispatch_nra_constraints(
     let mut poly_atoms: Vec<PolyAtom> = Vec::new();
     let mut dropped = false;
     for &assertion in assertions {
-        dropped |= extract_real_poly_atoms(assertion, manager, &mut translator, &mut poly_atoms);
+        dropped |= extract_real_poly_atoms(assertion, true, manager, &mut translator, &mut poly_atoms);
     }
 
     if poly_atoms.is_empty() {

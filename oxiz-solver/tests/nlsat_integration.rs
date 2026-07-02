@@ -54,6 +54,83 @@ fn test_nia_x_squared_eq_3_unsat() {
     );
 }
 
+// ── Folded-implication decomposition (the lu-kb delegation shape) ──────────────
+// The lu-kb driver folds a sequent `H ⊢ G` into the single negated implication
+// `¬(H ⇒ G)`; polarity-threaded `extract_poly_atoms` decomposes `¬(a⇒b)` into the
+// conjunction `a ∧ ¬b` so the folded nonlinear obligation reaches the sound NIA/NRA
+// dispatch instead of dropping to CDCL(T)/Unknown. These three tests pin the win
+// AND the two soundness guards (no spurious refutation, disjunctions stay dropped).
+
+#[test]
+fn test_nia_folded_implication_valid_is_unsat() {
+    // `x>0 ⊢ x*x>0` folds to `¬(x>0 ⇒ x*x>0)` = `x>0 ∧ x*x≤0` → UNSAT (goal valid).
+    let mut ctx = Context::new();
+    ctx.set_logic("QF_NIA");
+    let int_sort = ctx.terms.sorts.int_sort;
+    let x = ctx.declare_const("x", int_sort);
+    let zero = ctx.terms.mk_int(0);
+    let sq = ctx.terms.mk_mul(vec![x, x]);
+    let h = ctx.terms.mk_gt(x, zero); // x > 0
+    let g = ctx.terms.mk_gt(sq, zero); // x*x > 0
+    let imp = ctx.terms.mk_implies(h, g);
+    let neg = ctx.terms.mk_not(imp);
+    ctx.assert(neg);
+    let result = ctx.check_sat();
+    assert!(
+        matches!(result, SolverResult::Unsat),
+        "¬(x>0 ⇒ x*x>0) must be UNSAT (goal valid), got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_nia_folded_implication_invalid_is_not_unsat() {
+    // SOUNDNESS: `¬(x>0 ⇒ x*x>5)` = `x>0 ∧ x*x≤5` has the model x=1 — the goal is
+    // NOT valid, so a sound solver must NEVER report UNSAT here.
+    let mut ctx = Context::new();
+    ctx.set_logic("QF_NIA");
+    let int_sort = ctx.terms.sorts.int_sort;
+    let x = ctx.declare_const("x", int_sort);
+    let zero = ctx.terms.mk_int(0);
+    let five = ctx.terms.mk_int(5);
+    let sq = ctx.terms.mk_mul(vec![x, x]);
+    let h = ctx.terms.mk_gt(x, zero);
+    let g = ctx.terms.mk_gt(sq, five);
+    let imp = ctx.terms.mk_implies(h, g);
+    let neg = ctx.terms.mk_not(imp);
+    ctx.assert(neg);
+    let result = ctx.check_sat();
+    assert!(
+        !matches!(result, SolverResult::Unsat),
+        "¬(x>0 ⇒ x*x>5) must NOT be UNSAT (x=1 is a model), got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_nia_positive_disjunction_is_not_spurious_unsat() {
+    // SOUNDNESS: a POSITIVE top-level `a ∨ b` is not a conjunction of literals — the
+    // extractor must DROP it (never read it as `a ∧ b`). `x*x>100 ∨ x<0` is
+    // satisfiable, so the only sound outcomes are Sat/Unknown — never UNSAT.
+    let mut ctx = Context::new();
+    ctx.set_logic("QF_NIA");
+    let int_sort = ctx.terms.sorts.int_sort;
+    let x = ctx.declare_const("x", int_sort);
+    let zero = ctx.terms.mk_int(0);
+    let hundred = ctx.terms.mk_int(100);
+    let sq = ctx.terms.mk_mul(vec![x, x]);
+    let a = ctx.terms.mk_gt(sq, hundred);
+    let b = ctx.terms.mk_lt(x, zero);
+    let disj = ctx.terms.mk_or(vec![a, b]);
+    ctx.assert(disj);
+    let result = ctx.check_sat();
+    assert!(
+        !matches!(result, SolverResult::Unsat),
+        "satisfiable disjunction must NOT be UNSAT, got {:?}",
+        result
+    );
+}
+
 #[test]
 fn test_nia_x_squared_eq_neg1_unsat() {
     // x * x = -1 → UNSAT (squares are non-negative)
@@ -546,9 +623,17 @@ fn nira_mixed_int_nonlinear_and_real_linear_is_sat() {
         "unknown" => Some("unknown"),
         _ => None,
     });
-    assert_eq!(
+    // #278's genuine soundness intent is "no SPURIOUS UNSAT" (do not integerize
+    // the real `y`). The exact `sat` here came from trusting an UNVERIFIED opaque
+    // CDCL(T) model (`(* x x)` abstracted to a fresh `w`, `w = 4` trivially sat) —
+    // structurally the SAME unsound path that reports `(= (* x x) 3)` a spurious
+    // `sat`. The opaque-nonlinear soundness gate (`nonlinear_opaque_sat`, keyed on
+    // a native nonlinear term regardless of logic string) now downgrades that
+    // unverified `sat` to the sound `unknown`. `unknown` is sound (z3: sat); the
+    // hazard #278 forbids is a false `unsat`, which must NEVER be returned.
+    assert_ne!(
         verdict,
-        Some("sat"),
+        Some("unsat"),
         "mixed NIRA must NOT integerize the real variable into a spurious Unsat, got {out:?}"
     );
 }
