@@ -403,14 +403,24 @@ impl Simplifier {
                             self.stats.trivial_equalities += 1;
                             return manager.mk_true();
                         } else if lhs_args.len() == rhs_args.len() {
-                            // Same constructor: decompose to field equalities
+                            // Same constructor: decompose to field equalities.
+                            // Re-simplify each created equality — the args were
+                            // already simplified, but the fresh `=` node was
+                            // not, so a NESTED constructor equality (e.g.
+                            // `succ(n) = zero` out of `succ(succ n) = succ
+                            // zero`) would otherwise stay an opaque atom and
+                            // the clash go unseen (spurious sat). Structural
+                            // descent, so the recursion terminates.
                             self.stats.terms_eliminated += 1;
                             let lhs_args = lhs_args.clone();
                             let rhs_args = rhs_args.clone();
                             let equalities: Vec<_> = lhs_args
                                 .iter()
                                 .zip(rhs_args.iter())
-                                .map(|(&a, &b)| manager.mk_eq(a, b))
+                                .map(|(&a, &b)| {
+                                    let eq = manager.mk_eq(a, b);
+                                    self.simplify(eq, manager)
+                                })
                                 .collect();
                             return manager.mk_and(equalities);
                         }

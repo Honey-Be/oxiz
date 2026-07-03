@@ -1002,21 +1002,34 @@ impl<'a> Parser<'a> {
                     // Apply substitution to get the result
                     self.manager.substitute(body, &substitution)
                 } else {
-                    // Regular function application.
-                    //
-                    // Look up the declared return sort from the functions table so
-                    // that the Apply node carries the correct sort (e.g. `Int` for
-                    // `(declare-fun f (Int) Int)` applications).  This is essential
-                    // for theory reasoning: without the correct sort, an expression
-                    // like `(> (f k) 10)` would be created with `f(k)` having
-                    // `Bool` sort, causing the arithmetic theory to ignore it.
                     let args = self.parse_term_list()?;
-                    let sort = self
-                        .functions
-                        .get(&op)
-                        .map(|(_, ret)| *ret)
-                        .unwrap_or(self.manager.sorts.bool_sort);
-                    self.manager.mk_apply(&op, args, sort)
+                    // An APPLIED datatype constructor must build a DtConstructor
+                    // node, not an opaque Apply: the simplifier's injectivity /
+                    // distinct-constructor rewrites and the datatype checks all
+                    // match on `TermKind::DtConstructor`, and an Apply-headed
+                    // constructor left ground equalities like
+                    // `(= (c01 a true) (c01 1 false))` OPAQUE to them — EUF then
+                    // models `c01` as an uninterpreted function and reports a
+                    // spurious `sat` (adsmt #392 differential, seed 982). The
+                    // nullary case already routes through `parse_symbol`.
+                    if let Some(&dt_sort) = self.dt_constructors.get(&op) {
+                        self.manager.mk_dt_constructor(&op, args, dt_sort)
+                    } else {
+                        // Regular function application.
+                        //
+                        // Look up the declared return sort from the functions table so
+                        // that the Apply node carries the correct sort (e.g. `Int` for
+                        // `(declare-fun f (Int) Int)` applications).  This is essential
+                        // for theory reasoning: without the correct sort, an expression
+                        // like `(> (f k) 10)` would be created with `f(k)` having
+                        // `Bool` sort, causing the arithmetic theory to ignore it.
+                        let sort = self
+                            .functions
+                            .get(&op)
+                            .map(|(_, ret)| *ret)
+                            .unwrap_or(self.manager.sorts.bool_sort);
+                        self.manager.mk_apply(&op, args, sort)
+                    }
                 }
             }
         };
