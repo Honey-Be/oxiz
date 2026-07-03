@@ -193,6 +193,10 @@ pub struct Solver {
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
+    /// Monotone counter naming the fresh constants of the ground term-ite
+    /// elimination (`eliminate_term_ites`). Never decremented — a popped
+    /// definition must never have its name reused by a later scope.
+    pub(super) term_ite_counter: usize,
     /// Cache for parsed arithmetic constraints, keyed by the comparison term id.
     /// `ParsedArithConstraint` is purely structural (depends only on the term graph),
     /// so it is safe to reuse across CDCL backtracks.
@@ -278,6 +282,7 @@ impl Solver {
             has_bv_arith_ops: false,
             arith_terms: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
+            term_ite_counter: 0,
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
             fp_constraint_cache: FxHashMap::default(),
@@ -867,21 +872,35 @@ impl Solver {
                                             // that entails the conflict → a spurious
                                             // `Saturated`/`sat` (regression:
                                             // `patterned_quantifier_still_instantiates_at_real_ground_terms`).
-                                            let bound_names: smallvec::SmallVec<
-                                                [oxiz_core::interner::Spur; 2],
+                                            // Compare (name, sort) — not the name
+                                            // alone. OxiZ models declared constants
+                                            // as `Var(name)` too, so a GROUND
+                                            // constant that merely shares a bound
+                                            // var's name (verus AIR: the axiom binds
+                                            // `x!: Poly` while the query declares a
+                                            // global `x!: Int`) matched a name-only
+                                            // check and the legitimate instance was
+                                            // dropped → the fuel-chain never closed
+                                            // → spurious unknown that was ORDER-
+                                            // sensitive (only when the axiom was
+                                            // asserted before the colliding decl
+                                            // did the witness contain the const).
+                                            // #397 part C.
+                                            let bound_vars: smallvec::SmallVec<
+                                                [(oxiz_core::interner::Spur, oxiz_core::SortId); 2],
                                             > = match manager.get(q).map(|t| &t.kind) {
                                                 Some(
                                                     TermKind::Forall { vars, .. }
                                                     | TermKind::Exists { vars, .. },
-                                                ) => vars.iter().map(|(n, _)| *n).collect(),
+                                                ) => vars.iter().map(|(n, s)| (*n, *s)).collect(),
                                                 _ => Default::default(),
                                             };
                                             let retains_bound =
                                                 manager.free_vars(phi).into_iter().any(|v| {
                                                     matches!(
-                                                        manager.get(v).map(|t| &t.kind),
-                                                        Some(TermKind::Var(n))
-                                                            if bound_names.contains(n)
+                                                        manager.get(v).map(|t| (&t.kind, t.sort)),
+                                                        Some((TermKind::Var(n), srt))
+                                                            if bound_vars.contains(&(*n, srt))
                                                     )
                                                 });
                                             if retains_bound {
@@ -915,6 +934,12 @@ impl Solver {
                                                 // `Q ⇒ false` ≡ `¬Q`.
                                                 let _ = self.sat.add_clause([qlit.negate()]);
                                             } else {
+                                                // #397 — an instance body is ground
+                                                // by construction, so any `ite` the
+                                                // quantifier body carried is now a
+                                                // ground term-ite: lower it here
+                                                // (this path bypasses `assert`).
+                                                let phi = self.eliminate_term_ites(phi, manager);
                                                 let philit = self.encode(phi, manager);
                                                 let _ =
                                                     self.sat.add_clause([qlit.negate(), philit]);
@@ -923,6 +948,9 @@ impl Solver {
                                         // The engine always guards with `Implies`;
                                         // a bare lemma is only a defensive fallback.
                                         _ => {
+                                            // #397 — same ground term-ite lowering as
+                                            // the guarded arm.
+                                            let l = self.eliminate_term_ites(l, manager);
                                             let lit = self.encode(l, manager);
                                             let _ = self.sat.add_clause([lit]);
                                         }

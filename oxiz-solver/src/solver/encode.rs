@@ -501,6 +501,91 @@ impl Solver {
     }
 
     /// Assert a term
+    /// #397 (adsmt AIR-path residual) — ground term-ite elimination.
+    ///
+    /// Only the BOOL-sorted `ite` has a Tseitin arm in `encode`, and only the
+    /// BV bit-blaster interprets `TermKind::Ite` on the theory side. An
+    /// Int/Real/uninterpreted-sorted `ite` reaching a theory atom made the
+    /// whole atom OPAQUE — EUF saw `a = <ite-term>` as an unconstrained pair,
+    /// arith saw nothing — so `(= a (ite p 1 2)) ∧ a≠1 ∧ a≠2` read a
+    /// confident spurious `sat` (z3+cvc5: unsat). The verus fuel-unfolding
+    /// definition axioms instantiate to exactly this shape
+    /// (`abs(x) = ite(x≥0, x, 0−x)`), which is how the AIR-path 1v/2e
+    /// surfaced it.
+    ///
+    /// Every CLOSED innermost non-Bool/non-BV `ite` is replaced by a fresh
+    /// constant `k` and the defining constraint `(ite c (= k t) (= k e))` — a
+    /// BOOL ite, which `encode` Tseitin-encodes correctly — conjoined onto
+    /// the rewritten formula, so the definition lives and dies with this
+    /// assertion (push/pop-safe: no cross-assertion cache to dangle after a
+    /// pop; the name counter is monotone so a popped name is never reused).
+    ///
+    /// Quantifier bodies keep their `ite`s: a fresh constant cannot cross a
+    /// binder, a bound-var-dependent `ite` occurs only under its binder (the
+    /// binder-depth-0 collector never picks it, and hash-consed sharing of a
+    /// CLOSED `ite` into a body is harmless — the substitution equates it
+    /// with `k` everywhere). Instance lemmas are ground by construction and
+    /// run through this same pass at their own assertion sites.
+    pub(super) fn eliminate_term_ites(
+        &mut self,
+        term: TermId,
+        manager: &mut TermManager,
+    ) -> TermId {
+        fn find_innermost(
+            id: TermId,
+            manager: &TermManager,
+        ) -> Option<TermId> {
+            let t = manager.get(id)?;
+            // Never descend into a binder: any ite in there either depends on
+            // the bound vars (must stay) or is closed (its instances/shared
+            // ground occurrences are handled at depth 0).
+            if matches!(t.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                return None;
+            }
+            for c in oxiz_core::ast::traversal::get_children(&t.kind) {
+                if let Some(found) = find_innermost(c, manager) {
+                    return Some(found);
+                }
+            }
+            if matches!(t.kind, TermKind::Ite(..))
+                && t.sort != manager.sorts.bool_sort
+                && manager
+                    .sorts
+                    .get(t.sort)
+                    .and_then(|s| s.bitvec_width())
+                    .is_none()
+            {
+                return Some(id);
+            }
+            None
+        }
+
+        let mut root = term;
+        let mut defs: Vec<TermId> = Vec::new();
+        while let Some(ite) = find_innermost(root, manager) {
+            let Some(TermKind::Ite(c, t, e)) = manager.get(ite).map(|x| x.kind.clone()) else {
+                break;
+            };
+            let sort = manager.get(ite).map(|x| x.sort);
+            let Some(sort) = sort else { break };
+            let name = format!("%%termite!{}", self.term_ite_counter);
+            self.term_ite_counter += 1;
+            let k = manager.mk_var(&name, sort);
+            let eq_then = manager.mk_eq(k, t);
+            let eq_else = manager.mk_eq(k, e);
+            let def = manager.mk_ite(c, eq_then, eq_else);
+            let mut map = FxHashMap::default();
+            map.insert(ite, k);
+            root = manager.substitute(root, &map);
+            defs.push(def);
+        }
+        if defs.is_empty() {
+            return term;
+        }
+        defs.push(root);
+        manager.mk_and(defs)
+    }
+
     pub fn assert(&mut self, term: TermId, manager: &mut TermManager) {
         let index = self.assertions.len();
         // Clean-MBQI quantifier preprocessing (equisatisfiable, polarity-safe):
@@ -575,6 +660,10 @@ impl Solver {
         } else {
             term
         };
+
+        // #397 — replace ground non-Bool `ite`s with fresh constants + Bool-ite
+        // definitions BEFORE encoding (see `eliminate_term_ites`).
+        let term_to_encode = self.eliminate_term_ites(term_to_encode, manager);
 
         // Check again if simplification produced a constant
         if let Some(t) = manager.get(term_to_encode) {
@@ -690,13 +779,17 @@ impl Solver {
             }
         }
 
+        // #397 — same ground term-ite elimination as `assert` (this named
+        // path skips the simplifier but must not skip the ite lowering).
+        let term_to_encode = self.eliminate_term_ites(term, manager);
+
         // Collect polarity information if polarity-aware encoding is enabled
         if self.polarity_aware {
-            self.collect_polarities(term, Polarity::Positive, manager);
+            self.collect_polarities(term_to_encode, Polarity::Positive, manager);
         }
 
         // Encode the assertion immediately
-        let lit = self.encode(term, manager);
+        let lit = self.encode(term_to_encode, manager);
         self.sat.add_clause([lit]);
 
         // Eagerly add arith diseq split for Not(Eq(a,b)) assertions
