@@ -25,6 +25,17 @@ pub struct Quant<S: Sig> {
     pub vars: Vec<(S::VarName, S::Sort)>,
     /// `:pattern` trigger groups (flattened); empty ⇒ trigger-free.
     pub triggers: Vec<Vec<S::Term>>,
+    /// `triggers` were INFERRED from the body (no parsed `:pattern`). An
+    /// inferred trigger drives e-matching exactly like a parsed one, but it is
+    /// NOT a user contract: at saturation the quantifier must still be
+    /// model-verified (`eval_forall`) like a trigger-free one — trigger
+    /// semantics may only justify `Sat` for patterns the AUTHOR supplied.
+    pub inferred: bool,
+    /// Trigger inference already ran (it runs LAZILY on the quantifier's
+    /// first active round — it needs `bounded_var_domains`, which requires
+    /// `&mut` host access registration does not have; and a FULLY-bounded
+    /// quantifier must keep its complete finite-box enumeration instead).
+    pub inference_tried: bool,
     /// The matrix.
     pub body: S::Term,
     /// Universal? (Existentials are skolemized by the host before reaching us.)

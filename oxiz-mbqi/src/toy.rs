@@ -141,6 +141,11 @@ impl TermLang for Toy {
         }
     }
 
+    fn matchable_head(&self, t: Tid) -> bool {
+        // Only a real `App` is e-matchable; `⇒`/`∨` are reserved pseudo-syms.
+        matches!(&self.nodes[t as usize], Node::App(..))
+    }
+
     fn sort_of(&self, t: Tid) -> Sort {
         self.sort[t as usize]
     }

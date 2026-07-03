@@ -83,19 +83,22 @@ fn guarded_quantifier_when_inactive_is_skipped_entirely() {
 }
 
 #[test]
-fn guarded_quantifier_when_active_and_verified_skips_instantiation() {
+fn guarded_quantifier_when_active_and_verified_saturates_sat() {
     // Guard true ⇒ active, and the model verifies it (`eval_forall ⇒
-    // Some(true)`). The M3 model-completion short-circuit then needs NO ground
-    // instances — Sat with zero lemmas (no fabrication, no unnecessary
-    // enumeration). The completion's witness never crosses into the engine.
+    // Some(true)`). Since trigger INFERENCE landed, this quantifier carries
+    // an inferred trigger, so it e-matches its (bounded, trigger-confined)
+    // ground occurrences instead of taking the trigger-free M3 short-circuit
+    // — the instances are sound consequences and cannot diverge (frontier-
+    // filtered). The verdict still saturates to Sat because an
+    // inferred-trigger quantifier is model-verified at saturation exactly
+    // like a trigger-free one (never trigger-semantics `Sat`).
     let mut t = Toy::new();
     let (q, fbd_c) = fuel_quant(&mut t);
     let mut e = Engine::new(Config::default());
     e.assert(&t, fbd_c);
     e.assert(&t, q);
-    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: true });
+    let (verdict, _lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: true });
     assert_eq!(verdict, "Sat");
-    assert_eq!(lemmas, 0, "verified ⇒ short-circuited, no instances needed");
     assert_eq!(e.rejected(), 0);
 }
 

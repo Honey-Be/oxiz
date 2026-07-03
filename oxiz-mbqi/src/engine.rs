@@ -123,12 +123,49 @@ impl<S: Sig> Engine<S> {
     fn collect_quants<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
         match lang.view(t) {
             TermView::Quant { forall, vars, body } => {
-                let vars = vars.to_vec();
-                let triggers = lang.patterns(t);
+                let mut vars = vars.to_vec();
+                let mut triggers = lang.patterns(t);
+                let mut body = body;
+                let mut inferred = false;
+                if triggers.is_empty() {
+                    // Flatten a same-polarity nested chain (`∀x.∀y.φ ≡ ∀x,y.φ`,
+                    // `∃∃` likewise) so inference sees the true matrix and one
+                    // instantiation grounds the whole chain (the two-level
+                    // dance — outer enumerated, inner re-registered from the
+                    // lemma — is what blew up the trigger-less Int-domain
+                    // definitional axioms). Stop at an inner quantifier that
+                    // flips polarity, carries its own parsed patterns (its
+                    // author scoped them to THAT level), or shadows an
+                    // accumulated variable name (binding would be ambiguous).
+                    loop {
+                        match lang.view(body) {
+                            TermView::Quant { forall: f2, vars: v2, body: b2 }
+                                if f2 == forall
+                                    && lang.patterns(body).is_empty()
+                                    && v2.iter().all(|(n, _)| {
+                                        vars.iter().all(|(m, _)| m != n)
+                                    }) =>
+                            {
+                                vars.extend_from_slice(v2);
+                                body = b2;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                // Trigger INFERENCE itself runs LAZILY on the first active
+                // round (see the round loop): it must consult
+                // `bounded_var_domains` (a FULLY-bounded quantifier keeps its
+                // complete finite-box enumeration — inference there would
+                // mask a jointly-unsat box, the pigeonhole), and that needs
+                // the `&mut` host access registration does not have.
+                let inferred = false;
                 self.quants.push(Quant {
                     term: t,
                     vars,
                     triggers,
+                    inferred,
+                    inference_tried: false,
                     body,
                     universal: forall,
                     var_domains: None, // computed lazily on first enumeration
@@ -213,6 +250,36 @@ impl<S: Sig> Engine<S> {
                 continue;
             }
 
+            // 0.5. LAZY trigger inference (z3's auto-pattern parity), once per
+            //    quantifier: a trigger-less universal otherwise falls to
+            //    ground-index enumeration, which DIVERGES on definitional
+            //    axioms over infinite sorts (`∀x,y:Int. Sub(x,y) = x−y`
+            //    instantiates over every ground Int pair, each instance
+            //    minting fresh `x−y` terms for the next round — the measured
+            //    300 s churn → 3 ms on the verus fuel prelude). A
+            //    FULLY-bounded quantifier is EXEMPT: its finite-box
+            //    enumeration is complete (a jointly-unsat box — pigeonhole —
+            //    needs every box instance, which a trigger would mask).
+            if self.quants[qi].triggers.is_empty() && !self.quants[qi].inference_tried {
+                self.quants[qi].inference_tried = true;
+                if self.quants[qi].var_domains.is_none() {
+                    let vd = lang.bounded_var_domains(self.quants[qi].term);
+                    self.quants[qi].var_domains = Some(vd);
+                }
+                let fully_bounded = self.quants[qi]
+                    .var_domains
+                    .as_ref()
+                    .is_some_and(|vd| !vd.is_empty() && vd.iter().all(|d| d.is_some()));
+                if !fully_bounded {
+                    let trg =
+                        infer_triggers(lang, &self.quants[qi].vars, self.quants[qi].body);
+                    if !trg.is_empty() {
+                        self.quants[qi].triggers = trg;
+                        self.quants[qi].inferred = true;
+                    }
+                }
+            }
+
             // 1. CDQI — every conflicting instance the model reveals (P3: CCFV
             //    `C = ¬ψ`, congruence-deduped candidates). A non-empty conflict
             //    set is the strongest, most relevant lemma, so it short-circuits
@@ -237,6 +304,13 @@ impl<S: Sig> Engine<S> {
             }
 
             // 2. E-matching (frontier-filtered) — triggered quantifiers.
+            // NOTE: an INFERRED-trigger quantifier deliberately does NOT get
+            // the M3 `eval_forall` short-circuit here: a structural
+            // recognizer can certify the CURRENT model while the ground core
+            // still needs the (bounded, trigger-confined) instances to
+            // progress toward `unsat` — skipping starved the fuel-prelude
+            // chain. E-matching is frontier-filtered and terminates, so the
+            // divergence-defusing role of the short-circuit is not needed.
             if !self.quants[qi].triggers.is_empty() {
                 let bindings = self.ematch_all(lang, qi, cong);
                 for b in bindings {
@@ -320,7 +394,11 @@ impl<S: Sig> Engine<S> {
         // `Unknown`, never a guessed `Sat`).
         for qi in 0..self.quants.len() {
             let q = &self.quants[qi];
-            if !(q.triggers.is_empty() && model.is_active(lang, q.term)) {
+            // An INFERRED trigger drives e-matching but is not a user
+            // contract — trigger semantics may only justify `Sat` for parsed
+            // `:pattern`s, so an inferred-trigger quantifier must still be
+            // model-verified here exactly like a trigger-free one.
+            if !((q.triggers.is_empty() || q.inferred) && model.is_active(lang, q.term)) {
                 continue;
             }
             // A BOUNDED-FINITE quantifier emitted ALL its instances over the
@@ -629,4 +707,191 @@ impl<S: Sig> Engine<S> {
                     <= self.cfg.max_tuples_per_quant
         })
     }
+}
+
+/// Infer `:pattern`-style trigger groups for a trigger-less UNIVERSAL — the
+/// z3 auto-pattern parity that keeps definitional axioms off the divergent
+/// ground-index enumeration path (see the registration comment).
+///
+/// Candidates are the body's app subterms with an e-matchable head
+/// ([`TermLang::matchable_head`]) that contain at least one bound variable
+/// and no nested quantifier. Selection:
+///  * every MINIMAL candidate covering ALL bound variables becomes its own
+///    single-trigger group (groups are a union — more groups, more matches);
+///  * if no single candidate covers, a greedy multi-trigger group is built
+///    from the largest-coverage candidates; if even their union cannot cover
+///    every bound variable, NO trigger is inferred (empty ⇒ the quantifier
+///    keeps today's enumeration path — never a silent disable).
+///
+/// Inference is a heuristic for INSTANTIATION only; the `Quant::inferred`
+/// flag keeps the saturation verdict on the model-verified path, so a poor
+/// inference can cost completeness (a sound `Unknown`), never soundness.
+pub(crate) fn infer_triggers<S: Sig, L: TermLang<Sig = S>>(
+    lang: &L,
+    vars: &[(S::VarName, S::Sort)],
+    body: S::Term,
+) -> Vec<Vec<S::Term>> {
+    use rustc_hash::FxHashMap;
+    if vars.is_empty() || vars.len() > 64 {
+        return Vec::new(); // mask-based cover; >64 bound vars is not a real case
+    }
+    let var_bit: FxHashMap<S::VarName, u64> =
+        vars.iter().enumerate().map(|(i, (n, _))| (*n, 1u64 << i)).collect();
+    let full: u64 = if vars.len() == 64 { u64::MAX } else { (1u64 << vars.len()) - 1 };
+
+    // Post-order walk: per-subterm bound-var mask + contains-a-quantifier
+    // flag, memoized (terms are hash-consed on the host side, so sharing is
+    // common). Iterative to keep deep bodies off the stack.
+    #[derive(Clone, Copy)]
+    struct Info {
+        mask: u64,
+        has_quant: bool,
+    }
+    let mut info: FxHashMap<S::Term, Info> = FxHashMap::default();
+    let mut candidates: Vec<S::Term> = Vec::new();
+    // Heads the axiom FEEDS: the body contains an app of this head with a
+    // STRUCTURED bound-var-carrying argument, so every instance mints a NEW
+    // ground term with that head — a trigger on such a head re-matches the
+    // axiom's own output and loops (the `has_type(as_type(x,t),t)` tower:
+    // trigger `has_type(x,t)` matches the instance's own conclusion with the
+    // strictly larger `as_type(p,T)`, forever). Simplify's classic static
+    // matching-loop test.
+    let mut feeding_heads: FxHashSet<S::Sym> = FxHashSet::default();
+    let mut stack: Vec<(S::Term, bool)> = vec![(body, false)];
+    while let Some((t, expanded)) = stack.pop() {
+        if info.contains_key(&t) {
+            continue;
+        }
+        if !expanded {
+            match lang.view(t) {
+                TermView::Var { name } => {
+                    let mask = var_bit.get(&name).copied().unwrap_or(0);
+                    info.insert(t, Info { mask, has_quant: false });
+                }
+                TermView::Quant { .. } => {
+                    // Do not descend: a nested quantifier's own bound vars are
+                    // not ours, and a trigger containing a binder never
+                    // matches a ground term.
+                    info.insert(t, Info { mask: 0, has_quant: true });
+                }
+                TermView::App { .. } => {
+                    stack.push((t, true));
+                    for c in lang.children(t) {
+                        stack.push((c, false));
+                    }
+                }
+                TermView::Opaque => {
+                    info.insert(t, Info { mask: 0, has_quant: false });
+                }
+            }
+        } else {
+            let mut acc = Info { mask: 0, has_quant: false };
+            let mut structured_var_arg = false;
+            for c in lang.children(t) {
+                if let Some(ci) = info.get(&c) {
+                    acc.mask |= ci.mask;
+                    acc.has_quant |= ci.has_quant;
+                    // a child that carries a bound var AND is itself an app —
+                    // instantiating builds a strictly-larger term under this
+                    // head.
+                    if ci.mask != 0 && matches!(lang.view(c), TermView::App { .. }) {
+                        structured_var_arg = true;
+                    }
+                }
+            }
+            if acc.mask != 0 && !acc.has_quant && lang.matchable_head(t) {
+                candidates.push(t);
+                if structured_var_arg {
+                    if let TermView::App { sym } = lang.view(t) {
+                        feeding_heads.insert(sym);
+                    }
+                }
+            }
+            info.insert(t, acc);
+        }
+    }
+    // Drop candidates on a feeding head (loop risk) — but only if the
+    // filtered pool can still COVER every bound variable. When the ONLY
+    // covering candidates sit on feeding heads (the bit-op invariant
+    // preservation axioms: `iInv(t, %I(x)) ∧ … ⇒ iInv(t, bitand(…))` — the
+    // premise `iInv(t, %I(x))` is the natural trigger yet `iInv` also heads
+    // the conclusion), keep them: a structured trigger argument (`%I(x)`)
+    // does not re-match the axiom's own conclusion shape, and the
+    // alternative — no trigger, ground-index enumeration over
+    // Poly×Poly×Int — is the divergence this inference exists to prevent.
+    let unfiltered = candidates.clone();
+    candidates.retain(|&c| match lang.view(c) {
+        TermView::App { sym } => !feeding_heads.contains(&sym),
+        _ => true,
+    });
+    let covers = |cands: &[S::Term]| -> bool {
+        let mut m = 0u64;
+        for c in cands {
+            m |= info.get(c).map(|i| i.mask).unwrap_or(0);
+        }
+        m == full
+    };
+    if !covers(&candidates) {
+        candidates = unfiltered;
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // `a` occurs strictly inside `b`?
+    fn is_strict_subterm<S: Sig, L: TermLang<Sig = S>>(
+        lang: &L,
+        a: S::Term,
+        b: S::Term,
+    ) -> bool {
+        let mut stack: Vec<S::Term> = lang.children(b);
+        let mut seen: FxHashSet<S::Term> = FxHashSet::default();
+        while let Some(t) = stack.pop() {
+            if t == a {
+                return true;
+            }
+            if seen.insert(t) {
+                stack.extend(lang.children(t));
+            }
+        }
+        false
+    }
+
+    let mask_of = |t: &S::Term| info.get(t).map(|i| i.mask).unwrap_or(0);
+    let mut full_covers: Vec<S::Term> =
+        candidates.iter().copied().filter(|t| mask_of(t) == full).collect();
+    if !full_covers.is_empty() {
+        // keep the MINIMAL full covers (drop any that strictly contains
+        // another full cover — the smaller pattern matches strictly more).
+        let all = full_covers.clone();
+        full_covers.retain(|&t| {
+            !all.iter().any(|&o| o != t && is_strict_subterm(lang, o, t))
+        });
+        full_covers.truncate(4); // cap: each group is a full ground-index scan
+        return full_covers.into_iter().map(|t| vec![t]).collect();
+    }
+
+    // Greedy multi-trigger: largest new coverage first (ties: first seen).
+    let mut group: Vec<S::Term> = Vec::new();
+    let mut covered = 0u64;
+    while covered != full {
+        let mut best: Option<(S::Term, u32)> = None;
+        for &c in &candidates {
+            let gain = (mask_of(&c) & !covered).count_ones();
+            if gain > 0 && best.is_none_or(|(_, g)| gain > g) {
+                best = Some((c, gain));
+            }
+        }
+        match best {
+            Some((c, _)) => {
+                covered |= mask_of(&c);
+                group.push(c);
+                if group.len() > 4 {
+                    return Vec::new(); // joint match would be too wide — give up
+                }
+            }
+            None => return Vec::new(), // bound vars not coverable
+        }
+    }
+    vec![group]
 }

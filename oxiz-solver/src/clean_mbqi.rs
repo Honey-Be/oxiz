@@ -702,6 +702,14 @@ impl<'a> TermLang for OxizHost<'a> {
         }
     }
 
+    fn matchable_head(&self, t: TermId) -> bool {
+        // Only an uninterpreted `Apply` is e-matchable; every structured
+        // operator (`=`, `and`, `+`, `select`, …) presents under a reserved
+        // `OP_*` sym and never heads a ground-index bucket a trigger could
+        // fire on.
+        matches!(self.m().get(t).map(|x| &x.kind), Some(TermKind::Apply { .. }))
+    }
+
     fn sort_of(&self, t: TermId) -> SortId {
         self.m().get(t).map(|x| x.sort).unwrap_or(self.m().sorts.bool_sort)
     }

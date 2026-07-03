@@ -107,6 +107,15 @@ pub trait TermLang {
     /// registration. Returns `Vec` to sidestep nested-slice borrows.
     fn patterns(&self, quant: <Self::Sig as Sig>::Term) -> Vec<Vec<<Self::Sig as Sig>::Term>>;
 
+    /// `true` iff `t` is an application of an UNINTERPRETED function symbol —
+    /// a head the ground index buckets and the CCFV matcher can fire on.
+    /// Structured/interpreted operators (`=`, `and`, `+`, `-`, `select`, …)
+    /// must return `false`: a trigger headed by one never matches a ground
+    /// congruence class, so inferring it would silently disable a quantifier.
+    /// Consulted ONLY by trigger inference ([`crate::Engine`] registration);
+    /// parsed `:pattern` groups are taken as-is.
+    fn matchable_head(&self, t: <Self::Sig as Sig>::Term) -> bool;
+
     /// The sort of a term.
     fn sort_of(&self, t: <Self::Sig as Sig>::Term) -> <Self::Sig as Sig>::Sort;
 
