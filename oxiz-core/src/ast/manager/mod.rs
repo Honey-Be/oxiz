@@ -47,6 +47,16 @@ pub struct TermManager {
     pub sorts: SortManager,
     /// Cache for structural sharing
     pub(super) cache: FxHashMap<TermKind, TermId>,
+    /// Variable hash-consing keyed by (name, SORT) — `TermKind::Var(spur)`
+    /// alone cannot key the main cache: two same-named variables of DIFFERENT
+    /// sorts are distinct terms, but a kind-only key made the first intern win
+    /// (`mk_var("x!", Poly)` then `mk_var("x!", Int)` returned the Poly term).
+    /// In the verus AIR stream a quantifier's bound `x!: Poly` collides with a
+    /// later query-local `x!: Int` constant this way: the goal's ground term
+    /// literally BECAME the axiom's bound variable, so its instances were
+    /// dropped as "retains a bound var" → order-sensitive spurious
+    /// unknown/sat (adsmt #397 part C).
+    pub(super) var_cache: FxHashMap<(Spur, SortId), TermId>,
     /// True constant
     pub true_id: TermId,
     /// False constant
@@ -77,6 +87,7 @@ impl TermManager {
             interner: Rodeo::default(),
             sorts,
             cache: FxHashMap::default(),
+            var_cache: FxHashMap::default(),
             true_id: TermId(0),
             false_id: TermId(1),
             gc_stats: GCStatistics::default(),
@@ -102,7 +113,13 @@ impl TermManager {
 
     /// Intern a term, returning its unique ID
     pub(crate) fn intern(&mut self, kind: TermKind, sort: SortId) -> TermId {
-        if let Some(&id) = self.cache.get(&kind) {
+        // A variable's identity is (name, sort) — the kind alone conflates
+        // same-named variables of different sorts (see `var_cache`).
+        if let TermKind::Var(spur) = kind {
+            if let Some(&id) = self.var_cache.get(&(spur, sort)) {
+                return id;
+            }
+        } else if let Some(&id) = self.cache.get(&kind) {
             return id;
         }
 
@@ -119,7 +136,11 @@ impl TermManager {
         }
 
         Arc::make_mut(&mut self.terms).push(term);
-        self.cache.insert(kind, id);
+        if let TermKind::Var(spur) = kind {
+            self.var_cache.insert((spur, sort), id);
+        } else {
+            self.cache.insert(kind, id);
+        }
         id
     }
 
@@ -206,9 +227,10 @@ impl TermManager {
         }
 
         // Sweep phase: remove unreachable entries from cache
-        let original_cache_size = self.cache.len();
+        let original_cache_size = self.cache.len() + self.var_cache.len();
         self.cache.retain(|_, &mut id| reachable.contains(&id));
-        let removed = original_cache_size - self.cache.len();
+        self.var_cache.retain(|_, &mut id| reachable.contains(&id));
+        let removed = original_cache_size - self.cache.len() - self.var_cache.len();
 
         // Update statistics
         self.gc_stats.gc_count += 1;
@@ -233,6 +255,7 @@ impl TermManager {
     pub fn gc_aggressive(&mut self, roots: &FxHashSet<TermId>) -> usize {
         let removed = self.gc(roots);
         self.cache.shrink_to_fit();
+        self.var_cache.shrink_to_fit();
         removed
     }
 
@@ -245,7 +268,7 @@ impl TermManager {
     /// Get the current cache size (number of hash-consed terms)
     #[must_use]
     pub fn cache_size(&self) -> usize {
-        self.cache.len()
+        self.cache.len() + self.var_cache.len()
     }
 
     /// Get the total number of terms allocated
