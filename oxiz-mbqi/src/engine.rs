@@ -819,20 +819,21 @@ pub(crate) fn infer_triggers<S: Sig, L: TermLang<Sig = S>>(
     // does not re-match the axiom's own conclusion shape, and the
     // alternative — no trigger, ground-index enumeration over
     // Poly×Poly×Int — is the divergence this inference exists to prevent.
-    let unfiltered = candidates.clone();
-    candidates.retain(|&c| match lang.view(c) {
+    let keep = |c: &S::Term| match lang.view(*c) {
         TermView::App { sym } => !feeding_heads.contains(&sym),
         _ => true,
-    });
-    let covers = |cands: &[S::Term]| -> bool {
+    };
+    // Decide FIRST whether the feeding-filtered pool still covers, then
+    // apply the filter only if it does — no clone-and-restore.
+    let filtered_covers = {
         let mut m = 0u64;
-        for c in cands {
+        for c in candidates.iter().filter(|c| keep(c)) {
             m |= info.get(c).map(|i| i.mask).unwrap_or(0);
         }
         m == full
     };
-    if !covers(&candidates) {
-        candidates = unfiltered;
+    if filtered_covers {
+        candidates.retain(keep);
     }
     if candidates.is_empty() {
         return Vec::new();
