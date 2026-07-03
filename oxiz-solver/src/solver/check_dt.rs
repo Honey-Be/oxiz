@@ -266,41 +266,56 @@ impl Solver {
                     }
                 }
 
-                self.collect_dt_constraints_v2(
-                    *lhs,
-                    manager,
-                    constructor_testers,
-                    negative_testers,
-                    constructor_equalities,
-                    dt_var_equalities,
-                    in_positive_context,
-                );
-                self.collect_dt_constraints_v2(
-                    *rhs,
-                    manager,
-                    constructor_testers,
-                    negative_testers,
-                    constructor_equalities,
-                    dt_var_equalities,
-                    in_positive_context,
-                );
+                // Do NOT recurse into the equality's operands: they are not
+                // asserted facts. A Bool-sorted `=` is an iff — a tester inside
+                // either operand has UNDETERMINED polarity (`(= b ((_ is C) x))`
+                // with `(not b)` asserts the tester FALSE), and collecting it as
+                // if asserted produced a spurious unsat (#392 differential,
+                // minR shape). Non-Bool operands are first-order terms with no
+                // asserted sub-facts. The direct `x = Ctor(..)` / `x = y`
+                // collections above are the equality's whole contribution.
             }
             TermKind::And(args) => {
-                for &arg in args {
-                    self.collect_dt_constraints_v2(
-                        arg,
-                        manager,
-                        constructor_testers,
-                        negative_testers,
-                        constructor_equalities,
-                        dt_var_equalities,
-                        in_positive_context,
-                    );
+                // A conjunction contributes its children only when the And
+                // itself is asserted POSITIVELY. Under a negative context
+                // `(not (and X Y))` is a DISJUNCTION (≡ ¬X ∨ ¬Y) — collecting
+                // both children as joint facts falsely conflicted
+                // `(not (and (not (= k c00)) (not (= k c01))))` (≡ k=c00 ∨
+                // k=c01) with 2-ctor exhaustiveness (#392 differential, minB).
+                if in_positive_context {
+                    for &arg in args {
+                        self.collect_dt_constraints_v2(
+                            arg,
+                            manager,
+                            constructor_testers,
+                            negative_testers,
+                            constructor_equalities,
+                            dt_var_equalities,
+                            in_positive_context,
+                        );
+                    }
                 }
             }
-            TermKind::Or(_args) => {
+            TermKind::Or(args) => {
                 // Don't collect from OR branches - they represent disjunctions, not conjunctions
                 // If we collected from both branches of (or (= x A) (= x B)), we'd falsely detect a conflict
+                //
+                // ...but a NEGATED Or is a conjunction (¬(X ∨ Y) ≡ ¬X ∧ ¬Y):
+                // each child is genuinely asserted at the (negative) context,
+                // so collect them — the dual of the And rule above.
+                if !in_positive_context {
+                    for &arg in args {
+                        self.collect_dt_constraints_v2(
+                            arg,
+                            manager,
+                            constructor_testers,
+                            negative_testers,
+                            constructor_equalities,
+                            dt_var_equalities,
+                            in_positive_context,
+                        );
+                    }
+                }
             }
             TermKind::Not(inner) => {
                 // Flip context when entering Not
@@ -382,35 +397,41 @@ impl Solver {
                     }
                 }
 
-                self.collect_dt_constraints_inner(
-                    *lhs,
-                    manager,
-                    constructor_testers,
-                    constructor_equalities,
-                    in_positive_context,
-                );
-                self.collect_dt_constraints_inner(
-                    *rhs,
-                    manager,
-                    constructor_testers,
-                    constructor_equalities,
-                    in_positive_context,
-                );
+                // No operand recursion — see collect_dt_constraints_v2: equality
+                // operands are not asserted facts (Bool `=` is an iff).
             }
             TermKind::And(args) => {
-                for &arg in args {
-                    self.collect_dt_constraints_inner(
-                        arg,
-                        manager,
-                        constructor_testers,
-                        constructor_equalities,
-                        in_positive_context,
-                    );
+                // Positive context only — a negated And is a disjunction
+                // (see collect_dt_constraints_v2).
+                if in_positive_context {
+                    for &arg in args {
+                        self.collect_dt_constraints_inner(
+                            arg,
+                            manager,
+                            constructor_testers,
+                            constructor_equalities,
+                            in_positive_context,
+                        );
+                    }
                 }
             }
-            TermKind::Or(_args) => {
+            TermKind::Or(args) => {
                 // Don't collect from OR branches - they represent disjunctions, not conjunctions
                 // If we collected from both branches of (or (= x A) (= x B)), we'd falsely detect a conflict
+                //
+                // ...but a NEGATED Or is a conjunction — collect its children
+                // (see collect_dt_constraints_v2).
+                if !in_positive_context {
+                    for &arg in args {
+                        self.collect_dt_constraints_inner(
+                            arg,
+                            manager,
+                            constructor_testers,
+                            constructor_equalities,
+                            in_positive_context,
+                        );
+                    }
+                }
             }
             TermKind::Not(inner) => {
                 // Flip context when entering Not
