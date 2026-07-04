@@ -11,9 +11,10 @@
 //! constant before the axiom flipped the verdict). Fixed by keying variable
 //! interning on (name, sort) (`TermManager::var_cache`).
 //!
-//! KNOWN residual (tracked separately): a bound var and a constant sharing
-//! BOTH name and sort still conflate — irreducible while constants and bound
-//! vars share the `Var` representation.
+//! The same-name SAME-sort flavour (a bound var vs a later-declared constant
+//! sharing both) was closed separately (#400): quantifier binders are now
+//! alpha-renamed UNCONDITIONALLY into the reserved `!q<N>` namespace at parse,
+//! so no later declaration can collide in either order.
 
 use oxiz_solver::Context;
 
@@ -123,6 +124,25 @@ fn air_fuel_chain_raw_order_is_unsat() {
          (assert fuel_defaults)\n\
          (declare-const x! Int)\n\
          (assert (not (>= (abs? (I x!)) 0)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// #400 — the same-name SAME-sort collision (bound `x!: Poly` vs a
+/// later-declared constant `x!: Poly`, the witness being the constant
+/// itself). Closed by the unconditional binder alpha-rename.
+#[test]
+fn same_sort_colliding_const_declared_after_axiom_is_unsat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-sort Poly 0)\n\
+         (declare-fun abs? (Poly) Int)\n\
+         (declare-fun I (Int) Poly)\n\
+         (declare-fun %I (Poly) Int)\n\
+         (assert (forall ((x! Poly)) (! (= (abs? x!) (ite (>= (%I x!) 0) (%I x!) (- 0 (%I x!)))) :pattern ((abs? x!)))))\n\
+         (declare-const x! Poly)\n\
+         (assert (not (>= (abs? x!) 0)))\n\
          (check-sat)\n",
     );
     assert_eq!(v, "unsat");

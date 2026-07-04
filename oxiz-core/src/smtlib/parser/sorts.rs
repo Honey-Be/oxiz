@@ -108,24 +108,27 @@ impl<'a> Parser<'a> {
             .iter()
             .filter_map(|(name, _)| self.constants.get(name).map(|&s| (name.clone(), s)))
             .collect();
-        // #352: a bound var whose source name collides with a declared constant
-        // (or an outer binding) would be the SAME hash-consed `Var` term as that
-        // constant — so a trigger `(f x)` becomes identical to a GROUND `(f x)`
-        // and the e-matcher reads it as already-ground (no instantiation →
-        // spurious sat). Alpha-rename a colliding bound var to a fresh name so it
-        // is structurally distinct; the binding key stays the SOURCE name (so body
-        // references resolve), and the fresh name flows into the `Forall`'s var
-        // list. Non-colliding names are untouched (term identity preserved — the
-        // verus prelude / AOT bank are unaffected).
+        // #352/#400: a bound var whose source name collides with a declared
+        // constant (or an outer binding) of the SAME sort is the SAME
+        // hash-consed `Var` term as that constant — a trigger `(f x)` becomes
+        // identical to a GROUND `(f x)` and the e-matcher reads it as
+        // already-ground (no instantiation → spurious sat), and an instance
+        // whose witness contains the constant reads as "retains a bound var"
+        // (dropped → spurious sat/unknown). #352 renamed only on a collision
+        // with an ALREADY-declared name, which left the DECLARED-AFTER order
+        // conflated (#400): the quantifier parses first, then a later
+        // `(declare-const x! S)` interns the very same (name, sort) `Var`.
+        // Rename UNCONDITIONALLY into the reserved `!q<N>` namespace — sound
+        // alpha-equivalence; the binding key stays the SOURCE name (so body
+        // references resolve) and the fresh name flows into the `Forall`'s
+        // var list, so no future declaration can ever collide.
         let effective: Vec<String> = vars
             .iter()
             .map(|(name, sort)| {
-                let eff = if self.constants.contains_key(name) || self.bindings.contains_key(name) {
+                let eff = {
                     let f = format!("{name}!q{}", self.quant_counter);
                     self.quant_counter += 1;
                     f
-                } else {
-                    name.clone()
                 };
                 let var_term = self.manager.mk_var(&eff, *sort);
                 self.bindings.insert(name.clone(), var_term);
@@ -209,17 +212,16 @@ impl<'a> Parser<'a> {
             .iter()
             .filter_map(|(name, _)| self.constants.get(name).map(|&s| (name.clone(), s)))
             .collect();
-        // #352: alpha-rename a bound var colliding with a declared constant /
-        // outer binding to a fresh name (same rationale as `parse_forall`).
+        // #352/#400: alpha-rename every bound var UNCONDITIONALLY into the
+        // reserved `!q<N>` namespace (same rationale as `parse_forall` — the
+        // conditional rename left the declared-AFTER collision conflated).
         let effective: Vec<String> = vars
             .iter()
             .map(|(name, sort)| {
-                let eff = if self.constants.contains_key(name) || self.bindings.contains_key(name) {
+                let eff = {
                     let f = format!("{name}!q{}", self.quant_counter);
                     self.quant_counter += 1;
                     f
-                } else {
-                    name.clone()
                 };
                 let var_term = self.manager.mk_var(&eff, *sort);
                 self.bindings.insert(name.clone(), var_term);
