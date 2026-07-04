@@ -443,6 +443,14 @@ impl<'a> Parser<'a> {
             datatype_names.push(dt_name);
         }
 
+        // Pre-create every declared datatype's SORT before parsing the
+        // constructor groups, so a selector of a MUTUALLY-recursive sibling
+        // (or a self-reference) resolves to the datatype sort rather than the
+        // uninterpreted fallback (#399).
+        for n in &datatype_names {
+            let _ = self.manager.sorts.mk_datatype_sort(n);
+        }
+
         // Parse the constructor-groups list — one group per declared
         // datatype.  adsmt-patch (rc.30): the previous code parsed
         // only the FIRST group then expected the command-closing `)`,
@@ -505,6 +513,24 @@ impl<'a> Parser<'a> {
             for (ctor_name, _selectors) in &group_ctors {
                 self.dt_constructors.insert(ctor_name.clone(), dt_sort);
             }
+            // #399 — register the full definition (ctor inventory + selector
+            // sorts) with the SortManager, so sort-driven datatype reasoning
+            // (nullary-ctor exhaustiveness, selector typing) can see it. The
+            // pre-created sibling sorts make forward references resolve.
+            let mut ctor_defs: Vec<crate::sort::DataTypeConstructor> = Vec::new();
+            for (ctor_name, selectors) in &group_ctors {
+                let mut sels: smallvec::SmallVec<
+                    [(crate::interner::Spur, crate::sort::SortId); 4],
+                > = smallvec::SmallVec::new();
+                for (sel_name, sel_sort) in selectors {
+                    let sid = self.parse_sort_name(sel_sort)?;
+                    let sspur = self.manager.sorts.intern_str(sel_name);
+                    sels.push((sspur, sid));
+                }
+                let cspur = self.manager.sorts.intern_str(ctor_name);
+                ctor_defs.push(crate::sort::DataTypeConstructor { name: cspur, selectors: sels });
+            }
+            self.manager.sorts.declare_datatype(&dt_name, ctor_defs);
             constructors.extend(group_ctors);
             group_idx += 1;
         }
@@ -562,6 +588,22 @@ impl<'a> Parser<'a> {
         for (ctor_name, _selectors) in &constructors {
             self.dt_constructors.insert(ctor_name.clone(), dt_sort);
         }
+        // #399 — register the full definition with the SortManager (see the
+        // plural form for the rationale).
+        let mut ctor_defs: Vec<crate::sort::DataTypeConstructor> = Vec::new();
+        for (ctor_name, selectors) in &constructors {
+            let mut sels: smallvec::SmallVec<
+                [(crate::interner::Spur, crate::sort::SortId); 4],
+            > = smallvec::SmallVec::new();
+            for (sel_name, sel_sort) in selectors {
+                let sid = self.parse_sort_name(sel_sort)?;
+                let sspur = self.manager.sorts.intern_str(sel_name);
+                sels.push((sspur, sid));
+            }
+            let cspur = self.manager.sorts.intern_str(ctor_name);
+            ctor_defs.push(crate::sort::DataTypeConstructor { name: cspur, selectors: sels });
+        }
+        self.manager.sorts.declare_datatype(&name, ctor_defs);
 
         Ok(Command::DeclareDatatype { name, constructors })
     }

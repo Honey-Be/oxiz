@@ -849,8 +849,15 @@ impl<'a> Printer<'a> {
                 }
                 let _ = write!(w, ")");
             }
-            SortKind::Datatype(spur) => {
-                let name = self.manager.resolve_str(*spur);
+            SortKind::Datatype(_) => {
+                // Datatype spurs live in the SORT manager's interner (interned
+                // by `mk_datatype_sort`), not the term manager's — resolving
+                // through the wrong interner is an out-of-bounds panic.
+                let name = self
+                    .manager
+                    .sorts
+                    .datatype_name(sort_id)
+                    .unwrap_or("UnknownDatatype");
                 let _ = write!(w, "{name}");
             }
         }

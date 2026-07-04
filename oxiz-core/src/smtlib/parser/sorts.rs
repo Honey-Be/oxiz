@@ -308,6 +308,12 @@ impl<'a> Parser<'a> {
                             message: format!("invalid BitVec sort name: {name}"),
                         })
                     }
+                } else if let Some(dt) = self.manager.sorts.datatype_sort_if_exists(name) {
+                    // A declared DATATYPE name resolves to its datatype sort —
+                    // the uninterpreted fallback minted a same-named but
+                    // DIFFERENT sort, so constants of a datatype never carried
+                    // the datatype sort (#399).
+                    Ok(dt)
                 } else {
                     // Uninterpreted sort
                     let spur = self.manager.intern_str(name);
@@ -493,8 +499,16 @@ impl<'a> Parser<'a> {
                 crate::sort::SortKind::Uninterpreted(spur) => {
                     self.manager.resolve_str(*spur).to_string()
                 }
-                crate::sort::SortKind::Datatype(spur) => {
-                    self.manager.resolve_str(*spur).to_string()
+                crate::sort::SortKind::Datatype(_) => {
+                    // Datatype spurs live in the SORT manager's interner (they
+                    // are interned by `mk_datatype_sort`), NOT the term
+                    // manager's — resolving through the wrong interner is an
+                    // out-of-bounds panic.
+                    self.manager
+                        .sorts
+                        .datatype_name(sort_id)
+                        .unwrap_or("UnknownDatatype")
+                        .to_string()
                 }
                 _ => "Unknown".to_string(),
             }

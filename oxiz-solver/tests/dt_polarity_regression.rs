@@ -164,9 +164,8 @@ fn real_distinct_ctor_equalities_still_unsat() {
 /// children are real facts. A positive tester conflicting with a tester
 /// inside a negated Or is a genuine conflict the collector now sees.
 /// (The equality flavour `¬(k=c00 ∨ k=c01)` — unsat by nullary-ctor
-/// exhaustiveness — is a separate PRE-EXISTING spurious-sat: negative
-/// ctor-equalities are not collected and the downstream path lacks the
-/// finite-exhaustiveness argument; tracked as adsmt task #399.)
+/// exhaustiveness — was a separate pre-existing spurious-sat, CLOSED by the
+/// #399 fix; see `dt_exhaustiveness_regression.rs`.)
 #[test]
 fn negated_or_collects_its_children_as_facts() {
     let v = verdict(

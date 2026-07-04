@@ -14,6 +14,11 @@ impl Solver {
         let mut negative_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         // Collect constructor equalities: x = Constructor(...)
         let mut constructor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+        // Collect NEGATIVE constructor equalities: (not (= x Constructor)) — the
+        // ctor must be NULLARY for the diseq to exclude the whole constructor
+        // class (x ≠ cons(a,b) only excludes ONE instance), which the collector
+        // enforces (#399 — the nullary-ctor exhaustiveness check below).
+        let mut negative_ctor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         // Collect DT variable equalities: x = y where both are DT variables
         let mut dt_var_equalities: Vec<(TermId, TermId)> = Vec::new();
 
@@ -24,6 +29,7 @@ impl Solver {
                 &mut constructor_testers,
                 &mut negative_testers,
                 &mut constructor_equalities,
+                &mut negative_ctor_equalities,
                 &mut dt_var_equalities,
                 true,
             );
@@ -207,6 +213,34 @@ impl Solver {
             }
         }
 
+        // #399 — nullary-ctor EXHAUSTIVENESS: every datatype value is built by
+        // some constructor, so a variable excluded from EVERY constructor of
+        // its (nonempty) datatype is a ground conflict. An exclusion is a
+        // negative TESTER (any ctor) or a negative equality to a NULLARY ctor
+        // (the collector only records those — `x ≠ cons(a,b)` excludes one
+        // instance, not the class). Pre-fix `¬(k=c00 ∨ k=c01)` over a 2-ctor
+        // enum read `sat` (z3+cvc5: unsat).
+        for var in negative_testers.keys().chain(negative_ctor_equalities.keys()) {
+            let Some(var_term) = manager.get(*var) else {
+                continue;
+            };
+            let Some(ctors) = manager.sorts.datatype_constructors_of(var_term.sort) else {
+                continue;
+            };
+            if ctors.is_empty() {
+                continue;
+            }
+            let neg_t = negative_testers.get(var);
+            let neg_e = negative_ctor_equalities.get(var);
+            let all_excluded = ctors.iter().all(|(name, arity)| {
+                neg_t.is_some_and(|v| v.iter().any(|n| n == name))
+                    || (*arity == 0 && neg_e.is_some_and(|v| v.iter().any(|n| n == name)))
+            });
+            if all_excluded {
+                return true; // Conflict: x is none of its datatype's constructors
+            }
+        }
+
         false
     }
 
@@ -218,6 +252,7 @@ impl Solver {
         constructor_testers: &mut FxHashMap<TermId, Vec<String>>,
         negative_testers: &mut FxHashMap<TermId, Vec<String>>,
         constructor_equalities: &mut FxHashMap<TermId, Vec<String>>,
+        negative_ctor_equalities: &mut FxHashMap<TermId, Vec<String>>,
         dt_var_equalities: &mut Vec<(TermId, TermId)>,
         in_positive_context: bool,
     ) {
@@ -264,6 +299,25 @@ impl Solver {
                     if self.is_dt_variable(*lhs, manager) && self.is_dt_variable(*rhs, manager) {
                         dt_var_equalities.push((*lhs, *rhs));
                     }
+                } else {
+                    // #399 — a NEGATED equality to a NULLARY constructor excludes
+                    // that whole constructor class (the nullary ctor's value is
+                    // unique). A field-bearing ctor diseq excludes only one
+                    // instance, so it is deliberately NOT collected.
+                    let mut record = |v: TermId, c: TermId| {
+                        if let Some(cd) = manager.get(c) {
+                            if let TermKind::DtConstructor { constructor, args } = &cd.kind {
+                                if args.is_empty() && self.is_dt_variable(v, manager) {
+                                    negative_ctor_equalities
+                                        .entry(v)
+                                        .or_default()
+                                        .push(manager.resolve_str(*constructor).to_string());
+                                }
+                            }
+                        }
+                    };
+                    record(*lhs, *rhs);
+                    record(*rhs, *lhs);
                 }
 
                 // Do NOT recurse into the equality's operands: they are not
@@ -290,6 +344,7 @@ impl Solver {
                             constructor_testers,
                             negative_testers,
                             constructor_equalities,
+                            negative_ctor_equalities,
                             dt_var_equalities,
                             in_positive_context,
                         );
@@ -311,6 +366,7 @@ impl Solver {
                             constructor_testers,
                             negative_testers,
                             constructor_equalities,
+                            negative_ctor_equalities,
                             dt_var_equalities,
                             in_positive_context,
                         );
@@ -325,6 +381,7 @@ impl Solver {
                     constructor_testers,
                     negative_testers,
                     constructor_equalities,
+                    negative_ctor_equalities,
                     dt_var_equalities,
                     !in_positive_context,
                 );

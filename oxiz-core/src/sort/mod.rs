@@ -754,6 +754,18 @@ impl SortManager {
             .is_some_and(|key| self.datatypes.contains_key(&key))
     }
 
+    /// The SortId of an ALREADY-CREATED datatype sort by name — lookup only,
+    /// never creates (that is `mk_datatype_sort`). Lets the parser resolve a
+    /// plain sort SYMBOL to the datatype sort: the uninterpreted fallback used
+    /// to mint a same-named but DIFFERENT sort, so a `(declare-const k D0)`
+    /// variable never carried the datatype sort and sort-driven datatype
+    /// reasoning (#399 exhaustiveness) could not see it.
+    #[must_use]
+    pub fn datatype_sort_if_exists(&self, name: &str) -> Option<SortId> {
+        let spur = self.interner.get(name)?;
+        self.cache.get(&SortKind::Datatype(spur)).copied()
+    }
+
     /// Check if a sort is a datatype sort
     #[must_use]
     pub fn is_datatype(&self, sort_id: SortId) -> bool {
@@ -770,6 +782,27 @@ impl SortManager {
         } else {
             None
         }
+    }
+
+    /// The constructor inventory of a datatype SORT — each constructor's
+    /// resolved name plus its selector (field) count. `None` when the sort is
+    /// not a declared datatype (incl. forward references whose definition has
+    /// not landed yet). Used by the eager datatype exhaustiveness check: a
+    /// variable excluded from EVERY constructor of its (nonempty) datatype is
+    /// a ground conflict.
+    #[must_use]
+    pub fn datatype_constructors_of(&self, sort_id: SortId) -> Option<Vec<(String, usize)>> {
+        let sort = self.get(sort_id)?;
+        let SortKind::Datatype(spur) = &sort.kind else {
+            return None;
+        };
+        let def = self.datatypes.get(spur)?;
+        Some(
+            def.constructors
+                .iter()
+                .map(|c| (self.interner.resolve(&c.name).to_string(), c.selectors.len()))
+                .collect(),
+        )
     }
 
     /// Intern a string into the interner
