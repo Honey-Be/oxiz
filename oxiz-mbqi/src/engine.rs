@@ -221,8 +221,13 @@ impl<S: Sig> Engine<S> {
         let mut lemmas = Vec::new();
         let round_start = self.ground.frontier();
         let n = self.quants.len();
-        let mut active = vec![false; n];
         let mut budget_hit = false;
+        if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+            eprintln!(
+                "[mbqi-dbg] round: quants={n} frontier={round_start} emitted={} rejected={}",
+                self.emitted, self.rejected,
+            );
+        }
         for qi in 0..n {
             if self.emitted >= self.cfg.max_instances {
                 budget_hit = true;
@@ -233,7 +238,6 @@ impl<S: Sig> Engine<S> {
             if !model.is_active(lang, self.quants[qi].term) {
                 continue;
             }
-            active[qi] = true;
 
             // 0. EXISTENTIALS are never ground-instantiated like universals —
             //    asserting `Q ⇒ φ[x̄↦t̄]` for an arbitrary ground `t̄` is UNSOUND
@@ -273,6 +277,14 @@ impl<S: Sig> Engine<S> {
                 if !fully_bounded {
                     let trg =
                         infer_triggers(lang, &self.quants[qi].vars, self.quants[qi].body);
+                    if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                        let shapes: Vec<usize> = trg.iter().map(Vec::len).collect();
+                        eprintln!(
+                            "[mbqi-dbg] quant {qi}: vars={} inferred {} group(s), sizes {shapes:?}",
+                            self.quants[qi].vars.len(),
+                            trg.len(),
+                        );
+                    }
                     if !trg.is_empty() {
                         self.quants[qi].triggers = trg;
                         self.quants[qi].inferred = true;
@@ -313,6 +325,26 @@ impl<S: Sig> Engine<S> {
             // divergence-defusing role of the short-circuit is not needed.
             if !self.quants[qi].triggers.is_empty() {
                 let bindings = self.ematch_all(lang, qi, cong);
+                // #404 — the frontier watermark advances HERE, in the branch
+                // that actually CONSUMED the frontier, not in a blanket
+                // end-of-round sweep. The old sweep advanced `scanned[qi]`
+                // even on rounds where a `continue` (a CDQI conflict, an
+                // existential, a model-completion short-circuit) skipped this
+                // e-match — so a trigger inferred in such a round never saw
+                // the PRE-watermark ground seeds again, permanently starving
+                // the quantifier (the corpus decreases-check wall: CDQI emits
+                // one conflict instance in the inference round, the watermark
+                // sweeps past the seed terms, every later `ematch_all` sees
+                // an empty frontier). Re-scans after a skipped round are
+                // idempotent — `emit` dedups by `(qi, tuple)`.
+                self.scanned[qi] = round_start;
+                if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                    eprintln!(
+                        "[mbqi-dbg] quant {qi}: ematch_all -> {} binding(s), emitted so far {}",
+                        bindings.len(),
+                        self.emitted,
+                    );
+                }
                 for b in bindings {
                     if self.emitted >= self.cfg.max_instances {
                         budget_hit = true;
@@ -363,12 +395,18 @@ impl<S: Sig> Engine<S> {
             //    Unknown once it saturates.
             self.enumerate(lang, qi, &mut lemmas);
         }
-        // Advance the frontier watermark for every quantifier scanned this
-        // round: terms that existed at round start are now "old" for them.
-        for qi in 0..n {
-            if active[qi] {
-                self.scanned[qi] = round_start;
-            }
+        // #404 — NO blanket end-of-round watermark sweep: `scanned[qi]`
+        // advances inside the e-match branch, exactly when the frontier was
+        // consumed (see the comment there). `enumerate` ignores the
+        // watermark (full ground-index rescan, `emit`-deduped) and the
+        // `continue` branches must NOT age the frontier they never read.
+        if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+            eprintln!(
+                "[mbqi-dbg] round end: lemmas={} emitted={} rejected={} budget_hit={budget_hit}",
+                lemmas.len(),
+                self.emitted,
+                self.rejected,
+            );
         }
         if !lemmas.is_empty() {
             return Verdict::NewLemmas(lemmas);
@@ -616,7 +654,12 @@ impl<S: Sig> Engine<S> {
                 out.push(l);
                 self.emitted += 1;
             }
-            InstResult::Rejected => self.rejected += 1,
+            InstResult::Rejected => {
+                if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                    eprintln!("[mbqi-dbg] quant {qi}: instance REJECTED");
+                }
+                self.rejected += 1;
+            }
         }
     }
 

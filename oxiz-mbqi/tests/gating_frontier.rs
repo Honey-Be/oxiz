@@ -119,3 +119,62 @@ fn guarded_quantifier_when_active_but_unverified_enumerates_real_ground() {
     assert_eq!(verdict, "Unknown", "unverified trigger-free quant ⇒ sound Unknown");
     assert_eq!(e.rejected(), 0);
 }
+
+/// A toy model that reports a fixed set of terms false (others unknown) —
+/// the CDQI driver (mirrors `ematch_cdqi.rs`).
+struct FalseSet(rustc_hash::FxHashSet<Tid>);
+impl ModelEval<Toy> for FalseSet {
+    fn eval_bool(&self, _lang: &Toy, t: Tid) -> Option<bool> {
+        if self.0.contains(&t) { Some(false) } else { None }
+    }
+}
+
+/// #404 — the frontier watermark must NOT advance on a round whose e-match
+/// step never ran. `∀x. P(x)` (trigger-less → inference installs `[P x]`)
+/// with TWO pre-existing ground seeds `P(a)`, `P(b)`: round 1's model
+/// falsifies `P(a)`, so CDQI emits that single conflict instance and
+/// `continue`s — e-matching is skipped for this quantifier this round. The
+/// old blanket end-of-round sweep then aged BOTH seeds below the watermark,
+/// so round 2's frontier-filtered e-match saw nothing and `P(b)` was never
+/// instantiated — the quantifier permanently starved on terms that existed
+/// BEFORE its first real scan (the corpus decreases-check wall: measured as
+/// `ematch_all -> 0 binding(s)` on the minimized `datatypes-match-3` core,
+/// flipping to 8 with the sweep moved into the consuming branch). Round 2
+/// must still see `b` and emit `Q ⇒ P(b)`.
+#[test]
+fn frontier_survives_a_cdqi_short_circuited_round() {
+    const INT: u32 = 2;
+    const P: u32 = 22;
+    let mut t = Toy::new();
+    let a = t.konst(P + 100, INT);
+    let b = t.konst(P + 101, INT);
+    let pa = t.app(P, &[a], BOOL);
+    let pb = t.app(P, &[b], BOOL);
+    let x = t.var(302, INT);
+    let body = t.app(P, &[x], BOOL);
+    let q = t.forall(&[(302, INT)], &[], body, BOOL); // trigger-less
+
+    let mut e = Engine::new(Config::default());
+    e.assert(&t, pa);
+    e.assert(&t, pb);
+    e.assert(&t, q);
+
+    // Round 1: `P(a)` false ⇒ CDQI emits exactly the `a` conflict instance
+    // and short-circuits e-matching (the round that also inferred `[P x]`).
+    let m1 = FalseSet([pa].into_iter().collect());
+    match e.round_with(&mut t, &m1) {
+        Verdict::NewLemmas(ls) => assert_eq!(ls.len(), 1, "one CDQI conflict instance"),
+        _ => panic!("round 1 must emit the CDQI conflict"),
+    }
+
+    // Round 2: nothing falsified ⇒ CDQI silent ⇒ e-matching runs — and must
+    // still see the PRE-round-1 seeds (the `a` tuple dedups; `b` is new).
+    let m2 = FalseSet(rustc_hash::FxHashSet::default());
+    match e.round_with(&mut t, &m2) {
+        Verdict::NewLemmas(ls) => {
+            assert_eq!(ls.len(), 1, "the `b` instance must not be starved by the watermark");
+        }
+        _ => panic!("round 2 must e-match the pre-existing seed `P(b)`"),
+    }
+    assert_eq!(e.rejected(), 0);
+}
