@@ -644,6 +644,50 @@ impl Solver {
     }
 
     /// Add a clause
+    /// #404 phase 2 — an INCREMENTALLY added clause (post-solve, mid-MBQI)
+    /// can already be UNIT under the level-0 trail: every false literal was
+    /// assigned BEFORE the clause's watches existed, and watch events fire
+    /// only on NEW falsifications, so nothing ever visits the clause again —
+    /// it is silently inert, and the next solve can return a model that
+    /// plainly violates it. (The corpus decreases-check wall: the MBQI
+    /// instance lemma's guard Tseitin `[g₁, g₂, and]` was added after a Sat
+    /// round with `g₁`,`g₂` already pinned false at level 0 — `and` was
+    /// never forced, so the guarded instance never fired and the ground
+    /// core stayed "Sat" while violating the clause.) If exactly one
+    /// literal is non-false (and unassigned) while every false literal sits
+    /// at level 0, enqueue the forced literal at the root with the clause
+    /// as its reason — the next `propagate()` runs the consequences. A
+    /// clause with a false literal ABOVE level 0 is left alone: that
+    /// literal is unassigned again after the backtrack that any subsequent
+    /// solve performs, and the watch scheme handles it from there.
+    fn propagate_added_unit(&mut self, lits: &[Lit], clause_id: ClauseId) {
+        let mut unassigned: Option<Lit> = None;
+        for &l in lits {
+            let v = self.trail.lit_value(l);
+            if v.is_true() {
+                return; // satisfied — nothing to force
+            }
+            if v.is_false() {
+                if self.trail.level(l.var()) > 0 {
+                    return; // will be re-visited via backtrack + watches
+                }
+            } else {
+                if unassigned.is_some() {
+                    return; // ≥2 free literals — the watch scheme suffices
+                }
+                unassigned = Some(l);
+            }
+        }
+        // All-false is the caller's conflict path; here: exactly one free.
+        let Some(l) = unassigned else { return };
+        if self.trail.decision_level() > 0 {
+            // Root the forced assignment (the false literals are all at
+            // level 0, so they survive the backtrack unchanged).
+            self.backtrack_to_root();
+        }
+        self.trail.assign_propagation(l, clause_id);
+    }
+
     pub fn add_clause(&mut self, lits: impl IntoIterator<Item = Lit>) -> bool {
         let mut clause_lits: SmallVec<[Lit; 8]> = lits.into_iter().collect();
 
@@ -759,8 +803,11 @@ impl Solver {
                     self.backtrack_to_root();
                 }
 
-                // If one literal is false and one undefined, propagate
-                // after adding the clause (via next solve())
+                // If one literal is false and one undefined, the watch/
+                // binary-graph events for the ALREADY-false literal fired
+                // before this clause existed — force the survivor NOW (see
+                // `propagate_added_unit`; the old "via next solve()" comment
+                // was wrong: nothing re-visits an old falsification).
 
                 let clause_id = self.clauses.add_original(clause_lits.iter().copied());
                 self.track_clause(clause_id);
@@ -770,6 +817,7 @@ impl Solver {
                     .add(lit0.negate(), Watcher::new(clause_id, lit1));
                 self.watches
                     .add(lit1.negate(), Watcher::new(clause_id, lit0));
+                self.propagate_added_unit(&clause_lits, clause_id);
                 return true;
             }
             _ => {}
@@ -797,19 +845,59 @@ impl Solver {
             self.backtrack_to_root();
         }
 
+        // Watch selection — prefer non-false literals. The old code watched
+        // `clause_lits[0..2]` VERBATIM (despite its own comment): an
+        // incrementally added clause whose first two (sorted) literals were
+        // already false was never visited by propagation again (#404 — watch
+        // events fire only on NEW falsifications), leaving the clause
+        // silently inert. The chosen watches are SWAPPED into slots 0/1
+        // BEFORE the clause is stored, because `propagate()` maintains the
+        // classic invariant that the watched literals ARE `lits[0]`/`lits[1]`
+        // (it 0↔1-swaps and hunts replacements from index 2) — watching
+        // other positions mis-propagates.
+        let (idx0, idx1) = {
+            let mut first: Option<usize> = None;
+            let mut second: Option<usize> = None;
+            for (i, l) in clause_lits.iter().enumerate() {
+                if !self.trail.lit_value(*l).is_false() {
+                    if first.is_none() {
+                        first = Some(i);
+                    } else if second.is_none() {
+                        second = Some(i);
+                        break;
+                    }
+                }
+            }
+            match (first, second) {
+                (Some(a), Some(b)) => (a, b),
+                (Some(a), None) => (a, usize::from(a == 0)),
+                (None, _) => (0, 1),
+            }
+        };
+        if idx0 != 0 {
+            clause_lits.swap(0, idx0);
+        }
+        // The first swap may have displaced the second choice to `idx0`.
+        let idx1 = if idx1 == 0 { idx0 } else { idx1 };
+        if idx1 != 1 {
+            clause_lits.swap(1, idx1);
+        }
+        let lit0 = clause_lits[0];
+        let lit1 = clause_lits[1];
+
         let clause_id = self.clauses.add_original(clause_lits.iter().copied());
 
         // Track clause for incremental solving (per-push undo ledger).
         self.track_clause(clause_id);
 
-        // Set up watches - prefer non-false literals for watching
-        let lit0 = clause_lits[0];
-        let lit1 = clause_lits[1];
-
         self.watches
             .add(lit0.negate(), Watcher::new(clause_id, lit1));
         self.watches
             .add(lit1.negate(), Watcher::new(clause_id, lit0));
+
+        // #404 — an added clause that is ALREADY unit under the level-0
+        // trail must force its survivor now (see `propagate_added_unit`).
+        self.propagate_added_unit(&clause_lits, clause_id);
 
         true
     }
