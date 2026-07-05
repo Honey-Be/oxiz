@@ -302,18 +302,68 @@ impl Solver {
                 } else {
                     // #399 — a NEGATED equality to a NULLARY constructor excludes
                     // that whole constructor class (the nullary ctor's value is
-                    // unique). A field-bearing ctor diseq excludes only one
-                    // instance, so it is deliberately NOT collected.
+                    // unique). A generic field-bearing ctor diseq excludes only
+                    // one instance, so it is deliberately NOT collected — with
+                    // ONE exception (#404 phase 2): the TESTER SHAPE
+                    // `v ≠ C(sel_{C,0}(v), …, sel_{C,k}(v))` is exactly
+                    // `¬is-C(v)` for ANY arity (rebuilding `v` from its own
+                    // C-fields equals `v` iff `v` is C-shaped; a non-C `v`
+                    // differs by constructor distinctness) — this is the very
+                    // form the parser's recognizer desugar and the verus
+                    // decreases-check guards emit. Record it as a negative
+                    // TESTER, feeding the same injectivity + exhaustiveness
+                    // reasoning; excluding ALL ctors this way is a ground
+                    // conflict (z3 parity — was a spurious `sat`).
                     let mut record = |v: TermId, c: TermId| {
-                        if let Some(cd) = manager.get(c) {
-                            if let TermKind::DtConstructor { constructor, args } = &cd.kind {
-                                if args.is_empty() && self.is_dt_variable(v, manager) {
-                                    negative_ctor_equalities
-                                        .entry(v)
-                                        .or_default()
-                                        .push(manager.resolve_str(*constructor).to_string());
+                        if !self.is_dt_variable(v, manager) {
+                            return;
+                        }
+                        let Some(cd) = manager.get(c) else { return };
+                        let TermKind::DtConstructor { constructor, args } = &cd.kind else {
+                            return;
+                        };
+                        let cons_name = manager.resolve_str(*constructor).to_string();
+                        if args.is_empty() {
+                            negative_ctor_equalities.entry(v).or_default().push(cons_name);
+                            return;
+                        }
+                        // Positional selector match: every argᵢ must be
+                        // `(sel_{C,i} v)` — the selector names come from the
+                        // SORT manager (datatype spurs live in ITS interner,
+                        // the #399 cross-interner lesson), the node spurs
+                        // from the term manager; compare resolved strings.
+                        let Some(vsort) = manager.get(v).map(|t| t.sort) else { return };
+                        let Some(sel_names) =
+                            manager.sorts.datatype_ctor_selectors(vsort, &cons_name)
+                        else {
+                            return;
+                        };
+                        if sel_names.len() != args.len() {
+                            return;
+                        }
+                        // A selector application reaches us either as the
+                        // dedicated `DtSelector` node or as a plain `Apply` of
+                        // the selector's (namespace-unique) function symbol —
+                        // the parser emits the latter for user-written
+                        // `(sel v)`. `datatype_ctor_selectors` already proved
+                        // `want` IS this ctor's selector for v's sort, so a
+                        // same-named unary Apply on exactly `v` is that
+                        // selector application.
+                        let tester_shape = args.iter().zip(sel_names.iter()).all(|(&a, want)| {
+                            manager.get(a).is_some_and(|ad| match &ad.kind {
+                                TermKind::DtSelector { selector, arg } => {
+                                    *arg == v && manager.resolve_str(*selector) == *want
                                 }
-                            }
+                                TermKind::Apply { func, args } => {
+                                    args.len() == 1
+                                        && args[0] == v
+                                        && manager.resolve_str(*func) == *want
+                                }
+                                _ => false,
+                            })
+                        });
+                        if tester_shape {
+                            negative_testers.entry(v).or_default().push(cons_name);
                         }
                     };
                     record(*lhs, *rhs);

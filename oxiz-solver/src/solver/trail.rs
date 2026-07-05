@@ -27,6 +27,10 @@ pub(crate) enum TrailOp {
     BvTermAdded { term: TermId },
     /// An arithmetic term was added
     ArithTermAdded { term: TermId },
+    /// A datatype constructor-cover axiom was encoded for this term
+    /// (see `Solver::add_dt_cover_axioms`) — undone so a later scope
+    /// re-emits the clause the SAT-level pop discarded.
+    DtCoverAdded { term: TermId },
 }
 
 /// State for push/pop with trail-based undo

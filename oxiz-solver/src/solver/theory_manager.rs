@@ -710,9 +710,12 @@ impl TheoryManager {
         // congruence (an entailed equality) fire; it never asserts anything new.
         let mgr = Arc::clone(&self.manager);
         for &t in &arith_terms {
-            let is_app_or_select = mgr
-                .get(t)
-                .is_some_and(|td| matches!(td.kind, TermKind::Apply { .. } | TermKind::Select(..)));
+            let is_app_or_select = mgr.get(t).is_some_and(|td| {
+                matches!(
+                    td.kind,
+                    TermKind::Apply { .. } | TermKind::Select(..) | TermKind::DtSelector { .. }
+                )
+            });
             if is_app_or_select && self.euf.term_to_node(t).is_none() {
                 self.intern_term_for_congruence(t, &mgr);
             }
@@ -969,6 +972,32 @@ impl TheoryManager {
                         [array_node, index_node],
                     );
                 }
+                TermKind::DtConstructor { constructor, args } => {
+                    // #404 phase 2 — a datatype constructor application is a
+                    // FUNCTION application to EUF (congruence is valid for any
+                    // function; distinctness/injectivity stay elsewhere). As an
+                    // opaque leaf, `x=y` never derived `C(sel(x)…)=C(sel(y)…)`,
+                    // so a shape equality established at one term never reached
+                    // the congruent shape atom of an equal term (the dm3
+                    // decreases-check bridge init≡E).
+                    let func_id = constructor.into_inner().get();
+                    let arg_nodes: SmallVec<[u32; 4]> = args
+                        .iter()
+                        .map(|&a| self.intern_term_deep(a, manager))
+                        .collect();
+                    return self.euf.intern_app(term, func_id, arg_nodes);
+                }
+                TermKind::DtSelector { selector, arg } => {
+                    // Selector application = unary function application. Keyed
+                    // by the selector's name spur — identical to a same-named
+                    // `Apply`'s key, so the parser's `(sel x)` (an `Apply`) and
+                    // a `DtSelector` node over the same argument land in ONE
+                    // congruence class automatically.
+                    let arg_node = self.intern_term_deep(*arg, manager);
+                    return self
+                        .euf
+                        .intern_app(term, selector.into_inner().get(), [arg_node]);
+                }
                 TermKind::IntConst(n) => {
                     // Intern the integer constant as an EUF node and maintain
                     // pairwise disequalities between *distinct* integer values.
@@ -1047,6 +1076,24 @@ impl TheoryManager {
                         Self::SELECT_FUNC_ID,
                         [array_node, index_node],
                     );
+                }
+                TermKind::DtConstructor { constructor, args } => {
+                    // #404 phase 2 — see `intern_term_deep`: ctor application
+                    // is a function application to EUF (congruence only).
+                    let func_id = constructor.into_inner().get();
+                    let arg_nodes: SmallVec<[u32; 4]> = args
+                        .iter()
+                        .map(|&a| self.intern_term_for_congruence(a, manager))
+                        .collect();
+                    return self.euf.intern_app(term, func_id, arg_nodes);
+                }
+                TermKind::DtSelector { selector, arg } => {
+                    // Unary app keyed by the selector's name spur (unifies with
+                    // a same-named `Apply` — see `intern_term_deep`).
+                    let arg_node = self.intern_term_for_congruence(*arg, manager);
+                    return self
+                        .euf
+                        .intern_app(term, selector.into_inner().get(), [arg_node]);
                 }
                 TermKind::IntConst(n) => {
                     // Maintain pairwise disequalities between *distinct* integer

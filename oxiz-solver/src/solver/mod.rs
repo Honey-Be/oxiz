@@ -193,6 +193,12 @@ pub struct Solver {
     /// Datatype constructor constraints: variable -> constructor name
     /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
+    /// Datatype-sorted subterms whose ground constructor-cover axiom
+    /// `(or (= t (C₁ sels(t))) …)` has been encoded into the SAT core
+    /// (see `add_dt_cover_axioms`). Entries are trail-undone on `pop()` —
+    /// the cover CLAUSE dies with the SAT level, so a re-assert of the same
+    /// term in a later scope must re-emit it.
+    pub(super) dt_cover_done: FxHashSet<TermId>,
     /// Monotone counter naming the fresh constants of the ground term-ite
     /// elimination (`eliminate_term_ites`). Never decremented — a popped
     /// definition must never have its name reused by a later scope.
@@ -282,6 +288,7 @@ impl Solver {
             has_bv_arith_ops: false,
             arith_terms: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
+            dt_cover_done: FxHashSet::default(),
             term_ite_counter: 0,
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -778,6 +785,74 @@ impl Solver {
                     // structurally impossible. A trigger-free axiom it cannot
                     // model-verify yields the sound `Unknown`, never a guess.
                     if self.config.clean_mbqi {
+                        // #404 phase-2 probe (env-gated): the wall shows a lemma
+                        // asserted in round N with the ground core still SAT in
+                        // round N+1 — dump each clean instance's SAT-model truth
+                        // plus its immediate structure to see which link of
+                        // `Q ⇒ (guard ⇒ concl)` failed to bite.
+                        if std::env::var_os("OXIZ_MBQI_DBG").is_some()
+                            && !clean_instances.is_empty()
+                        {
+                            let sat_model = self.sat.model();
+                            let tv = |t: TermId| -> &'static str {
+                                match self.term_to_var.get(&t) {
+                                    Some(v) => match sat_model.get(v.index()).copied() {
+                                        Some(b) if b.is_true() => "T",
+                                        Some(b) if b.is_false() => "F",
+                                        _ => "?",
+                                    },
+                                    None => "novar",
+                                }
+                            };
+                            for &l in &clean_instances {
+                                eprintln!("[mbqi-dbg] model: lemma {l:?}={}", tv(l));
+                                let Some(TermKind::Implies(q, phi)) =
+                                    manager.get(l).map(|t| t.kind.clone())
+                                else {
+                                    continue;
+                                };
+                                eprintln!(
+                                    "[mbqi-dbg]   q {q:?}={} phi {phi:?}={}",
+                                    tv(q),
+                                    tv(phi)
+                                );
+                                if let Some(TermKind::Implies(g, c)) =
+                                    manager.get(phi).map(|t| t.kind.clone())
+                                {
+                                    eprintln!(
+                                        "[mbqi-dbg]   guard {g:?}={} concl {c:?}={}",
+                                        tv(g),
+                                        tv(c)
+                                    );
+                                    if let Some(TermKind::And(args)) =
+                                        manager.get(g).map(|t| t.kind.clone())
+                                    {
+                                        for a in args {
+                                            // a is typically Not(eq): print the
+                                            // inner ATOM too (the Not node itself
+                                            // never gets a var — its literal is
+                                            // the negated atom var).
+                                            let inner = match manager.get(a).map(|t| t.kind.clone())
+                                            {
+                                                Some(TermKind::Not(i)) => Some(i),
+                                                _ => None,
+                                            };
+                                            match inner {
+                                                Some(i) => eprintln!(
+                                                    "[mbqi-dbg]     guard-conj {a:?}={} (inner atom {i:?}={})",
+                                                    tv(a),
+                                                    tv(i)
+                                                ),
+                                                None => eprintln!(
+                                                    "[mbqi-dbg]     guard-conj {a:?}={}",
+                                                    tv(a)
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Build + assert the formula once; persist across rounds.
                         if clean_engine.is_none() {
                             let mut eng = CleanEngine::new(CleanConfig {
@@ -904,6 +979,11 @@ impl Solver {
                                                     )
                                                 });
                                             if retains_bound {
+                                                if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                                                    eprintln!(
+                                                        "[mbqi-dbg] host: lemma DROPPED (retains a bound var)"
+                                                    );
+                                                }
                                                 continue;
                                             }
                                             // Record the GUARDED lemma `Q ⇒ φ`
@@ -923,10 +1003,29 @@ impl Solver {
                                             // `encode(q)`, which re-runs the `Forall` arm and
                                             // re-registers the quantifier with mbqi/ematch on
                                             // every instance (state pollution).
+                                            let qlit_reused = self.term_to_var.contains_key(&q);
                                             let qlit = match self.term_to_var.get(&q) {
                                                 Some(&v) => oxiz_sat::Lit::pos(v),
                                                 None => self.encode(q, manager),
                                             };
+                                            if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                                                let p = oxiz_core::smtlib::Printer::new(manager);
+                                                let g = match manager.get(phi).map(|t| t.kind.clone())
+                                                {
+                                                    Some(TermKind::Implies(g, _)) => Some(g),
+                                                    _ => None,
+                                                };
+                                                eprintln!(
+                                                    "[mbqi-dbg] host: lemma asserted — qlit {} (q={:?}), phi={:?} pol={:?} guard-pol={:?} aware={} = {}",
+                                                    if qlit_reused { "REUSED" } else { "FRESH" },
+                                                    q,
+                                                    phi,
+                                                    self.polarities.get(&phi),
+                                                    g.and_then(|g| self.polarities.get(&g)),
+                                                    self.polarity_aware,
+                                                    p.print_term(phi),
+                                                );
+                                            }
                                             if manager
                                                 .get(phi)
                                                 .is_some_and(|t| matches!(t.kind, TermKind::False))
@@ -1291,6 +1390,11 @@ impl Solver {
                             // Remove the arithmetic term
                             self.arith_terms.remove(&term);
                         }
+                        TrailOp::DtCoverAdded { term } => {
+                            // The cover CLAUSE died with the SAT-level pop; drop
+                            // the marker so a later scope re-emits it.
+                            self.dt_cover_done.remove(&term);
+                        }
                     }
                 }
             }
@@ -1332,6 +1436,7 @@ impl Solver {
         self.bv_terms.clear();
         self.arith_terms.clear();
         self.dt_var_constructors.clear();
+        self.dt_cover_done.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();
     }

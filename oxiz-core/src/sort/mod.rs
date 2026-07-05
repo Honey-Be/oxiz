@@ -805,6 +805,66 @@ impl SortManager {
         )
     }
 
+    /// The ORDERED selector (field) names of one constructor of a datatype
+    /// SORT, resolved to strings (the datatype spurs live in THIS manager's
+    /// interner — never resolve them through the term interner). `None` when
+    /// the sort is not a declared datatype or `ctor` is not one of its
+    /// constructors. Used by the datatype tester-shape recognizer
+    /// (`v ≠ C(sel_{C,0}(v), …) ⟺ ¬is-C(v)`), which must match the
+    /// selectors POSITIONALLY.
+    #[must_use]
+    pub fn datatype_ctor_selectors(&self, sort_id: SortId, ctor: &str) -> Option<Vec<String>> {
+        let sort = self.get(sort_id)?;
+        let SortKind::Datatype(spur) = &sort.kind else {
+            return None;
+        };
+        let def = self.datatypes.get(spur)?;
+        let c = def
+            .constructors
+            .iter()
+            .find(|c| self.interner.resolve(&c.name) == ctor)?;
+        Some(
+            c.selectors
+                .iter()
+                .map(|(s, _)| self.interner.resolve(s).to_string())
+                .collect(),
+        )
+    }
+
+    /// The FULL constructor layout of a datatype SORT: every constructor's
+    /// resolved name plus its ordered selector `(name, field sort)` pairs.
+    /// `None` when the sort is not a declared datatype. Used to BUILD the
+    /// ground constructor-cover axiom
+    /// `(or (= t (C₁ (sel_{C₁,0} t) …)) … (= t (Cₙ …)))` — every datatype
+    /// value is made by some constructor, and rebuilding `t` from its own
+    /// `Cᵢ`-fields equals `t` exactly when `t` is `Cᵢ`-shaped, so the
+    /// disjunction is valid for any `t` of this sort.
+    #[must_use]
+    pub fn datatype_ctor_layouts(
+        &self,
+        sort_id: SortId,
+    ) -> Option<Vec<(String, Vec<(String, SortId)>)>> {
+        let sort = self.get(sort_id)?;
+        let SortKind::Datatype(spur) = &sort.kind else {
+            return None;
+        };
+        let def = self.datatypes.get(spur)?;
+        Some(
+            def.constructors
+                .iter()
+                .map(|c| {
+                    (
+                        self.interner.resolve(&c.name).to_string(),
+                        c.selectors
+                            .iter()
+                            .map(|(s, fs)| (self.interner.resolve(s).to_string(), *fs))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// Intern a string into the interner
     ///
     /// This is used for creating Spur values for datatype constructors and selectors.

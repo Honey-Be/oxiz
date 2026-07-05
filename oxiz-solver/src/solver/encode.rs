@@ -721,6 +721,9 @@ impl Solver {
         // the ArithSolver may not enforce disequalities correctly.
         self.add_arith_diseq_split(term_to_encode, manager);
 
+        // Ground datatype exhaustiveness at the SAT level (#404 phase 2).
+        self.add_dt_cover_axioms(term_to_encode, manager);
+
         if self.produce_unsat_cores {
             let na_index = self.named_assertions.len();
             self.named_assertions.push(NamedAssertion {
@@ -730,6 +733,103 @@ impl Solver {
             });
             self.trail
                 .push(TrailOp::NamedAssertionAdded { index: na_index });
+        }
+    }
+
+    /// #404 phase 2 (gap #3) — GROUND datatype exhaustiveness at the SAT level.
+    ///
+    /// The static `check_dt_constraints` pre-pass reads only top-level
+    /// assertion polarity (And/Or/Not), so a constructor-shape disequality
+    /// buried under `=>`/mixed structure — exactly the verus decreases-check
+    /// goal shape — never reaches it, and the CDCL(T) search has no datatype
+    /// theory to refute a model where a term is NO constructor's shape at
+    /// all: the ground core reported a spurious `sat` where z3 says `unsat`.
+    ///
+    /// For every ground datatype-sorted subterm `t` of the asserted formula,
+    /// encode two VALID axiom families over the same shape atoms
+    /// `sᵢ ≔ (= t (Cᵢ (sel_{Cᵢ,0} t) …))`:
+    ///   - COVER  (≥1 shape): `(or s₁ … sₙ)` — every datatype value is built
+    ///     by SOME constructor, and rebuilding `t` from its own `Cᵢ`-fields
+    ///     equals `t` exactly when `t` is `Cᵢ`-shaped;
+    ///   - EXCLUSION (≤1 shape): `(not sᵢ) ∨ (not sⱼ)` pairwise — two shapes
+    ///     at once would force `Cᵢ(…) = Cⱼ(…)`, impossible by constructor
+    ///     distinctness. Without this a model can take BOTH shapes, which
+    ///     falsifies every `¬is-Cₖ`-style axiom guard in sight and lets the
+    ///     guarded facts silently vanish (the dm3 decreases-check escape).
+    /// Validity makes both additions sound in BOTH directions.
+    ///
+    /// Each disjunct uses the parser's own node shapes (`DtConstructor` head,
+    /// selector application as a unary `Apply`), so hash-consing makes it the
+    /// SAME atom as a user-written shape (dis)equality and the exhaustiveness
+    /// conflict becomes purely propositional.
+    ///
+    /// The walk skips binder subtrees (a cover mentioning a bound variable
+    /// would be ill-formed) and never walks the cover terms themselves (the
+    /// rebuilt fields are datatype-sorted too — covering them recursively
+    /// would diverge).
+    fn add_dt_cover_axioms(&mut self, root: TermId, manager: &mut TermManager) {
+        use oxiz_core::sort::SortId;
+
+        let mut stack = vec![root];
+        let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        #[allow(clippy::type_complexity)]
+        let mut targets: Vec<(TermId, SortId, Vec<(String, Vec<(String, SortId)>)>)> = Vec::new();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let Some(td) = manager.get(t) else { continue };
+            if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                continue;
+            }
+            for c in oxiz_core::ast::get_children(&td.kind) {
+                stack.push(c);
+            }
+            // A constructor application's own cover is trivially true.
+            if matches!(td.kind, TermKind::DtConstructor { .. })
+                || self.dt_cover_done.contains(&t)
+            {
+                continue;
+            }
+            let sort = td.sort;
+            if let Some(layouts) = manager.sorts.datatype_ctor_layouts(sort) {
+                if !layouts.is_empty() {
+                    targets.push((t, sort, layouts));
+                }
+            }
+        }
+        for (t, sort, layouts) in targets {
+            let dbg = std::env::var("OXIZ_MBQI_DBG").is_ok();
+            let shape_lits: Vec<Lit> = layouts
+                .iter()
+                .map(|(ctor, fields)| {
+                    let args: Vec<TermId> = fields
+                        .iter()
+                        .map(|(sel, fsort)| manager.mk_apply(sel, [t], *fsort))
+                        .collect();
+                    let app = manager.mk_dt_constructor(ctor, args, sort);
+                    let eq = manager.mk_eq(t, app);
+                    if dbg {
+                        eprintln!("[mbqi-dbg] dt-cover: t={t:?} ctor={ctor} eq-atom={eq:?}");
+                    }
+                    self.encode(eq, manager)
+                })
+                .collect();
+            // ≥1 shape: the cover clause itself.
+            self.sat.add_clause(shape_lits.iter().copied());
+            // ≤1 shape: pairwise exclusion — `t = Cᵢ(…) ∧ t = Cⱼ(…)` forces
+            // `Cᵢ(…) = Cⱼ(…)`, impossible by constructor distinctness. Without
+            // this the model can make a term BOTH shapes at once, which
+            // falsifies every `¬is-Cₖ`-style axiom guard and lets the guarded
+            // facts silently vanish (the dm3 decreases-check escape).
+            for i in 0..shape_lits.len() {
+                for j in (i + 1)..shape_lits.len() {
+                    self.sat
+                        .add_clause([shape_lits[i].negate(), shape_lits[j].negate()]);
+                }
+            }
+            self.dt_cover_done.insert(t);
+            self.trail.push(TrailOp::DtCoverAdded { term: t });
         }
     }
 
@@ -794,6 +894,9 @@ impl Solver {
 
         // Eagerly add arith diseq split for Not(Eq(a,b)) assertions
         self.add_arith_diseq_split(term, manager);
+
+        // Ground datatype exhaustiveness at the SAT level (#404 phase 2).
+        self.add_dt_cover_axioms(term_to_encode, manager);
 
         if self.produce_unsat_cores {
             let na_index = self.named_assertions.len();
@@ -904,6 +1007,12 @@ impl Solver {
                     let mut clause: Vec<Lit> = arg_lits.iter().map(|l| l.negate()).collect();
                     clause.push(result);
                     self.sat.add_clause(clause);
+                }
+
+                if std::env::var_os("OXIZ_MBQI_DBG").is_some() && polarity != Polarity::Both {
+                    eprintln!(
+                        "[mbqi-dbg] encode And {term:?}: polarity {polarity:?} (one Tseitin direction suppressed)"
+                    );
                 }
 
                 result
