@@ -21,6 +21,30 @@
 //! generic in `oxiz-mbqi`; the live EUF adapter (interning is entangled with the
 //! theory manager) is the *port* half, landed when CCFV (Phase P1+) consumes the
 //! ledger. Pure addition — no current consumer, no behaviour change.
+//!
+//! ## ⚠️ NOT YET USED — reserved substrate (as of 2026-07-06)
+//!
+//! Nothing in the live solver consumes this module. The clean-MBQI engine is
+//! **monotone by design** (never-conclude-unsat = only ever *add* sound lemmas),
+//! so it needs no scoped rollback and never calls [`GroundLedger`] /
+//! [`GroundIndex::rollback_to`]. It is kept, tested (see the tests below — the
+//! rot-guard), and public deliberately, reserved for its two named future
+//! consumers, either of which activates it:
+//!   1. **CCFV Phase P2+** — the deferred E-ground-(dis)unification wiring this
+//!      spike was landed for (design `CCFV_UNIFIED_INSTANTIATION.md` §10).
+//!   2. **The fuel-aware cost-scheduler's *persist-across-obligations* path**
+//!      (`.claude-research-library/FUEL_AWARE_INSTANTIATION_RESEARCH.md` §5) — a
+//!      `QiMark` funnel folding {pending PQ, scoped fingerprints, [`GroundIndex`]}
+//!      that mirrors this ledger, needed ONLY if the engine is later made to assert
+//!      the prelude once and push/pop per-obligation deltas. The scheduler's
+//!      **default is monotone**, so even that redesign does not consume this by
+//!      default.
+//!
+//! The `#![allow(dead_code)]` below is a reader signal, not a functional gate
+//! (the items are `pub`, so the lint is inert): it flags the whole module as
+//! intentionally-unused-for-now. Delete this module (blueprint survives in the
+//! §10 design doc + git) OR wire a consumer — do not let it drift silently.
+#![allow(dead_code)]
 use crate::ground::GroundIndex;
 use crate::term::{Sig, TermLang};
 
