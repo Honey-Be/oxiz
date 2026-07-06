@@ -81,6 +81,21 @@ pub enum TermView<'a, S: Sig> {
     Opaque,
 }
 
+/// The structural role of a symbol in the recursion-**fuel** encoding
+/// (Dafny/F★/Verus; design `FUEL_AWARE_COST_SCHEDULER.md` E2). The fuel argument
+/// of a recursive-definition axiom is a unary Peano counter `succ(succ(…zero))`;
+/// recognizing its two constructors lets the engine read the fuel-unfolding depth
+/// (`succ`-nesting) of a term — the gradient the cost-scheduler discounts. A host
+/// that does not use fuel returns `None` from [`TermLang::fuel_role`], degrading
+/// the scheduler to a pure `weight + generation` cost (Z3 parity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FuelRole {
+    /// The `succ` fuel constructor (`succ(fuel)` — one more unfold available).
+    Succ,
+    /// The `zero` fuel constant (no fuel — the unfolding floor).
+    Zero,
+}
+
 /// The host term language *behavior* the engine drives. Its identity types
 /// live in [`Sig`] (lifetime-free); `Self` may borrow the host arena.
 ///
@@ -168,6 +183,34 @@ pub trait TermLang {
         _quant: <Self::Sig as Sig>::Term,
     ) -> Vec<Option<Vec<<Self::Sig as Sig>::Term>>> {
         Vec::new()
+    }
+
+    /// **E2 — the fuel-role accessor** (design `FUEL_AWARE_COST_SCHEDULER.md` §2.5).
+    /// `Some(Succ)`/`Some(Zero)` iff `sym` is the recursion-fuel `succ`/`zero`
+    /// constructor of the Dafny/F★/Verus fuel encoding; `None` for any other symbol
+    /// (and for hosts with no fuel encoding). Read-only and pure. The fuel sort is
+    /// otherwise opaque at this trait surface (`succ` is indistinguishable from any
+    /// unary uninterpreted function), so the cost-scheduler's fuel gradient is
+    /// unreadable without this hook; with it, the engine computes a term's
+    /// fuel-unfolding depth as the `succ`-nesting of its fuel argument.
+    ///
+    /// Default: `None` everywhere ⇒ the scheduler degrades to `weight + generation`
+    /// (Z3 parity) on any non-fuel host.
+    fn fuel_role(&self, _sym: <Self::Sig as Sig>::Sym) -> Option<FuelRole> {
+        None
+    }
+
+    /// **E3 — the content-key accessor** (design `FUEL_AWARE_COST_SCHEDULER.md` §2.5,
+    /// R7 shuffle-invariance). A stable hash of `sym`'s CONTENT (its name/definition),
+    /// NOT its interner/construction-order id. The scheduler's tie-break key
+    /// (`FUEL_AWARE_COST_SCHEDULER.md` §5.2) must be a function of E-graph content so
+    /// the release order — and hence the verdict — is invariant under an
+    /// assertion-shuffle (Mariposa R7); the raw `Sym` id is order-variant and cannot
+    /// serve. `None` ⇒ no stable content key available, and the engine falls back to
+    /// the raw id (today's order-variant behaviour — acceptable only for
+    /// non-shuffle-sensitive / toy hosts).
+    fn content_key(&self, _sym: <Self::Sig as Sig>::Sym) -> Option<u64> {
+        None
     }
 }
 

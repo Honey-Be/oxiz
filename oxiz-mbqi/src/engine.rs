@@ -650,7 +650,19 @@ impl<S: Sig> Engine<S> {
         }
         match instantiate(lang, &self.ground, &self.quants[qi], binding) {
             InstResult::Lemma(l) => {
-                self.ground.add_term(lang, l); // chained triggers next round
+                // E1 (design FUEL_AWARE_COST_SCHEDULER.md): the minted lemma's fresh
+                // ground terms carry generation `1 + max(generation of the binding
+                // terms)` — the well-founded instantiation-depth measure the
+                // cost-scheduler prices on. Binding terms are ground-index terms
+                // whose generation is already recorded; an empty binding (nullary /
+                // existential sentinel) yields generation 1. Additive: nothing reads
+                // `gen` yet, so verdicts are unchanged.
+                let g = 1 + binding
+                    .iter()
+                    .map(|(_, t)| self.ground.gen_of(*t))
+                    .max()
+                    .unwrap_or(0);
+                self.ground.add_term_gen(lang, l, g); // chained triggers next round
                 out.push(l);
                 self.emitted += 1;
             }

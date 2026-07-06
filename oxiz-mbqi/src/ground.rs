@@ -35,6 +35,17 @@ pub struct GroundIndex<S: Sig> {
     /// rolls back; only a [`GroundLedger`](crate::ledger::GroundLedger) does, to
     /// keep the index in lock-step with a scoped congruence store (design §10).
     order: Vec<S::Term>,
+    /// **Instantiation generation** per term (design `FUEL_AWARE_COST_SCHEDULER.md`
+    /// E1): input (assertion) terms are generation 0; a term first registered while
+    /// minting an instance carries `1 + max(generation of that instance's binding
+    /// terms)` (see [`add_term_gen`](Self::add_term_gen)). This is the well-founded
+    /// depth measure the cost-scheduler prices on — distinct from the insertion-order
+    /// `idx` above. Write-once (a term keeps the generation of its FIRST registration,
+    /// like `idx`); read-only thereafter. **Additive: nothing consumes it yet
+    /// (P0.5); verdicts are unchanged.**
+    term_gen: FxHashMap<S::Term, u32>,
+    /// The maximum generation registered so far (cached; recomputed on rollback).
+    max_gen: u32,
 }
 
 impl<S: Sig> Default for GroundIndex<S> {
@@ -52,7 +63,21 @@ impl<S: Sig> GroundIndex<S> {
             idx: FxHashMap::default(),
             next_idx: 0,
             order: Vec::new(),
+            term_gen: FxHashMap::default(),
+            max_gen: 0,
         }
+    }
+
+    /// The instantiation generation of a term (E1): 0 for an input/assertion term
+    /// or one never registered; `1 + max binding generation` for an instance-minted
+    /// term. See [`add_term_gen`](Self::add_term_gen).
+    pub fn gen_of(&self, t: S::Term) -> u32 {
+        self.term_gen.get(&t).copied().unwrap_or(0)
+    }
+
+    /// The largest generation registered so far.
+    pub fn max_gen(&self) -> u32 {
+        self.max_gen
     }
 
     /// Total ground terms registered so far — the current frontier watermark.
@@ -85,12 +110,22 @@ impl<S: Sig> GroundIndex<S> {
     /// becomes a candidate. This is the structural guarantee behind
     /// invariant #1: the index can only hold variable-free, in-problem terms.
     pub fn add_term<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
-        self.add_rec(lang, t);
+        self.add_rec(lang, t, 0);
+    }
+
+    /// Register the ground subterms of an INSTANCE-minted term `t` at generation
+    /// `g` (E1). Newly-registered subterms take generation `g`; already-known terms
+    /// keep their existing generation (write-once, like `idx`). The caller computes
+    /// `g = 1 + max(generation of the instance's binding terms)`. Same registration
+    /// path / same structural guarantees as [`add_term`] — the only difference is
+    /// the generation tag on fresh terms.
+    pub fn add_term_gen<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term, g: u32) {
+        self.add_rec(lang, t, g);
     }
 
     /// Returns `true` if `t` is ground (contains no variables) — and as a
-    /// side effect registers its ground subterms.
-    fn add_rec<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) -> bool {
+    /// side effect registers its ground subterms at generation `g`.
+    fn add_rec<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term, g: u32) -> bool {
         match lang.view(t) {
             TermView::Var { .. } => {
                 // A `Var` REACHED by the index is a free / declared constant,
@@ -102,7 +137,7 @@ impl<S: Sig> GroundIndex<S> {
                 // constants as `Var` (OxiZ) rely on it. e-matching still
                 // distinguishes bound variables via the quantifier's bound set,
                 // so this is sound.
-                self.register(lang, t);
+                self.register(lang, t, g);
                 true
             }
             TermView::Quant { .. } => {
@@ -111,19 +146,19 @@ impl<S: Sig> GroundIndex<S> {
                 false
             }
             TermView::Opaque => {
-                self.register(lang, t);
+                self.register(lang, t, g);
                 true
             }
             TermView::App { sym } => {
                 let args = lang.children(t);
                 let mut all_ground = true;
                 for &a in &args {
-                    if !self.add_rec(lang, a) {
+                    if !self.add_rec(lang, a, g) {
                         all_ground = false;
                     }
                 }
                 if all_ground {
-                    self.register(lang, t);
+                    self.register(lang, t, g);
                     self.by_head.entry(sym).or_default().push(t);
                 }
                 all_ground
@@ -131,12 +166,16 @@ impl<S: Sig> GroundIndex<S> {
         }
     }
 
-    fn register<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term) {
+    fn register<L: TermLang<Sig = S>>(&mut self, lang: &L, t: S::Term, g: u32) {
         if self.all.insert(t) {
             self.by_sort.entry(lang.sort_of(t)).or_default().push(t);
             self.idx.insert(t, self.next_idx);
             self.order.push(t);
             self.next_idx += 1;
+            self.term_gen.insert(t, g);
+            if g > self.max_gen {
+                self.max_gen = g;
+            }
         }
     }
 
@@ -160,6 +199,7 @@ impl<S: Sig> GroundIndex<S> {
         for t in &removed {
             self.all.remove(t);
             self.idx.remove(t);
+            self.term_gen.remove(t);
         }
         // Drop the removed terms from the sort/head buckets (split borrow: `all`
         // and the bucket maps are disjoint fields).
@@ -167,5 +207,7 @@ impl<S: Sig> GroundIndex<S> {
         self.by_sort.values_mut().for_each(|b| b.retain(|t| all.contains(t)));
         self.by_head.values_mut().for_each(|b| b.retain(|t| all.contains(t)));
         self.next_idx = frontier;
+        // Recompute the generation high-water mark over the surviving terms.
+        self.max_gen = self.term_gen.values().copied().max().unwrap_or(0);
     }
 }

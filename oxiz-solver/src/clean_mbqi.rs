@@ -30,11 +30,11 @@
 //! so adding a kind to `view`-App no longer requires touching `substitute_cached`.)
 
 use oxiz_core::ast::{TermId, TermKind, TermManager};
-use oxiz_core::interner::Spur;
+use oxiz_core::interner::{Key, Spur};
 use oxiz_core::sort::{SortId, SortKind};
 use oxiz_mbqi::{
-    solve, Binding, Congruence, Constraint, FuncApp, Lit, ModelEval, Sig, TermLang, TermView,
-    TotalView,
+    solve, Binding, Congruence, Constraint, FuelRole, FuncApp, Lit, ModelEval, Sig, TermLang,
+    TermView, TotalView,
 };
 use oxiz_theories::euf::EufSolver;
 use num_traits::ToPrimitive;
@@ -666,6 +666,48 @@ impl<'a> TermLang for OxizHost<'a> {
             // Leaf constants and anything not mapped above → opaque atom.
             _ => TermView::Opaque,
         }
+    }
+
+    /// E2 (design `FUEL_AWARE_COST_SCHEDULER.md`): recognize the Verus/Dafny/F★
+    /// recursion-fuel `succ`/`zero` constructors by NAME. A reserved structured-op
+    /// sym (`OP | k`, bit 60 set — see [`OP`]) is never a fuel constructor; a real
+    /// function sym is `spur_sym(func)` = the func's `Spur` inner value, which we
+    /// reverse into a `Spur` and resolve to its name. Read-only, pure.
+    fn fuel_role(&self, sym: u64) -> Option<FuelRole> {
+        if sym & OP != 0 {
+            return None; // reserved structured operator, not a fuel constructor
+        }
+        // spur_sym(s) = s.into_inner().get(); Spur::try_from_usize(i) sets inner = i+1,
+        // so the interner key is `sym - 1`. The sym came from a real interned func
+        // (view maps only `Apply { func }` below OP), so the resolve is in-bounds.
+        let spur = Spur::try_from_usize((sym as usize).checked_sub(1)?)?;
+        match self.m().resolve_str(spur) {
+            "succ" => Some(FuelRole::Succ),
+            "zero" => Some(FuelRole::Zero),
+            _ => None,
+        }
+    }
+
+    /// E3 (design `FUEL_AWARE_COST_SCHEDULER.md`, R7 shuffle-invariance): a stable,
+    /// content-derived key for a sym. A reserved structured-op sym (`OP | k`) is
+    /// already a fixed constant (content-stable), so it is its own key; a real
+    /// function sym is interner-order-variant, so we key on a deterministic FNV-1a
+    /// hash of its NAME instead — making the scheduler's tie-break order invariant
+    /// under an assertion shuffle. Read-only, pure.
+    fn content_key(&self, sym: u64) -> Option<u64> {
+        if sym & OP != 0 {
+            return Some(sym); // reserved op: a fixed constant, already content-stable
+        }
+        let spur = Spur::try_from_usize((sym as usize).checked_sub(1)?)?;
+        let name = self.m().resolve_str(spur);
+        // FNV-1a over the name bytes — deterministic within the process (no random
+        // seed), which is exactly what shuffle-invariance within a run requires.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Some(h)
     }
 
     fn children(&self, t: TermId) -> Vec<TermId> {
@@ -4844,5 +4886,36 @@ mod ccfv_congruence_tests {
         assert_eq!(cong.rep(x), x);
         assert_eq!(cong.class(x), vec![x]);
         assert!(cong.apps_like(x).is_empty());
+    }
+
+    #[test]
+    fn e2_e3_fuel_role_and_content_key_on_real_host() {
+        use super::{spur_sym, FuelRole, OxizHost, TermLang, OP_AND};
+        use oxiz_core::ast::TermManager;
+        // P0.5 (design `FUEL_AWARE_COST_SCHEDULER.md` §2.5): the fuel-role and
+        // content-key accessors must recognize the fuel constructors by NAME on
+        // the real OxiZ host. A silent failure here (fuel_role always None) would
+        // make the whole cost-scheduler degrade to Z3 parity and the redesign
+        // quietly no-op — a failure the differential gate cannot catch — so pin
+        // the reverse-`Spur` resolution directly.
+        let mut tm = TermManager::new();
+        let succ = tm.intern_str("succ");
+        let zero = tm.intern_str("zero");
+        let other = tm.intern_str("some_fn");
+        let host = OxizHost::new(&mut tm);
+
+        // E2 — fuel_role by name; other funcs and reserved structured ops → None.
+        assert_eq!(host.fuel_role(spur_sym(succ)), Some(FuelRole::Succ));
+        assert_eq!(host.fuel_role(spur_sym(zero)), Some(FuelRole::Zero));
+        assert_eq!(host.fuel_role(spur_sym(other)), None);
+        assert_eq!(host.fuel_role(OP_AND), None, "reserved op is not a fuel ctor");
+
+        // E3 — a reserved op is its own (content-stable) key; a real func hashes
+        // by name: deterministic, and distinct names get distinct keys.
+        assert_eq!(host.content_key(OP_AND), Some(OP_AND));
+        let ks = host.content_key(spur_sym(succ));
+        let ko = host.content_key(spur_sym(other));
+        assert!(ks.is_some() && ko.is_some());
+        assert_ne!(ks, ko, "distinct function names get distinct content keys");
     }
 }

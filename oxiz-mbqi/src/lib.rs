@@ -24,4 +24,4 @@ pub use engine::{Config, Engine, Verdict};
 pub use ledger::{CongruenceSink, GroundLedger, LedgerMark};
 pub use instantiate::Quant;
 pub use model::{ModelEval, NoModel};
-pub use term::{Binding, Sig, TermLang, TermView};
+pub use term::{Binding, FuelRole, Sig, TermLang, TermView};
