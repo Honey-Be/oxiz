@@ -155,6 +155,38 @@ fn scheduled_round_matches_fire_all_verdict_and_count() {
     assert!(fire_n >= 2, "P(a) and P(b) both instantiated");
 }
 
+/// P3a (design `FUEL_AWARE_COST_SCHEDULER.md` §8, task #413): the scheduled
+/// round fixpoint must honour the wall-clock non-termination guard. The host's
+/// between-round check cannot interrupt a single `round_cost_scheduled` call, so
+/// the deadline is threaded into the engine and polled inside the fixpoint /
+/// discovery loop. On expiry the round bails as a budget event ⇒ the §8 gate
+/// forbids `Saturated` (a sound candidate may still be queued) ⇒ `Unknown` —
+/// never a guessed Sat. Here an already-expired deadline makes the very first
+/// fixpoint pass bail: zero lemmas, sound `Unknown`, and no hang.
+#[test]
+fn scheduled_round_bails_to_unknown_on_deadline() {
+    const P: u32 = 22;
+    const IINT: u32 = 2;
+    let mut t = Toy::new();
+    let a = t.konst(P + 210, IINT);
+    let pa = t.app(P, &[a], BOOL);
+    let x = t.var(304, IINT);
+    let body = t.app(P, &[x], BOOL);
+    let q = t.forall(&[(304, IINT)], &[], body, BOOL); // trigger-less
+    let mut cfg = Config::default();
+    cfg.cost_schedule = true;
+    let mut e = Engine::new(cfg);
+    // Deadline captured NOW is already in the past by the time the fixpoint's
+    // monotonic-clock check runs (`Instant::now() >= d`), so the guard fires on
+    // the first pass — the mechanism, not a real timeout, is what we assert.
+    e.set_deadline(Some(std::time::Instant::now()));
+    e.assert(&t, pa);
+    e.assert(&t, q);
+    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: false });
+    assert_eq!(verdict, "Unknown", "expired deadline ⇒ sound Unknown, never Saturated");
+    assert_eq!(lemmas, 0, "guard fires before any candidate is drained");
+}
+
 /// A toy model that reports a fixed set of terms false (others unknown) —
 /// the CDQI driver (mirrors `ematch_cdqi.rs`).
 struct FalseSet(rustc_hash::FxHashSet<Tid>);

@@ -124,6 +124,16 @@ pub struct Engine<S: Sig> {
     /// Count of NEW candidates the scheduler accepted (dedup-passing inserts) —
     /// used to detect a stalled fixpoint pass.
     sched_inserts: usize,
+    /// Wall-clock non-termination guard for the **scheduled** round fixpoint
+    /// (design P3a). The host's between-round deadline check cannot interrupt a
+    /// single `round_cost_scheduled` call whose intra-round discover⇄drain
+    /// fixpoint is cascading on a diverging (fuel-ascending) quantifier — so the
+    /// deadline is threaded IN here and checked inside the fixpoint / discovery
+    /// loop. On expiry the fixpoint bails with `budget_hit` set ⇒ the §8 gate
+    /// routes to `BudgetExhausted` → `Unknown` (never a guessed Sat). `None`
+    /// (default) = no guard; only the scheduled path consults it, so the fire-all
+    /// path stays byte-identical.
+    deadline: Option<std::time::Instant>,
 }
 
 impl<S: Sig> Engine<S> {
@@ -139,11 +149,29 @@ impl<S: Sig> Engine<S> {
             scheduler: None,
             scheduling: false,
             sched_inserts: 0,
+            deadline: None,
         }
     }
 
     pub fn rejected(&self) -> usize {
         self.rejected
+    }
+
+    /// Install the scheduled round's wall-clock non-termination guard (design
+    /// P3a). The host passes its MBQI deadline so a single `round_cost_scheduled`
+    /// call's intra-round fixpoint cannot outrun the between-round check on a
+    /// diverging quantifier. Only the scheduled path reads it, so this is a no-op
+    /// for the fire-all path (flag-off stays byte-identical). `None` clears it.
+    pub fn set_deadline(&mut self, d: Option<std::time::Instant>) {
+        self.deadline = d;
+    }
+
+    /// True once the installed deadline has passed. Cheap (`Instant::now`) but
+    /// still only polled at fixpoint/discovery boundaries, not per candidate.
+    #[inline]
+    fn deadline_hit(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     /// Register an asserted top-level term: index its ground subterms and
@@ -755,6 +783,15 @@ impl<S: Sig> Engine<S> {
         // large prelude (a 20 s+ hang), never seeing the early conflict.
         let call_start = self.emitted;
         loop {
+            // P3a guard: the between-round host deadline cannot interrupt THIS
+            // call, so the fixpoint polls it itself. A hit is a budget event
+            // (DEFER-not-DROP): the queue stays non-empty ⇒ §8 → BudgetExhausted
+            // → Unknown. Checked at the loop head so a long discovery pass that
+            // already overran is caught before another one starts.
+            if self.deadline_hit() {
+                budget_hit = true;
+                break;
+            }
             let before = self.sched_inserts;
             let bh = self.discover_collect(lang, model, cong, &mut lemmas);
             budget_hit |= bh;
@@ -826,6 +863,13 @@ impl<S: Sig> Engine<S> {
         let pass_start = self.sched_inserts;
         for qi in 0..n {
             if self.emitted >= self.cfg.max_instances {
+                budget_hit = true;
+                break;
+            }
+            // P3a guard: e-matching one quantifier against a large frontier is
+            // itself unbounded — poll the deadline every quantifier so a single
+            // discovery pass cannot outrun the guard. Bail as a budget event.
+            if self.deadline_hit() {
                 budget_hit = true;
                 break;
             }

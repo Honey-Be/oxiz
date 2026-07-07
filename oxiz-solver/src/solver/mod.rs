@@ -875,6 +875,14 @@ impl Solver {
                                     .unwrap_or(1),
                                 ..CleanConfig::default()
                             });
+                            // P3a: hand the MBQI wall-clock guard to the engine so
+                            // the SCHEDULED round's intra-round fixpoint bails to
+                            // `Unknown` on expiry (the between-round check below
+                            // cannot interrupt a single `round_cost_scheduled`
+                            // call). No-op for the fire-all path (it never reads
+                            // the deadline), so flag-off stays byte-identical.
+                            #[cfg(feature = "std")]
+                            eng.set_deadline(mbqi_deadline);
                             {
                                 let host = OxizHost::new(manager);
                                 for &a in &self.assertions {
