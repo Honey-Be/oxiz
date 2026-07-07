@@ -152,13 +152,50 @@ impl<S: Sig> CostScheduler<S> {
         self.pop_age()
     }
 
-    /// Drain up to `budget` candidates in AWR order.
+    /// Drain up to `budget` candidates. In single-tier mode (`age_ratio == 0`,
+    /// the default) this uses the efficient cheapest-tier path: scan up the
+    /// buckets to the cheapest non-empty one, sort its live entries by `sort_key`
+    /// ONCE, and take them in order — O(tier·log tier) per drained tier, not the
+    /// O(n) linear-min scan `next` does per candidate. With an age pulse it falls
+    /// back to the per-candidate AWR interleave.
     pub fn drain(&mut self, budget: usize) -> Vec<(u32, Vec<S::Term>)> {
+        if self.age_ratio == 0 {
+            return self.drain_weight(budget);
+        }
         let mut out = Vec::new();
         while out.len() < budget {
             match self.next() {
                 Some(c) => out.push(c),
                 None => break,
+            }
+        }
+        out
+    }
+
+    fn drain_weight(&mut self, budget: usize) -> Vec<(u32, Vec<S::Term>)> {
+        let mut out = Vec::new();
+        'outer: for c in 0..self.buckets.len() {
+            let mut live: Vec<u32> = self.buckets[c]
+                .iter()
+                .copied()
+                .filter(|&ix| {
+                    let cd = &self.arena[ix as usize];
+                    !cd.fired && !cd.superseded
+                })
+                .collect();
+            if live.is_empty() {
+                continue;
+            }
+            live.sort_unstable_by(|&a, &b| {
+                self.arena[a as usize]
+                    .sort_key
+                    .cmp(&self.arena[b as usize].sort_key)
+            });
+            for ix in live {
+                if out.len() >= budget {
+                    break 'outer;
+                }
+                out.push(self.take(ix));
             }
         }
         out

@@ -71,6 +71,21 @@ pub struct Config {
     /// the path is byte-identical. Set by the live solver from
     /// `SolverConfig::ccfv_model_compl`.
     pub ccfv_model_compl: bool,
+    /// **The fuel-aware cost scheduler (design `FUEL_AWARE_COST_SCHEDULER.md`).**
+    /// When `false` (default) the round loop fires every discovered instance
+    /// immediately, exactly as before — byte-identical. When `true`, discovered
+    /// candidates are SCORED and routed through a [`CostScheduler`], drained
+    /// cheapest-first within an intra-round discover⇄drain fixpoint (§5.3). The
+    /// scheduler only reorders/defers sound instances; the `instantiate`/`emit`
+    /// firewall and the never-conclude-unsat verdict are unchanged. Off until the
+    /// corpus A/B gate (P2) validates 0 regressions.
+    pub cost_schedule: bool,
+    /// Cost-function parameters (default = Z3 parity: `cost = weight + generation`).
+    pub cost_params: crate::cost::CostParams,
+    /// AWR age:weight pulse ratio for the scheduler. `awr_age_ratio = 0` (default)
+    /// is single-min-tier mode; a positive age share is the fairness pulse (P3).
+    pub awr_age_ratio: u32,
+    pub awr_weight_ratio: u32,
 }
 
 impl Default for Config {
@@ -80,6 +95,10 @@ impl Default for Config {
             max_tuples_per_quant: 4_096,
             ccfv_ematch: false,
             ccfv_model_compl: false,
+            cost_schedule: false,
+            cost_params: crate::cost::CostParams::default(),
+            awr_age_ratio: 0,
+            awr_weight_ratio: 1,
         }
     }
 }
@@ -94,6 +113,17 @@ pub struct Engine<S: Sig> {
     emitted: usize,
     rejected: usize,
     cfg: Config,
+    /// The cost-scheduler priority queue (built lazily on the first scheduled
+    /// round; `None` when `cfg.cost_schedule` is off). Monotone — accumulates
+    /// within a solve, never rolled back.
+    scheduler: Option<crate::cost_scheduler::CostScheduler<S>>,
+    /// Set only during a scheduled discovery pass: routes [`emit`](Self::emit) to
+    /// [`collect_candidate`](Self::collect_candidate) instead of firing. Off in
+    /// the fire-all (flag-off) path, so that path is byte-identical.
+    scheduling: bool,
+    /// Count of NEW candidates the scheduler accepted (dedup-passing inserts) —
+    /// used to detect a stalled fixpoint pass.
+    sched_inserts: usize,
 }
 
 impl<S: Sig> Engine<S> {
@@ -106,6 +136,9 @@ impl<S: Sig> Engine<S> {
             emitted: 0,
             rejected: 0,
             cfg,
+            scheduler: None,
+            scheduling: false,
+            sched_inserts: 0,
         }
     }
 
@@ -218,6 +251,12 @@ impl<S: Sig> Engine<S> {
         M: ModelEval<L>,
         C: Congruence<S>,
     {
+        // Cost-schedule dispatch (design §7). Default OFF ⇒ the fire-all body
+        // below runs unchanged (byte-identical). The scheduled path is a separate
+        // method so this one is provably untouched when the flag is clear.
+        if self.cfg.cost_schedule {
+            return self.round_cost_scheduled(lang, model, cong);
+        }
         let mut lemmas = Vec::new();
         let round_start = self.ground.frontier();
         let n = self.quants.len();
@@ -414,22 +453,31 @@ impl<S: Sig> Engine<S> {
         if budget_hit {
             return Verdict::BudgetExhausted;
         }
-        // Saturated. A triggered quantifier is satisfied by trigger semantics
-        // once e-matching adds nothing; a trigger-free, ACTIVE one must be
-        // model-verified (inactive ones are vacuously satisfied). The host's
-        // synthetic witnesses never cross into the engine → nothing fabricated.
-        //
-        // NOTE: a bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`) is NOT
-        // auto-satisfied just because all its instances were emitted. The earlier
-        // "finite exhaustion ⇒ sat" shortcut trusted that `Saturated` implied the
-        // ground solve had a CONSISTENT model of those instances — but the
-        // incremental CDCL(T) can MISS a conflict that is GLOBAL across the
-        // instances (e.g. pigeonhole: `n+1` holes pairwise-distinct in `[1,n]` is
-        // unsat, yet the incremental model stays `sat`), so the shortcut reported
-        // a spurious `sat`. The bounded enumeration above still defuses the
-        // `f`-tower (no hang); the VERDICT now defers to `eval_forall`, which is
-        // sound (a bounded quantifier it cannot verify yields the sound
-        // `Unknown`, never a guessed `Sat`).
+        self.saturation_verdict(lang, model, cong)
+    }
+
+    /// The per-quantifier saturation verdict (shared by the fire-all and the
+    /// cost-scheduled rounds). Reached only when a round emitted no lemma and did
+    /// not hit the budget; returns `Saturated` (host may report `Sat`) unless some
+    /// active quantifier is unverified → `Inconclusive` (host reports `Unknown`).
+    ///
+    /// A triggered quantifier is satisfied by trigger semantics once e-matching
+    /// adds nothing; a trigger-free, ACTIVE one must be model-verified (inactive
+    /// ones are vacuously satisfied). The host's synthetic witnesses never cross
+    /// into the engine → nothing fabricated.
+    ///
+    /// NOTE: a bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`) is NOT
+    /// auto-satisfied just because all its instances were emitted — the earlier
+    /// "finite exhaustion ⇒ sat" shortcut was the #277 spurious-sat (the
+    /// incremental CDCL(T) can miss a GLOBAL conflict, e.g. pigeonhole); the
+    /// verdict now defers to `eval_forall` (a bounded quantifier it cannot verify
+    /// yields the sound `Unknown`, never a guessed `Sat`).
+    fn saturation_verdict<L, M, C>(&mut self, lang: &mut L, model: &M, cong: &C) -> Verdict<S::Term>
+    where
+        L: TermLang<Sig = S>,
+        M: ModelEval<L>,
+        C: Congruence<S>,
+    {
         for qi in 0..self.quants.len() {
             let q = &self.quants[qi];
             // An INFERRED trigger drives e-matching but is not a user
@@ -440,14 +488,8 @@ impl<S: Sig> Engine<S> {
                 continue;
             }
             // A BOUNDED-FINITE quantifier emitted ALL its instances over the
-            // guard's box, so it is FULLY captured: a `∀`'s box conjunction
-            // (`⋀_{t̄∈D} φ[t̄]`) or a `∃`'s box disjunction (`⋁_{t̄∈D} φ[t̄]`,
-            // emitted as one lemma). Both defer the verdict to the ground solver
-            // via `Saturated` — and for the `∀` direction the SOLVER confirms
-            // that `Saturated` with a single-shot re-solve (the incremental
-            // `Saturated`→`Sat` alone was the #277 spurious-sat; the re-solve is
-            // sound now that it carries the logic). The `∃` disjunction is the
-            // easy satisfiability direction and needs no re-solve.
+            // guard's box, so it is FULLY captured; the `∀`-direction re-solve is
+            // sound (the incremental `Saturated`→`Sat` alone was #277).
             if self.bounded_finite(qi) {
                 continue;
             }
@@ -461,14 +503,9 @@ impl<S: Sig> Engine<S> {
                 Some(true) => {}
                 Some(false) => return Verdict::Inconclusive,
                 None => {
-                    // P4 model-completion backstop: the structural recognizers
-                    // could not verify this saturated universal — give CCFV `¬ψ`
-                    // over the total view `E_TOT` the final word. No conflict ⇒
-                    // the completed model satisfies it (`Some(true)`) → this
-                    // quantifier is satisfied. Any conflict / undecidable
-                    // lowering / unmet gate ⇒ `None` here too → the sound
-                    // `Unknown`. Gated (default off): with the flip disabled this
-                    // is exactly the old `None ⇒ Inconclusive`.
+                    // P4 model-completion backstop (gated, default off): CCFV `¬ψ`
+                    // over the total view `E_TOT` gets the final word — no conflict
+                    // ⇒ satisfied; any conflict / undecidable ⇒ sound `Unknown`.
                     if self.cfg.ccfv_model_compl
                         && model.model_completion(lang, cong, q.term) == Some(true)
                     {
@@ -644,6 +681,14 @@ impl<S: Sig> Engine<S> {
         binding: &[(S::VarName, S::Term)],
         out: &mut Vec<S::Term>,
     ) {
+        // Cost-schedule routing (design §7): during a scheduled discovery pass,
+        // a discovered candidate is SCORED and queued rather than fired now; the
+        // fixpoint drains it (through `emit_bound`) in cost order. The fire-all
+        // path never sets `scheduling`, so it is unaffected (byte-identical).
+        if self.scheduling {
+            self.collect_candidate(lang, qi, binding);
+            return;
+        }
         let tuple: Vec<S::Term> = binding.iter().map(|(_, t)| *t).collect();
         if !self.seen.insert((qi, tuple)) {
             return; // already emitted
@@ -670,6 +715,269 @@ impl<S: Sig> Engine<S> {
                 if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
                     eprintln!("[mbqi-dbg] quant {qi}: instance REJECTED");
                 }
+                self.rejected += 1;
+            }
+        }
+    }
+
+    // ===== Cost-scheduled path (design `FUEL_AWARE_COST_SCHEDULER.md` §5.3, §8) =====
+    // Reached only when `cfg.cost_schedule` is set; the fire-all path above is
+    // untouched, so it stays byte-identical when the flag is clear.
+
+    /// The cost-scheduled round: an intra-round **discover⇄drain fixpoint** (§5.3).
+    /// Each pass discovers candidates (routing them into the scheduler), then
+    /// drains a cheapest-first batch and fires it — the mints land in the ground
+    /// index immediately, so the next pass re-discovers on the grown frontier and
+    /// the within-round cascade the deep-closers need is reconstructed. The §8
+    /// gate: a sound candidate still queued ⇒ `BudgetExhausted` (→ `Unknown`),
+    /// never `Saturated`.
+    fn round_cost_scheduled<L, M, C>(&mut self, lang: &mut L, model: &M, cong: &C) -> Verdict<S::Term>
+    where
+        L: TermLang<Sig = S>,
+        M: ModelEval<L>,
+        C: Congruence<S>,
+    {
+        if self.scheduler.is_none() {
+            self.scheduler = Some(crate::cost_scheduler::CostScheduler::new(
+                self.cfg.awr_age_ratio,
+                self.cfg.awr_weight_ratio,
+            ));
+        }
+        let mut lemmas = Vec::new();
+        let mut budget_hit = false;
+        // Per-CALL emit budget: the intra-round fixpoint cascades a few
+        // generations (so a deep-closer reaches its fuel depth within the round),
+        // then RETURNS to the host so it can re-solve — which lets an `unsat`
+        // close early (the fire-all path gets this for free by emitting one pass
+        // per round) and lets the between-round MBQI wall-clock guard bound total
+        // time. Without this cap the fixpoint drains the whole cascade before the
+        // host ever re-solves → it over-instantiates to `max_instances` on a
+        // large prelude (a 20 s+ hang), never seeing the early conflict.
+        let call_start = self.emitted;
+        loop {
+            let before = self.sched_inserts;
+            let bh = self.discover_collect(lang, model, cong, &mut lemmas);
+            budget_hit |= bh;
+            let inserted = self.sched_inserts > before;
+            // Drain a cheapest-first batch; fire each → mints grow the frontier.
+            let batch = self
+                .scheduler
+                .as_mut()
+                .unwrap()
+                .drain(self.cfg.max_tuples_per_quant);
+            let drained = !batch.is_empty();
+            for (qi, sigma) in batch {
+                if self.emitted >= self.cfg.max_instances {
+                    budget_hit = true;
+                    break;
+                }
+                self.emit_bound(lang, qi as usize, &sigma, &mut lemmas);
+            }
+            if self.emitted >= self.cfg.max_instances {
+                budget_hit = true;
+            }
+            // Fixpoint end: budget hit, per-call cap reached (yield to the host),
+            // or nothing new discovered AND nothing left to drain.
+            if budget_hit
+                || self.emitted - call_start >= self.cfg.max_tuples_per_quant
+                || (!inserted && !drained)
+            {
+                break;
+            }
+        }
+        if !lemmas.is_empty() {
+            return Verdict::NewLemmas(lemmas);
+        }
+        // §8 — DEFER never DROP: a sound candidate still queued (budget-deferred
+        // this check) forbids `Saturated` (which would license the host to report
+        // `Sat` while a refuter is withheld). Route to `Unknown`.
+        let queued = self.scheduler.as_ref().is_some_and(|s| !s.is_empty());
+        if budget_hit || queued {
+            return Verdict::BudgetExhausted;
+        }
+        self.saturation_verdict(lang, model, cong)
+    }
+
+    /// One scheduled DISCOVERY pass: the same per-quantifier strategy sequence as
+    /// the fire-all loop, but with `self.scheduling` set so every `emit` routes to
+    /// [`collect_candidate`](Self::collect_candidate) (universal candidates are
+    /// queued + scored, not fired). Existentials fire directly into `lemmas` (they
+    /// bypass the scheduler, like CDQI conflicts). Returns whether the budget hit.
+    fn discover_collect<L, M, C>(
+        &mut self,
+        lang: &mut L,
+        model: &M,
+        cong: &C,
+        lemmas: &mut Vec<S::Term>,
+    ) -> bool
+    where
+        L: TermLang<Sig = S>,
+        M: ModelEval<L>,
+        C: Congruence<S>,
+    {
+        let round_start = self.ground.frontier();
+        let n = self.quants.len();
+        let mut budget_hit = false;
+        // Bound how many candidates ONE discovery pass queues before yielding to a
+        // drain: without this a single enumeration flood (up to `max_tuples` PER
+        // quantifier × hundreds of quantifiers) balloons the scheduler, and the
+        // whole point of the fixpoint is to interleave discover with drain. Bounded
+        // via the O(1) insert counter (not an O(n) live scan).
+        let pass_start = self.sched_inserts;
+        for qi in 0..n {
+            if self.emitted >= self.cfg.max_instances {
+                budget_hit = true;
+                break;
+            }
+            if self.sched_inserts - pass_start >= self.cfg.max_tuples_per_quant {
+                break; // pass collection cap → go drain, then re-discover
+            }
+            if !model.is_active(lang, self.quants[qi].term) {
+                continue;
+            }
+            // Existentials fire directly (scheduling off around this call so the
+            // disjunction is emitted, not queued).
+            if !self.quants[qi].universal {
+                self.emit_existential_disjunction(lang, qi, lemmas);
+                continue;
+            }
+            // Lazy trigger inference (identical to the fire path).
+            if self.quants[qi].triggers.is_empty() && !self.quants[qi].inference_tried {
+                self.quants[qi].inference_tried = true;
+                if self.quants[qi].var_domains.is_none() {
+                    let vd = lang.bounded_var_domains(self.quants[qi].term);
+                    self.quants[qi].var_domains = Some(vd);
+                }
+                let fully_bounded = self.quants[qi]
+                    .var_domains
+                    .as_ref()
+                    .is_some_and(|vd| !vd.is_empty() && vd.iter().all(|d| d.is_some()));
+                if !fully_bounded {
+                    let trg = infer_triggers(lang, &self.quants[qi].vars, self.quants[qi].body);
+                    if !trg.is_empty() {
+                        self.quants[qi].triggers = trg;
+                        self.quants[qi].inferred = true;
+                    }
+                }
+            }
+            // 1. CDQI — fire conflicts IMMEDIATELY (bypass the scheduler, §5.1):
+            //    a conflicting instance is the strongest lemma and drives the
+            //    ground core to `unsat`; queuing it by cost would delay the
+            //    refutation behind cheaper non-conflict instances and the host
+            //    would never re-solve to the conflict. `scheduling` stays off, so
+            //    `emit` fires into `lemmas` (and reserves `seen`, so the cost path
+            //    won't re-queue it). Short-circuits e-match/enumerate this round,
+            //    exactly like the fire-all path.
+            let conflicts = cdqi::find_conflicts(
+                lang,
+                &self.ground,
+                model,
+                cong,
+                &self.quants[qi],
+                self.cfg.max_tuples_per_quant,
+            );
+            if !conflicts.is_empty() {
+                for b in &conflicts {
+                    self.emit(lang, qi, b, lemmas);
+                }
+                continue;
+            }
+            // 2. E-matching — collect (queue + score) into the scheduler.
+            if !self.quants[qi].triggers.is_empty() {
+                let bindings = self.ematch_all(lang, qi, cong);
+                self.scanned[qi] = round_start;
+                self.scheduling = true;
+                for b in &bindings {
+                    self.emit(lang, qi, b, lemmas);
+                }
+                self.scheduling = false;
+                continue;
+            }
+            // 2.5/2.6 Model-completion short-circuits (identical to the fire path).
+            if model.eval_forall(lang, cong, self.quants[qi].term) == Some(true) {
+                continue;
+            }
+            if self.cfg.ccfv_model_compl
+                && model.model_completion(lang, cong, self.quants[qi].term) == Some(true)
+            {
+                continue;
+            }
+            // 3. Enumeration — collect into the scheduler.
+            self.scheduling = true;
+            self.enumerate(lang, qi, lemmas);
+            self.scheduling = false;
+        }
+        self.scheduling = false;
+        budget_hit
+    }
+
+    /// Score a discovered universal candidate and queue it (design §3/§5.2). No
+    /// instantiation here — the drain does that in cost order via `emit_bound`.
+    fn collect_candidate<L: TermLang<Sig = S>>(
+        &mut self,
+        lang: &L,
+        qi: usize,
+        binding: &[(S::VarName, S::Term)],
+    ) {
+        let tuple: Vec<S::Term> = binding.iter().map(|(_, t)| *t).collect();
+        // Unified dedup on the engine's `seen` (design fix #6): a candidate that a
+        // fire-first CDQI conflict / existential already emitted is NOT re-queued,
+        // and once queued it is not re-collected — so a drained candidate is never
+        // double-emitted (`emit_bound` does not re-check `seen`; this reservation is
+        // its dedup).
+        if !self.seen.insert((qi, tuple.clone())) {
+            return;
+        }
+        // generation = 1 + max binding generation (E1) — the candidate's depth.
+        let generation = 1 + tuple.iter().map(|t| self.ground.gen_of(*t)).max().unwrap_or(0);
+        // P2: Z3-parity cost = weight + generation (default CostParams zero the
+        // fuel gradient + class penalty; those are wired at P3). weight is 0 until
+        // the host supplies a per-quantifier `:weight`.
+        let cost = crate::cost::cost_of(
+            &self.cfg.cost_params,
+            0,
+            generation,
+            0,
+            crate::cost::GenClass::Unknown,
+        );
+        // Content sort-key (§5.2): the quantifier's content then each tuple term's;
+        // `(q, σ)` is unique so this totally orders within a cost tier.
+        let qterm = self.quants[qi].term;
+        let mut key: Vec<u64> = Vec::with_capacity(tuple.len() + 1);
+        key.push(crate::cost::term_content_key(lang, qterm));
+        for t in &tuple {
+            key.push(crate::cost::term_content_key(lang, *t));
+        }
+        let sched = self.scheduler.as_mut().unwrap();
+        if sched.insert(qi as u32, tuple, cost, key.into_boxed_slice()) {
+            self.sched_inserts += 1;
+        }
+    }
+
+    /// Fire a drained candidate `(qi, σ)`: reconstruct the binding from the
+    /// quantifier's variable names and run the same `instantiate`/`emit` firewall
+    /// + generation-tagged indexing. The scheduler already deduped, so no `seen`.
+    fn emit_bound<L: TermLang<Sig = S>>(
+        &mut self,
+        lang: &mut L,
+        qi: usize,
+        sigma: &[S::Term],
+        out: &mut Vec<S::Term>,
+    ) {
+        let binding: Vec<(S::VarName, S::Term)> = self.quants[qi]
+            .vars
+            .iter()
+            .map(|(n, _)| *n)
+            .zip(sigma.iter().copied())
+            .collect();
+        match instantiate(lang, &self.ground, &self.quants[qi], &binding) {
+            InstResult::Lemma(l) => {
+                let g = 1 + sigma.iter().map(|t| self.ground.gen_of(*t)).max().unwrap_or(0);
+                self.ground.add_term_gen(lang, l, g);
+                out.push(l);
+                self.emitted += 1;
+            }
+            InstResult::Rejected => {
                 self.rejected += 1;
             }
         }

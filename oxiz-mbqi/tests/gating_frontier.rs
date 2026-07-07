@@ -120,6 +120,41 @@ fn guarded_quantifier_when_active_but_unverified_enumerates_real_ground() {
     assert_eq!(e.rejected(), 0);
 }
 
+/// P2 (design `FUEL_AWARE_COST_SCHEDULER.md` §5.3): the cost-scheduled round
+/// (flag ON) must emit the SAME instance set and reach the SAME verdict as the
+/// fire-all path (it only reorders/defers sound instances). Single-tier
+/// Z3-parity cost by default, so this checks the discover⇄drain fixpoint's
+/// completeness. `∀x. P(x)` with ground `P(a), P(b)`, model unverified ⇒ both
+/// paths enumerate `P(a), P(b)` then report the sound `Unknown`.
+#[test]
+fn scheduled_round_matches_fire_all_verdict_and_count() {
+    const P: u32 = 22;
+    const IINT: u32 = 2;
+    fn once(cost_schedule: bool) -> (&'static str, usize) {
+        let mut t = Toy::new();
+        let a = t.konst(P + 200, IINT);
+        let b = t.konst(P + 201, IINT);
+        let pa = t.app(P, &[a], BOOL);
+        let pb = t.app(P, &[b], BOOL);
+        let x = t.var(303, IINT);
+        let body = t.app(P, &[x], BOOL);
+        let q = t.forall(&[(303, IINT)], &[], body, BOOL); // trigger-less
+        let mut cfg = Config::default();
+        cfg.cost_schedule = cost_schedule;
+        let mut e = Engine::new(cfg);
+        e.assert(&t, pa);
+        e.assert(&t, pb);
+        e.assert(&t, q);
+        run(&mut e, &mut t, &Gated { active: true, verifies: false })
+    }
+    let (fire_v, fire_n) = once(false);
+    let (sched_v, sched_n) = once(true);
+    assert_eq!(fire_v, sched_v, "cost-scheduled path reaches the same verdict");
+    assert_eq!(fire_n, sched_n, "cost-scheduled path emits the same instance count");
+    assert_eq!(fire_v, "Unknown", "unverified trigger-free ∀ ⇒ sound Unknown");
+    assert!(fire_n >= 2, "P(a) and P(b) both instantiated");
+}
+
 /// A toy model that reports a fixed set of terms false (others unknown) —
 /// the CDQI driver (mirrors `ematch_cdqi.rs`).
 struct FalseSet(rustc_hash::FxHashSet<Tid>);

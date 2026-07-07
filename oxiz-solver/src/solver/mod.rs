@@ -860,6 +860,19 @@ impl Solver {
                                 ccfv_ematch: self.config.ccfv_ematch,
                                 // CCFV (P4): opt-in model-completion verdict-flip.
                                 ccfv_model_compl: self.config.ccfv_model_compl,
+                                // Fuel-aware cost scheduler (P2): env-gated for the
+                                // corpus A/B until it is validated 0-regression. Off
+                                // (default) ⇒ the fire-all round is byte-identical.
+                                cost_schedule: std::env::var_os("OXIZ_COST_SCHEDULE")
+                                    .is_some(),
+                                awr_age_ratio: std::env::var("OXIZ_AWR_AGE_RATIO")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0),
+                                awr_weight_ratio: std::env::var("OXIZ_AWR_WEIGHT_RATIO")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(1),
                                 ..CleanConfig::default()
                             });
                             {
