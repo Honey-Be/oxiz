@@ -45,6 +45,20 @@ pub struct Quant<S: Sig> {
     /// `None` = not yet computed; once `Some`, each entry is `Some(literals)`
     /// (restrict to that finite set) or `None` (enumerate over the ground index).
     pub var_domains: Option<Vec<Option<Vec<S::Term>>>>,
+    /// **Static generativity class (design §4 / P3c), memoized.** `None` until the
+    /// cost-scheduler first prices a candidate of this quantifier (its triggers are
+    /// fixed by then), when [`crate::cost::classify_static`] runs on its fuel
+    /// structure. Only the scheduled path reads it, so the fire-all path leaves it
+    /// `None` (byte-identical). `Some(Decreasing)` grants the fuel discount;
+    /// otherwise the live `g_out` proxy escalates.
+    pub gen_class: Option<crate::cost::GenClass>,
+    /// **`g_out` proxy (design §4).** Set once this quantifier has fired ≥ 1
+    /// instance. Since `generation(minted) − generation(matched) = 1` for every
+    /// active quantifier, `g_out` is exactly this "has fired" bit; combined with
+    /// [`crate::cost::reconcile`] it escalates a non-`Decreasing` quantifier to
+    /// `Ascending` AFTER its first (base-cost) instance — a fair first shot, then
+    /// throttle. Scheduled-path-only.
+    pub emitted_any: bool,
 }
 
 /// Outcome of attempting one instantiation.

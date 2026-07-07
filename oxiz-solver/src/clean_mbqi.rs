@@ -4951,4 +4951,69 @@ mod ccfv_congruence_tests {
         assert_eq!(oxiz_mbqi::fuel_arg_depth(&host, gapp), None, "no ground fuel argument");
         assert_eq!(oxiz_mbqi::fuel_succ_depth(&host, fapp), None, "f(...) is not itself a fuel ctor");
     }
+
+    #[test]
+    fn classify_static_detects_fuel_peel_on_real_host() {
+        use super::OxizHost;
+        use oxiz_core::ast::{TermKind, TermManager};
+        use oxiz_core::SortId;
+        use oxiz_mbqi::{classify_static, GenClass};
+        // P3c (design §4): the static generativity classifier must separate a
+        // terminating `succ`-peel (Decreasing — run uncapped/discounted) from a
+        // fuel-growing or non-fuel axiom (Unknown — left for the live signal). The
+        // load-bearing subtlety: the quantifier BODY is the whole equation, so the
+        // trigger's `succ(F)` appears in it on the LHS — the classifier must not let
+        // that echo counterfeit growth, and must not let the non-fuel bound arg `a`
+        // (bare, depth 0) counterfeit a peel. Only the real host resolves succ/zero.
+        let mut tm = TermManager::new();
+        let succ = tm.intern_str("succ");
+        let f = tm.intern_str("f");
+        let g = tm.intern_str("g");
+        let fvar = tm.intern_str("F"); // fuel bound var
+        let avar = tm.intern_str("a"); // non-fuel bound arg
+        let s = SortId::new(0);
+        let mkapp = |tm: &mut TermManager, func, args: Vec<_>| {
+            tm.intern_term(TermKind::Apply { func, args: args.into() }, s)
+        };
+        let mkvar = |tm: &mut TermManager, name| tm.intern_term(TermKind::Var(name), s);
+        let mkeq = |tm: &mut TermManager, a, b| tm.intern_term(TermKind::Eq(a, b), s);
+
+        let var_f = mkvar(&mut tm, fvar);
+        let var_a = mkvar(&mut tm, avar);
+        let succ_f = mkapp(&mut tm, succ, vec![var_f]); // succ(F)
+        let succ_succ_f = mkapp(&mut tm, succ, vec![succ_f]); // succ(succ(F))
+
+        // DECREASING: `f(succ(F), a) = f(F, a)` triggered on the LHS — the RHS peels
+        // F to strictly smaller fuel (and `a` never counts as a peel).
+        let trig_dec = mkapp(&mut tm, f, vec![succ_f, var_a]);
+        let rhs_dec = mkapp(&mut tm, f, vec![var_f, var_a]);
+        let body_dec = mkeq(&mut tm, trig_dec, rhs_dec);
+
+        // GROWING: `f(succ(F)) = g(succ(succ(F)))` — the RHS re-wraps F deeper.
+        let trig_asc = mkapp(&mut tm, f, vec![succ_f]);
+        let rhs_asc = mkapp(&mut tm, g, vec![succ_succ_f]);
+        let body_asc = mkeq(&mut tm, trig_asc, rhs_asc);
+
+        // NON-FUEL: `f(F) = a` — no bound fuel var ever appears under a succ.
+        let trig_flat = mkapp(&mut tm, f, vec![var_f]);
+        let body_flat = mkeq(&mut tm, trig_flat, var_a);
+
+        let vars = [fvar, avar];
+        let host = OxizHost::new(&mut tm);
+        assert_eq!(
+            classify_static(&host, &vars, &[vec![trig_dec]], body_dec),
+            GenClass::Decreasing,
+            "f(succ F,a)=f(F,a) is a terminating succ-peel"
+        );
+        assert_eq!(
+            classify_static(&host, &vars, &[vec![trig_asc]], body_asc),
+            GenClass::Unknown,
+            "growing fuel is not statically Decreasing (live signal governs)"
+        );
+        assert_eq!(
+            classify_static(&host, &vars, &[vec![trig_flat]], body_flat),
+            GenClass::Unknown,
+            "no bound fuel var under succ ⇒ Unknown"
+        );
+    }
 }

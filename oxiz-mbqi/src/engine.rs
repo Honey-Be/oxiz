@@ -230,6 +230,8 @@ impl<S: Sig> Engine<S> {
                     body,
                     universal: forall,
                     var_domains: None, // computed lazily on first enumeration
+                    gen_class: None,   // computed lazily on first scheduled pricing
+                    emitted_any: false,
                 });
                 self.scanned.push(0); // new quantifier: scan the whole index once
             }
@@ -738,6 +740,7 @@ impl<S: Sig> Engine<S> {
                 self.ground.add_term_gen(lang, l, g); // chained triggers next round
                 out.push(l);
                 self.emitted += 1;
+                self.quants[qi].emitted_any = true; // g_out proxy (scheduled-path read)
             }
             InstResult::Rejected => {
                 if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
@@ -974,16 +977,39 @@ impl<S: Sig> Engine<S> {
         }
         // generation = 1 + max binding generation (E1) — the candidate's depth.
         let generation = 1 + tuple.iter().map(|t| self.ground.gen_of(*t)).max().unwrap_or(0);
-        // P2: Z3-parity cost = weight + generation (default CostParams zero the
-        // fuel gradient + class penalty; those are wired at P3). weight is 0 until
-        // the host supplies a per-quantifier `:weight`.
-        let cost = crate::cost::cost_of(
-            &self.cfg.cost_params,
-            0,
-            generation,
-            0,
-            crate::cost::GenClass::Unknown,
-        );
+        // P3c: memoize the STATIC generativity class on first pricing (triggers are
+        // fixed by now — inference already ran this round). A `Decreasing` fuel-peel
+        // is authoritative; anything else is `Unknown`, left for the live signal.
+        if self.quants[qi].gen_class.is_none() {
+            let varnames: Vec<S::VarName> =
+                self.quants[qi].vars.iter().map(|(n, _)| *n).collect();
+            let body = self.quants[qi].body;
+            let cls = crate::cost::classify_static(lang, &varnames, &self.quants[qi].triggers, body);
+            self.quants[qi].gen_class = Some(cls);
+        }
+        // Reconcile with the live `g_out` proxy (the has-fired bit): a static
+        // `Decreasing` stays final; an `Unknown` that has already fired escalates to
+        // `Ascending` (§4 M3 — never the other way). So a non-fuel quantifier gets a
+        // fair first (base-cost) instance, then its later offspring are throttled.
+        let static_class = self.quants[qi].gen_class.unwrap();
+        let g_out = u32::from(self.quants[qi].emitted_any);
+        let class = crate::cost::reconcile(static_class, g_out);
+        // Δfuel (design §3): a `Decreasing` succ-peel discounts by the binding's
+        // fuel level (a deeper fuel binding ⇒ larger discount ⇒ the top-down peel
+        // cascade drains first, reconstructing the within-round unfold the deep
+        // closers need); non-decreasing candidates carry no gradient. With the
+        // Z3-parity default (`k_fuel = 0`) this term vanishes — the sweep raises it.
+        let delta_fuel = if class == crate::cost::GenClass::Decreasing {
+            let d = tuple
+                .iter()
+                .filter_map(|t| crate::cost::fuel_succ_depth(lang, *t))
+                .max()
+                .unwrap_or(1);
+            -(d as i32)
+        } else {
+            0
+        };
+        let cost = crate::cost::cost_of(&self.cfg.cost_params, 0, generation, delta_fuel, class);
         // Content sort-key (§5.2): the quantifier's content then each tuple term's;
         // `(q, σ)` is unique so this totally orders within a cost tier.
         let qterm = self.quants[qi].term;
@@ -1020,6 +1046,7 @@ impl<S: Sig> Engine<S> {
                 self.ground.add_term_gen(lang, l, g);
                 out.push(l);
                 self.emitted += 1;
+                self.quants[qi].emitted_any = true; // g_out proxy (§4)
             }
             InstResult::Rejected => {
                 self.rejected += 1;

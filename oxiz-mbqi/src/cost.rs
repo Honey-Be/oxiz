@@ -49,6 +49,105 @@ pub fn fuel_arg_depth<L: TermLang>(lang: &L, t: <L::Sig as Sig>::Term) -> Option
     None
 }
 
+/// `(v, k)` if `t` is a **pure fuel chain over a bound variable** — `succ^k(v)`
+/// with `v ∈ vars` (`k = 0` ⇒ `t` is the bare bound var, `k ≥ 1` ⇒ wrapped in
+/// that many `succ`s) — else `None`. Unlike [`fuel_succ_depth`] (which bottoms out
+/// at the ground `zero`), this bottoms out at a BOUND var: it reads the fuel level
+/// a recursive-definition trigger/body binds *symbolically*.
+fn fuel_chain_var<L: TermLang>(
+    lang: &L,
+    t: <L::Sig as Sig>::Term,
+    vars: &[<L::Sig as Sig>::VarName],
+) -> Option<(<L::Sig as Sig>::VarName, u32)> {
+    match lang.view(t) {
+        TermView::Var { name } if vars.contains(&name) => Some((name, 0)),
+        TermView::App { sym } if lang.fuel_role(sym) == Some(FuelRole::Succ) => lang
+            .children(t)
+            .first()
+            .and_then(|c| fuel_chain_var(lang, *c, vars))
+            .map(|(v, k)| (v, k + 1)),
+        _ => None,
+    }
+}
+
+/// Collect every `(bound_var, succ_depth)` fuel occurrence in `t`: each maximal
+/// `succ^k(v)` chain (v ∈ `vars`) contributes ONE pair — the whole chain is a
+/// single fuel argument at depth `k`, so the inner `succ`s are NOT double-counted
+/// as shallower occurrences (which would spoof a peel). When `only` is `Some`, an
+/// occurrence is kept only if its var is in that set (used to restrict the body
+/// scan to the identified fuel vars, excluding non-fuel bound args like the `a` in
+/// `f(succ(F), a)`).
+fn collect_fuel_occ<L: TermLang>(
+    lang: &L,
+    t: <L::Sig as Sig>::Term,
+    vars: &[<L::Sig as Sig>::VarName],
+    only: Option<&[<L::Sig as Sig>::VarName]>,
+    out: &mut Vec<(<L::Sig as Sig>::VarName, u32)>,
+) {
+    if let Some((v, k)) = fuel_chain_var(lang, t, vars) {
+        if only.is_none_or(|s| s.contains(&v)) {
+            out.push((v, k));
+        }
+        return; // the whole `succ`-chain is one occurrence — don't recurse into it
+    }
+    for c in lang.children(t) {
+        collect_fuel_occ(lang, c, vars, only, out);
+    }
+}
+
+/// **Static generativity class (design §4), computed at trigger-fix from the E2
+/// fuel structure.** Two passes: (1) identify the quantifier's *fuel* variables —
+/// the bound vars a trigger wraps in ≥ 1 `succ` (`trig_depth` = their max trigger
+/// `succ`-depth); (2) scan the body for how deep those same vars are re-committed.
+///
+/// - **`Decreasing`** iff `trig_depth ≥ 1`, the body never wraps a fuel var
+///   *deeper* than `trig_depth` (no growth), AND the body uses one *shallower* than
+///   `trig_depth` (a real `succ`-peel: `f(succ(F),a) = …f(F,a)…`). The
+///   self-bounding cascade the deep closers need — run it uncapped/discounted.
+/// - **`Unknown`** otherwise: a non-fuel quantifier (`trig_depth = 0`), a fuel-flat
+///   one (body echoes only the trigger depth), or a fuel-*growing* one. §4 makes
+///   the static analysis authoritative ONLY for `Decreasing`, so growth is left for
+///   the live `g_out` corroborator to escalate toward `Ascending` — a mis-inferred
+///   trigger can then only under-discount a real peel, never wrongly throttle it.
+///
+/// The body-scan restricts to the identified fuel vars, so a non-fuel bound arg
+/// (bare, depth 0) never counterfeits a peel. Pure + read-only.
+pub fn classify_static<L: TermLang>(
+    lang: &L,
+    vars: &[<L::Sig as Sig>::VarName],
+    triggers: &[Vec<<L::Sig as Sig>::Term>],
+    body: <L::Sig as Sig>::Term,
+) -> GenClass {
+    // Pass 1 — the fuel vars are those a trigger wraps in ≥ 1 `succ`.
+    let mut trig_occ = Vec::new();
+    for &t in triggers.iter().flatten() {
+        collect_fuel_occ(lang, t, vars, None, &mut trig_occ);
+    }
+    let mut fuel_vars: Vec<<L::Sig as Sig>::VarName> = Vec::new();
+    let mut trig_depth = 0u32;
+    for &(v, k) in &trig_occ {
+        if k >= 1 {
+            trig_depth = trig_depth.max(k);
+            if !fuel_vars.contains(&v) {
+                fuel_vars.push(v);
+            }
+        }
+    }
+    if fuel_vars.is_empty() {
+        return GenClass::Unknown; // no bound fuel var under succ in any trigger
+    }
+    // Pass 2 — how deep does the body re-commit those fuel vars?
+    let mut body_occ = Vec::new();
+    collect_fuel_occ(lang, body, vars, Some(&fuel_vars), &mut body_occ);
+    let grows = body_occ.iter().any(|&(_, k)| k > trig_depth);
+    let peels = body_occ.iter().any(|&(_, k)| k < trig_depth);
+    if !grows && peels {
+        GenClass::Decreasing
+    } else {
+        GenClass::Unknown // fuel-flat / growing → live signal governs
+    }
+}
+
 // ---- content sort-key (E3) -------------------------------------------------
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -237,6 +336,22 @@ mod tests {
         // 0xA9 fallback, so same-shape/different-head terms are NOT discriminated —
         // the graceful non-content degrade. Real head/leaf discrimination via the
         // E3 content_key is exercised on the OxiZ host in oxiz-solver.
+    }
+
+    #[test]
+    fn classify_static_degrades_to_unknown_without_fuel_ctors() {
+        // The toy host has no fuel constructors (fuel_role = None), so no trigger
+        // can bind a fuel var under a `succ` ⇒ every quantifier is `Unknown` (the
+        // Z3-parity degrade). Real `Decreasing` detection is exercised on the OxiZ
+        // host (oxiz-solver `classify_static_detects_fuel_peel_on_real_host`).
+        let mut t = Toy::new();
+        let x = t.var(700, INT);
+        let px = t.app(40, &[x], INT);
+        assert_eq!(
+            classify_static(&t, &[700], &[vec![px]], px),
+            GenClass::Unknown,
+            "no fuel ctors ⇒ Unknown regardless of shape"
+        );
     }
 
     #[test]

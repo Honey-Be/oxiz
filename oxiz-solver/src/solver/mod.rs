@@ -873,6 +873,21 @@ impl Solver {
                                     .ok()
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(1),
+                                // P3c cost knobs (design §3): fuel discount
+                                // magnitude + ascending penalty. Default (0, 0) =
+                                // Z3 parity (cost = weight + generation), so the
+                                // classifier is computed but inert until the sweep
+                                // raises these — the corpus A/B tunes them.
+                                cost_params: oxiz_mbqi::CostParams {
+                                    k_fuel: std::env::var("OXIZ_K_FUEL")
+                                        .ok()
+                                        .and_then(|s| s.parse().ok())
+                                        .unwrap_or(0),
+                                    gen_class_delta: std::env::var("OXIZ_GEN_CLASS_DELTA")
+                                        .ok()
+                                        .and_then(|s| s.parse().ok())
+                                        .unwrap_or(0),
+                                },
                                 ..CleanConfig::default()
                             });
                             // P3a: hand the MBQI wall-clock guard to the engine so
