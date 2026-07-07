@@ -385,23 +385,52 @@ Inconclusive/BudgetExhausted, never Saturated* — tested through the real produ
 
 ## 10. Phasing (each gated: `clean_mbqi_corpus --ignored` + `cargo test --workspace`)
 
-- **P0.5 — firewall/host-extension slice (pre-verified; gates P2).** E1 generation on
-  `GroundIndex`; E2 fuel-role accessor; E3 content-key accessor. Discharge §9(0).
-  No behaviour change yet (nothing consumes them) — differential-clean by construction.
-- **P0 — substrate.** `CostScheduler` (AWR bucket queue, monotone, exact dedup,
-  content-key sort, promote, DEFER overflow) unit-tested: insert/drain order, AWR
-  ratio, promote, overflow, **shuffle-determinism differential** (needs E3).
-- **P1 — cost + classifier (flag OFF = queue BYPASSED).** `cost_fn` (E1+E2), `GenClass`
-  static+live (M3 direction), `g_out`. `cost_schedule=false` must **bypass insert/drain
-  entirely** (drain reorders ≠ discovery order, so "off" cannot route through the queue)
-  → byte-identical verdicts (differential gate).
-- **P2 — flip on, single-tier first (`awr_ratio=0`) + the §5.3 fixpoint + §8 gate.**
-  Corpus A/B vs b4518db: **0 regressions** + ground-DT z3+cvc5 differential **0
-  spurious-unsat** + the §8 deferred-refuter regression. Expect deep-closers to hold
-  (no cap); measure fr1/ob06.
-- **P3 — AWR + causal-root.** Age pulse + the §6 engine-local root signal (with
-  `emit` provenance if kept); sweep the ratio; "does §6 earn its keep?" Target: fr1/ob06
-  **and** the fuel/seq siblings both closed, 0 regressions.
+- **P0.5 — firewall/host-extension slice (pre-verified; gates P2). ✅ LANDED**
+  (`45f56f2`). E1 generation on `GroundIndex`; E2 fuel-role accessor; E3
+  content-key accessor. §9(0) discharged; no behaviour change (nothing consumed
+  them yet) — differential-clean by construction.
+- **P0 — substrate. ✅ LANDED** (`c58939f`). `CostScheduler` (AWR bucket queue,
+  monotone, exact dedup, content-key sort, promote, DEFER overflow) unit-tested:
+  insert/drain order, AWR ratio, promote, overflow. (Shuffle-determinism
+  differential is the corpus-side R7 gate — see §11.3, still user-run.)
+- **P1 — cost + classifier stubs. ✅ LANDED** (`7170ff8`). `cost_of` (E1+E2 fuel
+  readers), `GenClass`, `reconcile` (M3 direction), content sort-key. Flag-off
+  bypasses the queue entirely → byte-identical.
+- **P2 — flip on, single-tier (`awr_ratio=0`) + the §5.3 fixpoint + §8 gate.
+  ✅ LANDED flag-off-safe** (`dc62414`). Flag-off byte-identical (oxiz-mbqi 34/0 +
+  corpus smoke matches baseline). Flag-on shipped WITH a known perf hole (the
+  single-tier drain floods gen-1 and the guard did not bound the fixpoint → hung)
+  — resolved in P3a. Corpus A/B remains the user's `!` gate.
+- **P3 — the completeness/fairness/safety core. ✅ LANDED (a/b/c).**
+  - **P3a — wall-clock guard** (`a00ff0b`): `Engine::set_deadline`, polled in the
+    fixpoint + discovery loop, host-wired from `MBQI_NONTERMINATION_GUARD_MS`. A
+    hit is a budget event (DEFER-not-DROP) ⇒ §8 → `BudgetExhausted` → `Unknown`.
+    **Measured end-to-end**: flag-on on `fuel-recursion-2/ob01` (oxiz-delegated)
+    now returns `unknown` in **3.14 s** (the guard), not the P2 20 s+ hang;
+    flag-off returns the same at 3.15 s. This is the fix that unblocks flag-on.
+  - **P3b — AWR age pulse** (`f26feee`): the P0 `next`/`pop_age` interleave is
+    wired via `drain(age_ratio>0)` + the `OXIZ_AWR_AGE_RATIO`/`_WEIGHT_RATIO` env
+    knobs; validated end-to-end (`scheduled_round_with_age_pulse_matches_fire_all`).
+    R7 caveat: the age FIFO is discovery order (shuffle-sensitive when the pulse is
+    on) — the sweep MUST run the §11.3 differential before adopting `age_ratio>0`.
+  - **P3c — fuel-peel static classifier + cost wiring** (`218e468`):
+    `classify_static` (two-pass fuel-var identify → peel-vs-grow test, both
+    counterfeit traps handled) feeds `collect_candidate`'s cost via `reconcile`
+    (static `Decreasing` final; live `g_out` = has-fired bit escalates `Unknown`→
+    `Ascending`) + the real Δfuel discount. Sweep knobs `OXIZ_K_FUEL` +
+    `OXIZ_GEN_CLASS_DELTA`; **default (0,0) = Z3 parity ⇒ classifier computed but
+    INERT** (flag-on w/ defaults unchanged from P2, just now guard-bounded).
+  - **§6 causal-root throttle — DEFERRED** (design-demoted SHOULD-FIX). The core
+    resolution (P3c `gen_class_penalty` + P3b age pulse) stands without it; whether
+    it earns its keep is the post-A/B measurement, and it needs net-new `emit`
+    provenance plumbing. Revisit only if the corpus A/B shows a residual the
+    classifier+pulse can't close.
+  - **REMAINING (user's `!` idle-machine sweep):** tune `k_fuel`/`gen_class_delta`/
+    `awr_age_ratio` and run the corpus A/B vs `b4518db` — **0 regressions** +
+    ground-DT z3+cvc5 differential **0 spurious-unsat** + (if age pulse adopted)
+    the R7 shuffle differential. Target: fr1/ob06 **and** the fuel/seq siblings
+    both closed. Recipe:
+    `OXIZ_COST_SCHEDULE=1 OXIZ_K_FUEL=<n> OXIZ_GEN_CLASS_DELTA=<n> [OXIZ_AWR_AGE_RATIO=<a> OXIZ_AWR_WEIGHT_RATIO=<w>] adsmtc --features oxiz <row>`.
 - **P4 — 선검증 (i)(ii)(iii) discharged; DEFICIT-re-run decision (§12); docs/comments
   sweep (`[[feedback_per_slice_doc_sweep]]`); verus-fork reply; memory.**
 

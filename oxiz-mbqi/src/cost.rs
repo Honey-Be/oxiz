@@ -4,10 +4,13 @@
 //!
 //! Pure functions over the host term language ([`TermLang`]) + the E1/E2/E3
 //! accessors: they compute what the [`crate::cost_scheduler::CostScheduler`]
-//! prices and orders on, but do NOT touch the round loop's firing path. **Nothing
-//! consumes this module yet (P1); it changes no verdict.** The engine wiring (the
-//! §5.3 discover⇄drain fixpoint, behind the `cost_schedule` flag) and the fuller
-//! fuel-peel static analysis land with the corpus A/B at P2.
+//! prices and orders on. Consumed by the engine's scheduled discover⇄drain
+//! fixpoint ([`crate::engine::Engine`], behind the `cost_schedule` flag): P3c
+//! wired [`classify_static`] + the Δfuel discount into `collect_candidate`. With
+//! the **default `CostParams` (`k_fuel = 0`, `gen_class_delta = 0`) the classifier
+//! is COMPUTED but INERT** — `cost = weight + generation` (Z3 parity) — so a
+//! flag-on run with defaults is byte-identical in *ordering effect* to P2; the
+//! corpus sweep raises the knobs.
 
 use crate::cost_scheduler::CAP;
 use crate::term::{FuelRole, Sig, TermLang, TermView};

@@ -20,11 +20,13 @@
 //! candidate cheaper via a fresh entry + a `superseded` flag on the old one
 //! (lazy-delete, no decrease-key).
 //!
-//! This module is host-agnostic: it never touches the term language. The
-//! consumer (the engine round loop, P1) computes each candidate's `cost` (from
-//! `weight + generation + fuel_gradient`) and `sort_key` (from the host's
-//! `content_key`) and hands them in at `insert`. **Nothing consumes this module
-//! yet (P0); it changes no verdict — it is a unit-tested substrate only.**
+//! This module is host-agnostic: it never touches the term language. The consumer
+//! (the engine's scheduled round fixpoint, `round_cost_scheduled`) computes each
+//! candidate's `cost` (from `weight + generation + fuel_gradient`) and `sort_key`
+//! (from the host's `content_key`) and hands them in at `insert`, then `drain`s
+//! cheapest-first (single-tier) or through the AWR age-weight pulse
+//! (`age_ratio > 0`). Live behind the `cost_schedule` flag (default off); the
+//! P3a wall-clock guard bounds the fixpoint so a diverging quantifier cannot hang.
 
 use crate::term::Sig;
 use rustc_hash::FxHashSet;
