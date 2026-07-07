@@ -155,6 +155,44 @@ fn scheduled_round_matches_fire_all_verdict_and_count() {
     assert!(fire_n >= 2, "P(a) and P(b) both instantiated");
 }
 
+/// P3b (design §5.3/§5.4, task #414): the AWR **age pulse** (`awr_age_ratio > 0`)
+/// drains through the per-candidate age⇄weight interleave (`next`) instead of the
+/// single-tier cheapest-first fast path — a *different* drain route. It must still
+/// emit the SAME sound instance set and reach the SAME verdict as the fire-all
+/// path: the pulse only reorders/defers, never drops (the fairness lever that
+/// stops the weight side starving a deferred deep candidate). `∀x. P(x)` with
+/// ground `P(a), P(b)`, model unverified ⇒ both `P(a), P(b)` fire then a sound
+/// `Unknown`, identical to flag-off.
+#[test]
+fn scheduled_round_with_age_pulse_matches_fire_all() {
+    const P: u32 = 22;
+    const IINT: u32 = 2;
+    fn once(cost_schedule: bool, age_ratio: u32) -> (&'static str, usize) {
+        let mut t = Toy::new();
+        let a = t.konst(P + 220, IINT);
+        let b = t.konst(P + 221, IINT);
+        let pa = t.app(P, &[a], BOOL);
+        let pb = t.app(P, &[b], BOOL);
+        let x = t.var(305, IINT);
+        let body = t.app(P, &[x], BOOL);
+        let q = t.forall(&[(305, IINT)], &[], body, BOOL); // trigger-less
+        let mut cfg = Config::default();
+        cfg.cost_schedule = cost_schedule;
+        cfg.awr_age_ratio = age_ratio; // 1:1 age:weight pulse when scheduled
+        let mut e = Engine::new(cfg);
+        e.assert(&t, pa);
+        e.assert(&t, pb);
+        e.assert(&t, q);
+        run(&mut e, &mut t, &Gated { active: true, verifies: false })
+    }
+    let (fire_v, fire_n) = once(false, 0);
+    let (sched_v, sched_n) = once(true, 1); // age pulse ON
+    assert_eq!(fire_v, sched_v, "age-pulse drain reaches the same verdict");
+    assert_eq!(fire_n, sched_n, "age-pulse drain emits the same instance count");
+    assert_eq!(fire_v, "Unknown");
+    assert!(fire_n >= 2, "P(a) and P(b) both instantiated under the age pulse");
+}
+
 /// P3a (design `FUEL_AWARE_COST_SCHEDULER.md` §8, task #413): the scheduled
 /// round fixpoint must honour the wall-clock non-termination guard. The host's
 /// between-round check cannot interrupt a single `round_cost_scheduled` call, so

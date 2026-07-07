@@ -54,7 +54,17 @@ pub struct CostScheduler<S: Sig> {
     /// `buckets[c]` = arena indices of candidates whose cost is `c` (len `CAP+1`).
     buckets: Vec<Vec<u32>>,
     /// Insertion-order FIFO for the age side; `age_cursor` walks it forward,
-    /// skipping fired/superseded entries.
+    /// skipping fired/superseded entries. O(1) amortized — the efficient fairness
+    /// structure.
+    ///
+    /// **R7 caveat (design §5.2).** This is *discovery* order, which an assertion
+    /// shuffle can permute, so with `age_ratio > 0` the release schedule is not
+    /// provably shuffle-invariant (the weight side, sorted by the content-derived
+    /// `sort_key`, is). The design's content-derived age key (`born = generation`)
+    /// would need an efficient ordered structure to avoid an O(n²) per-pop scan
+    /// over a whole-solve age list; kept as the O(1) FIFO here. The `age_ratio = 0`
+    /// default has no age pulse ⇒ fully weight-sorted ⇒ R7-clean; the sweep MUST
+    /// run the §11.3 assertion-shuffle differential before adopting `age_ratio > 0`.
     age: Vec<u32>,
     age_cursor: usize,
     /// Exact `(q, σ)` dedup — no lossy hash (design fix #3).
