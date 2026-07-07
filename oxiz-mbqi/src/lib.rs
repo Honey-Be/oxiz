@@ -10,6 +10,7 @@
 pub mod ccfv;
 pub mod cdqi;
 pub mod congruence;
+pub mod cost;
 pub mod cost_scheduler;
 pub mod engine;
 pub mod ground;
@@ -21,6 +22,7 @@ pub mod toy;
 
 pub use ccfv::{match_trigger, match_trigger_multi, solve, Conj, Constraint, Lit, Subst};
 pub use congruence::{Congruence, FuncApp, Mode, NoCong, TotalView};
+pub use cost::{cost_of, fuel_arg_depth, fuel_succ_depth, reconcile, term_content_key, CostParams, GenClass};
 pub use cost_scheduler::{CostScheduler, CAP};
 pub use engine::{Config, Engine, Verdict};
 pub use ledger::{CongruenceSink, GroundLedger, LedgerMark};

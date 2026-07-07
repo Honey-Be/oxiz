@@ -4918,4 +4918,37 @@ mod ccfv_congruence_tests {
         assert!(ks.is_some() && ko.is_some());
         assert_ne!(ks, ko, "distinct function names get distinct content keys");
     }
+
+    #[test]
+    fn fuel_depth_reads_succ_zero_on_real_host() {
+        use super::OxizHost;
+        use oxiz_core::ast::{TermKind, TermManager};
+        use oxiz_core::SortId;
+        // P1 (design §3, E2 consumption): the fuel-depth readers must count the
+        // real `succ`-nesting through the OxizHost — the Some-path the toy host
+        // (fuel_role = None) cannot exercise.
+        let mut tm = TermManager::new();
+        let succ = tm.intern_str("succ");
+        let zero = tm.intern_str("zero");
+        let f = tm.intern_str("f");
+        let g = tm.intern_str("g");
+        let s = SortId::new(0); // sort is irrelevant to the fuel readers
+        let mk = |tm: &mut TermManager, func, args: Vec<_>| {
+            tm.intern_term(TermKind::Apply { func, args: args.into() }, s)
+        };
+        let z = mk(&mut tm, zero, vec![]);
+        let s1 = mk(&mut tm, succ, vec![z]);
+        let s2 = mk(&mut tm, succ, vec![s1]);
+        let fapp = mk(&mut tm, f, vec![s2]); // f(succ(succ(zero)))
+        let n = mk(&mut tm, g, vec![]); // g() — non-fuel
+        let gapp = mk(&mut tm, f, vec![n]); // f(g()) — no fuel argument
+
+        let host = OxizHost::new(&mut tm);
+        assert_eq!(oxiz_mbqi::fuel_succ_depth(&host, z), Some(0));
+        assert_eq!(oxiz_mbqi::fuel_succ_depth(&host, s1), Some(1));
+        assert_eq!(oxiz_mbqi::fuel_succ_depth(&host, s2), Some(2));
+        assert_eq!(oxiz_mbqi::fuel_arg_depth(&host, fapp), Some(2), "f's fuel arg is at succ-depth 2");
+        assert_eq!(oxiz_mbqi::fuel_arg_depth(&host, gapp), None, "no ground fuel argument");
+        assert_eq!(oxiz_mbqi::fuel_succ_depth(&host, fapp), None, "f(...) is not itself a fuel ctor");
+    }
 }
