@@ -11,6 +11,24 @@ Companion to `CCFV_UNIFIED_INSTANTIATION.md` (the calculus this schedules) and t
 the research synthesis `<adsmt root>/.claude-research-library/FUEL_AWARE_INSTANTIATION_RESEARCH.md`.
 Memory: `[[mbqi-term-growth-throttle]]`, `[[oxiz_mbqi_rewrite]]`.
 
+> **⛔ STATUS (2026-07-08) — BUILT, MEASURED, SHELVED. Do NOT re-implement on this
+> branch.** This design was implemented in full (P0.5→P3) and corpus-measured on
+> branch `0.2.4-feat/fuel-cost-scheduler`, then found **NET-NEGATIVE** on the
+> 213-row verus lukb corpus and **not merged here except the `OXIZ_MBQI_GUARD_MS`
+> guard knob**. A 7-config sweep spanning the whole parameter space (from Z3-parity
+> `(0,0)` to CAP-saturated `(48,48)` to age-dominant) was **verdict-invariant**:
+> `GAIN=0 / REGRESS=8 / spurious=0`, every config byte-identical to `(0,0)`.
+> Raising the guard 3 s→4 s made it *worse* (net loss 8→15): the budget-scaling
+> closures fire-all captures, the scheduled path's per-instance overhead loses to
+> the guard. Root cause: closure on this corpus is decided by **budget-fit, not
+> instance order**, so reordering opens nothing; and the corpus's "fuel" is mostly
+> `fuel_bool_default` boolean gating, not a `succ`-peel the cost gradient can read.
+> Like the hard generation cap before it, the scheduler is **strictly dominated by
+> fire-all** here — the verified baseline is Pareto-optimal (`[[mbqi-term-growth-throttle]]`).
+> Full method + tables live on the feature branch's copy of this doc (§10/§11).
+> Revisit only for a genuinely `succ`-peel-heavy corpus (Dafny/F★). The rest of
+> this document is the (sound, flag-off-safe, but unhelpful-here) design as built.
+
 > **Revision 2 (2026-07-06)** — incorporates the 3-lens adversarial design review
 > (`#404-D`, workflow `wehgar69d`), which ground-truthed the doc against the code
 > and found the v1 draft would *reproduce the cap-0 stall* it exists to kill. The
