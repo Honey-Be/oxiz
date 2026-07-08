@@ -458,11 +458,29 @@ Inconclusive/BudgetExhausted, never Saturated* — tested through the real produ
     shipped regression) for a future genuinely succ-peel-heavy corpus (Dafny/F★);
     the P3a guard is kept as an independent runaway-bounding win.
     Reproduce: `OXIZ_COST_SCHEDULE=1 [OXIZ_K_FUEL=<n> OXIZ_GEN_CLASS_DELTA=<n> OXIZ_AWR_AGE_RATIO=<a> OXIZ_AWR_WEIGHT_RATIO=<w>] adsmtc --features oxiz <row>`.
-  - **NOT measured (low expected value):** the budget-decoupled diagnostic
-    (flag-off vs flag-on both at a 20 s guard — does reordering unlock closure when
-    budget is not binding?). The 7-config verdict-invariance is already strong
-    evidence reordering does not change the closure set; deferred unless a
-    succ-peel-heavy corpus revives the question.
+  - **BUDGET FOLLOW-UP — 4 s guard, MEASURED 2026-07-08 (the budget-decoupled
+    A/B, via the new `OXIZ_MBQI_GUARD_MS` env override):** raising the default MBQI
+    guard 3 s→4 s and re-running flag-off + flag-on (default and `k4/asc8`, both at
+    4 s) makes the scheduler's case **STRICTLY WORSE**, not better:
+
+    | comparison (4 s) | GAIN | REGRESS | reading |
+    |---|---|---|---|
+    | flag-on-4s **vs flag-off-4s** | **0** | **15** | the real A/B — net loss grew 8→15 |
+    | flag-off-4s **vs flag-off-3s** | **8** | 0 | budget alone gains 8 for the BASELINE |
+    | flag-on(default)-4s vs -3s | 1 | 0 | flag-on barely moves with budget |
+    | c1_4s vs c3_4s | — | — | 0 diffs (param-invariant at 4 s too) |
+
+    Mechanism (airtight): **the 8 rows flag-off newly closes at 4 s are EXACTLY 8 of
+    the 15 rows flag-on regresses.** The extra second lets fire-all close 8 borderline
+    obligations; the scheduled path's per-instance overhead pushes those same rows
+    past the 4 s guard → sound `unknown`. So the scheduler cannot capture the
+    budget-scaling win, and its net loss *grows* with the budget (8 → 15). This
+    confirms — and strengthens — the null result: **the scheduler is strictly
+    dominated by fire-all at every budget, more so at higher budget** (reordering
+    still opens nothing: GAIN 0 throughout). Soundness perfect (all baseline gains
+    are sound `unknown→unsat`; 0 spurious). The 3 FLIPs are 4 s-boundary timing
+    jitter (`unknown`↔`timeout` labels), not verdict-class changes. Reproduce:
+    `OXIZ_MBQI_GUARD_MS=4000 [OXIZ_COST_SCHEDULE=1 …] adsmtc --features oxiz <row>`.
 - **P4 — 선검증 (i)(ii)(iii) discharged; DEFICIT-re-run decision (§12); docs/comments
   sweep (`[[feedback_per_slice_doc_sweep]]`); verus-fork reply; memory.**
 

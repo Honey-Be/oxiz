@@ -669,7 +669,14 @@ impl Solver {
             let ms = if self.config.timeout_ms > 0 {
                 self.config.timeout_ms
             } else {
-                MBQI_NONTERMINATION_GUARD_MS
+                // Env override for the default guard (tune without recompiling —
+                // e.g. corpus A/B at a different budget). Unset ⇒ the 3 s default,
+                // so this is byte-identical at rest.
+                std::env::var("OXIZ_MBQI_GUARD_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(MBQI_NONTERMINATION_GUARD_MS)
             };
             Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
         };
