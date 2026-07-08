@@ -425,12 +425,44 @@ Inconclusive/BudgetExhausted, never Saturated* — tested through the real produ
     it earns its keep is the post-A/B measurement, and it needs net-new `emit`
     provenance plumbing. Revisit only if the corpus A/B shows a residual the
     classifier+pulse can't close.
-  - **REMAINING (user's `!` idle-machine sweep):** tune `k_fuel`/`gen_class_delta`/
-    `awr_age_ratio` and run the corpus A/B vs `b4518db` — **0 regressions** +
-    ground-DT z3+cvc5 differential **0 spurious-unsat** + (if age pulse adopted)
-    the R7 shuffle differential. Target: fr1/ob06 **and** the fuel/seq siblings
-    both closed. Recipe:
-    `OXIZ_COST_SCHEDULE=1 OXIZ_K_FUEL=<n> OXIZ_GEN_CLASS_DELTA=<n> [OXIZ_AWR_AGE_RATIO=<a> OXIZ_AWR_WEIGHT_RATIO=<w>] adsmtc --features oxiz <row>`.
+  - **CORPUS A/B — MEASURED 2026-07-08 (idle machine, serial, scripted tally):
+    NET-NEGATIVE. The default stays OFF.** Own flag-off baseline on the current
+    binary (adsmtc `--features oxiz`, 213-row lukb corpus): **103 SOLVED / 110
+    open**. Flag-on swept across **7 configs** spanning the full parameter space —
+    `(k_fuel, gen_class_delta, age:wt)` from `(0,0,0:1)` through `(4,8,1:4)` up to
+    the CAP-saturated `(48,48,1:1)` and an age-dominant `(0,48,3:1)`:
+
+    | metric | every one of the 7 configs |
+    |---|---|
+    | GAIN (open→solved) | **0** |
+    | REGRESS (solved→open) | **8** |
+    | FLIP / spurious-sat / spurious-unsat | **0** |
+    | verdict diff vs the `(0,0)` config | **0** (all 213 identical) |
+
+    **The reordering is verdict-invariant on this corpus** — no parameter flips any
+    verdict. Root cause: closure here is decided by *budget-fit*, not instance
+    order — the 110 open rows need more instances than one 3 s-guarded round
+    delivers regardless of order (GAIN 0), and the 8 regressions are pure
+    scheduled-path *overhead* (borderline `unsat` rows at 2.0–3.1 s crossing the 3 s
+    guard → sound `unknown`; all non-fuel: divmod/linear-euf/nonlinear/verify-arith).
+    The classifier DOES engage where succ-peel axioms exist (fr1's
+    `rec%sum_to(n!, succ(fuel%))` ⇒ `Decreasing`), but even engaged the discount
+    changes no verdict. Soundness is perfect (0 spurious across all configs). A
+    side effect: the P3a guard makes divergent rows bail *faster* (fr1/ob04
+    20.2 s→3.2 s) — same verdict, tighter runaway bounding.
+
+    **Verdict: like the hard cap before it, the cost-scheduler loses to baseline on
+    this corpus** (`[[mbqi_term_growth_throttle]]`: the verified baseline is
+    Pareto-optimal). The design's central bet — a fuel-aware cost schedule beats the
+    cap — is **falsified for THIS corpus**. Retained flag-off (byte-identical, 0
+    shipped regression) for a future genuinely succ-peel-heavy corpus (Dafny/F★);
+    the P3a guard is kept as an independent runaway-bounding win.
+    Reproduce: `OXIZ_COST_SCHEDULE=1 [OXIZ_K_FUEL=<n> OXIZ_GEN_CLASS_DELTA=<n> OXIZ_AWR_AGE_RATIO=<a> OXIZ_AWR_WEIGHT_RATIO=<w>] adsmtc --features oxiz <row>`.
+  - **NOT measured (low expected value):** the budget-decoupled diagnostic
+    (flag-off vs flag-on both at a 20 s guard — does reordering unlock closure when
+    budget is not binding?). The 7-config verdict-invariance is already strong
+    evidence reordering does not change the closure set; deferred unless a
+    succ-peel-heavy corpus revives the question.
 - **P4 — 선검증 (i)(ii)(iii) discharged; DEFICIT-re-run decision (§12); docs/comments
   sweep (`[[feedback_per_slice_doc_sweep]]`); verus-fork reply; memory.**
 
