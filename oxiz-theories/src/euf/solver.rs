@@ -689,108 +689,123 @@ impl EufSolver {
 
     /// Explain why two nodes are equal.
     ///
-    /// Uses BFS through the proof forest to find a path from `a` to `b`.
+    /// Uses BFS through the proof forest to find a path from `a` to `b`, then an
+    /// explicit worklist (`pending`, a heap `Vec` — NOT recursion) to expand any
+    /// `MergeReason::Congruence` edge on that path into its own argument-equality
+    /// sub-explanation. This used to recurse one native call frame per congruence
+    /// level; a long chain of nested congruence merges (e.g. a deep repeated
+    /// selector/constructor application, or several cross-product OR-branch merges
+    /// stacking up) could recurse deep enough to overflow the stack — a real crash
+    /// found by #418's adversarial differential fuzzing (#419), on inputs that only
+    /// became reachable once #418's own new reductions started closing more
+    /// congruences. The worklist makes total work scale with heap memory instead
+    /// of stack depth, with no bound on chain length. `pending_seen`/`reasons_seen`
+    /// dedup by unordered node-pair / by `TermId` respectively, so a reason or a
+    /// sub-explanation already produced is never redone (this also caps total work
+    /// at O(V) pair-expansions, same asymptotic bound the recursive version had).
     /// Reusable buffers (`explain_queue`, `explain_visited`, `explain_parent`) are
-    /// moved out of `self` via `mem::take` at entry and restored at exit so that
-    /// recursive calls (for congruence sub-explanations) each work on a fresh,
-    /// independently sized set of buffers without re-allocating from the heap once
-    /// the buffers are warm.
+    /// still moved out of `self` via `mem::take` for each BFS sub-call and restored
+    /// immediately after, exactly as before.
     fn explain_equality(&mut self, a: u32, b: u32) -> Vec<TermId> {
-        if a == b {
-            return Vec::new();
-        }
+        let mut reasons: Vec<TermId> = Vec::new();
+        let mut reasons_seen: FxHashSet<TermId> = FxHashSet::default();
+        let mut pending: Vec<(u32, u32)> = vec![(a, b)];
+        let mut pending_seen: FxHashSet<(u32, u32)> = FxHashSet::default();
 
-        let n = self.proof_forest.len();
-        // Guard against out-of-bounds indices
-        if (a as usize) >= n || (b as usize) >= n {
-            return Vec::new();
-        }
-
-        // Take reusable buffers out of self so recursive calls (for congruence
-        // sub-explanations) do not conflict with the current borrow.
-        let mut queue = mem::take(&mut self.explain_queue);
-        let mut visited = mem::take(&mut self.explain_visited);
-        let mut parent = mem::take(&mut self.explain_parent);
-
-        // Reset / resize in-place — existing heap capacity is retained.
-        queue.clear();
-        visited.clear();
-        visited.resize(n, false);
-        parent.clear();
-        parent.resize(n, None);
-
-        // BFS to find path from a to b
-        queue.push_back(a);
-        visited[a as usize] = true;
-
-        let mut found = false;
-        while let Some(node) = queue.pop_front() {
-            if node == b {
-                found = true;
-                break;
-            }
-
-            if (node as usize) >= self.proof_forest.len() {
+        while let Some((a, b)) = pending.pop() {
+            if a == b {
                 continue;
             }
-            for (idx, edge) in self.proof_forest[node as usize].iter().enumerate() {
-                let other_idx = edge.other as usize;
-                if other_idx < n && !visited[other_idx] {
-                    visited[other_idx] = true;
-                    parent[other_idx] = Some((node, idx));
-                    queue.push_back(edge.other);
+
+            let n = self.proof_forest.len();
+            // Guard against out-of-bounds indices
+            if (a as usize) >= n || (b as usize) >= n {
+                continue;
+            }
+
+            let key = if a < b { (a, b) } else { (b, a) };
+            if !pending_seen.insert(key) {
+                continue;
+            }
+
+            // Take reusable buffers out of self for this BFS sub-call.
+            let mut queue = mem::take(&mut self.explain_queue);
+            let mut visited = mem::take(&mut self.explain_visited);
+            let mut parent = mem::take(&mut self.explain_parent);
+
+            // Reset / resize in-place — existing heap capacity is retained.
+            queue.clear();
+            visited.clear();
+            visited.resize(n, false);
+            parent.clear();
+            parent.resize(n, None);
+
+            // BFS to find path from a to b
+            queue.push_back(a);
+            visited[a as usize] = true;
+
+            let mut found = false;
+            while let Some(node) = queue.pop_front() {
+                if node == b {
+                    found = true;
+                    break;
+                }
+
+                if (node as usize) >= self.proof_forest.len() {
+                    continue;
+                }
+                for (idx, edge) in self.proof_forest[node as usize].iter().enumerate() {
+                    let other_idx = edge.other as usize;
+                    if other_idx < n && !visited[other_idx] {
+                        visited[other_idx] = true;
+                        parent[other_idx] = Some((node, idx));
+                        queue.push_back(edge.other);
+                    }
                 }
             }
-        }
 
-        if !found {
-            // Restore buffers before returning so they are available for the next call.
+            if !found {
+                // Restore buffers before moving on so they are available for the next pair.
+                self.explain_queue = queue;
+                self.explain_visited = visited;
+                self.explain_parent = parent;
+                continue;
+            }
+
+            // Collect the (prev, edge_idx) pairs from the parent chain into a local
+            // Vec before dropping the parent borrow.
+            let mut path: Vec<(u32, usize)> = Vec::new();
+            let mut current = b;
+            while let Some((prev, edge_idx)) = parent[current as usize] {
+                path.push((prev, edge_idx));
+                current = prev;
+            }
+
+            // Restore buffers now.
             self.explain_queue = queue;
             self.explain_visited = visited;
             self.explain_parent = parent;
-            return Vec::new();
-        }
 
-        // Collect the (prev, edge_idx) pairs from the parent chain into a local
-        // Vec before dropping the parent borrow — this lets us recursively call
-        // explain_equality below without conflicting with `parent`.
-        let mut path: Vec<(u32, usize)> = Vec::new();
-        let mut current = b;
-        while let Some((prev, edge_idx)) = parent[current as usize] {
-            path.push((prev, edge_idx));
-            current = prev;
-        }
+            // Reconstruct path and collect reasons
+            for (prev, edge_idx) in path {
+                let reason = self.proof_forest[prev as usize][edge_idx].reason.clone();
 
-        // Restore buffers now — recursive calls may reuse them safely.
-        self.explain_queue = queue;
-        self.explain_visited = visited;
-        self.explain_parent = parent;
-
-        // Reconstruct path and collect reasons
-        let mut reasons = Vec::new();
-
-        for (prev, edge_idx) in path {
-            let reason = self.proof_forest[prev as usize][edge_idx].reason.clone();
-
-            match reason {
-                MergeReason::Assertion(term_id) => {
-                    if term_id.raw() != 0 && !reasons.contains(&term_id) {
-                        reasons.push(term_id);
+                match reason {
+                    MergeReason::Assertion(term_id) => {
+                        if term_id.raw() != 0 && reasons_seen.insert(term_id) {
+                            reasons.push(term_id);
+                        }
                     }
-                }
-                MergeReason::Congruence { term1, term2 } => {
-                    // For congruence, we need to explain why the arguments are equal
-                    let args1: SmallVec<[u32; 4]> = self.nodes[term1 as usize].args.clone();
-                    let args2: SmallVec<[u32; 4]> = self.nodes[term2 as usize].args.clone();
+                    MergeReason::Congruence { term1, term2 } => {
+                        // For congruence, we need to explain why the arguments are
+                        // equal — push their (arg1, arg2) pairs onto the worklist
+                        // instead of recursing.
+                        let args1: SmallVec<[u32; 4]> = self.nodes[term1 as usize].args.clone();
+                        let args2: SmallVec<[u32; 4]> = self.nodes[term2 as usize].args.clone();
 
-                    // Recursively explain argument equalities
-                    for (&arg1, &arg2) in args1.iter().zip(args2.iter()) {
-                        if arg1 != arg2 && self.uf.same_no_compress(arg1, arg2) {
-                            let arg_reasons = self.explain_equality(arg1, arg2);
-                            for r in arg_reasons {
-                                if !reasons.contains(&r) {
-                                    reasons.push(r);
-                                }
+                        for (&arg1, &arg2) in args1.iter().zip(args2.iter()) {
+                            if arg1 != arg2 && self.uf.same_no_compress(arg1, arg2) {
+                                pending.push((arg1, arg2));
                             }
                         }
                     }
@@ -1309,6 +1324,67 @@ mod tests {
             // Should contain at least one of the equality reasons
             assert!(reasons.len() >= 2);
         }
+    }
+
+    /// Regression for #419 (found via #418's differential fuzzing): a long chain
+    /// of nested congruence merges must not blow the native call stack when
+    /// `explain_equality` unwinds it. Builds two parallel `DEPTH`-deep chains
+    /// `f^DEPTH(a)` / `f^DEPTH(b)`, merges the base case `a = b` (the synchronous,
+    /// already-iterative `propagate()` congruence-closure cascade merges every
+    /// level of both chains — that part was never the crashing path), then forces
+    /// a disequality conflict at the TOP of the chains so `check_conflicts` ->
+    /// `explain_equality` must walk back down through every congruence level to
+    /// produce reasons. Before this fix, `explain_equality` recursed one native
+    /// stack frame per level here; a chain as short as a few thousand deep (well
+    /// within what a fuzzer-sized SMT-LIB input can trigger via a handful of
+    /// repeated selector/constructor applications, e.g. `oxiz-solver`'s ground-DT
+    /// tests) crashed with a stack overflow.
+    #[test]
+    fn test_explain_equality_does_not_recurse_on_deep_congruence_chain() {
+        let mut solver = EufSolver::new();
+        const DEPTH: usize = 20_000;
+        const FUNC: u32 = 0;
+
+        let a0 = solver.intern(TermId::new(1));
+        let b0 = solver.intern(TermId::new(2));
+
+        let mut a = a0;
+        let mut b = b0;
+        let mut next_term_id: u32 = 3;
+        for _ in 0..DEPTH {
+            a = solver.intern_app(TermId::new(next_term_id), FUNC, [a]);
+            next_term_id += 1;
+            b = solver.intern_app(TermId::new(next_term_id), FUNC, [b]);
+            next_term_id += 1;
+        }
+
+        // Merging the base case cascades congruence all the way up both chains.
+        // (Reason id 0 is a reserved "no reason" sentinel elsewhere in this file
+        // — `term_id.raw() != 0` in explain_equality's Assertion arm — so a
+        // nonzero id is used here to make sure it can actually show up below.)
+        solver.merge(a0, b0, TermId::new(1_000_000)).unwrap_or(());
+        assert!(
+            solver.are_equal(a, b),
+            "congruence closure should merge the top of both {DEPTH}-deep chains"
+        );
+
+        // Force a conflict at the top: explaining it must unwind DEPTH levels of
+        // MergeReason::Congruence — this is the call path that used to recurse.
+        solver.assert_diseq(a, b, TermId::new(999_999));
+        let conflict = solver.check_conflicts();
+        assert!(
+            conflict.is_some(),
+            "a disequality on two now-equal deep-chain tops must conflict"
+        );
+        let reasons = conflict.unwrap();
+        assert!(
+            reasons.contains(&TermId::new(999_999)),
+            "explanation must cite the disequality reason"
+        );
+        assert!(
+            reasons.contains(&TermId::new(1_000_000)),
+            "explanation must trace all the way back to the base-case merge reason"
+        );
     }
 
     #[test]
