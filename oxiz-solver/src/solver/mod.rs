@@ -593,6 +593,16 @@ impl Solver {
             return SatLevel::DefiniteUnsat;
         }
 
+        // #418 item 2 — re-derive selector/tester reductions using the
+        // CURRENT check-sat's variable->constructor binding map (the
+        // indirect-variable and equality-chain cases the per-assert
+        // structural pass alone can't see, since a binding may arrive in a
+        // LATER assertion than the selector/tester it unblocks). See
+        // `encode.rs::add_dt_indirect_var_reduction_axioms` and
+        // `check_dt.rs::collect_var_ctor_bindings` for the full design.
+        let dt_var_ctor_bindings = self.collect_var_ctor_bindings(manager);
+        self.add_dt_indirect_var_reduction_axioms(&dt_var_ctor_bindings, manager);
+
         // Check array constraints for early conflict detection
         if self.check_array_constraints(manager) {
             return SatLevel::DefiniteUnsat;

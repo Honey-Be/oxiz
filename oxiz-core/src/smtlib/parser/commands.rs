@@ -443,25 +443,22 @@ impl<'a> Parser<'a> {
             datatype_names.push(dt_name);
         }
 
-        // Pre-create every declared datatype's SORT before parsing the
-        // constructor groups, so a selector of a MUTUALLY-recursive sibling
-        // (or a self-reference) resolves to the datatype sort rather than the
-        // uninterpreted fallback (#399).
-        for n in &datatype_names {
-            let _ = self.manager.sorts.mk_datatype_sort(n);
-        }
-
         // Parse the constructor-groups list — one group per declared
         // datatype.  adsmt-patch (rc.30): the previous code parsed
         // only the FIRST group then expected the command-closing `)`,
         // so a multi-datatype `(declare-datatypes ((R 0)(L 0)) (g1 g2))`
         // failed with "expected ')', found LParen" at the second
-        // group.  Loop over every group and register each datatype's
-        // sort + constructors so later terms resolve.
+        // group.  Loop over every group and collect each datatype's raw
+        // constructor structure so later terms resolve.
+        //
+        // #418 item 4 (well-foundedness): this pass is deliberately RAW —
+        // selector sorts are kept as parsed symbol strings, with NO
+        // SortManager/dt_constructors/dt_selectors mutation yet — so that if
+        // the well-foundedness gate below rejects the group, no partial
+        // registration state is left behind for the rejected declaration.
         self.expect_lparen()?; // outer constructor-groups list
 
-        let mut constructors: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        let mut group_idx = 0usize;
+        let mut raw_groups: Vec<Vec<(String, Vec<(String, String)>)>> = Vec::new();
         loop {
             // End of the outer constructor-groups list?
             if let Some(t) = self.lexer.peek()
@@ -504,6 +501,31 @@ impl<'a> Parser<'a> {
                 group_ctors.push((ctor_name, selectors));
             }
 
+            raw_groups.push(group_ctors);
+        }
+
+        // Close the outer command list.
+        self.expect_rparen()?;
+
+        // #418 item 4 — well-foundedness (strict positivity) check, BEFORE
+        // any sort/constructor registration below. z3/cvc5 reject a
+        // mutually-recursive group with no reachable base case at
+        // declare-time; oxiz must match that (a parse-time rejection, not a
+        // silent accept that can make a provably-uninhabited sort report
+        // `sat`).
+        let position = self.lexer.position();
+        Self::check_dt_group_well_founded(position, &datatype_names, &raw_groups)?;
+
+        // Pre-create every declared datatype's SORT before resolving the
+        // constructor groups' field sorts, so a selector of a MUTUALLY-
+        // recursive sibling (or a self-reference) resolves to the datatype
+        // sort rather than the uninterpreted fallback (#399).
+        for n in &datatype_names {
+            let _ = self.manager.sorts.mk_datatype_sort(n);
+        }
+
+        let mut constructors: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for (group_idx, group_ctors) in raw_groups.into_iter().enumerate() {
             // Register this datatype's sort + constructors.
             let dt_name = datatype_names
                 .get(group_idx)
@@ -537,11 +559,7 @@ impl<'a> Parser<'a> {
             }
             self.manager.sorts.declare_datatype(&dt_name, ctor_defs);
             constructors.extend(group_ctors);
-            group_idx += 1;
         }
-
-        // Close the outer command list.
-        self.expect_rparen()?;
 
         let name = datatype_names
             .first()
@@ -549,6 +567,99 @@ impl<'a> Parser<'a> {
             .unwrap_or_else(|| "UnknownDatatype".to_string());
 
         Ok(Command::DeclareDatatype { name, constructors })
+    }
+
+    /// #418 item 4 — well-foundedness / strict-positivity check for a
+    /// `declare-datatypes` mutually-recursive group (or a singular
+    /// `declare-datatype`, as the size-1 case). Mirrors the standard
+    /// algorithm z3/cvc5 use (equivalent to computing productive/nullable
+    /// nonterminals in a grammar, or Coq/Agda "strict positivity"):
+    ///
+    /// A datatype D (within its declared group) is "founded" if it has at
+    /// least one constructor all of whose FIELDS are either (a) not of a
+    /// datatype sort belonging to this same group, or (b) of a
+    /// group-datatype sort that is ALREADY founded. Fixpoint from
+    /// founded = {}, repeatedly adding any datatype that now qualifies,
+    /// until no change (monotone, bounded by group size, always
+    /// terminates). If any group member is not founded at the fixpoint, the
+    /// whole group is rejected.
+    ///
+    /// `names[i]` is the i-th declared datatype's name; `groups[i]` is its
+    /// constructor list as `(ctor_name, [(selector_name, selector_SORT_NAME)])`
+    /// — the selector sort is still the RAW parsed symbol string (sort
+    /// resolution/registration happens only after this check passes, and
+    /// only if it passes), so this needs no SortManager access at all: a
+    /// field's sort counts as "a group member" purely by matching one of
+    /// `names` textually — a field sort naming some OTHER, already-declared
+    /// and hence already-validated, datatype is correctly treated as case
+    /// (a) (safe), since it cannot participate in a NEW cycle through this
+    /// group.
+    fn check_dt_group_well_founded(
+        position: usize,
+        names: &[String],
+        groups: &[Vec<(String, Vec<(String, String)>)>],
+    ) -> Result<()> {
+        let n = names.len();
+        let mut founded = vec![false; n];
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                if founded[i] {
+                    continue;
+                }
+                // `.get(i)` (not `groups[i]`): a malformed script can supply
+                // a MISMATCHED number of constructor groups vs. declared
+                // names (a separate, unrelated grammar error the rest of the
+                // parser already tolerates via `.get()`/fallback names
+                // rather than panicking) — a name with no group at all
+                // correctly has zero constructors, hence trivially never
+                // founds, rather than indexing out of bounds.
+                let has_base_ctor = groups.get(i).into_iter().flatten().any(|(_ctor_name, selectors)| {
+                    selectors.iter().all(|(_sel_name, sel_sort)| {
+                        match names.iter().position(|nm| nm == sel_sort) {
+                            // A field whose sort is another (or the same)
+                            // datatype IN THIS GROUP is only safe once that
+                            // sibling is already founded.
+                            Some(j) => founded[j],
+                            // Not a member of this recursive group at all (a
+                            // base/interpreted sort, or an unrelated,
+                            // already-declared — hence already-validated —
+                            // datatype) — always safe.
+                            None => true,
+                        }
+                    })
+                });
+                if has_base_ctor {
+                    founded[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let non_founded: Vec<&str> = names
+            .iter()
+            .zip(founded.iter())
+            .filter(|(_, f)| !**f)
+            .map(|(nm, _)| nm.as_str())
+            .collect();
+
+        if non_founded.is_empty() {
+            Ok(())
+        } else {
+            Err(OxizError::ParseError {
+                position,
+                message: format!(
+                    "non-well-founded datatype declaration: {} — every constructor of every \
+                     listed datatype recursively requires a value of a datatype in the same \
+                     mutually-recursive group, so no ground (finite/base) value of this sort can \
+                     ever be constructed; z3/cvc5 reject this at declaration time",
+                    non_founded.join(", ")
+                ),
+            })
+        }
     }
 
     /// Parse `(declare-datatype name (...))` — single-datatype form
@@ -588,6 +699,20 @@ impl<'a> Parser<'a> {
         }
 
         self.expect_rparen()?;
+
+        // #418 item 4 — well-foundedness check (a single self-recursive
+        // datatype is just a mutually-recursive group of size 1: it must
+        // have at least one constructor with no field of its own sort,
+        // reachable without going through any OTHER not-yet-founded
+        // group member — trivially itself here). Runs BEFORE any
+        // sort/constructor registration below, so a rejection leaves no
+        // partial state behind.
+        let position = self.lexer.position();
+        Self::check_dt_group_well_founded(
+            position,
+            std::slice::from_ref(&name),
+            std::slice::from_ref(&constructors),
+        )?;
 
         let dt_sort = self.manager.sorts.mk_datatype_sort(&name);
         for (ctor_name, _selectors) in &constructors {

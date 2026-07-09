@@ -6,6 +6,13 @@ use oxiz_core::ast::{TermId, TermKind, TermManager};
 
 use super::Solver;
 
+/// #418 item 3 — pragmatic safety valve for
+/// `Solver::check_dt_or_case_split_conflict`'s combinatorial case-split
+/// search (never a soundness concern in either direction: exceeding the
+/// budget only means "no conflict found," the always-safe answer). See that
+/// function's doc comment, "Termination / blowup guard".
+const DT_OR_CASE_SPLIT_BUDGET: u32 = 200_000;
+
 impl Solver {
     pub(super) fn check_dt_constraints(&self, manager: &TermManager) -> bool {
         // Collect positive constructor tester constraints: ((_ is Constructor) x)
@@ -262,6 +269,18 @@ impl Solver {
             return true;
         }
 
+        // #418 item 3 — OR-branch cyclic disjunction case-split: even when
+        // NO single equality is unconditionally (flatly) true, every WAY of
+        // satisfying the assertion set might still force a cycle (e.g. every
+        // disjunct of an `or` independently forces one). See
+        // `check_dt_or_case_split_conflict`'s doc comment for the full
+        // design; this is a pure generalization of the check just above (it
+        // reduces to exactly the same answer when there is no case-split
+        // structure to consider).
+        if self.check_dt_or_case_split_conflict(manager) {
+            return true;
+        }
+
         false
     }
 
@@ -325,6 +344,61 @@ impl Solver {
         dt_var_equalities: &[(TermId, TermId)],
         var_ctor_term_eqs: &[(TermId, TermId)],
     ) -> bool {
+        let ctor_terms = self.build_dt_ctor_terms(manager);
+        self.cycle_exists_given(dt_var_equalities, var_ctor_term_eqs, &ctor_terms, manager)
+    }
+
+    /// Unconditional structural walk: record every manifest `DtConstructor`
+    /// application's own (term-id, args) shape, over the WHOLE current
+    /// assertion set. Ground-only: skips quantifier bodies (see
+    /// `check_dt_acyclicity`'s doc comment, point 2, for why this needs no
+    /// polarity gating — a term's shape is a fact about the term, not a
+    /// proposition). Extracted out of `check_dt_acyclicity` so `#418` item
+    /// 3's case-split evaluator (`check_dt_or_case_split_conflict`) can reuse
+    /// it as a subroutine: this structural shape NEVER depends on which
+    /// branch of an Or/And is chosen, so it is always safe/correct to compute
+    /// it exactly ONCE and share it across every hypothesis-set variant the
+    /// case-split evaluator tries.
+    fn build_dt_ctor_terms(&self, manager: &TermManager) -> Vec<(TermId, Vec<TermId>)> {
+        let mut ctor_terms: Vec<(TermId, Vec<TermId>)> = Vec::new();
+        let mut stack: Vec<TermId> = self.assertions.clone();
+        let mut seen: FxHashSet<TermId> = FxHashSet::default();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            let Some(td) = manager.get(t) else { continue };
+            if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                continue;
+            }
+            for c in oxiz_core::ast::get_children(&td.kind) {
+                stack.push(c);
+            }
+            if let TermKind::DtConstructor { args, .. } = &td.kind {
+                ctor_terms.push((t, args.iter().copied().collect()));
+            }
+        }
+        ctor_terms
+    }
+
+    /// Union-Find + directed-containment-graph + DFS cycle detector,
+    /// PARAMETERIZED by an arbitrary equality set (`dt_var_equalities`,
+    /// `var_ctor_term_eqs`) and the precomputed `ctor_terms` structural walk
+    /// (see `build_dt_ctor_terms`). This is the exact same algorithm
+    /// `check_dt_acyclicity` always used, extracted so `#418` item 3's
+    /// recursive per-branch evaluator can reuse it as a subroutine — feeding
+    /// it the union of the global background equalities and whatever
+    /// branch-local hypothesis the case split is currently exploring,
+    /// exactly as the task's design calls for ("Reuse
+    /// `check_dt_acyclicity`'s existing union-find + DFS cycle-detection
+    /// machinery as a subroutine").
+    fn cycle_exists_given(
+        &self,
+        dt_var_equalities: &[(TermId, TermId)],
+        var_ctor_term_eqs: &[(TermId, TermId)],
+        ctor_terms: &[(TermId, Vec<TermId>)],
+        manager: &TermManager,
+    ) -> bool {
         // --- Union-Find over TermId (path compression; inputs are tiny, no
         // union-by-rank needed). ---
         fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
@@ -353,33 +427,9 @@ impl Solver {
             union(&mut parent, v, c);
         }
 
-        // --- Unconditional structural walk: record every manifest
-        // `DtConstructor` application's own (term-id, args) shape. Ground-
-        // only: skip quantifier bodies (see doc comment). ---
-        let mut ctor_terms: Vec<(TermId, Vec<TermId>)> = Vec::new();
-        {
-            let mut stack: Vec<TermId> = self.assertions.clone();
-            let mut seen: FxHashSet<TermId> = FxHashSet::default();
-            while let Some(t) = stack.pop() {
-                if !seen.insert(t) {
-                    continue;
-                }
-                let Some(td) = manager.get(t) else { continue };
-                if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
-                    continue;
-                }
-                for c in oxiz_core::ast::get_children(&td.kind) {
-                    stack.push(c);
-                }
-                if let TermKind::DtConstructor { args, .. } = &td.kind {
-                    ctor_terms.push((t, args.iter().copied().collect()));
-                }
-            }
-        }
-
         // --- Directed containment graph over equivalence-class roots. ---
         let mut adj: FxHashMap<TermId, Vec<TermId>> = FxHashMap::default();
-        for (t, args) in &ctor_terms {
+        for (t, args) in ctor_terms {
             let src = find(&mut parent, *t);
             for &a in args {
                 let Some(a_sort) = manager.get(a).map(|d| d.sort) else {
@@ -444,6 +494,343 @@ impl Solver {
         }
 
         false
+    }
+
+    /// #418 item 3 — OR-branch cyclic disjunction case-split detection.
+    ///
+    /// Generalizes the flat, globally-unconditional equality check above
+    /// (`check_dt_acyclicity`) into a genuine recursive per-branch
+    /// entailment evaluator: the current assertion set can force a datatype
+    /// acyclicity conflict even when NO single equality is unconditionally
+    /// true, as long as EVERY way of making the assertions true (i.e. every
+    /// combination of disjunct choices across every `Or`/negated-`And` case
+    /// split) independently forces a cycle. Minimal motivating example:
+    /// `(assert (or (= y (cons x y)) (and (= y (cons x z)) (= z (cons x
+    /// y)))))` — neither disjunct is unconditionally true, but BOTH force a
+    /// cycle through `y`, so the whole assertion does too.
+    ///
+    /// # Design
+    ///
+    /// The current assertion set is implicitly one big conjunction, so this
+    /// drives a single work-list evaluator (`dt_items_force_conflict`) over
+    /// `self.assertions` (each assertion starts at `ctx = true`, i.e.
+    /// "asserted true"). The evaluator processes a work-list of `(TermId,
+    /// bool)` pairs — `(term, "is this term currently required to be true
+    /// (true) or false (false)")` — one item at a time, POPPING the front
+    /// and, depending on the popped term's shape, either splicing replacement
+    /// items back onto the (still-to-process) rest of the list, extending
+    /// the accumulated hypothesis, or (for a genuine case split) branching:
+    ///
+    /// - `Not(inner)` at `(t, ctx)`: replace with `(inner, !ctx)` — flip and
+    ///   continue (no hypothesis change), mirroring
+    ///   `collect_dt_constraints_v2`'s existing `Not` handling exactly.
+    /// - `And(children)` at `ctx == true`, or `Or(children)` at `ctx ==
+    ///   false` (a **conjunctive** node — De Morgan makes `¬(A∨B) ≡
+    ///   ¬A∧¬B`, exactly `collect_dt_constraints_v2`'s existing recursion
+    ///   rule): splice `children` (each at the SAME `ctx`) in place of this
+    ///   item and continue with the combined list. This is the "extend the
+    ///   hypothesis set and recurse" half of the task's spec, expressed
+    ///   incrementally: rather than eagerly flattening first, the work-list
+    ///   just keeps walking, so the hypothesis grows lazily as each leaf
+    ///   equality is reached — an equivalent result to eager flattening, via
+    ///   the exact same recursion the existing flat collector already
+    ///   trusts.
+    /// - `Or(children)` at `ctx == true`, or `And(children)` at `ctx ==
+    ///   false` (a genuinely **disjunctive** node — the NEW case;
+    ///   `collect_dt_constraints_v2` deliberately contributes nothing here):
+    ///   a real case split. The whole remaining conjunction (this node plus
+    ///   everything still left on the work-list) is conflict-forced only if
+    ///   EVERY branch `b` of `children`, substituted for this item (at the
+    ///   SAME `ctx` — `Or`/true picks a disjunct that is true, `And`/false
+    ///   picks a disjunct that is false, so recursion continues under the
+    ///   identical polarity), independently forces a conflict. Because each
+    ///   branch simply CONTINUES processing the same rest-of-work-list under
+    ///   its own extended hypothesis, sibling/nested disjunctions naturally
+    ///   compose via full cross-product recursion — e.g. an `And` of two
+    ///   `Or`s recurses into the SECOND `Or`'s own branching once inside
+    ///   each branch of the FIRST, requiring all 2×2 combinations to
+    ///   conflict — with no special-casing needed.
+    /// - Anything else (a leaf w.r.t. the Boolean skeleton — `Eq`,
+    ///   `DtTester`, or any other term kind): delegate straight to
+    ///   `collect_dt_constraints_v2` on just this ONE node (which, being a
+    ///   non-recursing kind from that function's point of view, does exactly
+    ///   one thing: record whatever `dt_var_equalities`/`var_ctor_term_eqs`
+    ///   contribution this single node makes at this `ctx`, if any) to
+    ///   extend the hypothesis, then continue with the rest of the
+    ///   work-list. (`collect_dt_constraints_v2`'s other outputs, e.g.
+    ///   `constructor_testers`, are collected into throwaway maps — out of
+    ///   scope here, see below.)
+    /// - An empty work-list means every conjunct has been walked: check the
+    ///   FULLY accumulated hypothesis for a cycle via `cycle_exists_given`
+    ///   (the exact same union-find+DFS subroutine `check_dt_acyclicity`
+    ///   uses), parameterized by the SAME unconditional `ctor_terms`
+    ///   structural walk (computed ONCE up front, since it never depends on
+    ///   which branch is chosen — see `build_dt_ctor_terms`'s doc comment).
+    ///
+    /// # Scope: acyclicity only (the required minimum)
+    ///
+    /// This generalizes ONLY the acyclicity conflict signal (a manifest
+    /// cycle through constructor-argument containment). It does NOT
+    /// additionally case-split-check the constructor-tester /
+    /// constructor-equality conflict families checked earlier in
+    /// `check_dt_constraints` (e.g. "does every branch force a `(is C1 x)`
+    /// vs. `(is C2 x)` clash") — `#418` explicitly calls extending that far
+    /// a bonus, not the required minimum. Combining tester/equality
+    /// conflicts with this same case-split machinery is a documented
+    /// boundary, not attempted here.
+    ///
+    /// # Scope: cross-theory case splits
+    ///
+    /// Only a Boolean-skeleton `Or`/`And`/`Not` is treated as case-split
+    /// structure. An arithmetic disjunction that only INDIRECTLY implies a
+    /// datatype equality (e.g. two arithmetic branches that each happen to
+    /// pin down a shared integer-sorted selector value in a way that, when
+    /// combined with OTHER asserted facts, would force a datatype equality)
+    /// is out of scope — per `#418`'s own text, that needs live
+    /// SAT-trail-integrated theory propagation, a fundamentally bigger
+    /// change than this one-shot, once-per-check-sat structural evaluator.
+    ///
+    /// # Termination / blowup guard
+    ///
+    /// The work-list only ever splices in already-existing subterms
+    /// (bounded by the assertion set's own finite AST size for the
+    /// conjunctive/leaf cases), but disjunctive case-splits multiply
+    /// combinatorially when several independent `Or`s are effectively ANDed
+    /// together (the cross-product behavior above is intentional — it is
+    /// exactly what makes the "AND of two ORs" case work). As a pragmatic
+    /// safety valve against a pathological/adversarial input — NEVER a
+    /// soundness concern either way, since exceeding the budget just returns
+    /// `false` ("no conflict found," always the safe direction) — a bounded
+    /// step counter aborts the search past `DT_OR_CASE_SPLIT_BUDGET` total
+    /// work-list-pop steps.
+    pub(super) fn check_dt_or_case_split_conflict(&self, manager: &TermManager) -> bool {
+        let ctor_terms = self.build_dt_ctor_terms(manager);
+        let items: Vec<(TermId, bool)> = self.assertions.iter().map(|&a| (a, true)).collect();
+        let mut budget: u32 = DT_OR_CASE_SPLIT_BUDGET;
+        self.dt_items_force_conflict(&items, &[], &[], manager, &ctor_terms, &mut budget)
+    }
+
+    /// Work-list step of the `#418` item 3 evaluator — see
+    /// `check_dt_or_case_split_conflict`'s doc comment for the full design.
+    fn dt_items_force_conflict(
+        &self,
+        items: &[(TermId, bool)],
+        h_var: &[(TermId, TermId)],
+        h_ctor: &[(TermId, TermId)],
+        manager: &TermManager,
+        ctor_terms: &[(TermId, Vec<TermId>)],
+        budget: &mut u32,
+    ) -> bool {
+        if *budget == 0 {
+            // Safety valve only — never claims a conflict past this point,
+            // so exceeding the budget can only make us MISS a conflict
+            // (stay sat/unknown), never fabricate one.
+            return false;
+        }
+        *budget -= 1;
+
+        let Some((&(t, ctx), rest)) = items.split_first() else {
+            // Fully assembled hypothesis for this combination of branch
+            // choices — check it for a cycle.
+            return self.cycle_exists_given(h_var, h_ctor, ctor_terms, manager);
+        };
+
+        let Some(td) = manager.get(t) else {
+            return self.dt_items_force_conflict(rest, h_var, h_ctor, manager, ctor_terms, budget);
+        };
+
+        match &td.kind {
+            TermKind::Not(inner) => {
+                let mut new_items = Vec::with_capacity(rest.len() + 1);
+                new_items.push((*inner, !ctx));
+                new_items.extend_from_slice(rest);
+                self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+            }
+            TermKind::And(children) if ctx => {
+                // Conjunctive: all children are asserted true too.
+                let mut new_items = Vec::with_capacity(rest.len() + children.len());
+                new_items.extend(children.iter().map(|&c| (c, true)));
+                new_items.extend_from_slice(rest);
+                self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+            }
+            TermKind::Or(children) if !ctx => {
+                // Conjunctive (De Morgan): all children are asserted false too.
+                let mut new_items = Vec::with_capacity(rest.len() + children.len());
+                new_items.extend(children.iter().map(|&c| (c, false)));
+                new_items.extend_from_slice(rest);
+                self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+            }
+            TermKind::Or(children) if ctx => {
+                // Disjunctive case split: EVERY branch must independently
+                // force a conflict (combined with the unchanged rest of the
+                // work-list) for the whole thing to be conflict-forced.
+                children.iter().all(|&b| {
+                    let mut new_items = Vec::with_capacity(rest.len() + 1);
+                    new_items.push((b, true));
+                    new_items.extend_from_slice(rest);
+                    self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                })
+            }
+            TermKind::And(children) if !ctx => {
+                // Disjunctive case split (De Morgan — ¬(A∧B) ≡ ¬A∨¬B): EVERY
+                // branch (negated) must independently force a conflict.
+                children.iter().all(|&b| {
+                    let mut new_items = Vec::with_capacity(rest.len() + 1);
+                    new_items.push((b, false));
+                    new_items.extend_from_slice(rest);
+                    self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                })
+            }
+            _ => {
+                // A leaf w.r.t. the Boolean skeleton (`Eq`, `DtTester`, or
+                // anything else): delegate to the audited single-node
+                // extraction already in `collect_dt_constraints_v2` — it
+                // does not recurse into further Boolean structure for these
+                // kinds, so calling it on just `t` extracts exactly this
+                // node's own contribution (if any) and nothing more.
+                let mut throwaway_pos_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+                let mut throwaway_neg_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+                let mut throwaway_ctor_eqs: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+                let mut throwaway_neg_ctor_eqs: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+                let mut new_var_eqs: Vec<(TermId, TermId)> = Vec::new();
+                let mut new_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+                self.collect_dt_constraints_v2(
+                    t,
+                    manager,
+                    &mut throwaway_pos_testers,
+                    &mut throwaway_neg_testers,
+                    &mut throwaway_ctor_eqs,
+                    &mut throwaway_neg_ctor_eqs,
+                    &mut new_var_eqs,
+                    &mut new_ctor_eqs,
+                    ctx,
+                );
+                if new_var_eqs.is_empty() && new_ctor_eqs.is_empty() {
+                    self.dt_items_force_conflict(rest, h_var, h_ctor, manager, ctor_terms, budget)
+                } else {
+                    let mut h_var2 = h_var.to_vec();
+                    h_var2.extend(new_var_eqs);
+                    let mut h_ctor2 = h_ctor.to_vec();
+                    h_ctor2.extend(new_ctor_eqs);
+                    self.dt_items_force_conflict(rest, &h_var2, &h_ctor2, manager, ctor_terms, budget)
+                }
+            }
+        }
+    }
+
+    /// #418 item 2 — build a TRANSITIVELY-CLOSED variable→constructor-
+    /// application binding map for the CURRENT check-sat's assertion set, for
+    /// use by `encode.rs::resolve_dt_normal_form` (via
+    /// `Solver::add_dt_indirect_var_reduction_axioms`, called once per
+    /// check-sat from `mod.rs::check_level`).
+    ///
+    /// Reuses the exact same `collect_dt_constraints_v2` collector (and
+    /// hence the exact same positive/negative polarity gating already
+    /// proven correct by the acyclicity check in this file, `#406`) to
+    /// gather:
+    ///   - `dt_var_equalities`: pairs of DATATYPE VARIABLES asserted equal
+    ///     (`x = y`), unconditionally/globally positive (Or-branch-local
+    ///     equalities are NEVER collected here — see the collector's own
+    ///     doc comments for the And/Or/Not polarity threading that
+    ///     guarantees this);
+    ///   - `var_ctor_term_eqs`: a DATATYPE VARIABLE asserted equal to a
+    ///     manifest `DtConstructor` application (`x = C(args…)`), same
+    ///     polarity gating.
+    ///
+    /// Then closes `dt_var_equalities` under union-find (so a chain `w = z,
+    /// z = C(...)` binds `w` too, transitively, no matter how many plain
+    /// variable-to-variable hops away — this is what lets
+    /// `resolve_dt_normal_form` handle the "chain of plain equalities"
+    /// soundness-control case from #418's verification plan) and, for every
+    /// union-find class that contains at least one `var_ctor_term_eqs`
+    /// binding, maps EVERY variable in that class to that binding's
+    /// constructor term. (If a class somehow has more than one distinct
+    /// binding — e.g. `x = C(a,b)` and `x = C(c,d)` where `a≠c` as terms —
+    /// picking either is sound: this map is only a HINT for reduction, not a
+    /// source of truth, and the two bindings are already provably equal via
+    /// constructor injectivity/EUF congruence handled elsewhere; conflicting
+    /// DIFFERENTLY-NAMED constructors for the same class are already caught
+    /// as a ground conflict by `check_dt_constraints` itself, which always
+    /// runs before this map is even consulted.)
+    ///
+    /// Rebuilt from scratch every call (idempotent, no incremental state of
+    /// its own to desync) — callers key their own trail-undo on the SAT
+    /// clauses THEY inject from this map (see
+    /// `add_dt_indirect_var_reduction_axioms`'s doc comment), never on this
+    /// map's contents, which is why rebuilding it fresh every check-sat is
+    /// always safe regardless of push/pop history.
+    pub(super) fn collect_var_ctor_bindings(&self, manager: &TermManager) -> FxHashMap<TermId, TermId> {
+        let mut constructor_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+        let mut negative_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+        let mut constructor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+        let mut negative_ctor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+        let mut dt_var_equalities: Vec<(TermId, TermId)> = Vec::new();
+        let mut var_ctor_term_eqs: Vec<(TermId, TermId)> = Vec::new();
+
+        for &assertion in &self.assertions {
+            self.collect_dt_constraints_v2(
+                assertion,
+                manager,
+                &mut constructor_testers,
+                &mut negative_testers,
+                &mut constructor_equalities,
+                &mut negative_ctor_equalities,
+                &mut dt_var_equalities,
+                &mut var_ctor_term_eqs,
+                true,
+            );
+        }
+
+        // Union-Find over TermId — the exact same tiny shape as
+        // `check_dt_acyclicity`'s (kept separate/local here rather than
+        // shared to avoid coupling the two; both are cheap to rebuild and
+        // bounded by formula size).
+        fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
+            let p = *parent.entry(x).or_insert(x);
+            if p == x {
+                x
+            } else {
+                let root = find(parent, p);
+                parent.insert(x, root);
+                root
+            }
+        }
+        fn union(parent: &mut FxHashMap<TermId, TermId>, a: TermId, b: TermId) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+
+        let mut parent: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for &(a, b) in &dt_var_equalities {
+            union(&mut parent, a, b);
+        }
+
+        let mut root_to_ctor: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for &(v, c) in &var_ctor_term_eqs {
+            let root = find(&mut parent, v);
+            root_to_ctor.entry(root).or_insert(c);
+        }
+
+        let mut all_vars: FxHashSet<TermId> = FxHashSet::default();
+        for &(a, b) in &dt_var_equalities {
+            all_vars.insert(a);
+            all_vars.insert(b);
+        }
+        for &(v, _) in &var_ctor_term_eqs {
+            all_vars.insert(v);
+        }
+
+        let mut bindings: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for v in all_vars {
+            let root = find(&mut parent, v);
+            if let Some(&c) = root_to_ctor.get(&root) {
+                bindings.insert(v, c);
+            }
+        }
+        bindings
     }
 
     /// Collect datatype constraints from a term (version 2 with negative testers and var equalities)

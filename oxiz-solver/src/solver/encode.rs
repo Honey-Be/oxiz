@@ -856,49 +856,198 @@ impl Solver {
         }
     }
 
-    /// #406 — ground selector-of-constructor reduction at the SAT level.
+    /// #418 items 1 & 2 — structural + variable-binding resolution of a
+    /// ground datatype-sorted term to a manifest `DtConstructor` application
+    /// "normal form". This is the shared engine behind the generalized
+    /// `add_dt_selector_reduction_axioms`/`add_dt_tester_reduction_axioms`
+    /// below; see those functions' doc comments for how it closes the #418
+    /// item 1 (selector/tester CHAIN, depth ≥ 2) and item 2 (selector/tester
+    /// on a variable only shown equal to a constructor application via a
+    /// SEPARATE ground equality, possibly through a chain of plain variable
+    /// equalities) residuals from #406.
     ///
-    /// The parser now builds a real `TermKind::DtSelector` node for an
-    /// applied selector symbol (e.g. `(hd v)`), but nothing on the live
-    /// solving path ever REDUCED `sel_i(Cⱼ(args…))` when the selector's
-    /// argument is a syntactically manifest constructor application of its
-    /// own owning constructor — e.g. `(hd (cons x y))` stayed an opaque atom
-    /// unrelated to `x`, so `(assert (not (= (hd (cons x y)) x)))` was
-    /// satisfiable when it is actually `unsat` (z3 agrees).
+    /// Recursive rule (purely a function of the term DAG's own shape plus
+    /// `var_ctor_bindings`, never of "what's possible" — every step below is
+    /// either a syntactic identity or an already-established binding):
+    ///   - `t` IS a `DtConstructor` application: normal form is `t` itself.
+    ///   - `t` is a `Var` bound by `var_ctor_bindings` to some constructor
+    ///     term `c` (see `check_dt.rs::collect_var_ctor_bindings` — already
+    ///     transitively closed over plain variable-to-variable equalities,
+    ///     so a chain `w = z, z = C(args…)` binds `w` too, no matter how many
+    ///     var=var hops away): normal form is `resolve(c)`.
+    ///   - `t` is `DtSelector { selector, arg }`, `resolve(arg) =
+    ///     Some(C(cargs))`, and `selector` is one of `C`'s OWN fields at
+    ///     index `i`: normal form is `resolve(cargs[i])` — recursing here is
+    ///     exactly what closes a depth-N selector chain (e.g. `hd(tl(cons(a,
+    ///     cons(b, c))))`): each step first pins down its OWN direct
+    ///     argument's constructor shape (however many hops that itself
+    ///     took), then asks whether the extracted field is ITSELF further
+    ///     resolvable (another manifest constructor, another selector/tester
+    ///     chain, or another bound variable). When the extracted field is
+    ///     NOT itself datatype-sorted (e.g. an `Int` field, the common base
+    ///     case), this recursive call simply returns `None` — which is fine:
+    ///     the CALLER (one recursion level up, or the axiom-emission code
+    ///     below) uses the RAW field value directly as the reduction target
+    ///     regardless of whether it further resolves; `None` here only means
+    ///     "can't simplify further", never "this field has no value".
+    ///   - otherwise: `None` — this purely-static analysis has nothing to
+    ///     say about `t`. NEVER treated as a conflict, only ever as "no axiom
+    ///     to add here" (a missed completeness case stays unconstrained,
+    ///     exactly like the pre-#418 one-level check already did).
     ///
-    /// For every ground `DtSelector { selector, arg }` subterm `t` of the
-    /// asserted formula where `arg` is itself a `DtConstructor` application,
+    /// `var_ctor_bindings` may be the EMPTY map (pure structural resolution —
+    /// safe and correct to run at per-assert encode time, since it depends on
+    /// nothing but the term DAG already built by THIS assertion; this is what
+    /// `add_dt_selector_reduction_axioms`/`_tester_` below pass) or the full
+    /// check-sat-wide map built by `check_dt.rs::collect_var_ctor_bindings`
+    /// (used by `add_dt_indirect_var_reduction_axioms`, run once per
+    /// check-sat from `mod.rs::check_level`, since only THAT point has seen
+    /// every currently-active assertion — a per-assert pass cannot see a
+    /// binding established by a LATER assertion).
+    ///
+    /// `memo`/`in_progress` are supplied by the caller so repeated queries
+    /// across many selector/tester nodes in the same pass share the cache.
+    /// `in_progress` guards against a cycle in the recursion itself — a
+    /// well-formed ground term DAG never has one (this is a purely defensive
+    /// termination guard, not a soundness requirement).
+    pub(super) fn resolve_dt_normal_form(
+        term: TermId,
+        var_ctor_bindings: &FxHashMap<TermId, TermId>,
+        memo: &mut FxHashMap<TermId, Option<TermId>>,
+        in_progress: &mut FxHashSet<TermId>,
+        manager: &TermManager,
+    ) -> Option<TermId> {
+        if let Some(&cached) = memo.get(&term) {
+            return cached;
+        }
+        if !in_progress.insert(term) {
+            // Cycle in the recursion itself (shouldn't happen on a
+            // well-formed ground DAG) -- bail rather than loop forever.
+            return None;
+        }
+        let result =
+            Self::resolve_dt_normal_form_step(term, var_ctor_bindings, memo, in_progress, manager);
+        in_progress.remove(&term);
+        memo.insert(term, result);
+        result
+    }
+
+    fn resolve_dt_normal_form_step(
+        term: TermId,
+        var_ctor_bindings: &FxHashMap<TermId, TermId>,
+        memo: &mut FxHashMap<TermId, Option<TermId>>,
+        in_progress: &mut FxHashSet<TermId>,
+        manager: &TermManager,
+    ) -> Option<TermId> {
+        let td = manager.get(term)?;
+        match &td.kind {
+            TermKind::DtConstructor { .. } => Some(term),
+            TermKind::Var(_) => {
+                let &bound = var_ctor_bindings.get(&term)?;
+                Self::resolve_dt_normal_form(bound, var_ctor_bindings, memo, in_progress, manager)
+            }
+            TermKind::DtSelector { selector, arg } => {
+                let selector = *selector;
+                let arg = *arg;
+                let resolved_arg = Self::resolve_dt_normal_form(
+                    arg,
+                    var_ctor_bindings,
+                    memo,
+                    in_progress,
+                    manager,
+                )?;
+                let argd = manager.get(resolved_arg)?;
+                let TermKind::DtConstructor {
+                    constructor,
+                    args: ctor_args,
+                } = &argd.kind
+                else {
+                    return None;
+                };
+                let dt_sort = argd.sort;
+                let layouts = manager.sorts.datatype_ctor_layouts(dt_sort)?;
+                let ctor_name = manager.resolve_str(*constructor).to_string();
+                let sel_name = manager.resolve_str(selector).to_string();
+                let (_, fields) = layouts.iter().find(|(c, _)| *c == ctor_name)?;
+                let idx = fields.iter().position(|(s, _)| *s == sel_name)?;
+                let &field_term = ctor_args.get(idx)?;
+                Self::resolve_dt_normal_form(
+                    field_term,
+                    var_ctor_bindings,
+                    memo,
+                    in_progress,
+                    manager,
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// #406 (direct case) + #418 item 1 (chains) / item 2 (indirect
+    /// variables, via `add_dt_indirect_var_reduction_axioms`) — ground
+    /// selector-of-constructor reduction at the SAT level.
+    ///
+    /// The parser builds a real `TermKind::DtSelector` node for an applied
+    /// selector symbol (e.g. `(hd v)`). For every ground `DtSelector {
+    /// selector, arg }` subterm `t` among `roots`' descendants where
+    /// `resolve_dt_normal_form(arg, var_ctor_bindings, …) = Some(C(cargs))`,
     /// look up (via the SAME `SortManager::datatype_ctor_layouts` used by
-    /// `add_dt_cover_axioms`) whether `selector` names one of `arg`'s
-    /// constructor's fields:
+    /// `add_dt_cover_axioms`) whether `selector` names one of `C`'s fields:
     ///   - if so, at field index `i`, assert the VALID ground fact
-    ///     `(= t arg.args[i])` as a unit clause — this is the standard
-    ///     datatype selector axiom and holds unconditionally;
-    ///   - if `selector` is NOT one of that constructor's fields (e.g.
-    ///     `(hd nil)` — a selector applied to a DIFFERENT constructor of the
-    ///     same datatype), the SMT-LIB semantics leaves the value arbitrary
-    ///     but fixed, so NOTHING is asserted (never fabricate a value, never
-    ///     forbid one — this stays sound in both directions).
+    ///     `(= t cargs[i])` as a unit clause — the standard datatype selector
+    ///     axiom, holds unconditionally;
+    ///   - if `selector` is NOT one of that constructor's fields (e.g. `(hd
+    ///     nil)`), the SMT-LIB semantics leaves the value arbitrary but
+    ///     fixed, so NOTHING is asserted (never fabricate a value, never
+    ///     forbid one — sound in both directions).
     ///
-    /// This only covers the DIRECT syntactic case (the selector's argument
-    /// is a manifest `DtConstructor` application in the term graph itself).
-    /// A selector applied to a plain variable that is later shown EQUAL to a
-    /// constructor application only through ground equalities/congruence
-    /// during solving (e.g. `(assert (= y (cons x z))) (assert (not (= (hd
-    /// y) x)))`) is NOT covered by this static, encode-time pass — that
-    /// would need a genuine theory-propagation hook re-triggered as the
-    /// congruence closure grows, which is out of scope here (lower risk,
-    /// matches the `add_dt_cover_axioms` idiom exactly). Injectivity and the
-    /// exhaustiveness cover axioms already close the cases this corpus
-    /// needed; this residual is flagged, not silently papered over.
+    /// `resolve_dt_normal_form` is what upgrades this past the OLD "arg is
+    /// LITERALLY a manifest `DtConstructor` one level in" check: it chases
+    /// through selector CHAINS (`hd(tl(cons(a, cons(b, c))))`, #418 item 1)
+    /// and, when `var_ctor_bindings` is non-empty, through a variable bound
+    /// to a constructor application by a SEPARATE assertion (#418 item 2).
+    /// This function itself always passes the EMPTY map (pure structural
+    /// resolution, safe at per-assert encode time since it depends only on
+    /// the term DAG this one assertion already built) — see
+    /// `add_dt_indirect_var_reduction_axioms` for the check-sat-wide pass
+    /// that supplies the full binding map.
     ///
     /// Reuses the identical worklist/skip rules as `add_dt_cover_axioms`
     /// (skip binder bodies, hash-consed atoms) and the identical trail-undo
     /// idiom (`dt_selector_reduced` guard + `TrailOp::DtSelectorReduced`) so
-    /// incremental push/pop stays sound.
+    /// incremental push/pop stays sound; see `add_dt_selector_reduction_axioms_over`'s
+    /// doc comment for why REUSING that one dedup set across both the
+    /// per-assert and check-sat-wide callers is safe.
     fn add_dt_selector_reduction_axioms(&mut self, root: TermId, manager: &mut TermManager) {
-        let mut stack = vec![root];
+        let empty_bindings: FxHashMap<TermId, TermId> = FxHashMap::default();
+        self.add_dt_selector_reduction_axioms_over(&[root], &empty_bindings, manager);
+    }
+
+    /// Shared implementation behind `add_dt_selector_reduction_axioms`
+    /// (per-assert, `var_ctor_bindings` empty) and
+    /// `add_dt_indirect_var_reduction_axioms` (check-sat-wide, `roots` =
+    /// every current assertion, `var_ctor_bindings` = the full check-sat map
+    /// from `check_dt.rs::collect_var_ctor_bindings`).
+    ///
+    /// Reusing `dt_selector_reduced`/`TrailOp::DtSelectorReduced` for BOTH
+    /// callers is sound: that set/trail-op is purely a re-derivation cache
+    /// (never itself an asserted fact) whose sole job is to avoid re-adding
+    /// the SAME unit clause redundantly. Whichever pass first resolves a
+    /// given `DtSelector` term marks it; the other then skips it (no
+    /// duplicate clause). On `pop()`, the marker is dropped in lock-step with
+    /// the underlying SAT solver discarding the clause (`self.sat.pop()`),
+    /// so a later scope — or a later check-sat in the SAME scope, once a
+    /// binding becomes available — correctly re-derives and re-injects it.
+    fn add_dt_selector_reduction_axioms_over(
+        &mut self,
+        roots: &[TermId],
+        var_ctor_bindings: &FxHashMap<TermId, TermId>,
+        manager: &mut TermManager,
+    ) {
+        let mut stack: Vec<TermId> = roots.to_vec();
         let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        let mut memo: FxHashMap<TermId, Option<TermId>> = FxHashMap::default();
+        let mut in_progress: FxHashSet<TermId> = FxHashSet::default();
         // (selector_term, field_term) pairs to equate — collected during the
         // read-only walk, applied afterwards (mutating `manager`/`self.sat`
         // while `manager.get(..)` borrows are live would not typecheck).
@@ -924,7 +1073,18 @@ impl Solver {
                 TermKind::DtSelector { selector, arg } => (*selector, *arg),
                 _ => continue,
             };
-            let Some(argd) = manager.get(arg) else { continue };
+            let Some(resolved_arg) = Self::resolve_dt_normal_form(
+                arg,
+                var_ctor_bindings,
+                &mut memo,
+                &mut in_progress,
+                manager,
+            ) else {
+                continue;
+            };
+            let Some(argd) = manager.get(resolved_arg) else {
+                continue;
+            };
             let (dt_sort, constructor, ctor_args) = match &argd.kind {
                 TermKind::DtConstructor { constructor, args } => (argd.sort, *constructor, args),
                 _ => continue,
@@ -964,32 +1124,35 @@ impl Solver {
         }
     }
 
-    /// #406 — ground tester-of-constructor reduction at the SAT level.
-    ///
-    /// Confirmed by direct z3-differential this phase: `(assert (not
-    /// ((_ is cons) (cons x y)))) (check-sat)` was satisfiable in oxiz but
-    /// `unsat` in z3 — the SAME direct-syntactic gap as the selector case
-    /// (#406 item 5), just for testers. The existing tester handling
-    /// (`check_dt.rs`'s `collect_dt_constraints_v2`, #399/#404-phase-2) only
-    /// recognizes testers keyed by a DATATYPE VARIABLE (`is_dt_variable`) —
-    /// it has nothing to say when the tester's argument is itself a
-    /// syntactically manifest `DtConstructor` application, so `is-cons` of a
-    /// literal `(cons x y)` term was never decided at all.
-    ///
-    /// Unlike the selector case, a tester of a manifest constructor
-    /// application is ALWAYS decidable (constructors are pairwise distinct,
-    /// so `is-Cⱼ(Cᵢ(args…))` is `true` iff `i = j`, `false` otherwise) — there
-    /// is no "arbitrary but fixed" branch to leave unconstrained.
-    ///
-    /// Same worklist/skip rules and trail-undo idiom as
-    /// `add_dt_selector_reduction_axioms`; only the DIRECT syntactic case
-    /// (argument is a manifest `DtConstructor` in the term graph) is
-    /// covered — a tester of a variable only later shown equal to a
-    /// constructor via ground equalities/congruence is the same documented
-    /// residual as the selector case.
+    /// #406 (direct case) + #418 item 1 (chains) / item 2 (indirect
+    /// variables) — ground tester-of-constructor reduction at the SAT
+    /// level. Mirrors `add_dt_selector_reduction_axioms` exactly (see that
+    /// function's doc comment for the shared `resolve_dt_normal_form`
+    /// machinery); the only difference is that a tester of a resolved
+    /// constructor application is ALWAYS decidable (constructors are
+    /// pairwise distinct, so `is-Cⱼ(Cᵢ(args…))` is `true` iff `i = j`,
+    /// `false` otherwise) — there is no "arbitrary but fixed" branch to
+    /// leave unconstrained.
     fn add_dt_tester_reduction_axioms(&mut self, root: TermId, manager: &mut TermManager) {
-        let mut stack = vec![root];
+        let empty_bindings: FxHashMap<TermId, TermId> = FxHashMap::default();
+        self.add_dt_tester_reduction_axioms_over(&[root], &empty_bindings, manager);
+    }
+
+    /// Shared implementation behind `add_dt_tester_reduction_axioms`
+    /// (per-assert) and `add_dt_indirect_var_reduction_axioms`
+    /// (check-sat-wide) — see `add_dt_selector_reduction_axioms_over`'s doc
+    /// comment for why reusing `dt_tester_reduced`/`TrailOp::DtTesterReduced`
+    /// across both callers is sound.
+    fn add_dt_tester_reduction_axioms_over(
+        &mut self,
+        roots: &[TermId],
+        var_ctor_bindings: &FxHashMap<TermId, TermId>,
+        manager: &mut TermManager,
+    ) {
+        let mut stack: Vec<TermId> = roots.to_vec();
         let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        let mut memo: FxHashMap<TermId, Option<TermId>> = FxHashMap::default();
+        let mut in_progress: FxHashSet<TermId> = FxHashSet::default();
         // (tester_term, decided_value) pairs — collected during the
         // read-only walk, applied afterwards (see the selector-reduction
         // pass for why mutation is deferred to a second loop).
@@ -1012,7 +1175,18 @@ impl Solver {
                 TermKind::DtTester { constructor, arg } => (*constructor, *arg),
                 _ => continue,
             };
-            let Some(argd) = manager.get(arg) else { continue };
+            let Some(resolved_arg) = Self::resolve_dt_normal_form(
+                arg,
+                var_ctor_bindings,
+                &mut memo,
+                &mut in_progress,
+                manager,
+            ) else {
+                continue;
+            };
+            let Some(argd) = manager.get(resolved_arg) else {
+                continue;
+            };
             let arg_ctor = match &argd.kind {
                 TermKind::DtConstructor { constructor, .. } => *constructor,
                 _ => continue,
@@ -1037,6 +1211,52 @@ impl Solver {
             self.dt_tester_reduced.insert(t);
             self.trail.push(TrailOp::DtTesterReduced { term: t });
         }
+    }
+
+    /// #418 item 2 — re-derive selector/tester reductions across the WHOLE
+    /// current assertion set using a check-sat-wide variable→constructor
+    /// binding map (see `check_dt.rs::collect_var_ctor_bindings`), so a
+    /// selector/tester whose argument is a VARIABLE only shown equal to a
+    /// constructor application by a SEPARATE assertion — not the manifest
+    /// structural case `add_dt_selector_reduction_axioms`/`_tester_` already
+    /// cover at per-assert encode time — is still reduced. E.g. `(assert (=
+    /// z (cons x y))) (assert (not (= (hd z) x)))` is `unsat`, but the
+    /// per-assert pass alone can't see it: `z`'s binding to `cons(x, y)`
+    /// arrives in a LATER assertion than `(hd z)`'s own encoding.
+    ///
+    /// Called once per check-sat from `mod.rs::check_level`, right after
+    /// `check_dt_constraints` (which independently rebuilds the SAME
+    /// `var_ctor_term_eqs`/`dt_var_equalities` facts for its own acyclicity
+    /// check) — so this always sees the FULL current assertion set
+    /// regardless of assertion order, and is naturally idempotent (re-run on
+    /// every check-sat call) via the SAME `dt_selector_reduced`/
+    /// `dt_tester_reduced` trail-undone dedup sets the per-assert passes
+    /// already use (see `add_dt_selector_reduction_axioms_over`'s doc
+    /// comment for why sharing those sets across both origins is sound).
+    ///
+    /// Push/pop safety: any axiom this injects is a `self.sat.add_clause(…)`
+    /// at whatever the CURRENT scope is when check-sat runs; the underlying
+    /// SAT solver's OWN push/pop (driven 1:1 by `Solver::push`/`Solver::pop`)
+    /// discards that clause exactly when a `pop()` returns to a level before
+    /// it was added — identical to how the per-assert passes' clauses are
+    /// already scoped, and independent of the fact that `var_ctor_bindings`
+    /// itself is rebuilt from scratch every call (a stale binding can never
+    /// linger, because nothing here is trusted across calls except the SAT
+    /// clauses already committed to the (correctly scoped) SAT solver).
+    pub(super) fn add_dt_indirect_var_reduction_axioms(
+        &mut self,
+        var_ctor_bindings: &FxHashMap<TermId, TermId>,
+        manager: &mut TermManager,
+    ) {
+        if var_ctor_bindings.is_empty() {
+            // Nothing this pass could add that the per-assert structural
+            // pass (#418 item 1) hasn't already covered -- skip the
+            // (otherwise harmless but wasted) whole-assertion-set walk.
+            return;
+        }
+        let roots: Vec<TermId> = self.assertions.clone();
+        self.add_dt_selector_reduction_axioms_over(&roots, var_ctor_bindings, manager);
+        self.add_dt_tester_reduction_axioms_over(&roots, var_ctor_bindings, manager);
     }
 
     /// Assert a named term (for unsat core tracking)

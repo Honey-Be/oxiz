@@ -26,11 +26,23 @@
 //! application is ALWAYS decidable (constructors are pairwise distinct), so
 //! both the true and false cases are asserted directly.
 //!
-//! Both passes only cover the DIRECT syntactic case (the argument is a
-//! manifest `DtConstructor` application in the term graph itself) — a
-//! selector/tester of a variable only later shown equal to a constructor
-//! application through ground equalities/congruence during solving is a
-//! documented residual, not covered here (see `encode.rs` doc comments).
+//! Both passes originally only covered the DIRECT syntactic case (the
+//! argument is a manifest `DtConstructor` application in the term graph
+//! itself) — a selector/tester of a variable only later shown equal to a
+//! constructor application through ground equalities/congruence during
+//! solving, OR a selector/tester CHAIN of depth ≥ 2, was a documented
+//! residual (filed as #418).
+//!
+//! #418 items 1 & 2 close both of those: `encode.rs::resolve_dt_normal_form`
+//! generalizes the direct one-level check into a recursive structural
+//! resolver (closing depth-N chains, item 1) that ALSO consults a
+//! check-sat-wide variable→constructor binding map built from
+//! `check_dt.rs::collect_var_ctor_bindings` (closing the indirect-variable
+//! case, item 2, including through a chain of plain variable equalities).
+//! See that function's doc comment for the full design. The
+//! `nested_*_chain_depth_2_residual` tests below, once `#[ignore]`d, are now
+//! permanent green regressions; `indirect_var_*` tests cover item 2 plus its
+//! soundness controls.
 
 use oxiz_solver::Context;
 
@@ -156,24 +168,17 @@ fn unconstrained_dt_vars_stay_sat() {
     assert_eq!(v, "sat");
 }
 
-/// KNOWN RESIDUAL (#406, tracked — not a regression from this phase): a
-/// selector-of-selector CHAIN of depth ≥ 2, e.g. `(hd (tl (cons a (cons b
-/// c))))`, is NOT reduced end-to-end. The inner `(tl (cons a (cons b c)))`
-/// DOES reduce (its arg is a manifest `DtConstructor`), producing the unit
-/// fact `(tl (cons a (cons b c))) = (cons b c)` — but the OUTER `hd`'s
-/// literal argument in the ORIGINAL term graph is that `DtSelector` node,
-/// not a manifest `DtConstructor`, so `add_dt_selector_reduction_axioms`'s
-/// static one-pass walk never reduces the outer selector: this is exactly
-/// the documented "selector applied to a term only later shown equal to a
-/// constructor application through ground equalities/congruence" residual
-/// (see that function's doc comment), just reached via a same-formula
-/// selector chain instead of a separate assertion. Pre-fix AND
-/// post-#406-fix: `sat` (incomplete, NOT unsound — a missed completeness
-/// case stays `sat`, never fabricates `unsat`). z3: `unsat`. Left `#[ignore]`
-/// until a congruence-driven (re-triggered, not one-shot) reduction pass
-/// closes it; un-ignore and flip the assertion to `"unsat"` when it's fixed.
+/// FIXED (#418 item 1, was a #406 residual): a selector-of-selector CHAIN of
+/// depth ≥ 2, e.g. `(hd (tl (cons a (cons b c))))`, now reduces end-to-end.
+/// The inner `(tl (cons a (cons b c)))` reduces directly (its arg is a
+/// manifest `DtConstructor`), producing `(tl (cons a (cons b c))) = (cons b
+/// c)` — the OUTER `hd`'s literal argument in the term graph is that
+/// `DtSelector` node, not a manifest `DtConstructor`, so the OLD one-level
+/// check missed it. `encode.rs::resolve_dt_normal_form` closes this: it
+/// recursively resolves a `DtSelector`'s argument (chasing through however
+/// many nested selector hops) before checking whether the result is a
+/// manifest constructor of the matching shape. z3: `unsat`.
 #[test]
-#[ignore = "#406 residual: selector-of-selector chain depth>=2 not reduced (spurious sat, not unsound)"]
 fn nested_selector_chain_depth_2_residual() {
     let v = verdict(
         "(set-logic ALL)\n\
@@ -187,16 +192,12 @@ fn nested_selector_chain_depth_2_residual() {
     assert_eq!(v, "unsat");
 }
 
-/// KNOWN RESIDUAL (#406, tracked — not a regression from this phase): the
-/// SAME depth≥2 chain gap as `nested_selector_chain_depth_2_residual`, but
-/// for the tester-reduction pass — `((_ is cons) (tl (cons a (cons b c))))`
-/// is decidably true (the inner `tl` reduces to `(cons b c)`, which is
-/// manifestly `cons`-shaped) but `add_dt_tester_reduction_axioms` only
-/// reduces a tester whose LITERAL argument is a manifest `DtConstructor`,
-/// and here it's a `DtSelector` node. Pre-fix AND post-#406-fix: `sat`
-/// (incomplete, not unsound). z3: `unsat`.
+/// FIXED (#418 item 1, was a #406 residual): the SAME depth≥2 chain gap as
+/// `nested_selector_chain_depth_2_residual`, but for the tester-reduction
+/// pass — `((_ is cons) (tl (cons a (cons b c))))` is decidably true (the
+/// inner `tl` reduces to `(cons b c)`, manifestly `cons`-shaped) and now IS
+/// reduced via `resolve_dt_normal_form`. z3: `unsat`.
 #[test]
-#[ignore = "#406 residual: tester-of-selector chain depth>=2 not reduced (spurious sat, not unsound)"]
 fn nested_tester_chain_depth_2_residual() {
     let v = verdict(
         "(set-logic ALL)\n\
@@ -208,4 +209,196 @@ fn nested_tester_chain_depth_2_residual() {
          (check-sat)\n",
     );
     assert_eq!(v, "unsat");
+}
+
+/// #418 item 1 — depth-3 selector chain (one level deeper than the pinned
+/// depth-2 regression above), same datatype/shape family as the
+/// `sel^k(c01^k(v))` sweep from the #418 task write-up (here expressed over
+/// `Lst`'s `tl` selector, so `tl^3(cons(x0,cons(x1,cons(x2,y))))` should
+/// reduce to `y`).
+#[test]
+fn nested_selector_chain_depth_3() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x0 Int)\n\
+         (declare-const x1 Int)\n\
+         (declare-const x2 Int)\n\
+         (declare-const y Lst)\n\
+         (assert (not (= (tl (tl (tl (cons x0 (cons x1 (cons x2 y)))))) y)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// #418 item 1 — depth-4 selector chain (mixed `hd`/`tl`, closing at an
+/// `Int` field four selector-applications deep).
+#[test]
+fn nested_selector_chain_depth_4() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x0 Int)\n\
+         (declare-const x1 Int)\n\
+         (declare-const x2 Int)\n\
+         (declare-const x3 Int)\n\
+         (declare-const y Lst)\n\
+         (assert (not (= (hd (tl (tl (tl (cons x0 (cons x1 (cons x2 (cons x3 y)))))))) x3)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// #418 item 1 — depth-3 TESTER chain: `is-cons` of a term reached through
+/// three nested `tl` applications must decide `true` (the innermost `y` is
+/// unconstrained, but the resolved term itself is manifestly `cons`-shaped
+/// regardless of what `y` is).
+#[test]
+fn nested_tester_chain_depth_3() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x0 Int)\n\
+         (declare-const x1 Int)\n\
+         (declare-const x2 Int)\n\
+         (declare-const x3 Int)\n\
+         (declare-const y Lst)\n\
+         (assert (not ((_ is cons) (tl (tl (cons x0 (cons x1 (cons x2 (cons x3 y)))))))))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// #418 item 2 — a selector applied to a VARIABLE that is only later shown
+/// equal to a constructor application via a SEPARATE ground equality (not a
+/// manifest constructor application at the selector's own argument
+/// position). The per-assert structural pass (item 1) cannot see this by
+/// itself since `z`'s binding to `(cons x y)` arrives in a LATER assertion
+/// than `(hd z)`'s own encoding; the check-sat-wide pass
+/// (`add_dt_indirect_var_reduction_axioms`) closes it. z3: `unsat`.
+#[test]
+fn indirect_var_selector_via_separate_equality_is_unsat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x Int)\n\
+         (declare-const y Lst)\n\
+         (declare-const z Lst)\n\
+         (assert (= z (cons x y)))\n\
+         (assert (not (= (hd z) x)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// #418 item 2 — the TESTER analogue of
+/// `indirect_var_selector_via_separate_equality_is_unsat`: `z` is only shown
+/// `cons`-shaped by a separate equality, not at the tester's own argument
+/// position. z3: `unsat`.
+#[test]
+fn indirect_var_tester_via_separate_equality_is_unsat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x Int)\n\
+         (declare-const y Lst)\n\
+         (declare-const z Lst)\n\
+         (assert (= z (cons x y)))\n\
+         (assert (not ((_ is cons) z)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// #418 item 2 — the indirect binding reached through a CHAIN of plain
+/// variable equalities (`w = z`, `z = (cons x y)`) rather than a single
+/// direct `var = constructor` equality: `check_dt.rs::collect_var_ctor_bindings`
+/// must transitively close over `dt_var_equalities` so `w` inherits `z`'s
+/// binding. z3: `unsat`.
+#[test]
+fn indirect_var_selector_via_equality_chain_is_unsat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x Int)\n\
+         (declare-const y Lst)\n\
+         (declare-const z Lst)\n\
+         (declare-const w Lst)\n\
+         (assert (= w z))\n\
+         (assert (= z (cons x y)))\n\
+         (assert (not (= (hd w) x)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "unsat");
+}
+
+/// Soundness control (#418) — a selector on a variable with NO
+/// `var_ctor_term_eqs` binding at all (fully unconstrained) must stay `sat`:
+/// the indirect-var pass must never fabricate a binding out of thin air.
+#[test]
+fn indirect_var_no_binding_stays_sat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const z Lst)\n\
+         (assert (= (hd z) 5))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "sat");
+}
+
+/// Soundness control (#418) — a variable bound to the WRONG constructor
+/// (`z = nil`, a nullary constructor with no `hd` field) must leave `(hd z)`
+/// fully unconstrained in BOTH directions, exactly like the pre-#418 direct
+/// wrong-constructor controls above, just reached indirectly through a
+/// variable binding instead of a literal argument.
+#[test]
+fn indirect_var_wrong_constructor_positive_stays_sat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const z Lst)\n\
+         (assert (= z nil))\n\
+         (assert (= (hd z) 5))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "sat");
+}
+
+#[test]
+fn indirect_var_wrong_constructor_negative_stays_sat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const z Lst)\n\
+         (assert (= z nil))\n\
+         (assert (not (= (hd z) 5)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "sat");
+}
+
+/// Soundness control (#418) — a binding established only inside an INACTIVE
+/// `or` branch must NOT be treated as a global `var_ctor_term_eqs` fact.
+/// `check_dt.rs::collect_dt_constraints_v2`'s existing polarity gating
+/// already protects this (an `Or`'s children are never collected under a
+/// positive context — see that function's doc comments); this test
+/// exercises the SAME protection through the new indirect-var reduction
+/// pass, since `z = (cons x y)` here is only true in ONE disjunct of an
+/// `or`, not unconditionally. Must stay `sat` (z3 agrees — the `or` is
+/// satisfiable by taking the `z = nil` disjunct, under which `(hd z) = x`
+/// is unconstrained).
+#[test]
+fn indirect_var_or_branch_binding_stays_sat() {
+    let v = verdict(
+        "(set-logic ALL)\n\
+         (declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))\n\
+         (declare-const x Int)\n\
+         (declare-const y Lst)\n\
+         (declare-const z Lst)\n\
+         (assert (or (= z (cons x y)) (= z nil)))\n\
+         (assert (not (= (hd z) x)))\n\
+         (check-sat)\n",
+    );
+    assert_eq!(v, "sat");
 }
