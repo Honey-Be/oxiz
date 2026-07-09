@@ -243,11 +243,17 @@ fn test_model_evaluation_implies() {
 
 /// Test BV comparison model extraction: 5 < x < 10 should give x in [6, 9].
 ///
-/// Known issue: BV model extraction currently returns default value (0) instead of
-/// the actual satisfying assignment. The solver correctly returns SAT, but model
-/// extraction for BV variables needs to be improved.
+/// Root cause (fixed): the `Constraint::Lt`/`Le` BV-comparison bit-blasting
+/// path in `theory_manager.rs` called `BvSolver::new_bv` on BOTH operands
+/// unconditionally, including constant operands like `5`/`10`. `new_bv`
+/// allocates FRESH, unconstrained SAT bits, so a constant was bit-blasted as
+/// an independent free variable rather than pinned to its literal value —
+/// the embedded BV SAT solver was then free to pick ANY value for `x` (model
+/// extraction preferred this bogus bit-blasted value over the correct one
+/// the ArithSolver had derived). The fix pins constant operands via
+/// `BvSolver::assert_const` before bit-blasting the comparison, mirroring
+/// the `Constraint::Eq` BV handling in the same file.
 #[test]
-#[ignore = "Known BV model extraction issue - solver returns SAT but model extraction returns 0"]
 fn test_bv_comparison_model_generation() {
     // Test BV comparison: 5 < x < 10 should give x in range [6, 9]
     let mut solver = Solver::new();
@@ -289,6 +295,110 @@ fn test_bv_comparison_model_generation() {
             "Expected x in [6,9], got {}",
             x_val
         );
+    }
+}
+
+/// BV comparison model extraction with `bvule` (non-strict), a wider (16-bit)
+/// vector, and a tight window against the all-ones edge value: `100 <=u x`
+/// and `x <=u 65535` (i.e. `x <=u #xffff`, the all-ones 16-bit constant).
+/// Regression for the same constant-bit-blasting bug as
+/// `test_bv_comparison_model_generation`, but exercising `assert_ule` (rather
+/// than `assert_ult`) and a non-default width.
+#[test]
+fn test_bv_ule_model_generation_wide_all_ones_bound() {
+    let mut solver = Solver::new();
+    let mut manager = TermManager::new();
+    solver.set_logic("QF_BV");
+
+    let bv16_sort = manager.sorts.bitvec(16);
+    let x = manager.mk_var("x", bv16_sort);
+
+    let lo = manager.mk_bitvec(100i64, 16);
+    let hi = manager.mk_bitvec(0xffffi64, 16); // all-ones edge value
+
+    solver.assert(manager.mk_bv_ule(lo, x), &mut manager);
+    solver.assert(manager.mk_bv_ule(x, hi), &mut manager);
+
+    assert_eq!(solver.check(&mut manager), SolverResult::Sat);
+    let model = solver.model().expect("Should have model");
+
+    if let Some(x_value_id) = model.get(x)
+        && let Some(x_term) = manager.get(x_value_id)
+        && let TermKind::BitVecConst { value, .. } = &x_term.kind
+    {
+        let x_val = value.to_u64().unwrap_or(0);
+        assert!(
+            (100..=0xffff).contains(&x_val),
+            "Expected x in [100,65535], got {}",
+            x_val
+        );
+    } else {
+        panic!("Model did not assign a BitVecConst value to x");
+    }
+}
+
+/// BV comparison model extraction with signed comparisons (`bvslt`) on a
+/// 4-bit vector, both bounds within the positive (sign-bit-clear) half:
+/// `1 <s x` and `x <s 5` should give `x` in {2,3,4}.
+#[test]
+fn test_bv_slt_model_generation_signed_narrow_width() {
+    let mut solver = Solver::new();
+    let mut manager = TermManager::new();
+    solver.set_logic("QF_BV");
+
+    let bv4_sort = manager.sorts.bitvec(4);
+    let x = manager.mk_var("x", bv4_sort);
+
+    let one = manager.mk_bitvec(1i64, 4);
+    let five = manager.mk_bitvec(5i64, 4);
+
+    solver.assert(manager.mk_bv_slt(one, x), &mut manager);
+    solver.assert(manager.mk_bv_slt(x, five), &mut manager);
+
+    assert_eq!(solver.check(&mut manager), SolverResult::Sat);
+    let model = solver.model().expect("Should have model");
+
+    if let Some(x_value_id) = model.get(x)
+        && let Some(x_term) = manager.get(x_value_id)
+        && let TermKind::BitVecConst { value, .. } = &x_term.kind
+    {
+        let x_val = value.to_u64().unwrap_or(u64::MAX);
+        assert!(
+            (2..=4).contains(&x_val),
+            "Expected x in [2,4] (signed, sign-bit-clear range), got {}",
+            x_val
+        );
+    } else {
+        panic!("Model did not assign a BitVecConst value to x");
+    }
+}
+
+/// BV comparison model extraction pinned exactly to a single value via two
+/// non-strict bounds meeting at the all-zeros edge on one side: `x <=u 0`
+/// (unsigned) forces `x = 0` (all-zeros), the other edge value.
+#[test]
+fn test_bv_ule_model_generation_pinned_to_all_zeros() {
+    let mut solver = Solver::new();
+    let mut manager = TermManager::new();
+    solver.set_logic("QF_BV");
+
+    let bv8_sort = manager.sorts.bitvec(8);
+    let x = manager.mk_var("x", bv8_sort);
+    let zero = manager.mk_bitvec(0i64, 8);
+
+    solver.assert(manager.mk_bv_ule(x, zero), &mut manager);
+
+    assert_eq!(solver.check(&mut manager), SolverResult::Sat);
+    let model = solver.model().expect("Should have model");
+
+    if let Some(x_value_id) = model.get(x)
+        && let Some(x_term) = manager.get(x_value_id)
+        && let TermKind::BitVecConst { value, .. } = &x_term.kind
+    {
+        let x_val = value.to_u64().unwrap_or(u64::MAX);
+        assert_eq!(x_val, 0, "Expected x pinned to 0, got {}", x_val);
+    } else {
+        panic!("Model did not assign a BitVecConst value to x");
     }
 }
 

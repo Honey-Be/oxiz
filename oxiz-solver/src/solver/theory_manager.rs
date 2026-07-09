@@ -1639,9 +1639,41 @@ impl TheoryManager {
                         .and_then(|t| manager.sorts.get(t.sort).and_then(|s| s.bitvec_width()));
 
                     if let Some(width) = width {
-                        // Ensure both operands have BV variables
-                        self.bv.new_bv(lhs, width);
-                        self.bv.new_bv(rhs, width);
+                        // Ensure both operands have BV variables in the embedded
+                        // bit-blaster. A constant operand (e.g. `5` in `5 <u x`)
+                        // must be pinned to its literal bit pattern via
+                        // `assert_const` -- mirroring the `Constraint::Eq` BV
+                        // handling above -- rather than handed FRESH,
+                        // unconstrained bits by a bare `new_bv`. Without this,
+                        // the bit-blasted comparison relates `x` to an
+                        // independent free variable instead of the actual
+                        // constant, so `BvSolver::get_value` (consulted first
+                        // during model-building) can return ANY value at all
+                        // for `x`, not one that actually satisfies the
+                        // asserted bound (soundness of the check-sat verdict
+                        // itself is unaffected, since the parallel ArithSolver
+                        // bounded-integer path still decides the constraint
+                        // correctly -- only the extracted model was wrong).
+                        let get_bv_const = |term_id: TermId| -> Option<(u64, u32)> {
+                            manager.get(term_id).and_then(|t| match &t.kind {
+                                TermKind::BitVecConst { value, width } => {
+                                    Some((value.iter_u64_digits().next().unwrap_or(0), *width))
+                                }
+                                _ => None,
+                            })
+                        };
+                        match get_bv_const(lhs) {
+                            Some((val, w)) => self.bv.assert_const(lhs, val, w),
+                            None => {
+                                self.bv.new_bv(lhs, width);
+                            }
+                        }
+                        match get_bv_const(rhs) {
+                            Some((val, w)) => self.bv.assert_const(rhs, val, w),
+                            None => {
+                                self.bv.new_bv(rhs, width);
+                            }
+                        }
 
                         // Derive signedness from the original TermKind stored for
                         // the SAT variable.  Both BvSlt and BvUlt encode to
