@@ -197,7 +197,13 @@ pub struct Solver {
     /// Arithmetic terms (Int/Real variables for model extraction)
     pub(super) arith_terms: FxHashSet<TermId>,
     /// Datatype constructor constraints: variable -> constructor name
-    /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2)
+    /// Used to detect mutual exclusivity conflicts (var = C1 AND var = C2 where C1 != C2).
+    /// Trail-undone on `pop()` via `TrailOp::DtVarConstructorAdded` (P0 fix,
+    /// found during #406 adversarial review: a binding recorded in a popped
+    /// scope used to survive and falsely conflict with a later, unrelated
+    /// scope's fresh binding of the same variable — the same recurring
+    /// "cache mutated at assert-time, never scrubbed on pop" bug class as
+    /// `forget_learned_since`/`reduce_clause_database`'s watch-list fixes).
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
     /// Datatype-sorted subterms whose ground constructor-cover axiom
     /// `(or (= t (C₁ sels(t))) …)` has been encoded into the SAT core
@@ -205,6 +211,17 @@ pub struct Solver {
     /// the cover CLAUSE dies with the SAT level, so a re-assert of the same
     /// term in a later scope must re-emit it.
     pub(super) dt_cover_done: FxHashSet<TermId>,
+    /// Ground `TermKind::DtSelector` terms whose direct selector-reduction
+    /// fact `(= (sel (C args…)) args[i])` has already been encoded into the
+    /// SAT core (see `add_dt_selector_reduction_axioms`, #406). Entries are
+    /// trail-undone on `pop()` for the same reason as `dt_cover_done`.
+    pub(super) dt_selector_reduced: FxHashSet<TermId>,
+    /// Ground `TermKind::DtTester` terms whose direct tester-reduction fact
+    /// (`is-C(C'(args…))` decided true/false by comparing `C`/`C'`) has
+    /// already been encoded into the SAT core (see
+    /// `add_dt_tester_reduction_axioms`, #406). Entries are trail-undone on
+    /// `pop()` for the same reason as `dt_cover_done`.
+    pub(super) dt_tester_reduced: FxHashSet<TermId>,
     /// Monotone counter naming the fresh constants of the ground term-ite
     /// elimination (`eliminate_term_ites`). Never decremented — a popped
     /// definition must never have its name reused by a later scope.
@@ -295,6 +312,8 @@ impl Solver {
             arith_terms: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
             dt_cover_done: FxHashSet::default(),
+            dt_selector_reduced: FxHashSet::default(),
+            dt_tester_reduced: FxHashSet::default(),
             term_ite_counter: 0,
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -1409,6 +1428,24 @@ impl Solver {
                             // the marker so a later scope re-emits it.
                             self.dt_cover_done.remove(&term);
                         }
+                        TrailOp::DtSelectorReduced { term } => {
+                            // The reduction unit clause died with the SAT-level
+                            // pop; drop the marker so a later scope re-emits it.
+                            self.dt_selector_reduced.remove(&term);
+                        }
+                        TrailOp::DtTesterReduced { term } => {
+                            // The reduction unit clause died with the SAT-level
+                            // pop; drop the marker so a later scope re-emits it.
+                            self.dt_tester_reduced.remove(&term);
+                        }
+                        TrailOp::DtVarConstructorAdded { var } => {
+                            // The binding was scoped to the popped level; drop
+                            // it so a later scope's fresh constructor
+                            // assignment to the same variable isn't falsely
+                            // flagged as conflicting with a stale one (P0 fix,
+                            // see the doc comment on this TrailOp variant).
+                            self.dt_var_constructors.remove(&var);
+                        }
                     }
                 }
             }
@@ -1451,6 +1488,8 @@ impl Solver {
         self.arith_terms.clear();
         self.dt_var_constructors.clear();
         self.dt_cover_done.clear();
+        self.dt_selector_reduced.clear();
+        self.dt_tester_reduced.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();
     }

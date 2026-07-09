@@ -127,6 +127,13 @@ pub struct Parser<'a> {
     /// Datatype constructor names -> (datatype_sort, arity/selector_info)
     /// For nullary constructors (enums), the Vec is empty
     pub(super) dt_constructors: FxHashMap<String, SortId>,
+    /// Datatype selector names -> (owning constructor name, field index,
+    /// result sort). Populated by the same `declare-datatypes`/
+    /// `declare-datatype` handlers that populate `dt_constructors`, so an
+    /// applied selector symbol like `(hd v)` builds a `TermKind::DtSelector`
+    /// node with the correct field sort instead of falling through to an
+    /// opaque, wrongly-sorted (`Bool`-defaulted) `Apply` (#406).
+    pub(super) dt_selectors: FxHashMap<String, (String, usize, SortId)>,
     /// Monotonic counter for alpha-renaming quantifier-bound variables whose
     /// source name collides with a declared constant or an outer binding (#352).
     pub(super) quant_counter: u32,
@@ -147,6 +154,7 @@ impl<'a> Parser<'a> {
             recovery_mode: false,
             errors: Vec::new(),
             dt_constructors: FxHashMap::default(),
+            dt_selectors: FxHashMap::default(),
             quant_counter: 0,
         }
     }
@@ -166,6 +174,7 @@ impl<'a> Parser<'a> {
             recovery_mode: true,
             errors: Vec::new(),
             dt_constructors: FxHashMap::default(),
+            dt_selectors: FxHashMap::default(),
             quant_counter: 0,
         }
     }
@@ -305,6 +314,8 @@ pub struct ParserEnv {
     pub function_defs: FxHashMap<String, (Vec<(String, String)>, TermId)>,
     /// Datatype constructor names → their datatype sort.
     pub dt_constructors: FxHashMap<String, SortId>,
+    /// Datatype selector names → (owning constructor name, field index, result sort).
+    pub dt_selectors: FxHashMap<String, (String, usize, SortId)>,
 }
 
 /// Parse an SMT-LIB2 script, seeding the parser with `env` (the declarations
@@ -326,6 +337,7 @@ pub fn parse_script_with_env(
     parser.sort_aliases = env.sort_aliases.clone();
     parser.function_defs = env.function_defs.clone();
     parser.dt_constructors = env.dt_constructors.clone();
+    parser.dt_selectors = env.dt_selectors.clone();
 
     let mut commands = Vec::new();
     while let Some(cmd) = parser.parse_command()? {
@@ -338,6 +350,7 @@ pub fn parse_script_with_env(
     env.sort_aliases = parser.sort_aliases;
     env.function_defs = parser.function_defs;
     env.dt_constructors = parser.dt_constructors;
+    env.dt_selectors = parser.dt_selectors;
     Ok(commands)
 }
 

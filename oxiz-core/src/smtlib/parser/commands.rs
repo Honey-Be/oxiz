@@ -522,10 +522,15 @@ impl<'a> Parser<'a> {
                 let mut sels: smallvec::SmallVec<
                     [(crate::interner::Spur, crate::sort::SortId); 4],
                 > = smallvec::SmallVec::new();
-                for (sel_name, sel_sort) in selectors {
+                for (field_index, (sel_name, sel_sort)) in selectors.iter().enumerate() {
                     let sid = self.parse_sort_name(sel_sort)?;
                     let sspur = self.manager.sorts.intern_str(sel_name);
                     sels.push((sspur, sid));
+                    // An applied selector symbol (e.g. `(hd v)`) must build a
+                    // TermKind::DtSelector node, not an opaque Apply — the
+                    // same gap 74dd5ae fixed for constructors (#406).
+                    self.dt_selectors
+                        .insert(sel_name.clone(), (ctor_name.clone(), field_index, sid));
                 }
                 let cspur = self.manager.sorts.intern_str(ctor_name);
                 ctor_defs.push(crate::sort::DataTypeConstructor { name: cspur, selectors: sels });
@@ -595,10 +600,13 @@ impl<'a> Parser<'a> {
             let mut sels: smallvec::SmallVec<
                 [(crate::interner::Spur, crate::sort::SortId); 4],
             > = smallvec::SmallVec::new();
-            for (sel_name, sel_sort) in selectors {
+            for (field_index, (sel_name, sel_sort)) in selectors.iter().enumerate() {
                 let sid = self.parse_sort_name(sel_sort)?;
                 let sspur = self.manager.sorts.intern_str(sel_name);
                 sels.push((sspur, sid));
+                // See the plural-form handler for the rationale (#406).
+                self.dt_selectors
+                    .insert(sel_name.clone(), (ctor_name.clone(), field_index, sid));
             }
             let cspur = self.manager.sorts.intern_str(ctor_name);
             ctor_defs.push(crate::sort::DataTypeConstructor { name: cspur, selectors: sels });

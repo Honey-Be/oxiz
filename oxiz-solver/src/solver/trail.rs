@@ -31,6 +31,26 @@ pub(crate) enum TrailOp {
     /// (see `Solver::add_dt_cover_axioms`) — undone so a later scope
     /// re-emits the clause the SAT-level pop discarded.
     DtCoverAdded { term: TermId },
+    /// A ground selector-reduction fact `(= (sel (C args…)) args[i])` was
+    /// encoded for this `DtSelector` term (see
+    /// `Solver::add_dt_selector_reduction_axioms`, #406) — undone so a later
+    /// scope re-emits the unit clause the SAT-level pop discarded.
+    DtSelectorReduced { term: TermId },
+    /// A ground tester-reduction fact (`(is-C (C' args…))` decided true or
+    /// false by comparing `C` and `C'`) was encoded for this `DtTester` term
+    /// (see `Solver::add_dt_tester_reduction_axioms`, #406) — undone so a
+    /// later scope re-emits the unit clause the SAT-level pop discarded.
+    DtTesterReduced { term: TermId },
+    /// A datatype-variable-to-constructor binding was recorded in
+    /// `dt_var_constructors` (the mutual-exclusivity cache in
+    /// `Solver::assert`/`assert_named` that flags `x = C1(...)` then
+    /// `x = C2(...)` as an immediate conflict) — undone so a popped scope's
+    /// binding doesn't leak into a later, unrelated scope and falsely
+    /// conflict with a fresh constructor assignment to the same variable
+    /// (P0: this cache had no trail-undo at all before this fix, the same
+    /// bug class as `forget_learned_since`'s stale-watcher scrub and
+    /// `reduce_clause_database`'s clause-id-recycle fix).
+    DtVarConstructorAdded { var: TermId },
 }
 
 /// State for push/pop with trail-based undo

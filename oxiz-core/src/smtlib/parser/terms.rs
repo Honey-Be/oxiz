@@ -1012,7 +1012,33 @@ impl<'a> Parser<'a> {
                     // models `c01` as an uninterpreted function and reports a
                     // spurious `sat` (adsmt #392 differential, seed 982). The
                     // nullary case already routes through `parse_symbol`.
-                    if let Some(&dt_sort) = self.dt_constructors.get(&op) {
+                    if let Some(&(_, _, result_sort)) = self.dt_selectors.get(&op) {
+                        // An applied datatype selector (e.g. `(hd v)`) must
+                        // build a TermKind::DtSelector node, not an opaque
+                        // Apply — mirrors the analogous constructor fix
+                        // (74dd5ae). Without this, `rewrite_selector`'s
+                        // sel_i(C(args)) -> args[i] reduction (and this
+                        // solver's live ground-selector-reduction axiom) can
+                        // never fire, and the Apply node also silently
+                        // defaulted to `Bool` sort since selector names were
+                        // never registered in `self.functions` (#406).
+                        //
+                        // Checked BEFORE the constructor map: a well-formed
+                        // SMT-LIB script never lets a selector and a
+                        // constructor share a symbol, but if it ever did,
+                        // this order means a selector name is never
+                        // misrouted to the constructor branch.
+                        //
+                        // A selector always takes exactly one argument; a
+                        // malformed script applying it to !=1 args falls
+                        // through to the generic Apply case below rather
+                        // than panicking on an out-of-bounds access.
+                        if args.len() == 1 {
+                            self.manager.mk_dt_selector(&op, args[0], result_sort)
+                        } else {
+                            self.manager.mk_apply(&op, args, result_sort)
+                        }
+                    } else if let Some(&dt_sort) = self.dt_constructors.get(&op) {
                         self.manager.mk_dt_constructor(&op, args, dt_sort)
                     } else {
                         // Regular function application.

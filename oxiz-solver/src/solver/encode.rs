@@ -701,6 +701,7 @@ impl Solver {
                         }
                     } else {
                         self.dt_var_constructors.insert(var_term, constructor);
+                        self.trail.push(TrailOp::DtVarConstructorAdded { var: var_term });
                     }
                 }
             }
@@ -723,6 +724,12 @@ impl Solver {
 
         // Ground datatype exhaustiveness at the SAT level (#404 phase 2).
         self.add_dt_cover_axioms(term_to_encode, manager);
+
+        // Ground selector-of-constructor reduction (#406).
+        self.add_dt_selector_reduction_axioms(term_to_encode, manager);
+
+        // Ground tester-of-constructor reduction (#406).
+        self.add_dt_tester_reduction_axioms(term_to_encode, manager);
 
         if self.produce_unsat_cores {
             let na_index = self.named_assertions.len();
@@ -758,10 +765,26 @@ impl Solver {
     ///     guarded facts silently vanish (the dm3 decreases-check escape).
     /// Validity makes both additions sound in BOTH directions.
     ///
-    /// Each disjunct uses the parser's own node shapes (`DtConstructor` head,
-    /// selector application as a unary `Apply`), so hash-consing makes it the
-    /// SAME atom as a user-written shape (dis)equality and the exhaustiveness
-    /// conflict becomes purely propositional.
+    /// Each disjunct's constructor head uses `mk_dt_constructor` (the same
+    /// `DtConstructor` node shape the parser builds for a user-written
+    /// constructor application, so THAT part hash-cons-coincides directly).
+    /// The rebuilt field accessors are still built as plain `Apply(sel,
+    /// [t])` here (pre-#406 style), while a user-written `(sel t)` now
+    /// parses to a dedicated `TermKind::DtSelector` node (#406) — so the two
+    /// selector sub-terms are no longer the SAME TermId by hash-consing
+    /// alone. They still collapse into the same EUF congruence class:
+    /// `theory_manager::intern_term_deep`'s `DtSelector` arm keys itself by
+    /// the selector's name spur exactly like `Apply`'s function-id key
+    /// (`selector.into_inner().get() == func.into_inner().get()` for the
+    /// same name), so a same-named `Apply` and `DtSelector` over the same
+    /// argument are unified as soon as both are interned into EUF. The
+    /// exhaustiveness conflict is therefore closed at the EUF-congruence
+    /// level rather than by literal hash-cons identity, but it is still
+    /// closed — see `dt_ground_completeness_regression.rs`'s
+    /// `exhaustiveness_under_implication_is_unsat` /
+    /// `exhaustiveness_across_branches_is_unsat`, both of which exercise
+    /// user-written `(sel v)` syntax (now `DtSelector`) against this
+    /// function's `Apply`-shaped rebuilt terms and stay `unsat`.
     ///
     /// The walk skips binder subtrees (a cover mentioning a bound variable
     /// would be ill-formed) and never walks the cover terms themselves (the
@@ -833,6 +856,189 @@ impl Solver {
         }
     }
 
+    /// #406 — ground selector-of-constructor reduction at the SAT level.
+    ///
+    /// The parser now builds a real `TermKind::DtSelector` node for an
+    /// applied selector symbol (e.g. `(hd v)`), but nothing on the live
+    /// solving path ever REDUCED `sel_i(Cⱼ(args…))` when the selector's
+    /// argument is a syntactically manifest constructor application of its
+    /// own owning constructor — e.g. `(hd (cons x y))` stayed an opaque atom
+    /// unrelated to `x`, so `(assert (not (= (hd (cons x y)) x)))` was
+    /// satisfiable when it is actually `unsat` (z3 agrees).
+    ///
+    /// For every ground `DtSelector { selector, arg }` subterm `t` of the
+    /// asserted formula where `arg` is itself a `DtConstructor` application,
+    /// look up (via the SAME `SortManager::datatype_ctor_layouts` used by
+    /// `add_dt_cover_axioms`) whether `selector` names one of `arg`'s
+    /// constructor's fields:
+    ///   - if so, at field index `i`, assert the VALID ground fact
+    ///     `(= t arg.args[i])` as a unit clause — this is the standard
+    ///     datatype selector axiom and holds unconditionally;
+    ///   - if `selector` is NOT one of that constructor's fields (e.g.
+    ///     `(hd nil)` — a selector applied to a DIFFERENT constructor of the
+    ///     same datatype), the SMT-LIB semantics leaves the value arbitrary
+    ///     but fixed, so NOTHING is asserted (never fabricate a value, never
+    ///     forbid one — this stays sound in both directions).
+    ///
+    /// This only covers the DIRECT syntactic case (the selector's argument
+    /// is a manifest `DtConstructor` application in the term graph itself).
+    /// A selector applied to a plain variable that is later shown EQUAL to a
+    /// constructor application only through ground equalities/congruence
+    /// during solving (e.g. `(assert (= y (cons x z))) (assert (not (= (hd
+    /// y) x)))`) is NOT covered by this static, encode-time pass — that
+    /// would need a genuine theory-propagation hook re-triggered as the
+    /// congruence closure grows, which is out of scope here (lower risk,
+    /// matches the `add_dt_cover_axioms` idiom exactly). Injectivity and the
+    /// exhaustiveness cover axioms already close the cases this corpus
+    /// needed; this residual is flagged, not silently papered over.
+    ///
+    /// Reuses the identical worklist/skip rules as `add_dt_cover_axioms`
+    /// (skip binder bodies, hash-consed atoms) and the identical trail-undo
+    /// idiom (`dt_selector_reduced` guard + `TrailOp::DtSelectorReduced`) so
+    /// incremental push/pop stays sound.
+    fn add_dt_selector_reduction_axioms(&mut self, root: TermId, manager: &mut TermManager) {
+        let mut stack = vec![root];
+        let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        // (selector_term, field_term) pairs to equate — collected during the
+        // read-only walk, applied afterwards (mutating `manager`/`self.sat`
+        // while `manager.get(..)` borrows are live would not typecheck).
+        let mut reductions: Vec<(TermId, TermId)> = Vec::new();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let Some(td) = manager.get(t) else { continue };
+            if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                continue;
+            }
+            for c in oxiz_core::ast::get_children(&td.kind) {
+                stack.push(c);
+            }
+            if self.dt_selector_reduced.contains(&t) {
+                continue;
+            }
+            // Match by reference (`td` is `&Term`; `TermKind` is not `Copy`
+            // because non-selector variants hold a `SmallVec`) and copy out
+            // only the `Copy` fields we need.
+            let (selector, arg) = match &td.kind {
+                TermKind::DtSelector { selector, arg } => (*selector, *arg),
+                _ => continue,
+            };
+            let Some(argd) = manager.get(arg) else { continue };
+            let (dt_sort, constructor, ctor_args) = match &argd.kind {
+                TermKind::DtConstructor { constructor, args } => (argd.sort, *constructor, args),
+                _ => continue,
+            };
+            let Some(layouts) = manager.sorts.datatype_ctor_layouts(dt_sort) else {
+                continue;
+            };
+            let ctor_name = manager.resolve_str(constructor).to_string();
+            let sel_name = manager.resolve_str(selector).to_string();
+            let Some((_, fields)) = layouts.iter().find(|(c, _)| *c == ctor_name) else {
+                continue;
+            };
+            // `position` matches the selector name WITHIN this constructor's
+            // own field list — a selector belonging to a DIFFERENT
+            // constructor of the same datatype (e.g. `(hd nil)`) simply
+            // won't be found here, and nothing is asserted (see doc comment).
+            let Some(idx) = fields.iter().position(|(s, _)| *s == sel_name) else {
+                continue;
+            };
+            if let Some(&field_term) = ctor_args.get(idx) {
+                reductions.push((t, field_term));
+            }
+        }
+        for (t, field_term) in reductions {
+            if self.dt_selector_reduced.contains(&t) {
+                continue;
+            }
+            let dbg = std::env::var("OXIZ_MBQI_DBG").is_ok();
+            let eq = manager.mk_eq(t, field_term);
+            if dbg {
+                eprintln!("[mbqi-dbg] dt-selector-reduce: t={t:?} = {field_term:?} eq-atom={eq:?}");
+            }
+            let lit = self.encode(eq, manager);
+            self.sat.add_clause([lit]);
+            self.dt_selector_reduced.insert(t);
+            self.trail.push(TrailOp::DtSelectorReduced { term: t });
+        }
+    }
+
+    /// #406 — ground tester-of-constructor reduction at the SAT level.
+    ///
+    /// Confirmed by direct z3-differential this phase: `(assert (not
+    /// ((_ is cons) (cons x y)))) (check-sat)` was satisfiable in oxiz but
+    /// `unsat` in z3 — the SAME direct-syntactic gap as the selector case
+    /// (#406 item 5), just for testers. The existing tester handling
+    /// (`check_dt.rs`'s `collect_dt_constraints_v2`, #399/#404-phase-2) only
+    /// recognizes testers keyed by a DATATYPE VARIABLE (`is_dt_variable`) —
+    /// it has nothing to say when the tester's argument is itself a
+    /// syntactically manifest `DtConstructor` application, so `is-cons` of a
+    /// literal `(cons x y)` term was never decided at all.
+    ///
+    /// Unlike the selector case, a tester of a manifest constructor
+    /// application is ALWAYS decidable (constructors are pairwise distinct,
+    /// so `is-Cⱼ(Cᵢ(args…))` is `true` iff `i = j`, `false` otherwise) — there
+    /// is no "arbitrary but fixed" branch to leave unconstrained.
+    ///
+    /// Same worklist/skip rules and trail-undo idiom as
+    /// `add_dt_selector_reduction_axioms`; only the DIRECT syntactic case
+    /// (argument is a manifest `DtConstructor` in the term graph) is
+    /// covered — a tester of a variable only later shown equal to a
+    /// constructor via ground equalities/congruence is the same documented
+    /// residual as the selector case.
+    fn add_dt_tester_reduction_axioms(&mut self, root: TermId, manager: &mut TermManager) {
+        let mut stack = vec![root];
+        let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        // (tester_term, decided_value) pairs — collected during the
+        // read-only walk, applied afterwards (see the selector-reduction
+        // pass for why mutation is deferred to a second loop).
+        let mut reductions: Vec<(TermId, bool)> = Vec::new();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let Some(td) = manager.get(t) else { continue };
+            if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                continue;
+            }
+            for c in oxiz_core::ast::get_children(&td.kind) {
+                stack.push(c);
+            }
+            if self.dt_tester_reduced.contains(&t) {
+                continue;
+            }
+            let (tester_ctor, arg) = match &td.kind {
+                TermKind::DtTester { constructor, arg } => (*constructor, *arg),
+                _ => continue,
+            };
+            let Some(argd) = manager.get(arg) else { continue };
+            let arg_ctor = match &argd.kind {
+                TermKind::DtConstructor { constructor, .. } => *constructor,
+                _ => continue,
+            };
+            let tester_name = manager.resolve_str(tester_ctor).to_string();
+            let arg_name = manager.resolve_str(arg_ctor).to_string();
+            reductions.push((t, tester_name == arg_name));
+        }
+        for (t, decided_true) in reductions {
+            if self.dt_tester_reduced.contains(&t) {
+                continue;
+            }
+            let dbg = std::env::var("OXIZ_MBQI_DBG").is_ok();
+            let lit = self.encode(t, manager);
+            if dbg {
+                eprintln!(
+                    "[mbqi-dbg] dt-tester-reduce: t={t:?} decided={decided_true} lit={lit:?}"
+                );
+            }
+            self.sat
+                .add_clause([if decided_true { lit } else { lit.negate() }]);
+            self.dt_tester_reduced.insert(t);
+            self.trail.push(TrailOp::DtTesterReduced { term: t });
+        }
+    }
+
     /// Assert a named term (for unsat core tracking)
     pub fn assert_named(&mut self, term: TermId, name: &str, manager: &mut TermManager) {
         let index = self.assertions.len();
@@ -897,6 +1103,12 @@ impl Solver {
 
         // Ground datatype exhaustiveness at the SAT level (#404 phase 2).
         self.add_dt_cover_axioms(term_to_encode, manager);
+
+        // Ground selector-of-constructor reduction (#406).
+        self.add_dt_selector_reduction_axioms(term_to_encode, manager);
+
+        // Ground tester-of-constructor reduction (#406).
+        self.add_dt_tester_reduction_axioms(term_to_encode, manager);
 
         if self.produce_unsat_cores {
             let na_index = self.named_assertions.len();

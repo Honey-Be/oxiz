@@ -21,6 +21,12 @@ impl Solver {
         let mut negative_ctor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         // Collect DT variable equalities: x = y where both are DT variables
         let mut dt_var_equalities: Vec<(TermId, TermId)> = Vec::new();
+        // #406 — DT variable = manifest constructor-TERM equalities (the same
+        // shape `constructor_equalities` records by CTOR NAME, but here we
+        // also keep the actual constructor TERM id so the acyclicity check
+        // below can union the variable into that term's argument graph). One
+        // entry per positively-asserted `x = C(args…)` / `C(args…) = x`.
+        let mut var_ctor_term_eqs: Vec<(TermId, TermId)> = Vec::new();
 
         for &assertion in &self.assertions {
             self.collect_dt_constraints_v2(
@@ -31,6 +37,7 @@ impl Solver {
                 &mut constructor_equalities,
                 &mut negative_ctor_equalities,
                 &mut dt_var_equalities,
+                &mut var_ctor_term_eqs,
                 true,
             );
         }
@@ -241,6 +248,201 @@ impl Solver {
             }
         }
 
+        // #406 — ground acyclicity: SMT-LIB datatypes denote the free
+        // (well-founded) algebra, so no ground term may equal a proper
+        // constructor-subterm of itself (e.g. `y = cons(x, y)` is UNSAT — no
+        // finite list equals its own tail-extension). See
+        // `check_dt_acyclicity`'s doc comment for the full soundness
+        // argument; it only trusts the two equality collections above
+        // (`dt_var_equalities`, `var_ctor_term_eqs`), which are already
+        // filtered to genuinely-asserted-POSITIVE facts by
+        // `collect_dt_constraints_v2`'s existing And/Or/Not polarity
+        // handling.
+        if self.check_dt_acyclicity(manager, &dt_var_equalities, &var_ctor_term_eqs) {
+            return true;
+        }
+
+        false
+    }
+
+    /// #406 — ground datatype acyclicity check.
+    ///
+    /// Standard technique (as used in CVC4/Z3's datatype theory): build a
+    /// directed graph over EQUIVALENCE CLASSES of ground datatype-sorted
+    /// terms. An edge `class(t) -> class(a)` exists whenever some member of
+    /// `class(t)` is a manifest constructor application `C(…, a, …)` and `a`
+    /// is itself datatype-sorted (only a datatype-sorted field can
+    /// participate in a well-foundedness cycle — an `Int`/`Bool` field
+    /// can't). A CYCLE in this graph is a genuine ground conflict: it means
+    /// some class is asserted to properly contain itself as a constructor
+    /// argument, which is impossible in the free/well-founded algebra SMT-LIB
+    /// datatypes denote.
+    ///
+    /// # Soundness
+    ///
+    /// Two things must each be sound for the whole check to be sound:
+    ///
+    /// 1. **Which terms get UNIONED into the same class.** This function
+    ///    does NO polarity reasoning itself — it only unions pairs it is
+    ///    handed (`dt_var_equalities` for `x = y` between two DT variables,
+    ///    `var_ctor_term_eqs` for `x = C(args…)`), and BOTH of those are
+    ///    collected by `collect_dt_constraints_v2`, which already threads the
+    ///    `in_positive_context` flag correctly through `And`/`Or`/`Not` (the
+    ///    same collector `constructor_equalities`/`constructor_testers` rely
+    ///    on elsewhere in this file). Two datatype-sorted variables that
+    ///    merely SHARE A SORT but have no asserted equality are never handed
+    ///    to `union`, so they are never conflated — they simply never appear
+    ///    together in either input slice.
+    /// 2. **Which edges get added.** A constructor application's OWN shape
+    ///    (`C`'s name and argument list) is a fact about the TERM itself —
+    ///    `cons(x, y)` denotes "cons applied to x and y" regardless of what
+    ///    logical context that term sits in (a term is not a proposition), so
+    ///    the unconditional structural walk below (no polarity gating) that
+    ///    records `ctor_shape` is safe: it never claims anything is asserted,
+    ///    only that a certain term, IF it ever matters, has that shape. The
+    ///    walk stops at `Forall`/`Exists` bodies (ground-only scope, matching
+    ///    the rest of this file and `encode.rs`'s `add_dt_cover_axioms`
+    ///    worklist).
+    ///
+    /// Combining the two: an edge `class(t) -> class(a)` only ever exists
+    /// when `t`'s class contains a term that is LITERALLY `C(…, a, …)` in the
+    /// term graph, and `t`'s class is exactly what genuinely-asserted
+    /// equalities put there. No edge is ever added from a merely-possible or
+    /// currently-inactive relationship (e.g. an unevaluated `ite` branch
+    /// contributes no equality to either collection, so it contributes no
+    /// union and no edge).
+    ///
+    /// # Termination
+    ///
+    /// The structural walk is a bounded DFS over the (finite) term DAG,
+    /// deduplicated via `seen`. The graph has at most one node per distinct
+    /// `TermId` and at most `arity` edges per constructor application, both
+    /// bounded by formula size. Cycle detection is a standard iterative
+    /// (explicit-stack, no recursion) white/gray/black DFS, `O(V + E)`.
+    fn check_dt_acyclicity(
+        &self,
+        manager: &TermManager,
+        dt_var_equalities: &[(TermId, TermId)],
+        var_ctor_term_eqs: &[(TermId, TermId)],
+    ) -> bool {
+        // --- Union-Find over TermId (path compression; inputs are tiny, no
+        // union-by-rank needed). ---
+        fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
+            let p = *parent.entry(x).or_insert(x);
+            if p == x {
+                x
+            } else {
+                let root = find(parent, p);
+                parent.insert(x, root);
+                root
+            }
+        }
+        fn union(parent: &mut FxHashMap<TermId, TermId>, a: TermId, b: TermId) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+
+        let mut parent: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for &(a, b) in dt_var_equalities {
+            union(&mut parent, a, b);
+        }
+        for &(v, c) in var_ctor_term_eqs {
+            union(&mut parent, v, c);
+        }
+
+        // --- Unconditional structural walk: record every manifest
+        // `DtConstructor` application's own (term-id, args) shape. Ground-
+        // only: skip quantifier bodies (see doc comment). ---
+        let mut ctor_terms: Vec<(TermId, Vec<TermId>)> = Vec::new();
+        {
+            let mut stack: Vec<TermId> = self.assertions.clone();
+            let mut seen: FxHashSet<TermId> = FxHashSet::default();
+            while let Some(t) = stack.pop() {
+                if !seen.insert(t) {
+                    continue;
+                }
+                let Some(td) = manager.get(t) else { continue };
+                if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                    continue;
+                }
+                for c in oxiz_core::ast::get_children(&td.kind) {
+                    stack.push(c);
+                }
+                if let TermKind::DtConstructor { args, .. } = &td.kind {
+                    ctor_terms.push((t, args.iter().copied().collect()));
+                }
+            }
+        }
+
+        // --- Directed containment graph over equivalence-class roots. ---
+        let mut adj: FxHashMap<TermId, Vec<TermId>> = FxHashMap::default();
+        for (t, args) in &ctor_terms {
+            let src = find(&mut parent, *t);
+            for &a in args {
+                let Some(a_sort) = manager.get(a).map(|d| d.sort) else {
+                    continue;
+                };
+                if !manager.sorts.is_datatype(a_sort) {
+                    // Only a datatype-sorted argument can carry a
+                    // well-foundedness cycle (an Int/Bool/etc. field is not
+                    // itself a datatype value).
+                    continue;
+                }
+                let dst = find(&mut parent, a);
+                adj.entry(src).or_default().push(dst);
+            }
+        }
+
+        // --- Cycle detection: iterative white/gray/black DFS. A GRAY node
+        // reached again (a back-edge to a node still on the current path) is
+        // exactly a directed cycle. ---
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
+        let mut color: FxHashMap<TermId, Color> = FxHashMap::default();
+        let starts: Vec<TermId> = adj.keys().copied().collect();
+        for start in starts {
+            if color.get(&start).copied().unwrap_or(Color::White) != Color::White {
+                continue;
+            }
+            let mut path: Vec<(TermId, usize)> = vec![(start, 0)];
+            color.insert(start, Color::Gray);
+            while let Some(&(node, idx)) = path.last() {
+                let next_child = adj.get(&node).and_then(|c| c.get(idx)).copied();
+                match next_child {
+                    Some(child) => {
+                        path.last_mut().unwrap().1 += 1;
+                        match color.get(&child).copied().unwrap_or(Color::White) {
+                            Color::White => {
+                                color.insert(child, Color::Gray);
+                                path.push((child, 0));
+                            }
+                            Color::Gray => {
+                                // Back-edge to an ancestor on the current
+                                // path => a real cycle through asserted
+                                // constructor-argument containment.
+                                return true;
+                            }
+                            Color::Black => {
+                                // Already fully explored via another path —
+                                // not a cycle by itself.
+                            }
+                        }
+                    }
+                    None => {
+                        color.insert(node, Color::Black);
+                        path.pop();
+                    }
+                }
+            }
+        }
+
         false
     }
 
@@ -254,6 +456,7 @@ impl Solver {
         constructor_equalities: &mut FxHashMap<TermId, Vec<String>>,
         negative_ctor_equalities: &mut FxHashMap<TermId, Vec<String>>,
         dt_var_equalities: &mut Vec<(TermId, TermId)>,
+        var_ctor_term_eqs: &mut Vec<(TermId, TermId)>,
         in_positive_context: bool,
     ) {
         let Some(term_data) = manager.get(term) else {
@@ -281,6 +484,11 @@ impl Solver {
                                     .entry(*lhs)
                                     .or_default()
                                     .push(manager.resolve_str(*constructor).to_string());
+                                // #406 — also keep the actual constructor TERM
+                                // id (not just its name) so the acyclicity
+                                // check can union `lhs` into `rhs`'s
+                                // argument graph.
+                                var_ctor_term_eqs.push((*lhs, *rhs));
                             }
                         }
                     }
@@ -291,6 +499,7 @@ impl Solver {
                                     .entry(*rhs)
                                     .or_default()
                                     .push(manager.resolve_str(*constructor).to_string());
+                                var_ctor_term_eqs.push((*rhs, *lhs));
                             }
                         }
                     }
@@ -396,6 +605,7 @@ impl Solver {
                             constructor_equalities,
                             negative_ctor_equalities,
                             dt_var_equalities,
+                            var_ctor_term_eqs,
                             in_positive_context,
                         );
                     }
@@ -418,6 +628,7 @@ impl Solver {
                             constructor_equalities,
                             negative_ctor_equalities,
                             dt_var_equalities,
+                            var_ctor_term_eqs,
                             in_positive_context,
                         );
                     }
@@ -433,6 +644,7 @@ impl Solver {
                     constructor_equalities,
                     negative_ctor_equalities,
                     dt_var_equalities,
+                    var_ctor_term_eqs,
                     !in_positive_context,
                 );
             }
