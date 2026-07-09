@@ -402,6 +402,119 @@ fn test_bv_ule_model_generation_pinned_to_all_zeros() {
     }
 }
 
+/// Regression (#419 item 4): a SIGNED comparison against a constant with its
+/// sign bit set was routed through `parse_arith_comparison`/
+/// `extract_linear_terms` alongside its unsigned siblings — but that path
+/// treats a `BitVecConst` as its raw UNSIGNED magnitude (`value.to_i128()`,
+/// no two's-complement reinterpretation). For 4-bit `#xd` (value 13, meaning
+/// -3 signed) that fed the arithmetic solver the fact "13 < x" instead of
+/// "-3 <s x", which combined with a second bound (`x <s 3`, correctly parsed
+/// as "x < 3" since 3 has no sign ambiguity) produced the plain-arithmetic
+/// contradiction "13 < x < 3" — a spurious Unsat, even though `-3 <s x <s 3`
+/// is satisfied by e.g. `x = 0`. Confirmed via z3-differential (1000 random
+/// signed/unsigned BV-comparison instances across widths 4/8/16/32, 0
+/// disagreements post-fix). Fixed by no longer feeding `BvSlt`/`BvSle` into
+/// the arithmetic solver at all (see `encode.rs`'s `BvSlt`/`BvSle` arms) —
+/// the embedded bit-blaster's `assert_slt`/`assert_sle` (already correct,
+/// verified sound in isolation) is the sole source of truth for signed
+/// comparisons.
+#[test]
+fn test_bv_slt_regression_negative_constant_was_spurious_unsat() {
+    let mut solver = Solver::new();
+    let mut manager = TermManager::new();
+    solver.set_logic("QF_BV");
+
+    let bv4_sort = manager.sorts.bitvec(4);
+    let x = manager.mk_var("x", bv4_sort);
+
+    // #xd = 13 (raw bits) = -3 signed in 4 bits.
+    let neg3 = manager.mk_bitvec(13i64, 4);
+    let three = manager.mk_bitvec(3i64, 4);
+
+    // -3 <s x  AND  x <s 3  (satisfied by x in {-2,-1,0,1,2} = {14,15,0,1,2})
+    solver.assert(manager.mk_bv_slt(neg3, x), &mut manager);
+    solver.assert(manager.mk_bv_slt(x, three), &mut manager);
+
+    assert_eq!(
+        solver.check(&mut manager),
+        SolverResult::Sat,
+        "-3 <s x <s 3 has solutions (e.g. x=0) -- must not be Unsat"
+    );
+    let model = solver.model().expect("Should have model");
+
+    if let Some(x_value_id) = model.get(x)
+        && let Some(x_term) = manager.get(x_value_id)
+        && let TermKind::BitVecConst { value, .. } = &x_term.kind
+    {
+        let x_val = value.to_u64().unwrap_or(u64::MAX);
+        assert!(
+            matches!(x_val, 14 | 15 | 0 | 1 | 2),
+            "Expected x in signed range (-2..=2), raw bits {{14,15,0,1,2}}, got {}",
+            x_val
+        );
+    } else {
+        panic!("Model did not assign a BitVecConst value to x");
+    }
+}
+
+/// Regression (#419 item 4): mixing a SIGNED bound with a negative constant
+/// and an UNSIGNED bound on the same variable also triggered the bug (the
+/// unsigned bound's arithmetic parse is correct on its own, but combined with
+/// the mis-parsed signed bound it still derived a spurious arithmetic
+/// conflict). `-3 <s x` (i.e. raw `#xd <s x`) AND `x <u 2` (unsigned) should
+/// both be satisfiable together (e.g. x=0 or x=1).
+#[test]
+fn test_bv_slt_mixed_signed_unsigned_bounds_regression() {
+    let mut solver = Solver::new();
+    let mut manager = TermManager::new();
+    solver.set_logic("QF_BV");
+
+    let bv4_sort = manager.sorts.bitvec(4);
+    let x = manager.mk_var("x", bv4_sort);
+
+    let neg3 = manager.mk_bitvec(13i64, 4); // -3 signed
+    let two = manager.mk_bitvec(2i64, 4);
+
+    solver.assert(manager.mk_bv_slt(neg3, x), &mut manager); // -3 <s x
+    solver.assert(manager.mk_bv_ult(x, two), &mut manager); // x <u 2
+
+    assert_eq!(
+        solver.check(&mut manager),
+        SolverResult::Sat,
+        "-3 <s x AND x <u 2 has solutions (x=0 or x=1) -- must not be Unsat"
+    );
+}
+
+/// Regression (#419 item 4): the most-negative representable value as a
+/// signed lower bound pins `x` exactly to it via `bvsle`: `x <=s -8` (4-bit
+/// `#x8`) has exactly one solution, `x = -8` itself, since nothing is
+/// signed-less-than the most negative value.
+#[test]
+fn test_bv_sle_model_generation_most_negative_edge() {
+    let mut solver = Solver::new();
+    let mut manager = TermManager::new();
+    solver.set_logic("QF_BV");
+
+    let bv4_sort = manager.sorts.bitvec(4);
+    let x = manager.mk_var("x", bv4_sort);
+    let most_negative = manager.mk_bitvec(8i64, 4); // #x8 = -8 signed (min for 4-bit)
+
+    solver.assert(manager.mk_bv_sle(x, most_negative), &mut manager); // x <=s -8
+
+    assert_eq!(solver.check(&mut manager), SolverResult::Sat);
+    let model = solver.model().expect("Should have model");
+
+    if let Some(x_value_id) = model.get(x)
+        && let Some(x_term) = manager.get(x_value_id)
+        && let TermKind::BitVecConst { value, .. } = &x_term.kind
+    {
+        let x_val = value.to_u64().unwrap_or(u64::MAX);
+        assert_eq!(x_val, 8, "Expected x pinned to the most-negative value (raw bits 8), got {}", x_val);
+    } else {
+        panic!("Model did not assign a BitVecConst value to x");
+    }
+}
+
 #[test]
 fn test_arithmetic_model_generation() {
     use num_bigint::BigInt;

@@ -1818,32 +1818,49 @@ impl Solver {
                 Lit::pos(var)
             }
             TermKind::BvSlt(lhs, rhs) => {
-                // Bitvector signed less-than: treat as integer comparison
+                // Bitvector SIGNED less-than.
+                //
+                // Deliberately NOT fed into `parse_arith_comparison` (unlike the
+                // BvUlt/BvUle unsigned siblings below): `extract_linear_terms`
+                // treats a `BitVecConst` as its raw bit pattern's UNSIGNED
+                // magnitude (`value.to_i128()`, no two's-complement
+                // reinterpretation) and a BV variable as an opaque
+                // arbitrary-sign real/int variable. That mapping is exactly
+                // right for the unsigned comparators (bit pattern == unsigned
+                // magnitude, no ambiguity) but is UNSOUND here: a constant
+                // with its sign bit set (e.g. 4-bit `0xd` means -3, not 13)
+                // gets asserted to the arithmetic solver as its large
+                // unsigned value, and there is no sound way to correct a
+                // variable operand's contribution either (its sign is not
+                // known at parse time). Feeding this wrong constraint into
+                // the arithmetic solver let it derive a conflict from a
+                // premise that does not hold under signed semantics whenever
+                // that spurious "13 < x"-style fact combined with any other
+                // asserted bound (signed or unsigned) — a spurious UNSAT
+                // (confirmed via z3-differential: `(bvslt #xd x) (bvslt x
+                // #x3)` on 4-bit BVs, i.e. `-3 <s x <s 3`, wrongly reported
+                // Unsat). The embedded bit-blaster's `assert_slt`
+                // (theory_manager.rs) already encodes signed order exactly
+                // (sign-bit case split + unsigned compare on equal signs) and
+                // is independently verified sound in isolation, so it alone
+                // is the source of truth for signed comparisons.
                 let var = self.get_or_create_var(term);
                 self.var_to_constraint
                     .insert(var, Constraint::Lt(*lhs, *rhs));
                 self.trail.push(TrailOp::ConstraintAdded { var });
-                if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Lt, term, manager)
-                {
-                    self.var_to_parsed_arith.insert(var, parsed);
-                }
                 // Track theory variables for model extraction
                 self.track_theory_vars(*lhs, manager);
                 self.track_theory_vars(*rhs, manager);
                 Lit::pos(var)
             }
             TermKind::BvSle(lhs, rhs) => {
-                // Bitvector signed less-than-or-equal: treat as integer comparison
+                // Bitvector SIGNED less-than-or-equal — see `BvSlt` above for
+                // why this is deliberately NOT routed through
+                // `parse_arith_comparison`.
                 let var = self.get_or_create_var(term);
                 self.var_to_constraint
                     .insert(var, Constraint::Le(*lhs, *rhs));
                 self.trail.push(TrailOp::ConstraintAdded { var });
-                if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Le, term, manager)
-                {
-                    self.var_to_parsed_arith.insert(var, parsed);
-                }
                 // Track theory variables for model extraction
                 self.track_theory_vars(*lhs, manager);
                 self.track_theory_vars(*rhs, manager);
