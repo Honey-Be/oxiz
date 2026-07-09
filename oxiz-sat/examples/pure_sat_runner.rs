@@ -143,6 +143,12 @@ fn main() {
     if let Ok(v) = std::env::var("OXIZ_CHB") {
         config.use_chb_branching = v == "1";
     }
+    if let Ok(v) = std::env::var("OXIZ_RESTART_INT") {
+        config.restart_interval = v.parse().unwrap_or(config.restart_interval);
+    }
+    if let Ok(v) = std::env::var("OXIZ_CDT") {
+        config.clause_deletion_threshold = v.parse().unwrap_or(config.clause_deletion_threshold);
+    }
     let mut solver = Solver::with_config(config);
 
     // DRAT proof emission (opt-in): when OXIZ_DRAT is set, write the DRAT proof

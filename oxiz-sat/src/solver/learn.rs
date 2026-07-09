@@ -235,9 +235,22 @@ impl Solver {
         let num_local_delete = (local_candidates.len() * 3) / 4;
 
         for (cid, _) in core_candidates.iter().take(num_core_delete) {
-            // Track clause size for memory pool accounting before removal
+            // Detach every watcher that still references this clause BEFORE
+            // freeing its slot — see the identical scrub in
+            // `forget_learned_since` for the full mechanism: `ClauseDatabase::
+            // remove` pushes the id onto a free list the next `add_*` recycles,
+            // clearing the slot's `deleted` flag, so `propagate`'s "skip deleted
+            // clause" guard cannot catch a stale watcher once the id is reused —
+            // the recycled clause silently inherits the deleted clause's
+            // watchers and mis-propagates (the exact spurious-SAT mechanism
+            // that regression covers, reachable here too since this ordinary
+            // GC path recycles ids the same way). Track clause size for memory
+            // pool accounting before removal.
             if let Some(clause) = self.clauses.get(*cid) {
                 let num_lits = clause.lits.len();
+                for &lit in &clause.lits {
+                    self.watches.remove_clause(lit.negate(), *cid);
+                }
                 let buf = self.memory_optimizer.allocate(num_lits);
                 self.memory_optimizer.free(buf, num_lits);
             }
@@ -250,6 +263,9 @@ impl Solver {
         for (cid, _) in mid_candidates.iter().take(num_mid_delete) {
             if let Some(clause) = self.clauses.get(*cid) {
                 let num_lits = clause.lits.len();
+                for &lit in &clause.lits {
+                    self.watches.remove_clause(lit.negate(), *cid);
+                }
                 let buf = self.memory_optimizer.allocate(num_lits);
                 self.memory_optimizer.free(buf, num_lits);
             }
@@ -261,6 +277,9 @@ impl Solver {
         for (cid, _) in local_candidates.iter().take(num_local_delete) {
             if let Some(clause) = self.clauses.get(*cid) {
                 let num_lits = clause.lits.len();
+                for &lit in &clause.lits {
+                    self.watches.remove_clause(lit.negate(), *cid);
+                }
                 let buf = self.memory_optimizer.allocate(num_lits);
                 self.memory_optimizer.free(buf, num_lits);
             }

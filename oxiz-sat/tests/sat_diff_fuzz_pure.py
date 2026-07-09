@@ -263,7 +263,17 @@ def gen_instance(rng):
     if kind == 3:
         return gen_ksat(rng, rng.randint(4, 20), rng.uniform(6.0, 20.0), 2)
     if kind == 4:
-        return gen_php(rng.randint(2, 6))
+        # Range widened 2..6 -> 2..9 (2026-07-09): the recycled-clause-id
+        # stale-watcher bug (reduce_clause_database not scrubbing self.watches
+        # before freeing a slot, mirroring the forget_learned_since fix) only
+        # manifests once clause_deletion_threshold conflicts accumulate, which
+        # PHP(n<=6) never reaches — PHP(9) was the smallest instance in
+        # ad hoc testing that actually triggered it (deterministic, all
+        # presets, self-detected MODEL-INVALID). n=9 still solves within the
+        # harness's 15s per-instance timeout under every preset measured;
+        # n=10 is left out of routine fuzzing (it can take 10s of seconds even
+        # for cadical/minisat) but is the fixed regression's manual repro.
+        return gen_php(rng.randint(2, 9))
     if kind == 5:
         return gen_3sat(rng, rng.randint(3, 15), rng.uniform(2.0, 9.0))
     if kind == 6:
