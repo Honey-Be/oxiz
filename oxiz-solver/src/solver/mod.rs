@@ -118,8 +118,14 @@ fn abstract_quants(
 /// non-termination guard: quantifier reasoning over an infinite domain is
 /// semi-decidable, so without it a genuinely-SAT `forall`-with-trigger axiom
 /// can spin forever.  On expiry the loop returns the sound `Unknown`.
+///
+/// Raised 3s→4s (2026-07-09): measured on the 213-row verus lukb corpus
+/// (`adsmtc --features oxiz`), 4s strictly dominates 3s — GAIN=5 (unknown→
+/// sound unsat), REGRESS=0, FLIP=0. Override via `OXIZ_MBQI_GUARD_MS` (env,
+/// tune without recompiling) or `SolverConfig::timeout_ms` (takes precedence
+/// over both).
 #[cfg(feature = "std")]
-const MBQI_NONTERMINATION_GUARD_MS: u64 = 3_000;
+const MBQI_NONTERMINATION_GUARD_MS: u64 = 4_000;
 
 /// Main CDCL(T) SMT Solver
 #[derive(Debug)]
