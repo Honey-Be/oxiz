@@ -1040,6 +1040,26 @@ impl<'a> Parser<'a> {
                         }
                     } else if let Some(&dt_sort) = self.dt_constructors.get(&op) {
                         self.manager.mk_dt_constructor(&op, args, dt_sort)
+                    } else if args.len() == 1
+                        && !self.functions.contains_key(&op)
+                        && let Some(ctor_name) = op.strip_prefix("is-")
+                        && self.dt_constructors.contains_key(ctor_name)
+                    {
+                        // `is-<ctor>` shorthand tester sugar: some tooling emits
+                        // this plain-symbol form instead of the standard
+                        // indexed identifier `(_ is <ctor>)`. Build the exact
+                        // same `TermKind::DtTester` node that path constructs
+                        // (see the `"is"` arms above) so the live datatype
+                        // completeness gate treats both spellings identically.
+                        //
+                        // A real user declaration always wins: this arm is
+                        // only reached when `op` is NOT a key in `self.functions`
+                        // (i.e. no `(declare-fun is-<ctor> ...)` shadowing it),
+                        // checked BEFORE the `dt_constructors` lookup on the
+                        // stripped name so an actually-declared `is-cons`
+                        // function falls straight through to the ordinary
+                        // `Apply` case below instead of being hijacked.
+                        self.manager.mk_dt_tester(ctor_name, args[0])
                     } else {
                         // Regular function application.
                         //
