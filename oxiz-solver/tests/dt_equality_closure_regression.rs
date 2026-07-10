@@ -428,3 +428,61 @@ fn multi_binding_field_decomposition_without_cycle_stays_sat() {
     ));
     assert_eq!(v, "sat");
 }
+
+// ---------------------------------------------------------------------
+// #422 item 3 — direct `C(..) = D(..)` equality between two NON-VARIABLE
+// constructor applications (no mediating variable at all). Previously
+// invisible to `dt_var_equalities`/`var_ctor_term_eqs` (both require at
+// least one side to be a bare DT variable), so this fact never reached
+// `compute_dt_equality_closure`'s base equality set from the Rust-level
+// collector — even though `DatatypeRewriter::rewrite_constructor_eq`
+// (config.simplify-gated) already decomposes the SAME equality for ordinary
+// SAT-level solving. Closed by `collect_dt_constraints_v2`'s new
+// `dt_ctor_ctor_eqs` out-param (populated inside `record_dt_positive_eq_fact`
+// whenever BOTH sides are manifest `DtConstructor` applications), merged
+// into `var_ctor_term_eqs` at every call site before the closure call.
+// ---------------------------------------------------------------------
+
+/// ISOLATION test for item 3: the ctor-ctor equality is the ONLY equality
+/// source in the ENTIRE formula (no variable-mediated binding anywhere) —
+/// deliberately chosen to catch an argument-order/merge mistake in wiring
+/// `dt_ctor_ctor_eqs` into `var_ctor_term_eqs` (a swapped pair, a dropped
+/// entry, or a wrong-slice merge would all show up here, since there is no
+/// OTHER equality source that could accidentally paper over such a bug).
+/// `mk(vb1, 4, vn) = mk(vb0, vi1, vn)` forces `vb1 = vb0` (first-field
+/// injectivity decomposition, step (b2)) directly, no selector or variable
+/// binding involved at all; combined with `(distinct vb1 vb0)` this is a
+/// direct ground conflict. z3/cvc5: `unsat`.
+#[test]
+fn ctor_ctor_direct_equality_isolation_no_other_source_is_unsat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((Node422e 0)) (((leaf422e) \
+            (mk422e (mkf0_422e Bool) (mkf1_422e Int) (mkf2_422e Node422e)))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const vb0 Bool) (declare-const vb1 Bool)\n\
+         (declare-const vi1 Int) (declare-const vn Node422e)\n\
+         (assert (= (mk422e vb1 4 vn) (mk422e vb0 vi1 vn)))\n\
+         (assert (distinct vb1 vb0))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// SOUNDNESS CONTROL for the isolation test above: the SAME ctor-ctor
+/// equality, WITHOUT the disequality — `vb1 = vb0` and `4 = vi1` are both
+/// perfectly consistent derived facts on their own, so this must stay `sat`.
+/// Confirms `dt_ctor_ctor_eqs`'s field decomposition doesn't fabricate a
+/// conflict out of an otherwise-satisfiable ctor-ctor equality.
+#[test]
+fn ctor_ctor_direct_equality_isolation_no_conflict_stays_sat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((Node422f 0)) (((leaf422f) \
+            (mk422f (mkf0_422f Bool) (mkf1_422f Int) (mkf2_422f Node422f)))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const vb0 Bool) (declare-const vb1 Bool)\n\
+         (declare-const vi1 Int) (declare-const vn Node422f)\n\
+         (assert (= (mk422f vb1 4 vn) (mk422f vb0 vi1 vn)))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "sat");
+}

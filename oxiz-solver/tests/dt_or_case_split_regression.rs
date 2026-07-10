@@ -35,7 +35,10 @@
 //! full design (branch isolation + shared step-budget with the case-split
 //! work-list).
 
-use oxiz_solver::Context;
+use oxiz_core::ast::TermManager;
+use oxiz_core::sort::DataTypeConstructor;
+use oxiz_solver::{Context, Solver, SolverConfig, SolverResult};
+use smallvec::smallvec;
 
 fn verdict(script: &str) -> &'static str {
     let mut ctx = Context::new();
@@ -374,4 +377,305 @@ fn or_one_branch_closure_forced_other_branch_not_stays_sat() {
          (check-sat)\n"
     ));
     assert_eq!(v, "sat");
+}
+
+// ---------------------------------------------------------------------
+// #422 item 1 — OR-BRANCH NON-CYCLE CONFLICTS. `dt_items_force_conflict`
+// previously checked each branch's closed hypothesis for an ACYCLICITY
+// conflict ONLY (`cycle_exists_given`) — a branch internally contradictory
+// for a DIFFERENT reason (constructor injectivity forcing an equality that
+// contradicts an asserted disequality IN THE SAME BRANCH) was invisible to
+// it. Closed by threading a fourth hypothesis slice, `h_diseq` (cloned by
+// value through every recursive call exactly like `h_var`/`h_ctor`/`h_sel`
+// — same branch-isolation discipline), and checking `closure.
+// forces_disequality_conflict(h_diseq)` at the leaf alongside the existing
+// cycle check. See `check_dt.rs::dt_items_force_conflict`'s "#422 — beyond
+// acyclicity-only" doc section.
+// ---------------------------------------------------------------------
+
+/// #422 item 1's exact repro, OR-WRAPPED: `x=cons(a,b)`, `x=cons(c,b)`,
+/// `(not (= a c))` all inside ONE branch of an `or`, with a plain
+/// already-supported cyclic branch as the sibling. Neither branch is
+/// unconditionally forcing on its own syntax (branch 1 needs injectivity +
+/// the disequality check; branch 2 is an ordinary flat cycle), but BOTH are
+/// conflict-forced, so the whole `or` is `unsat`. Uses DT-SORTED fields
+/// (`Node`) so the disequality is collected via the DT-sort-gated `Eq`
+/// negative arm (see `collect_dt_constraints_v2`'s doc comment) — the
+/// literal target shape STEP 2 was written for. Pre-fix: `sat` (branch 1's
+/// injectivity-forced disequality conflict was invisible to the OR-branch
+/// evaluator, which only ever checked acyclicity). z3/cvc5: `unsat`.
+#[test]
+fn or_branch_injectivity_forced_disequality_dtfields_is_unsat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((Node422a 0)) (((leaf422a) \
+            (mk422a (mkf0_422a Bool) (mkf1_422a Int) (mkf2_422a Node422a)))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const vb0 Bool) (declare-const vi1 Int)\n\
+         (declare-const na Node422a) (declare-const nc Node422a)\n\
+         (declare-const mbx Node422a) (declare-const w Node422a)\n\
+         (assert (or\n\
+           (and (= mbx (mk422a vb0 4 na)) (= mbx (mk422a vb0 vi1 nc)) (not (= na nc)))\n\
+           (= w (mk422a vb0 0 w))\n\
+         ))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// The SAME OR-branch shape, but the injectivity-forced disequality is
+/// expressed as `(distinct a c)` over Int-sorted fields instead — since
+/// `Distinct`'s positive-context `dt_diseq_pairs` push is UNGATED by sort
+/// (unlike the `Eq` negative arm), this closes the OR-branch case even for
+/// NON-datatype-sorted fields, a strictly BROADER completeness win than the
+/// DT-sort-gated `Eq` path alone provides. Pre-fix: `sat`. z3/cvc5: `unsat`.
+#[test]
+fn or_branch_injectivity_forced_distinct_intfields_is_unsat() {
+    let pair_dt = "(set-logic ALL)\n\
+        (declare-datatypes ((MyPair422 0)) (((cons422 (hd422 Int) (tl422 Int)))))\n\
+        (declare-datatypes ((Lst422 0)) (((nil422) (lcons422 (lhd422 Int) (ltl422 Lst422)))))\n";
+    let v = verdict(&format!(
+        "{pair_dt}(declare-const x MyPair422) (declare-const a Int) (declare-const b Int)\n\
+         (declare-const c Int)\n\
+         (declare-const w Lst422) (declare-const wi Int)\n\
+         (assert (or\n\
+           (and (= x (cons422 a b)) (= x (cons422 c b)) (distinct a c))\n\
+           (= w (lcons422 wi w))\n\
+         ))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// SOUNDNESS CONTROL for the two tests above: identical shape, but the
+/// second (always-cyclic) branch is replaced with an ORDINARY satisfiable
+/// fact, so NOT every branch is conflict-forced — the whole `or` must stay
+/// `sat`, confirming `h_diseq` doesn't somehow leak across branches or
+/// otherwise over-fire.
+#[test]
+fn or_branch_injectivity_forced_disequality_other_branch_not_stays_sat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((Node422b 0)) (((leaf422b) \
+            (mk422b (mkf0_422b Bool) (mkf1_422b Int) (mkf2_422b Node422b)))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const vb0 Bool) (declare-const vi1 Int)\n\
+         (declare-const na Node422b) (declare-const nc Node422b)\n\
+         (declare-const mbx Node422b) (declare-const w Node422b)\n\
+         (assert (or\n\
+           (and (= mbx (mk422b vb0 4 na)) (= mbx (mk422b vb0 vi1 nc)) (not (= na nc)))\n\
+           (= w leaf422b)\n\
+         ))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "sat");
+}
+
+// ---------------------------------------------------------------------
+// #422 item 1 — FLAT PATH, `:simplify false` INDEPENDENCE (STEP 6). The
+// task's own motivating concern: the flat (non-OR) path used to catch this
+// conflict "for free" only once the derived ctor=ctor fact was injected as
+// a SAT-level clause AND decomposed by the simplifier
+// (`inject_dt_derived_ctor_equalities`, gated on `config.simplify`) — a
+// real, reachable config (`--preset minimal`, the portfolio's `LocalSearch`
+// strategy). `compute_dt_equality_closure`'s result is simplify-independent
+// by construction, so `check_dt_constraints`'s new `closure.
+// forces_disequality_conflict(&dt_diseq_pairs)` call (STEP 6) closes this
+// regardless.
+//
+// The SMT-LIB front end (`Context::set_option("simplify", ...)`) does not
+// currently wire through to `SolverConfig::simplify` (a separate,
+// pre-existing, unrelated gap this pass does not touch), so this is tested
+// via the public `Solver::with_config`/`Solver::assert`/`Solver::check` API
+// directly (mirroring `clean_mbqi_wiring.rs`'s pattern) rather than through
+// `Context::execute_script`, to get a genuine `simplify: false` run.
+// ---------------------------------------------------------------------
+
+/// Item 1's repro with DT-SORTED fields (the literal Eq-negative-arm target
+/// shape), flat (no `or` at all), under `simplify: false`. Must still be
+/// `unsat` — `check_dt_constraints`'s Rust-level pre-pass runs
+/// UNCONDITIONALLY (never gated on `config.simplify`), so this is expected
+/// to hold regardless.
+#[test]
+fn flat_injectivity_forced_disequality_dtfields_simplify_false_is_unsat() {
+    let mut cfg = SolverConfig::default();
+    cfg.simplify = false;
+    let mut s = Solver::with_config(cfg);
+    let mut m = TermManager::new();
+
+    let bool_sort = m.sorts.bool_sort;
+    let int_sort = m.sorts.int_sort;
+    let node_sort = m.sorts.mk_datatype_sort("Node422g");
+    let mk_name = m.sorts.intern_str("mk422g");
+    let f0 = m.sorts.intern_str("mkf0_422g");
+    let f1 = m.sorts.intern_str("mkf1_422g");
+    let f2 = m.sorts.intern_str("mkf2_422g");
+    let leaf_name = m.sorts.intern_str("leaf422g");
+    let mk = DataTypeConstructor {
+        name: mk_name,
+        selectors: smallvec![(f0, bool_sort), (f1, int_sort), (f2, node_sort)],
+    };
+    let leaf = DataTypeConstructor { name: leaf_name, selectors: smallvec![] };
+    m.sorts.declare_datatype("Node422g", vec![mk, leaf]);
+
+    let vb0 = m.mk_var("vb0", bool_sort);
+    let vi1 = m.mk_var("vi1", int_sort);
+    let na = m.mk_var("na", node_sort);
+    let nc = m.mk_var("nc", node_sort);
+    let mbx = m.mk_var("mbx", node_sort);
+    let four = m.mk_int(4);
+
+    let mk1 = m.mk_dt_constructor("mk422g", [vb0, four, na], node_sort);
+    let mk2 = m.mk_dt_constructor("mk422g", [vb0, vi1, nc], node_sort);
+    let eq1 = m.mk_eq(mbx, mk1);
+    let eq2 = m.mk_eq(mbx, mk2);
+    let eq_nanc = m.mk_eq(na, nc);
+    let diseq = m.mk_not(eq_nanc);
+
+    s.assert(eq1, &mut m);
+    s.assert(eq2, &mut m);
+    s.assert(diseq, &mut m);
+
+    let r = s.check(&mut m);
+    assert_eq!(
+        r,
+        SolverResult::Unsat,
+        "the flat Rust-level pre-pass (check_dt_constraints) must close this \
+         regardless of config.simplify"
+    );
+}
+
+/// The SAME flat repro, but expressed via `(distinct a c)` over Int-sorted
+/// (non-DT-sorted) fields under `simplify: false`. Since `Distinct`'s
+/// positive-context `dt_diseq_pairs` push is UNGATED by sort, this ALSO
+/// closes under `simplify: false` — a strictly broader completeness result
+/// than the DT-sort-gated `Eq`-negative path (see the next test for that
+/// path's own honest residual).
+#[test]
+fn flat_injectivity_forced_distinct_intfields_simplify_false_is_unsat() {
+    let mut cfg = SolverConfig::default();
+    cfg.simplify = false;
+    let mut s = Solver::with_config(cfg);
+    let mut m = TermManager::new();
+    let int_sort = m.sorts.int_sort;
+    let pair_sort = m.sorts.mk_datatype_sort("Pair422h");
+    let cons_name = m.sorts.intern_str("cons422h");
+    let hd = m.sorts.intern_str("hd422h");
+    let tl = m.sorts.intern_str("tl422h");
+    let ctor = DataTypeConstructor {
+        name: cons_name,
+        selectors: smallvec![(hd, int_sort), (tl, int_sort)],
+    };
+    m.sorts.declare_datatype("Pair422h", vec![ctor]);
+
+    let x = m.mk_var("x", pair_sort);
+    let a = m.mk_var("a", int_sort);
+    let b = m.mk_var("b", int_sort);
+    let c = m.mk_var("c", int_sort);
+    let cons_ab = m.mk_dt_constructor("cons422h", [a, b], pair_sort);
+    let cons_cb = m.mk_dt_constructor("cons422h", [c, b], pair_sort);
+    let eq1 = m.mk_eq(x, cons_ab);
+    let eq2 = m.mk_eq(x, cons_cb);
+    let distinct = m.mk_distinct([a, c]);
+
+    s.assert(eq1, &mut m);
+    s.assert(eq2, &mut m);
+    s.assert(distinct, &mut m);
+
+    let r = s.check(&mut m);
+    assert_eq!(r, SolverResult::Unsat);
+}
+
+/// HONEST, DOCUMENTED RESIDUAL (not a regression — this shape was NEVER
+/// caught before #422 either; #422 narrows but does not eliminate it): the
+/// SAME flat repro, disequality expressed as plain `(not (= a c))` over
+/// Int-sorted (non-DT-sorted) fields, under `simplify: false`. The `Eq`
+/// negative arm's `dt_diseq_pairs` push is DT-SORT-GATED (STEP 2's literal
+/// instruction — `both_dt_sorted`), so this specific combination (non-DT
+/// sort AND `simplify: false` AND expressed via `=`/`not` rather than
+/// `distinct`) is NOT closed by this pass. This stays `Sat` here — the
+/// SAFE direction (a missed conflict, never a fabricated one). With
+/// `simplify: true` (the default in every real front end — CLI, SMT-LIB
+/// `Context`), the SAT-level `inject_dt_derived_ctor_equalities` +
+/// simplifier-decomposition route from #419 already closes this case (see
+/// `dt_equality_closure_regression.rs`'s
+/// `three_way_binding_bare_no_selector_forces_pairwise_equality_is_unsat`
+/// and siblings), so this residual is reachable ONLY via the (currently
+/// unwired, separately-tracked) `simplify: false` config path.
+#[test]
+fn flat_injectivity_forced_noteq_intfields_simplify_false_documented_residual_stays_sat() {
+    let mut cfg = SolverConfig::default();
+    cfg.simplify = false;
+    let mut s = Solver::with_config(cfg);
+    let mut m = TermManager::new();
+    let int_sort = m.sorts.int_sort;
+    let pair_sort = m.sorts.mk_datatype_sort("Pair422i");
+    let cons_name = m.sorts.intern_str("cons422i");
+    let hd = m.sorts.intern_str("hd422i");
+    let tl = m.sorts.intern_str("tl422i");
+    let ctor = DataTypeConstructor {
+        name: cons_name,
+        selectors: smallvec![(hd, int_sort), (tl, int_sort)],
+    };
+    m.sorts.declare_datatype("Pair422i", vec![ctor]);
+
+    let x = m.mk_var("x", pair_sort);
+    let a = m.mk_var("a", int_sort);
+    let b = m.mk_var("b", int_sort);
+    let c = m.mk_var("c", int_sort);
+    let cons_ab = m.mk_dt_constructor("cons422i", [a, b], pair_sort);
+    let cons_cb = m.mk_dt_constructor("cons422i", [c, b], pair_sort);
+    let eq1 = m.mk_eq(x, cons_ab);
+    let eq2 = m.mk_eq(x, cons_cb);
+    let eq_ac = m.mk_eq(a, c);
+    let diseq = m.mk_not(eq_ac);
+
+    s.assert(eq1, &mut m);
+    s.assert(eq2, &mut m);
+    s.assert(diseq, &mut m);
+
+    let r = s.check(&mut m);
+    assert_eq!(
+        r,
+        SolverResult::Sat,
+        "documented residual — see this test's doc comment; must stay a SAFE \
+         (not fabricated-unsat) miss, not flip to unsat by accident either"
+    );
+}
+
+/// CONTROL confirming the residual above is specific to `simplify: false`:
+/// the IDENTICAL repro with the DEFAULT config (`simplify: true`) already
+/// correctly reads `unsat` via the pre-existing #419 SAT-level injection
+/// mechanism — confirming #422 introduces no regression on the default
+/// (every real front end's) configuration.
+#[test]
+fn flat_injectivity_forced_noteq_intfields_simplify_true_default_is_unsat() {
+    let mut s = Solver::new();
+    let mut m = TermManager::new();
+    let int_sort = m.sorts.int_sort;
+    let pair_sort = m.sorts.mk_datatype_sort("Pair422j");
+    let cons_name = m.sorts.intern_str("cons422j");
+    let hd = m.sorts.intern_str("hd422j");
+    let tl = m.sorts.intern_str("tl422j");
+    let ctor = DataTypeConstructor {
+        name: cons_name,
+        selectors: smallvec![(hd, int_sort), (tl, int_sort)],
+    };
+    m.sorts.declare_datatype("Pair422j", vec![ctor]);
+
+    let x = m.mk_var("x", pair_sort);
+    let a = m.mk_var("a", int_sort);
+    let b = m.mk_var("b", int_sort);
+    let c = m.mk_var("c", int_sort);
+    let cons_ab = m.mk_dt_constructor("cons422j", [a, b], pair_sort);
+    let cons_cb = m.mk_dt_constructor("cons422j", [c, b], pair_sort);
+    let eq1 = m.mk_eq(x, cons_ab);
+    let eq2 = m.mk_eq(x, cons_cb);
+    let eq_ac = m.mk_eq(a, c);
+    let diseq = m.mk_not(eq_ac);
+
+    s.assert(eq1, &mut m);
+    s.assert(eq2, &mut m);
+    s.assert(diseq, &mut m);
+
+    let r = s.check(&mut m);
+    assert_eq!(r, SolverResult::Unsat);
 }

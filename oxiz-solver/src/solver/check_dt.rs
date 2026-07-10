@@ -1,47 +1,64 @@
 //! Datatype theory constraint checking
 //!
 //! # Known residual completeness boundaries (spurious-SAT direction only,
-//! never spurious-unsat — both found by this integration pass's own
-//! 1000-seed z3-differential re-verification of the already-landed #419
-//! items, NOT newly introduced by this session's own changes)
+//! never spurious-unsat)
 //!
-//! 1. **OR-branch tester/constructor-equality conflicts.**
+//! Items 1-3 below were found by this integration pass's own 1000-seed
+//! z3-differential re-verification of the already-landed #419 items (NOT
+//! newly introduced by that session's own changes) and are recorded here,
+//! historically, as **CLOSED by #422** — see that task's own three landed
+//! fixes for the mechanism each one uses. The section is kept (rather than
+//! deleted) to match this file's existing convention of a permanent,
+//! append-only residual log.
+//!
+//! 1. **CLOSED (#422) — OR-branch non-cycle conflicts.**
 //!    `dt_items_force_conflict` (the `#418`/`#419` OR-branch case-split
-//!    evaluator) only ever checks each branch's closed hypothesis for an
-//!    ACYCLICITY conflict — see its own doc comment, "Scope: acyclicity
-//!    only". A branch whose conflict is instead a constructor-equality/
-//!    tester-family clash (e.g. this session's own item-1 injectivity
-//!    repro, but occurring INSIDE one arm of an `or` instead of flatly)
-//!    still reads `sat` — a documented, pre-existing `#418` scope
-//!    boundary this session's OR-wiring deliberately did not expand.
-//! 2. **`(not (distinct a b))` is not recognized as an equality.**
-//!    `collect_dt_constraints_v2` only pattern-matches `TermKind::Eq` for
-//!    its `dt_var_equalities`/`var_ctor_term_eqs`/`sel_eqs` collections —
-//!    a 2-ary `distinct` negated back into an equality (`(not (distinct a
-//!    b))`, semantically identical to `(= a b)`) is never recognized as
-//!    one, so a ground conflict expressed that way (rather than as a
-//!    direct `=`) is invisible to every check in this file. Confirmed via
-//!    z3-differential fuzzing, unrelated to #419's own three items (a
-//!    single flat `(not (distinct a b))` assertion reproduces it with no
-//!    multi-binding or selector chasing involved at all) — a separate,
-//!    pre-existing gap, not attempted here.
-//! 3. **A direct `C(..) = D(..)` equality between two NON-VARIABLE
-//!    constructor applications is invisible to `dt_var_equalities`/
-//!    `var_ctor_term_eqs`.** `collect_dt_constraints_v2`'s `Eq` arm only
-//!    records a var-ctor-term pair when ONE side `is_dt_variable` — an
-//!    equality where BOTH sides are manifest constructor applications
-//!    (e.g. `(= (C (C' x)) (C y))`, whose field-decomposed consequence
-//!    `x`-side may itself force a well-foundedness cycle) contributes
-//!    NOTHING to either collection, so it never reaches
-//!    `compute_dt_equality_closure` — hence never reaches `step (b2)`'s
-//!    field decomposition either, even though the SAT-level simplifier
-//!    (`DatatypeRewriter::rewrite_constructor_eq`) already decomposes the
-//!    same equality for ordinary solving purposes. Confirmed via
-//!    z3-differential fuzzing; a further, natural extension of the same
-//!    "feed the closure every field-level consequence" idea `step (b2)`
-//!    established, but NOT attempted in this pass — left as a distinct,
-//!    separately-scoped follow-up to keep this pass's own diff small and
-//!    independently re-verifiable.
+//!    evaluator) used to check each branch's closed hypothesis for an
+//!    ACYCLICITY conflict ONLY — see its own doc comment, "#422 — beyond
+//!    acyclicity-only". A branch internally contradictory for a DIFFERENT
+//!    reason (e.g. `x=cons(a,b) ∧ x=cons(c,b) ∧ (distinct a c)`, where
+//!    constructor injectivity forces `a=c`) was invisible to it. Fixed by
+//!    threading a fourth hypothesis slice, `h_diseq` (cloned by value
+//!    through every recursive call, same branch-isolation discipline as
+//!    `h_var`/`h_ctor`/`h_sel`), and checking `closure.
+//!    forces_disequality_conflict(h_diseq)` at the leaf alongside the
+//!    existing cycle check. The SAME gap also existed on the FLAT
+//!    (non-OR) path whenever `config.simplify == false` (a real, reachable
+//!    config via `--preset minimal`/the portfolio's `LocalSearch`
+//!    strategy) — closed there too, by the identical
+//!    `forces_disequality_conflict` check reusing the closure
+//!    `check_dt_constraints` already computes (see that function's #422
+//!    doc note). See `dt_or_case_split_regression.rs`'s `#422` test
+//!    section, including its HONEST documented residual: the flat path's
+//!    disequality-source collection (from `Eq`'s negative arm) is
+//!    DT-SORT-GATED (item 2 below never gates), so a `simplify: false` +
+//!    non-DT-sorted-field + `(not (= ..))` (rather than `distinct`)
+//!    combination is NOT closed by this pass — narrowed, not eliminated.
+//! 2. **CLOSED (#422) — `distinct` not recognized in any polarity.**
+//!    `collect_dt_constraints_v2` had NO `TermKind::Distinct` arm at all —
+//!    neither a positive `(distinct a b)` (a disequality) nor a negated
+//!    `(not (distinct a b))` (semantically `(= a b)`) was ever recognized,
+//!    so a ground conflict expressed either way was invisible to every
+//!    check in this file. Fixed by a new `TermKind::Distinct(args) if
+//!    args.len() == 2` arm reusing `record_dt_positive_eq_fact`/
+//!    `record_dt_negative_eq_fact` (see `collect_dt_constraints_v2`'s doc
+//!    comment, "`Distinct` polarity mapping", for the full soundness
+//!    argument and the N-ARY GUARD — `args.len() != 2` is a genuine
+//!    DISJUNCTION when negated, never collected as a single equality).
+//! 3. **CLOSED (#422) — direct `C(..) = D(..)` ctor-ctor equality
+//!    invisible to the closure.** `collect_dt_constraints_v2`'s `Eq` arm
+//!    only recorded a var-ctor-term pair when ONE side `is_dt_variable` —
+//!    an equality where BOTH sides are manifest constructor applications
+//!    (no mediating variable) contributed NOTHING to
+//!    `compute_dt_equality_closure`'s base equality set, even though the
+//!    SAT-level simplifier (`DatatypeRewriter::rewrite_constructor_eq`,
+//!    `config.simplify`-gated) already decomposes the same equality for
+//!    ordinary solving. Fixed by a new `dt_ctor_ctor_eqs` out-param,
+//!    populated inside `record_dt_positive_eq_fact` whenever BOTH sides
+//!    are `TermKind::DtConstructor`, merged into `var_ctor_term_eqs` at
+//!    every call site before the closure call (`compute_dt_equality_
+//!    closure`'s own signature is unchanged — both slices were already
+//!    treated identically inside it).
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -145,6 +162,15 @@ impl Solver {
         // #419 item 2 — raw `sel(t) = t2` facts feeding
         // `compute_dt_equality_closure`'s iterative selector-resolution step.
         let mut sel_eqs: Vec<(TermId, TermId)> = Vec::new();
+        // #422 item 3 — direct `C(..) = D(..)` ctor-ctor equalities (no
+        // mediating variable), merged into `var_ctor_term_eqs` before the
+        // closure call below (`compute_dt_equality_closure` itself treats
+        // both slices identically, so no signature change is needed there).
+        let mut dt_ctor_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+        // #422 items 1+2 — disequality-source pairs (from a negative
+        // DT-sorted `Eq`, or a positive 2-ary `distinct`) feeding
+        // `DtEqualityClosure::forces_disequality_conflict` below.
+        let mut dt_diseq_pairs: Vec<(TermId, TermId)> = Vec::new();
 
         for &assertion in &self.assertions {
             self.collect_dt_constraints_v2(
@@ -157,9 +183,12 @@ impl Solver {
                 &mut dt_var_equalities,
                 &mut var_ctor_term_eqs,
                 &mut sel_eqs,
+                &mut dt_ctor_ctor_eqs,
+                &mut dt_diseq_pairs,
                 true,
             );
         }
+        var_ctor_term_eqs.extend(dt_ctor_ctor_eqs);
 
         // Check: If a variable has multiple different constructor testers, it's UNSAT
         for (_var, testers) in &constructor_testers {
@@ -399,6 +428,24 @@ impl Solver {
             &mut closure_budget,
         );
         if self.check_dt_acyclicity(manager, &closure.closed_eqs, &[]) {
+            return true;
+        }
+
+        // #422 STEP 6 — close the flat-path non-cycle-conflict gap, reusing
+        // the closure just computed above (no new closure computation
+        // needed): a branch/assertion set can be internally contradictory
+        // for a reason OTHER than acyclicity — e.g. `x=cons(a,b)`,
+        // `x=cons(c,b)`, `(distinct a c)`, where injectivity forces `a=c`
+        // (folded into `closure.closed_eqs` by step (b2)'s field
+        // decomposition) while `a≠c` is also asserted. This check is
+        // UNCONDITIONAL (not gated on `config.simplify`) — unlike the
+        // SAT-level route (`inject_dt_derived_ctor_equalities`, which only
+        // decomposes an injected ctor=ctor equality through the simplifier
+        // when `config.simplify == true`), `compute_dt_equality_closure`'s
+        // result is simplify-independent by construction, so this closes the
+        // gap even under `--preset minimal` / `simplify=false` configs. See
+        // `DtEqualityClosure::forces_disequality_conflict`'s doc comment.
+        if closure.forces_disequality_conflict(&dt_diseq_pairs) {
             return true;
         }
 
@@ -753,17 +800,24 @@ impl Solver {
     ///   ONCE up front, since it never depends on which branch is chosen —
     ///   see `build_dt_ctor_terms`'s doc comment).
     ///
-    /// # Scope: acyclicity only (the required minimum)
+    /// # Scope: acyclicity + disequality (#422 — no longer acyclicity-only)
     ///
-    /// This generalizes ONLY the acyclicity conflict signal (a manifest
-    /// cycle through constructor-argument containment). It does NOT
-    /// additionally case-split-check the constructor-tester /
+    /// Originally (through `#419`) this generalized ONLY the acyclicity
+    /// conflict signal (a manifest cycle through constructor-argument
+    /// containment). `#422` item 1 extended the leaf check to ALSO fire on
+    /// a forced-disequality conflict (`closure.
+    /// forces_disequality_conflict(h_diseq)` — see "#422 — beyond
+    /// acyclicity-only" above), since a branch can be internally
+    /// contradictory via constructor injectivity forcing an equality that
+    /// contradicts an asserted `distinct`/`(not (= ..))` in the SAME
+    /// branch, a DIFFERENT conflict family than acyclicity. This still does
+    /// NOT additionally case-split-check the constructor-tester /
     /// constructor-equality conflict families checked earlier in
     /// `check_dt_constraints` (e.g. "does every branch force a `(is C1 x)`
-    /// vs. `(is C2 x)` clash") — `#418` explicitly calls extending that far
-    /// a bonus, not the required minimum. Combining tester/equality
-    /// conflicts with this same case-split machinery is a documented
-    /// boundary, not attempted here.
+    /// vs. `(is C2 x)` clash") — `#418` explicitly called extending that far
+    /// a bonus, not the required minimum, and `#422` did not revisit that
+    /// boundary either. Combining tester/equality conflicts with this same
+    /// case-split machinery remains a documented, not-attempted boundary.
     ///
     /// # Scope: cross-theory case splits
     ///
@@ -793,19 +847,35 @@ impl Solver {
         let ctor_terms = self.build_dt_ctor_terms(manager);
         let items: Vec<(TermId, bool)> = self.assertions.iter().map(|&a| (a, true)).collect();
         let mut budget: u32 = DT_OR_CASE_SPLIT_BUDGET;
-        self.dt_items_force_conflict(&items, &[], &[], &[], manager, &ctor_terms, &mut budget)
+        self.dt_items_force_conflict(
+            &items, &[], &[], &[], &[], manager, &ctor_terms, &mut budget,
+        )
     }
 
     /// Work-list step of the `#418` item 3 evaluator — see
     /// `check_dt_or_case_split_conflict`'s doc comment for the full design,
     /// including "#419 — equality closure wiring" for `h_sel` and the
     /// leaf-time `compute_dt_equality_closure` call.
+    ///
+    /// # #422 — beyond acyclicity-only
+    ///
+    /// Previously this evaluator's leaf ONLY checked the closed hypothesis
+    /// for an acyclicity conflict (`cycle_exists_given`) — a branch
+    /// internally contradictory for a DIFFERENT reason (e.g. constructor
+    /// injectivity forcing `a=c` while `a≠c` is also asserted in the SAME
+    /// branch) was invisible to it. `h_diseq` (the NEW fourth hypothesis
+    /// slice, threaded by VALUE through every recursive call exactly like
+    /// `h_var`/`h_ctor`/`h_sel` — same branch-isolation discipline, cloned
+    /// per branch, never a shared mutable reference) accumulates every
+    /// disequality-source pair (`dt_diseq_pairs`) each leaf contributes; the
+    /// leaf now also checks `closure.forces_disequality_conflict(h_diseq)`.
     fn dt_items_force_conflict(
         &self,
         items: &[(TermId, bool)],
         h_var: &[(TermId, TermId)],
         h_ctor: &[(TermId, TermId)],
         h_sel: &[(TermId, TermId)],
+        h_diseq: &[(TermId, TermId)],
         manager: &TermManager,
         ctor_terms: &[(TermId, Vec<TermId>)],
         budget: &mut u32,
@@ -829,12 +899,17 @@ impl Solver {
             // steps draw from the SAME shared total-work bound — see the
             // "#419 — equality closure wiring" doc section above.
             let closure = self.compute_dt_equality_closure(h_var, h_ctor, h_sel, manager, budget);
-            return self.cycle_exists_given(&closure.closed_eqs, &[], ctor_terms, manager);
+            // #422 — acyclicity OR a forced disequality conflict, whichever
+            // this branch's closed hypothesis exhibits (see this function's
+            // "#422 — beyond acyclicity-only" doc section above).
+            return self.cycle_exists_given(&closure.closed_eqs, &[], ctor_terms, manager)
+                || closure.forces_disequality_conflict(h_diseq);
         };
 
         let Some(td) = manager.get(t) else {
-            return self
-                .dt_items_force_conflict(rest, h_var, h_ctor, h_sel, manager, ctor_terms, budget);
+            return self.dt_items_force_conflict(
+                rest, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
+            );
         };
 
         match &td.kind {
@@ -843,7 +918,7 @@ impl Solver {
                 new_items.push((*inner, !ctx));
                 new_items.extend_from_slice(rest);
                 self.dt_items_force_conflict(
-                    &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                    &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
                 )
             }
             TermKind::And(children) if ctx => {
@@ -852,7 +927,7 @@ impl Solver {
                 new_items.extend(children.iter().map(|&c| (c, true)));
                 new_items.extend_from_slice(rest);
                 self.dt_items_force_conflict(
-                    &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                    &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
                 )
             }
             TermKind::Or(children) if !ctx => {
@@ -861,7 +936,7 @@ impl Solver {
                 new_items.extend(children.iter().map(|&c| (c, false)));
                 new_items.extend_from_slice(rest);
                 self.dt_items_force_conflict(
-                    &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                    &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
                 )
             }
             TermKind::Or(children) if ctx => {
@@ -873,7 +948,7 @@ impl Solver {
                     new_items.push((b, true));
                     new_items.extend_from_slice(rest);
                     self.dt_items_force_conflict(
-                        &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                        &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
                     )
                 })
             }
@@ -885,7 +960,7 @@ impl Solver {
                     new_items.push((b, false));
                     new_items.extend_from_slice(rest);
                     self.dt_items_force_conflict(
-                        &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                        &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
                     )
                 })
             }
@@ -911,6 +986,18 @@ impl Solver {
                 // resolve it once the rest of this branch's hypothesis is
                 // known.
                 let mut new_sel_eqs: Vec<(TermId, TermId)> = Vec::new();
+                // #422 item 3 — this leaf's own `C(..) = D(..)` ctor-ctor
+                // contribution (if any); folded into `h_ctor2` below (the
+                // SAME accumulator `var_ctor_term_eqs`-shaped facts use — no
+                // separate persistent thread needed, mirroring the flat-path
+                // call sites' `.extend()` merge).
+                let mut new_ctor_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+                // #422 items 1+2 — this leaf's own disequality-source
+                // contribution (if any); THIS one DOES need its own
+                // persistent thread (`h_diseq`), since it is not folded into
+                // `var_ctor_term_eqs`/`compute_dt_equality_closure` at all —
+                // it is consumed separately by `forces_disequality_conflict`.
+                let mut new_diseq_pairs: Vec<(TermId, TermId)> = Vec::new();
                 self.collect_dt_constraints_v2(
                     t,
                     manager,
@@ -921,21 +1008,38 @@ impl Solver {
                     &mut new_var_eqs,
                     &mut new_ctor_eqs,
                     &mut new_sel_eqs,
+                    &mut new_ctor_ctor_eqs,
+                    &mut new_diseq_pairs,
                     ctx,
                 );
-                if new_var_eqs.is_empty() && new_ctor_eqs.is_empty() && new_sel_eqs.is_empty() {
+                // #422 — extend the early-return emptiness check to ALSO
+                // cover the two new lists: a leaf whose ONLY contribution is
+                // a disequality/ctor-ctor fact (no var/ctor/sel fact at all)
+                // must still extend the hypothesis, not be silently dropped.
+                if new_var_eqs.is_empty()
+                    && new_ctor_eqs.is_empty()
+                    && new_sel_eqs.is_empty()
+                    && new_ctor_ctor_eqs.is_empty()
+                    && new_diseq_pairs.is_empty()
+                {
                     self.dt_items_force_conflict(
-                        rest, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                        rest, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
                     )
                 } else {
                     let mut h_var2 = h_var.to_vec();
                     h_var2.extend(new_var_eqs);
                     let mut h_ctor2 = h_ctor.to_vec();
                     h_ctor2.extend(new_ctor_eqs);
+                    // #422 item 3 — fold this leaf's ctor-ctor facts into the
+                    // SAME `var_ctor_term_eqs`-shaped accumulator
+                    // `compute_dt_equality_closure` consumes as `h_ctor`.
+                    h_ctor2.extend(new_ctor_ctor_eqs);
                     let mut h_sel2 = h_sel.to_vec();
                     h_sel2.extend(new_sel_eqs);
+                    let mut h_diseq2 = h_diseq.to_vec();
+                    h_diseq2.extend(new_diseq_pairs);
                     self.dt_items_force_conflict(
-                        rest, &h_var2, &h_ctor2, &h_sel2, manager, ctor_terms, budget,
+                        rest, &h_var2, &h_ctor2, &h_sel2, &h_diseq2, manager, ctor_terms, budget,
                     )
                 }
             }
@@ -1000,6 +1104,15 @@ impl Solver {
         let mut dt_var_equalities: Vec<(TermId, TermId)> = Vec::new();
         let mut var_ctor_term_eqs: Vec<(TermId, TermId)> = Vec::new();
         let mut sel_eqs: Vec<(TermId, TermId)> = Vec::new();
+        // #422 item 3 — merged into `var_ctor_term_eqs` below before the
+        // closure call (see `check_dt_constraints`'s analogous merge for the
+        // full rationale).
+        let mut dt_ctor_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+        // #422 items 1+2 — this call site (SAT-level axiom-injection feed,
+        // not a conflict check) has no use for the disequality-source pairs;
+        // collected only because `collect_dt_constraints_v2` requires the
+        // out-param, then discarded.
+        let mut dt_diseq_pairs: Vec<(TermId, TermId)> = Vec::new();
 
         for &assertion in &self.assertions {
             self.collect_dt_constraints_v2(
@@ -1012,9 +1125,12 @@ impl Solver {
                 &mut dt_var_equalities,
                 &mut var_ctor_term_eqs,
                 &mut sel_eqs,
+                &mut dt_ctor_ctor_eqs,
+                &mut dt_diseq_pairs,
                 true,
             );
         }
+        var_ctor_term_eqs.extend(dt_ctor_ctor_eqs);
 
         let mut closure_budget = DT_CLOSURE_STEP_BUDGET;
         self.compute_dt_equality_closure(
@@ -1043,6 +1159,28 @@ impl Solver {
     /// existing And/Or/Not polarity threading — the closure below does NO
     /// polarity reasoning of its own, it only ever combines/derives from
     /// facts already known to hold unconditionally.
+    ///
+    /// #422 item 3 — every call site now merges `dt_ctor_ctor_eqs` (direct
+    /// `C(..) = D(..)` equalities with NO mediating variable at all) into
+    /// `base_ctor_bindings` via `.extend()` BEFORE calling this function.
+    /// This function's OWN signature is deliberately UNCHANGED: both
+    /// `base_var_eqs` and `base_ctor_bindings` were already treated
+    /// IDENTICALLY inside it (`eqs.extend_from_slice(...)` for both, see
+    /// the loop below) — a "variable-to-ctor" binding is just one more
+    /// generic `(TermId, TermId)` equality pair to this closure, so folding
+    /// in a ctor-to-ctor pair the exact same way is exact, not an
+    /// approximation, and needs no new parameter.
+    ///
+    /// #422 items 1+2's `dt_diseq_pairs` (disequality-source facts from a
+    /// negative `Eq` between two datatype-sorted terms, or a positive 2-ary
+    /// `distinct`) are DELIBERATELY NOT an input here — they are consumed
+    /// separately, downstream of this closure's OUTPUT, by
+    /// `DtEqualityClosure::forces_disequality_conflict`. This closure's own
+    /// job remains exactly what it always was: derive every SOUND
+    /// consequence of the base equalities. Whether any of those derived
+    /// equalities happens to CONTRADICT a separately-asserted disequality is
+    /// a different question, answered by the caller after this function
+    /// returns.
     ///
     /// # Algorithm (iterative fixpoint)
     ///
@@ -1450,8 +1588,277 @@ impl Solver {
             derived_ctor_eqs,
         }
     }
+}
+
+impl DtEqualityClosure {
+    /// #422 STEP 5 — does this closure's fully-derived equality set force ANY
+    /// of `diseq_pairs` to be equal? Consumed by `check_dt_constraints`'s
+    /// flat pre-pass (STEP 6) and `dt_items_force_conflict`'s per-branch leaf
+    /// check (items 1+2's non-cycle conflict signal).
+    ///
+    /// Builds ONE union-find over `self.closed_eqs` (the SAME find/union
+    /// pattern `cycle_exists_given`/`compute_dt_equality_closure` already use,
+    /// for consistency), then checks whether any `(a, b)` pair in
+    /// `diseq_pairs` shares a root — i.e. whether the closure's OWN sound
+    /// derivations entail `a = b` despite `a`/`b` having been asserted (or,
+    /// for a positive `distinct`, implied) unequal. A pair that never
+    /// appears in `closed_eqs` at all gets its own singleton root (via the
+    /// union-find's `or_insert` default), so it can only ever report a
+    /// conflict when the two sides are LITERALLY the same `TermId` or were
+    /// genuinely unioned by a real, already-audited derivation — never a
+    /// false positive.
+    pub(super) fn forces_disequality_conflict(&self, diseq_pairs: &[(TermId, TermId)]) -> bool {
+        fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
+            let p = *parent.entry(x).or_insert(x);
+            if p == x {
+                x
+            } else {
+                let root = find(parent, p);
+                parent.insert(x, root);
+                root
+            }
+        }
+        fn union(parent: &mut FxHashMap<TermId, TermId>, a: TermId, b: TermId) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+
+        let mut parent: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for &(a, b) in &self.closed_eqs {
+            union(&mut parent, a, b);
+        }
+        diseq_pairs
+            .iter()
+            .any(|&(a, b)| find(&mut parent, a) == find(&mut parent, b))
+    }
+}
+
+impl Solver {
+    /// #422 STEP 1 (pure refactor, no behavior change) — the positive body of
+    /// the `Eq` arm below, extracted so #422's item 2 (`(not (distinct a b))`
+    /// recognized as an equality) and item 3 (`dt_ctor_ctor_eqs`) can reuse
+    /// the EXACT SAME polarity-correct logic instead of hand-duplicating it.
+    ///
+    /// Populates, for a POSITIVELY-asserted `lhs = rhs`:
+    ///   - `constructor_equalities` / `var_ctor_term_eqs`: when exactly one
+    ///     side is a manifest `DtConstructor` application and the other is a
+    ///     DT variable.
+    ///   - `dt_var_equalities`: when BOTH sides are DT variables.
+    ///   - `sel_eqs`: when either side is a `DtSelector` application (#419
+    ///     item 2 — no `is_dt_variable` gating on the other side, since the
+    ///     point is to feed `compute_dt_equality_closure`'s iterative
+    ///     resolution).
+    ///   - `dt_ctor_ctor_eqs` (#422 item 3): when BOTH sides are manifest
+    ///     `DtConstructor` applications (`C(..) = D(..)` with no mediating
+    ///     variable) — previously invisible to every collection above,
+    ///     since none of them fire unless at least one side is a variable.
+    #[allow(clippy::too_many_arguments)]
+    fn record_dt_positive_eq_fact(
+        &self,
+        lhs: TermId,
+        rhs: TermId,
+        manager: &TermManager,
+        constructor_equalities: &mut FxHashMap<TermId, Vec<String>>,
+        dt_var_equalities: &mut Vec<(TermId, TermId)>,
+        var_ctor_term_eqs: &mut Vec<(TermId, TermId)>,
+        sel_eqs: &mut Vec<(TermId, TermId)>,
+        dt_ctor_ctor_eqs: &mut Vec<(TermId, TermId)>,
+    ) {
+        // Check for x = Constructor(...)
+        if let Some(rhs_data) = manager.get(rhs) {
+            if let TermKind::DtConstructor { constructor, .. } = &rhs_data.kind {
+                if self.is_dt_variable(lhs, manager) {
+                    constructor_equalities
+                        .entry(lhs)
+                        .or_default()
+                        .push(manager.resolve_str(*constructor).to_string());
+                    // #406 — also keep the actual constructor TERM
+                    // id (not just its name) so the acyclicity
+                    // check can union `lhs` into `rhs`'s
+                    // argument graph.
+                    var_ctor_term_eqs.push((lhs, rhs));
+                }
+            }
+        }
+        if let Some(lhs_data) = manager.get(lhs) {
+            if let TermKind::DtConstructor { constructor, .. } = &lhs_data.kind {
+                if self.is_dt_variable(rhs, manager) {
+                    constructor_equalities
+                        .entry(rhs)
+                        .or_default()
+                        .push(manager.resolve_str(*constructor).to_string());
+                    var_ctor_term_eqs.push((rhs, lhs));
+                }
+            }
+        }
+
+        // Check for DT variable equality: x = y where both are DT variables
+        if self.is_dt_variable(lhs, manager) && self.is_dt_variable(rhs, manager) {
+            dt_var_equalities.push((lhs, rhs));
+        }
+
+        // #419 item 2 — also record a raw `sel(t) = t2` /
+        // `t2 = sel(t)` fact whenever one operand is a
+        // `DtSelector` application, with NO `is_dt_variable`
+        // gating on the other side (unlike `var_ctor_term_eqs`
+        // above): `compute_dt_equality_closure` is what decides,
+        // iteratively, whether `t` (the selector's own argument)
+        // ever becomes resolvable to a manifest constructor
+        // application — that may only happen once OTHER derived
+        // bindings have already landed, so this collector must
+        // hand over the raw fact unconditionally and let the
+        // closure do the (repeated) resolution attempts.
+        if manager
+            .get(lhs)
+            .is_some_and(|d| matches!(d.kind, TermKind::DtSelector { .. }))
+        {
+            sel_eqs.push((lhs, rhs));
+        }
+        if manager
+            .get(rhs)
+            .is_some_and(|d| matches!(d.kind, TermKind::DtSelector { .. }))
+        {
+            sel_eqs.push((rhs, lhs));
+        }
+
+        // #422 item 3 — a direct `C(..) = D(..)` equality between two
+        // NON-VARIABLE constructor applications (no mediating variable at
+        // all) was previously invisible to every collection above. Always a
+        // SOUND fact regardless of what `C`/`D` even denote (it's just the
+        // literal asserted equality between the two terms themselves);
+        // `compute_dt_equality_closure` decides what, if anything, follows
+        // from it (same-constructor injectivity decomposition, or a direct
+        // ground conflict if `C != D` — already caught elsewhere).
+        if let (Some(lhs_data), Some(rhs_data)) = (manager.get(lhs), manager.get(rhs)) {
+            if matches!(lhs_data.kind, TermKind::DtConstructor { .. })
+                && matches!(rhs_data.kind, TermKind::DtConstructor { .. })
+            {
+                dt_ctor_ctor_eqs.push((lhs, rhs));
+            }
+        }
+    }
+
+    /// #422 STEP 1 (pure refactor, no behavior change) — the negative body of
+    /// the `Eq` arm below (`#399`/`#404 phase 2`'s nullary-ctor-exclusion /
+    /// tester-shape recognizer), extracted so #422's item 2 (`(distinct a
+    /// b)`, a real disequality) can reuse the EXACT SAME polarity-correct
+    /// logic instead of hand-duplicating it.
+    ///
+    /// A NEGATED equality `v ≠ c` (or, after #422, a positively-asserted
+    /// `(distinct v c)`) to a NULLARY constructor excludes that whole
+    /// constructor class (the nullary ctor's value is unique). A generic
+    /// field-bearing ctor diseq excludes only one instance, so it is
+    /// deliberately NOT collected — with ONE exception (#404 phase 2): the
+    /// TESTER SHAPE `v ≠ C(sel_{C,0}(v), …, sel_{C,k}(v))` is exactly
+    /// `¬is-C(v)` for ANY arity (rebuilding `v` from its own C-fields equals
+    /// `v` iff `v` is C-shaped; a non-C `v` differs by constructor
+    /// distinctness) — this is the very form the parser's recognizer
+    /// desugar and the verus decreases-check guards emit. Record it as a
+    /// negative TESTER, feeding the same injectivity + exhaustiveness
+    /// reasoning; excluding ALL ctors this way is a ground conflict (z3
+    /// parity).
+    fn record_dt_negative_eq_fact(
+        &self,
+        v: TermId,
+        c: TermId,
+        manager: &TermManager,
+        negative_ctor_equalities: &mut FxHashMap<TermId, Vec<String>>,
+        negative_testers: &mut FxHashMap<TermId, Vec<String>>,
+    ) {
+        if !self.is_dt_variable(v, manager) {
+            return;
+        }
+        let Some(cd) = manager.get(c) else { return };
+        let TermKind::DtConstructor { constructor, args } = &cd.kind else {
+            return;
+        };
+        let cons_name = manager.resolve_str(*constructor).to_string();
+        if args.is_empty() {
+            negative_ctor_equalities.entry(v).or_default().push(cons_name);
+            return;
+        }
+        // Positional selector match: every argᵢ must be
+        // `(sel_{C,i} v)` — the selector names come from the
+        // SORT manager (datatype spurs live in ITS interner,
+        // the #399 cross-interner lesson), the node spurs
+        // from the term manager; compare resolved strings.
+        let Some(vsort) = manager.get(v).map(|t| t.sort) else { return };
+        let Some(sel_names) = manager.sorts.datatype_ctor_selectors(vsort, &cons_name) else {
+            return;
+        };
+        if sel_names.len() != args.len() {
+            return;
+        }
+        // A selector application reaches us either as the
+        // dedicated `DtSelector` node or as a plain `Apply` of
+        // the selector's (namespace-unique) function symbol —
+        // the parser emits the latter for user-written
+        // `(sel v)`. `datatype_ctor_selectors` already proved
+        // `want` IS this ctor's selector for v's sort, so a
+        // same-named unary Apply on exactly `v` is that
+        // selector application.
+        let tester_shape = args.iter().zip(sel_names.iter()).all(|(&a, want)| {
+            manager.get(a).is_some_and(|ad| match &ad.kind {
+                TermKind::DtSelector { selector, arg } => {
+                    *arg == v && manager.resolve_str(*selector) == *want
+                }
+                TermKind::Apply { func, args } => {
+                    args.len() == 1 && args[0] == v && manager.resolve_str(*func) == *want
+                }
+                _ => false,
+            })
+        });
+        if tester_shape {
+            negative_testers.entry(v).or_default().push(cons_name);
+        }
+    }
 
     /// Collect datatype constraints from a term (version 2 with negative testers and var equalities)
+    ///
+    /// # #422 — `Distinct` polarity mapping (soundness note)
+    ///
+    /// A 2-ary `(distinct a b)` is a real, non-desugared `TermKind::Distinct`
+    /// AST node (never rewritten to `Not(Eq(a,b))` at parse/build time — only
+    /// arity ≤ 1 collapses to `true`). Semantically `(distinct a b) ≡ ¬(a =
+    /// b)`, so its polarity mapping is the EXACT MIRROR of `Eq`'s:
+    ///
+    ///   - POSITIVE `(distinct a b)` is a disequality — handled by the SAME
+    ///     `record_dt_negative_eq_fact` helper `Eq`'s negative arm uses (a
+    ///     positive `distinct` and a negative `=` are the same fact), called
+    ///     BOTH ways (`(a,b)` then `(b,a)`) exactly like `Eq`'s existing
+    ///     dual-call, plus a `dt_diseq_pairs` entry for
+    ///     `forces_disequality_conflict` (see that method's doc comment).
+    ///   - NEGATIVE `(not (distinct a b))` is an EQUALITY — handled by the
+    ///     SAME `record_dt_positive_eq_fact` helper `Eq`'s positive arm uses.
+    ///     This is item 2's actual target: `(not (distinct a b))` was
+    ///     PREVIOUSLY invisible to every collection in this function (no
+    ///     `Distinct` arm existed at all), so a ground conflict expressed
+    ///     that way (rather than as a direct `=`) went undetected.
+    ///
+    /// **N-ARY GUARD — the single most important soundness guard in this
+    /// function.** The arm below is guarded `if args.len() == 2`. An N-ARY
+    /// `distinct` (3+ args) negated is a genuine DISJUNCTION (`¬distinct(a,b,c)
+    /// ≡ a=b ∨ a=c ∨ b=c`), NOT a single equality — collecting it as one
+    /// equality via `record_dt_positive_eq_fact` would be UNSOUND (it would
+    /// assert something strictly stronger than what is actually entailed,
+    /// risking a spurious conflict elsewhere). `args.len() != 2` therefore
+    /// falls through to the `_ => {}` catch-all below, collecting NOTHING —
+    /// safe (if incomplete) in both polarities, mirroring every other
+    /// deliberately-uncollected shape in this function. A POSITIVE N-ARY
+    /// `distinct` (all pairwise different) IS in principle decomposable into
+    /// `C(n,2)` pairwise disequalities, but that generalization is left for a
+    /// separate, distinctly-scoped follow-up (not needed by any of #422's
+    /// three items) to keep this diff small and independently re-verifiable.
+    ///
+    /// Neither `Distinct` arm recurses into its own operands, mirroring the
+    /// existing `Eq` arm's discipline (`#392` — a Bool-sorted `=`/`distinct`
+    /// is an iff/negated-iff; a tester nested inside an operand has
+    /// undetermined polarity until the WHOLE equality/distinct's own truth
+    /// value is fixed, which this collector never assumes beyond the direct
+    /// `a`/`b` shape it explicitly handles above).
     #[allow(clippy::too_many_arguments)]
     fn collect_dt_constraints_v2(
         &self,
@@ -1472,6 +1879,20 @@ impl Solver {
         // OTHER derived bindings arrive). One entry per selector-shaped
         // operand; a doubly-selector-shaped equality contributes both.
         sel_eqs: &mut Vec<(TermId, TermId)>,
+        // #422 item 3 — direct `C(..) = D(..)` ctor-ctor equalities (no
+        // mediating variable); see `record_dt_positive_eq_fact`'s doc
+        // comment.
+        dt_ctor_ctor_eqs: &mut Vec<(TermId, TermId)>,
+        // #422 items 1+2 — disequality-source pairs feeding
+        // `DtEqualityClosure::forces_disequality_conflict`: populated from a
+        // NEGATIVE `Eq` whose two sides are BOTH datatype-sorted (item 1 —
+        // the gate keys off the equality's own resolved `.sort`, not a
+        // heuristic like `is_dt_variable`, so it fires for `x ≠ y` between
+        // two DT variables AND for `C(..) ≠ D(..)` between two manifest
+        // constructor applications alike) and, UNCONDITIONALLY (no sort
+        // gate — see the `Distinct` arm's own doc note above), from a
+        // POSITIVE 2-ary `distinct` (item 2).
+        dt_diseq_pairs: &mut Vec<(TermId, TermId)>,
         in_positive_context: bool,
     ) {
         let Some(term_data) = manager.get(term) else {
@@ -1491,131 +1912,47 @@ impl Solver {
             }
             TermKind::Eq(lhs, rhs) => {
                 if in_positive_context {
-                    // Check for x = Constructor(...)
-                    if let Some(rhs_data) = manager.get(*rhs) {
-                        if let TermKind::DtConstructor { constructor, .. } = &rhs_data.kind {
-                            if self.is_dt_variable(*lhs, manager) {
-                                constructor_equalities
-                                    .entry(*lhs)
-                                    .or_default()
-                                    .push(manager.resolve_str(*constructor).to_string());
-                                // #406 — also keep the actual constructor TERM
-                                // id (not just its name) so the acyclicity
-                                // check can union `lhs` into `rhs`'s
-                                // argument graph.
-                                var_ctor_term_eqs.push((*lhs, *rhs));
-                            }
-                        }
-                    }
-                    if let Some(lhs_data) = manager.get(*lhs) {
-                        if let TermKind::DtConstructor { constructor, .. } = &lhs_data.kind {
-                            if self.is_dt_variable(*rhs, manager) {
-                                constructor_equalities
-                                    .entry(*rhs)
-                                    .or_default()
-                                    .push(manager.resolve_str(*constructor).to_string());
-                                var_ctor_term_eqs.push((*rhs, *lhs));
-                            }
-                        }
-                    }
-
-                    // Check for DT variable equality: x = y where both are DT variables
-                    if self.is_dt_variable(*lhs, manager) && self.is_dt_variable(*rhs, manager) {
-                        dt_var_equalities.push((*lhs, *rhs));
-                    }
-
-                    // #419 item 2 — also record a raw `sel(t) = t2` /
-                    // `t2 = sel(t)` fact whenever one operand is a
-                    // `DtSelector` application, with NO `is_dt_variable`
-                    // gating on the other side (unlike `var_ctor_term_eqs`
-                    // above): `compute_dt_equality_closure` is what decides,
-                    // iteratively, whether `t` (the selector's own argument)
-                    // ever becomes resolvable to a manifest constructor
-                    // application — that may only happen once OTHER derived
-                    // bindings have already landed, so this collector must
-                    // hand over the raw fact unconditionally and let the
-                    // closure do the (repeated) resolution attempts.
-                    if manager
-                        .get(*lhs)
-                        .is_some_and(|d| matches!(d.kind, TermKind::DtSelector { .. }))
-                    {
-                        sel_eqs.push((*lhs, *rhs));
-                    }
-                    if manager
-                        .get(*rhs)
-                        .is_some_and(|d| matches!(d.kind, TermKind::DtSelector { .. }))
-                    {
-                        sel_eqs.push((*rhs, *lhs));
-                    }
+                    self.record_dt_positive_eq_fact(
+                        *lhs,
+                        *rhs,
+                        manager,
+                        constructor_equalities,
+                        dt_var_equalities,
+                        var_ctor_term_eqs,
+                        sel_eqs,
+                        dt_ctor_ctor_eqs,
+                    );
                 } else {
-                    // #399 — a NEGATED equality to a NULLARY constructor excludes
-                    // that whole constructor class (the nullary ctor's value is
-                    // unique). A generic field-bearing ctor diseq excludes only
-                    // one instance, so it is deliberately NOT collected — with
-                    // ONE exception (#404 phase 2): the TESTER SHAPE
-                    // `v ≠ C(sel_{C,0}(v), …, sel_{C,k}(v))` is exactly
-                    // `¬is-C(v)` for ANY arity (rebuilding `v` from its own
-                    // C-fields equals `v` iff `v` is C-shaped; a non-C `v`
-                    // differs by constructor distinctness) — this is the very
-                    // form the parser's recognizer desugar and the verus
-                    // decreases-check guards emit. Record it as a negative
-                    // TESTER, feeding the same injectivity + exhaustiveness
-                    // reasoning; excluding ALL ctors this way is a ground
-                    // conflict (z3 parity — was a spurious `sat`).
-                    let mut record = |v: TermId, c: TermId| {
-                        if !self.is_dt_variable(v, manager) {
-                            return;
-                        }
-                        let Some(cd) = manager.get(c) else { return };
-                        let TermKind::DtConstructor { constructor, args } = &cd.kind else {
-                            return;
-                        };
-                        let cons_name = manager.resolve_str(*constructor).to_string();
-                        if args.is_empty() {
-                            negative_ctor_equalities.entry(v).or_default().push(cons_name);
-                            return;
-                        }
-                        // Positional selector match: every argᵢ must be
-                        // `(sel_{C,i} v)` — the selector names come from the
-                        // SORT manager (datatype spurs live in ITS interner,
-                        // the #399 cross-interner lesson), the node spurs
-                        // from the term manager; compare resolved strings.
-                        let Some(vsort) = manager.get(v).map(|t| t.sort) else { return };
-                        let Some(sel_names) =
-                            manager.sorts.datatype_ctor_selectors(vsort, &cons_name)
-                        else {
-                            return;
-                        };
-                        if sel_names.len() != args.len() {
-                            return;
-                        }
-                        // A selector application reaches us either as the
-                        // dedicated `DtSelector` node or as a plain `Apply` of
-                        // the selector's (namespace-unique) function symbol —
-                        // the parser emits the latter for user-written
-                        // `(sel v)`. `datatype_ctor_selectors` already proved
-                        // `want` IS this ctor's selector for v's sort, so a
-                        // same-named unary Apply on exactly `v` is that
-                        // selector application.
-                        let tester_shape = args.iter().zip(sel_names.iter()).all(|(&a, want)| {
-                            manager.get(a).is_some_and(|ad| match &ad.kind {
-                                TermKind::DtSelector { selector, arg } => {
-                                    *arg == v && manager.resolve_str(*selector) == *want
-                                }
-                                TermKind::Apply { func, args } => {
-                                    args.len() == 1
-                                        && args[0] == v
-                                        && manager.resolve_str(*func) == *want
-                                }
-                                _ => false,
-                            })
-                        });
-                        if tester_shape {
-                            negative_testers.entry(v).or_default().push(cons_name);
-                        }
-                    };
-                    record(*lhs, *rhs);
-                    record(*rhs, *lhs);
+                    self.record_dt_negative_eq_fact(
+                        *lhs,
+                        *rhs,
+                        manager,
+                        negative_ctor_equalities,
+                        negative_testers,
+                    );
+                    self.record_dt_negative_eq_fact(
+                        *rhs,
+                        *lhs,
+                        manager,
+                        negative_ctor_equalities,
+                        negative_testers,
+                    );
+                    // #422 item 1 — a NEGATIVE equality between two
+                    // datatype-sorted terms is a genuine disequality source
+                    // for `forces_disequality_conflict`, regardless of
+                    // whether either side is a plain variable (unlike
+                    // `record_dt_negative_eq_fact` above, which only ever
+                    // fires for a variable-vs-manifest-ctor shape): a direct
+                    // `C(..) ≠ D(..)` between two constructor applications,
+                    // or `x ≠ y` between two DT variables, both belong here.
+                    // Gated on the equality's ACTUAL resolved sort (not a
+                    // heuristic) so a plain-Int/Bool disequality is never
+                    // added — this theory's job is datatype conflicts only;
+                    // non-DT sorts already have their own (EUF/arith) theory
+                    // reasoning for equality/disequality conflicts.
+                    if Self::both_dt_sorted(*lhs, *rhs, manager) {
+                        dt_diseq_pairs.push((*lhs, *rhs));
+                    }
                 }
 
                 // Do NOT recurse into the equality's operands: they are not
@@ -1626,6 +1963,58 @@ impl Solver {
                 // minR shape). Non-Bool operands are first-order terms with no
                 // asserted sub-facts. The direct `x = Ctor(..)` / `x = y`
                 // collections above are the equality's whole contribution.
+            }
+            TermKind::Distinct(args) if args.len() == 2 => {
+                // #422 item 2 — see this function's own doc comment,
+                // "`Distinct` polarity mapping", for the full soundness
+                // argument (including the N-ARY GUARD above this arm).
+                let (a, b) = (args[0], args[1]);
+                if in_positive_context {
+                    // POSITIVE `(distinct a b)` ≡ a disequality — same
+                    // shape `Eq`'s negative arm handles, same dual-call.
+                    self.record_dt_negative_eq_fact(
+                        a,
+                        b,
+                        manager,
+                        negative_ctor_equalities,
+                        negative_testers,
+                    );
+                    self.record_dt_negative_eq_fact(
+                        b,
+                        a,
+                        manager,
+                        negative_ctor_equalities,
+                        negative_testers,
+                    );
+                    // Unconditional (no DT-sort gate): `(distinct a b)` is
+                    // ALWAYS a genuine disequality between exactly these two
+                    // terms regardless of their sort — `forces_disequality_
+                    // conflict`'s union-find only ever fires if `a`/`b` are
+                    // ACTUALLY unioned via a genuinely-derived `closed_eqs`
+                    // pair (itself always sound), so recording every 2-ary
+                    // `distinct` here can only ever help completeness, never
+                    // fabricate a conflict.
+                    dt_diseq_pairs.push((a, b));
+                } else {
+                    // NEGATIVE `(not (distinct a b))` ≡ `(= a b)` — same
+                    // shape `Eq`'s positive arm handles.
+                    self.record_dt_positive_eq_fact(
+                        a,
+                        b,
+                        manager,
+                        constructor_equalities,
+                        dt_var_equalities,
+                        var_ctor_term_eqs,
+                        sel_eqs,
+                        dt_ctor_ctor_eqs,
+                    );
+                }
+                // Do NOT recurse into the operands — mirrors `Eq`'s
+                // discipline above (same `#392` iff-polarity argument
+                // applies identically to a Bool-sorted `distinct`... though
+                // `distinct` is never itself Bool-ARGUMENT-sorted the way an
+                // `=` between two Bools can be an iff, the operands here are
+                // still not independently-asserted facts).
             }
             TermKind::And(args) => {
                 // A conjunction contributes its children only when the And
@@ -1646,6 +2035,8 @@ impl Solver {
                             dt_var_equalities,
                             var_ctor_term_eqs,
                             sel_eqs,
+                            dt_ctor_ctor_eqs,
+                            dt_diseq_pairs,
                             in_positive_context,
                         );
                     }
@@ -1670,6 +2061,8 @@ impl Solver {
                             dt_var_equalities,
                             var_ctor_term_eqs,
                             sel_eqs,
+                            dt_ctor_ctor_eqs,
+                            dt_diseq_pairs,
                             in_positive_context,
                         );
                     }
@@ -1687,11 +2080,31 @@ impl Solver {
                     dt_var_equalities,
                     var_ctor_term_eqs,
                     sel_eqs,
+                    dt_ctor_ctor_eqs,
+                    dt_diseq_pairs,
                     !in_positive_context,
                 );
             }
             _ => {}
         }
+    }
+
+    /// #422 items 1+2 — is `t`'s own resolved sort a datatype sort? Used by
+    /// `collect_dt_constraints_v2`'s negative-`Eq` arm to gate
+    /// `dt_diseq_pairs` on the equality's ACTUAL sort rather than a
+    /// syntactic heuristic (e.g. `is_dt_variable`, which only recognizes a
+    /// bare variable and would miss `C(..) ≠ D(..)` between two manifest
+    /// constructor applications). A term with no resolvable sort (shouldn't
+    /// happen for a well-formed term, but defensively) is treated as
+    /// NOT datatype-sorted — the safe direction (fewer pairs collected, at
+    /// worst a missed conflict, never a fabricated one).
+    fn both_dt_sorted(lhs: TermId, rhs: TermId, manager: &TermManager) -> bool {
+        let lhs_sort = manager.get(lhs).map(|d| d.sort);
+        let rhs_sort = manager.get(rhs).map(|d| d.sort);
+        matches!(
+            (lhs_sort, rhs_sort),
+            (Some(ls), Some(rs)) if manager.sorts.is_datatype(ls) && manager.sorts.is_datatype(rs)
+        )
     }
 
     /// Collect datatype constraints from a term
