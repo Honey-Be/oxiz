@@ -222,6 +222,19 @@ pub struct Solver {
     /// `add_dt_tester_reduction_axioms`, #406). Entries are trail-undone on
     /// `pop()` for the same reason as `dt_cover_done`.
     pub(super) dt_tester_reduced: FxHashSet<TermId>,
+    /// #419 item 1 — `(selector_term, field_value)` pairs whose EXTRA
+    /// (non-primary-binding) ground selector-reduction fact has already been
+    /// encoded (see `add_dt_multi_binding_selector_reduction_axioms`). Keyed
+    /// by the PAIR, not the term alone, since the same selector term can
+    /// legitimately resolve to several distinct field values here (one per
+    /// extra ctor-term binding of its argument's class). Trail-undone on
+    /// `pop()` for the same reason as `dt_selector_reduced`.
+    pub(super) dt_selector_extra_reduced: FxHashSet<(TermId, TermId)>,
+    /// #419 item 1 — canonicalized (smaller-`TermId`-first) pairs of
+    /// same-constructor ctor-term bindings whose ground equality axiom has
+    /// already been injected (see `inject_dt_derived_ctor_equalities`).
+    /// Trail-undone on `pop()` for the same reason as `dt_cover_done`.
+    pub(super) dt_ctor_eq_injected: FxHashSet<(TermId, TermId)>,
     /// Monotone counter naming the fresh constants of the ground term-ite
     /// elimination (`eliminate_term_ites`). Never decremented — a popped
     /// definition must never have its name reused by a later scope.
@@ -314,6 +327,8 @@ impl Solver {
             dt_cover_done: FxHashSet::default(),
             dt_selector_reduced: FxHashSet::default(),
             dt_tester_reduced: FxHashSet::default(),
+            dt_selector_extra_reduced: FxHashSet::default(),
+            dt_ctor_eq_injected: FxHashSet::default(),
             term_ite_counter: 0,
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
@@ -600,8 +615,36 @@ impl Solver {
         // LATER assertion than the selector/tester it unblocks). See
         // `encode.rs::add_dt_indirect_var_reduction_axioms` and
         // `check_dt.rs::collect_var_ctor_bindings` for the full design.
-        let dt_var_ctor_bindings = self.collect_var_ctor_bindings(manager);
-        self.add_dt_indirect_var_reduction_axioms(&dt_var_ctor_bindings, manager);
+        //
+        // #419 items 1 & 2 — `collect_var_ctor_bindings` now returns the
+        // full iterative closure (`check_dt.rs::compute_dt_equality_closure`),
+        // so the SAME call also feeds:
+        //   - `add_dt_multi_binding_selector_reduction_axioms` (item 1 — the
+        //     mechanism that actually closes the injectivity-transitivity
+        //     repro, see that function's doc comment), and
+        //   - `inject_dt_derived_ctor_equalities` (item 1 — the ground
+        //     `binding1 = binding2` fact, a complementary sound consequence
+        //     for other equality-consuming machinery).
+        let dt_closure = self.collect_var_ctor_bindings(manager);
+        self.add_dt_indirect_var_reduction_axioms(&dt_closure.primary_bindings, manager);
+        self.add_dt_multi_binding_selector_reduction_axioms(
+            &dt_closure.primary_bindings,
+            &dt_closure.extra_by_class,
+            manager,
+        );
+        self.inject_dt_derived_ctor_equalities(&dt_closure.derived_ctor_eqs, manager);
+        // Defense-in-depth: `derived_ctor_eqs` only ever pairs SAME-
+        // constructor-name bindings (see `compute_dt_equality_closure`'s
+        // doc comment), so `rewrite_constructor_eq`'s "different
+        // constructors" branch can never fire here in practice — but
+        // `inject_dt_derived_ctor_equalities` sets `has_false_assertion`
+        // rather than returning a verdict itself (it has no SatLevel to
+        // return), so this check must exist for that path to ever be
+        // observed if the invariant is ever violated by a future change.
+        if self.has_false_assertion {
+            self.build_unsat_core_trivial_false();
+            return SatLevel::DefiniteUnsat;
+        }
 
         // Check array constraints for early conflict detection
         if self.check_array_constraints(manager) {
@@ -1448,6 +1491,18 @@ impl Solver {
                             // pop; drop the marker so a later scope re-emits it.
                             self.dt_tester_reduced.remove(&term);
                         }
+                        TrailOp::DtSelectorExtraReduced { term, field } => {
+                            // The extra reduction unit clause died with the
+                            // SAT-level pop; drop the marker so a later scope
+                            // re-emits it.
+                            self.dt_selector_extra_reduced.remove(&(term, field));
+                        }
+                        TrailOp::DtCtorEqInjected { a, b } => {
+                            // The injected ctor=ctor equality unit clause died
+                            // with the SAT-level pop; drop the marker so a
+                            // later scope re-emits it.
+                            self.dt_ctor_eq_injected.remove(&(a, b));
+                        }
                         TrailOp::DtVarConstructorAdded { var } => {
                             // The binding was scoped to the popped level; drop
                             // it so a later scope's fresh constructor
@@ -1500,6 +1555,8 @@ impl Solver {
         self.dt_cover_done.clear();
         self.dt_selector_reduced.clear();
         self.dt_tester_reduced.clear();
+        self.dt_selector_extra_reduced.clear();
+        self.dt_ctor_eq_injected.clear();
         self.arith_parse_cache.clear();
         self.tracked_compound_terms.clear();
     }

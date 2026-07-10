@@ -1,4 +1,47 @@
 //! Datatype theory constraint checking
+//!
+//! # Known residual completeness boundaries (spurious-SAT direction only,
+//! never spurious-unsat — both found by this integration pass's own
+//! 1000-seed z3-differential re-verification of the already-landed #419
+//! items, NOT newly introduced by this session's own changes)
+//!
+//! 1. **OR-branch tester/constructor-equality conflicts.**
+//!    `dt_items_force_conflict` (the `#418`/`#419` OR-branch case-split
+//!    evaluator) only ever checks each branch's closed hypothesis for an
+//!    ACYCLICITY conflict — see its own doc comment, "Scope: acyclicity
+//!    only". A branch whose conflict is instead a constructor-equality/
+//!    tester-family clash (e.g. this session's own item-1 injectivity
+//!    repro, but occurring INSIDE one arm of an `or` instead of flatly)
+//!    still reads `sat` — a documented, pre-existing `#418` scope
+//!    boundary this session's OR-wiring deliberately did not expand.
+//! 2. **`(not (distinct a b))` is not recognized as an equality.**
+//!    `collect_dt_constraints_v2` only pattern-matches `TermKind::Eq` for
+//!    its `dt_var_equalities`/`var_ctor_term_eqs`/`sel_eqs` collections —
+//!    a 2-ary `distinct` negated back into an equality (`(not (distinct a
+//!    b))`, semantically identical to `(= a b)`) is never recognized as
+//!    one, so a ground conflict expressed that way (rather than as a
+//!    direct `=`) is invisible to every check in this file. Confirmed via
+//!    z3-differential fuzzing, unrelated to #419's own three items (a
+//!    single flat `(not (distinct a b))` assertion reproduces it with no
+//!    multi-binding or selector chasing involved at all) — a separate,
+//!    pre-existing gap, not attempted here.
+//! 3. **A direct `C(..) = D(..)` equality between two NON-VARIABLE
+//!    constructor applications is invisible to `dt_var_equalities`/
+//!    `var_ctor_term_eqs`.** `collect_dt_constraints_v2`'s `Eq` arm only
+//!    records a var-ctor-term pair when ONE side `is_dt_variable` — an
+//!    equality where BOTH sides are manifest constructor applications
+//!    (e.g. `(= (C (C' x)) (C y))`, whose field-decomposed consequence
+//!    `x`-side may itself force a well-foundedness cycle) contributes
+//!    NOTHING to either collection, so it never reaches
+//!    `compute_dt_equality_closure` — hence never reaches `step (b2)`'s
+//!    field decomposition either, even though the SAT-level simplifier
+//!    (`DatatypeRewriter::rewrite_constructor_eq`) already decomposes the
+//!    same equality for ordinary solving purposes. Confirmed via
+//!    z3-differential fuzzing; a further, natural extension of the same
+//!    "feed the closure every field-level consequence" idea `step (b2)`
+//!    established, but NOT attempted in this pass — left as a distinct,
+//!    separately-scoped follow-up to keep this pass's own diff small and
+//!    independently re-verifiable.
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -12,6 +55,71 @@ use super::Solver;
 /// budget only means "no conflict found," the always-safe answer). See that
 /// function's doc comment, "Termination / blowup guard".
 const DT_OR_CASE_SPLIT_BUDGET: u32 = 200_000;
+
+/// #419 (OR-branch wiring) — the per-call step budget `compute_dt_equality_
+/// closure` runs under when called from the two NON-branch-scoped call
+/// sites (`check_dt_constraints`'s flat acyclicity check and
+/// `collect_var_ctor_bindings`'s once-per-check-sat axiom-injection feed).
+/// Each of those sites owns its OWN fresh budget of this size (mirroring the
+/// closure's pre-OR-wiring behavior exactly — a once-per-check-sat call has
+/// no combinatorial sibling search to share a pool with). The THIRD call
+/// site — inside `dt_items_force_conflict`'s per-leaf conflict check, added
+/// for #418/#419's OR-branch case-split wiring — deliberately does NOT get
+/// its own fresh pool of this size; it instead threads the SAME `&mut u32`
+/// counter already bounding the case-split work-list's own pop-steps
+/// (`DT_OR_CASE_SPLIT_BUDGET`), so a pathological formula that visits many
+/// leaves, each triggering an expensive closure computation, is still
+/// bounded by ONE combined total-work budget rather than
+/// `DT_OR_CASE_SPLIT_BUDGET` leaves × `DT_CLOSURE_STEP_BUDGET` closure-steps
+/// each. See `dt_items_force_conflict`'s doc comment for the full argument;
+/// as ever, exceeding either budget only ever means "derive/search less,"
+/// never "fabricate a conflict."
+const DT_CLOSURE_STEP_BUDGET: u32 = 20_000;
+
+/// #419 — the full result of `Solver::compute_dt_equality_closure`, consumed
+/// by both the acyclicity check (non-OR path) and the SAT-level
+/// axiom-injection wiring in `mod.rs::check_level`. See that function's doc
+/// comment for the derivation algorithm.
+pub(super) struct DtEqualityClosure {
+    /// Every equality pair in the converged closure (base facts plus every
+    /// item-1/item-2 derivation), as generic `(TermId, TermId)` pairs — fed
+    /// directly into `Solver::check_dt_acyclicity`'s union-find (in place of
+    /// the old one-shot `dt_var_equalities`/`var_ctor_term_eqs` slices) so a
+    /// selector-shaped equality that only becomes acyclicity-relevant once
+    /// its argument resolves (#419 item 2) still participates in the cycle
+    /// graph.
+    pub(super) closed_eqs: Vec<(TermId, TermId)>,
+    /// var -> ONE representative (arbitrarily but deterministically chosen)
+    /// resolved ctor-term binding for its class. Same shape/contract the
+    /// pre-#419 `collect_var_ctor_bindings` always returned and
+    /// `encode.rs::resolve_dt_normal_form` still expects; now populated from
+    /// the FULL iterative closure rather than a single non-iterating pass,
+    /// so a binding only reachable via a chain of selector-resolutions
+    /// (#419 item 2) is included too.
+    pub(super) primary_bindings: FxHashMap<TermId, TermId>,
+    /// #419 item 1 — for every equivalence class with 2+ DISTINCT
+    /// same-constructor ctor-term bindings: the list of every DT VARIABLE in
+    /// that class (so a selector/tester applied to ANY synonym is covered),
+    /// paired with the list of every EXTRA (non-primary) same-constructor
+    /// ctor term for that class. Consumed by
+    /// `encode.rs::add_dt_multi_binding_selector_reduction_axioms`, which
+    /// re-runs the audited selector-reduction walk once per extra binding
+    /// (with that one class's entries in the resolution map overridden to
+    /// the extra value) so EVERY distinct resolved field value gets its own
+    /// ground fact injected — the actual mechanism that closes the
+    /// injectivity-transitivity repro (see that function's doc comment for
+    /// why the ctor=ctor equality below is not, by itself, sufficient).
+    pub(super) extra_by_class: Vec<(Vec<TermId>, Vec<TermId>)>,
+    /// #419 item 1 — the ground `binding1 = binding2` equality axiom for
+    /// every DISTINCT pair of same-constructor ctor-term bindings found
+    /// within one class. Always a SOUND consequence (ordinary equality
+    /// transitivity through the shared class) — injected as a SAT-level
+    /// ground unit clause by `encode.rs::inject_dt_derived_ctor_equalities`
+    /// so other equality-consuming machinery (cover-axiom exclusivity,
+    /// `distinct` reasoning, etc.) sees it directly too, not just the
+    /// selector-reduction consumers `extra_by_class` targets.
+    pub(super) derived_ctor_eqs: Vec<(TermId, TermId)>,
+}
 
 impl Solver {
     pub(super) fn check_dt_constraints(&self, manager: &TermManager) -> bool {
@@ -34,6 +142,9 @@ impl Solver {
         // below can union the variable into that term's argument graph). One
         // entry per positively-asserted `x = C(args…)` / `C(args…) = x`.
         let mut var_ctor_term_eqs: Vec<(TermId, TermId)> = Vec::new();
+        // #419 item 2 — raw `sel(t) = t2` facts feeding
+        // `compute_dt_equality_closure`'s iterative selector-resolution step.
+        let mut sel_eqs: Vec<(TermId, TermId)> = Vec::new();
 
         for &assertion in &self.assertions {
             self.collect_dt_constraints_v2(
@@ -45,6 +156,7 @@ impl Solver {
                 &mut negative_ctor_equalities,
                 &mut dt_var_equalities,
                 &mut var_ctor_term_eqs,
+                &mut sel_eqs,
                 true,
             );
         }
@@ -265,7 +377,28 @@ impl Solver {
         // filtered to genuinely-asserted-POSITIVE facts by
         // `collect_dt_constraints_v2`'s existing And/Or/Not polarity
         // handling.
-        if self.check_dt_acyclicity(manager, &dt_var_equalities, &var_ctor_term_eqs) {
+        //
+        // #419 item 2 — feed the ITERATIVE CLOSURE's fully-derived equality
+        // set (`compute_dt_equality_closure`), not the raw, one-shot
+        // `dt_var_equalities`/`var_ctor_term_eqs` collections directly: a
+        // selector application equated to something (`(= (tl z) z)`) only
+        // contributes an acyclicity-relevant equality once its OWN argument
+        // has been resolved to a manifest constructor application (possibly
+        // via another equality asserted elsewhere), which the raw collectors
+        // never attempt. The closure starts from exactly these same two
+        // (already-audited, polarity-gated) collections, so the soundness
+        // argument above still applies unchanged to everything it contains;
+        // see that function's doc comment for why every additional pair it
+        // derives is itself a sound logical consequence of the base facts.
+        let mut closure_budget = DT_CLOSURE_STEP_BUDGET;
+        let closure = self.compute_dt_equality_closure(
+            &dt_var_equalities,
+            &var_ctor_term_eqs,
+            &sel_eqs,
+            manager,
+            &mut closure_budget,
+        );
+        if self.check_dt_acyclicity(manager, &closure.closed_eqs, &[]) {
             return true;
         }
 
@@ -554,18 +687,71 @@ impl Solver {
     ///   `DtTester`, or any other term kind): delegate straight to
     ///   `collect_dt_constraints_v2` on just this ONE node (which, being a
     ///   non-recursing kind from that function's point of view, does exactly
-    ///   one thing: record whatever `dt_var_equalities`/`var_ctor_term_eqs`
-    ///   contribution this single node makes at this `ctx`, if any) to
-    ///   extend the hypothesis, then continue with the rest of the
-    ///   work-list. (`collect_dt_constraints_v2`'s other outputs, e.g.
-    ///   `constructor_testers`, are collected into throwaway maps — out of
-    ///   scope here, see below.)
-    /// - An empty work-list means every conjunct has been walked: check the
-    ///   FULLY accumulated hypothesis for a cycle via `cycle_exists_given`
-    ///   (the exact same union-find+DFS subroutine `check_dt_acyclicity`
-    ///   uses), parameterized by the SAME unconditional `ctor_terms`
-    ///   structural walk (computed ONCE up front, since it never depends on
-    ///   which branch is chosen — see `build_dt_ctor_terms`'s doc comment).
+    ///   one thing: record whatever `dt_var_equalities`/`var_ctor_term_eqs`/
+    ///   `sel_eqs` (#419 — see below) contribution this single node makes at
+    ///   this `ctx`, if any) to extend the hypothesis, then continue with
+    ///   the rest of the work-list. (`collect_dt_constraints_v2`'s other
+    ///   outputs, e.g. `constructor_testers`, are collected into throwaway
+    ///   maps — out of scope here, see below.)
+    ///
+    /// # #419 — equality closure wiring
+    ///
+    /// The three per-branch hypothesis slices (`h_var`, `h_ctor`, and now
+    /// `h_sel` — the raw `sel(t) = t2` facts `collect_dt_constraints_v2`
+    /// contributes per leaf, previously discarded here) are CLOSED via
+    /// `compute_dt_equality_closure` exactly once, at the SAME point the
+    /// (pre-#419) code already called `cycle_exists_given` — i.e. only when
+    /// the work-list is fully exhausted for THIS particular combination of
+    /// branch choices, never at every intermediate And/Or/Not node. This
+    /// mirrors the existing "check only at the leaf" discipline and means
+    /// the (non-trivial) closure fixpoint runs at most once per LEAF of the
+    /// case-split search tree, not once per node visited while walking down
+    /// to it.
+    ///
+    /// This closes both #419 items for the OR-branch path too: a branch
+    /// whose hypothesis needs an item-1 (injectivity-transitivity) or item-2
+    /// (selector-resolution-derived) fact to complete its own cycle is now
+    /// detected, exactly as the flat (non-OR) acyclicity check in
+    /// `check_dt_constraints` already was after that phase's landing.
+    ///
+    /// **Branch isolation.** `h_var`/`h_ctor`/`h_sel` are threaded by VALUE
+    /// (cloned, never a shared mutable reference) through the recursion —
+    /// the same discipline #418's own adversarial-verification report
+    /// confirmed for `h_var`/`h_ctor` ("clones h_var/h_ctor per branch with
+    /// no cross-contamination") continues to hold for `h_sel` and,
+    /// therefore, for the CLOSURE computed FROM them: `compute_dt_equality_
+    /// closure` is a pure function of whatever hypothesis slice a given leaf
+    /// call happens to hold, so two sibling branches (or a branch and its
+    /// unrelated sibling under an enclosing `And`) can never see each
+    /// other's derived facts — each leaf gets its own from-scratch closure
+    /// over only ITS OWN accumulated hypothesis.
+    ///
+    /// **Budget.** The closure computation is NOT given its own fresh
+    /// `DT_CLOSURE_STEP_BUDGET`-sized pool here — it is handed the SAME
+    /// `&mut u32 budget` already threading through every `dt_items_force_conflict`
+    /// call (the one bounding work-list pop-steps at
+    /// `DT_OR_CASE_SPLIT_BUDGET` total), so closure-fixpoint rounds run at
+    /// EVERY leaf draw from that one shared pool alongside the pop-steps.
+    /// This is what keeps the OVERALL search bounded even though a
+    /// combinatorial case-split can reach many leaves, each now doing
+    /// nontrivial extra work: the total of (pops + all closures' fixpoint
+    /// rounds, across every leaf visited) can never exceed
+    /// `DT_OR_CASE_SPLIT_BUDGET`, rather than that budget applying only to
+    /// pops while closures separately got `DT_CLOSURE_STEP_BUDGET` EACH
+    /// (which could multiply the two budgets together in the worst case).
+    /// Exceeding the shared budget mid-closure has the identical safe
+    /// semantics as everywhere else in this file: the search (or, here, one
+    /// leaf's closure) simply stops early, which can only make the overall
+    /// check MISS a conflict, never fabricate one.
+    /// - An empty work-list means every conjunct has been walked: first
+    ///   close the FULLY accumulated branch-local hypothesis
+    ///   (`h_var`/`h_ctor`/`h_sel`) via `compute_dt_equality_closure` — see
+    ///   "#419 — equality closure wiring" below — then check the CLOSED
+    ///   result for a cycle via `cycle_exists_given` (the exact same
+    ///   union-find+DFS subroutine `check_dt_acyclicity` uses), parameterized
+    ///   by the SAME unconditional `ctor_terms` structural walk (computed
+    ///   ONCE up front, since it never depends on which branch is chosen —
+    ///   see `build_dt_ctor_terms`'s doc comment).
     ///
     /// # Scope: acyclicity only (the required minimum)
     ///
@@ -607,16 +793,19 @@ impl Solver {
         let ctor_terms = self.build_dt_ctor_terms(manager);
         let items: Vec<(TermId, bool)> = self.assertions.iter().map(|&a| (a, true)).collect();
         let mut budget: u32 = DT_OR_CASE_SPLIT_BUDGET;
-        self.dt_items_force_conflict(&items, &[], &[], manager, &ctor_terms, &mut budget)
+        self.dt_items_force_conflict(&items, &[], &[], &[], manager, &ctor_terms, &mut budget)
     }
 
     /// Work-list step of the `#418` item 3 evaluator — see
-    /// `check_dt_or_case_split_conflict`'s doc comment for the full design.
+    /// `check_dt_or_case_split_conflict`'s doc comment for the full design,
+    /// including "#419 — equality closure wiring" for `h_sel` and the
+    /// leaf-time `compute_dt_equality_closure` call.
     fn dt_items_force_conflict(
         &self,
         items: &[(TermId, bool)],
         h_var: &[(TermId, TermId)],
         h_ctor: &[(TermId, TermId)],
+        h_sel: &[(TermId, TermId)],
         manager: &TermManager,
         ctor_terms: &[(TermId, Vec<TermId>)],
         budget: &mut u32,
@@ -631,12 +820,21 @@ impl Solver {
 
         let Some((&(t, ctx), rest)) = items.split_first() else {
             // Fully assembled hypothesis for this combination of branch
-            // choices — check it for a cycle.
-            return self.cycle_exists_given(h_var, h_ctor, ctor_terms, manager);
+            // choices — #419: close it (item 1 same-constructor-binding
+            // ctor=ctor derivations + item 2 selector-resolution
+            // derivations) before checking for a cycle, so a branch whose
+            // conflict only becomes visible after closing its OWN hypothesis
+            // is detected too. `budget` is deliberately reused (not a fresh
+            // `DT_CLOSURE_STEP_BUDGET` pool) so pop-steps and closure-fixpoint
+            // steps draw from the SAME shared total-work bound — see the
+            // "#419 — equality closure wiring" doc section above.
+            let closure = self.compute_dt_equality_closure(h_var, h_ctor, h_sel, manager, budget);
+            return self.cycle_exists_given(&closure.closed_eqs, &[], ctor_terms, manager);
         };
 
         let Some(td) = manager.get(t) else {
-            return self.dt_items_force_conflict(rest, h_var, h_ctor, manager, ctor_terms, budget);
+            return self
+                .dt_items_force_conflict(rest, h_var, h_ctor, h_sel, manager, ctor_terms, budget);
         };
 
         match &td.kind {
@@ -644,21 +842,27 @@ impl Solver {
                 let mut new_items = Vec::with_capacity(rest.len() + 1);
                 new_items.push((*inner, !ctx));
                 new_items.extend_from_slice(rest);
-                self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                self.dt_items_force_conflict(
+                    &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                )
             }
             TermKind::And(children) if ctx => {
                 // Conjunctive: all children are asserted true too.
                 let mut new_items = Vec::with_capacity(rest.len() + children.len());
                 new_items.extend(children.iter().map(|&c| (c, true)));
                 new_items.extend_from_slice(rest);
-                self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                self.dt_items_force_conflict(
+                    &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                )
             }
             TermKind::Or(children) if !ctx => {
                 // Conjunctive (De Morgan): all children are asserted false too.
                 let mut new_items = Vec::with_capacity(rest.len() + children.len());
                 new_items.extend(children.iter().map(|&c| (c, false)));
                 new_items.extend_from_slice(rest);
-                self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                self.dt_items_force_conflict(
+                    &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                )
             }
             TermKind::Or(children) if ctx => {
                 // Disjunctive case split: EVERY branch must independently
@@ -668,7 +872,9 @@ impl Solver {
                     let mut new_items = Vec::with_capacity(rest.len() + 1);
                     new_items.push((b, true));
                     new_items.extend_from_slice(rest);
-                    self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                    self.dt_items_force_conflict(
+                        &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                    )
                 })
             }
             TermKind::And(children) if !ctx => {
@@ -678,7 +884,9 @@ impl Solver {
                     let mut new_items = Vec::with_capacity(rest.len() + 1);
                     new_items.push((b, false));
                     new_items.extend_from_slice(rest);
-                    self.dt_items_force_conflict(&new_items, h_var, h_ctor, manager, ctor_terms, budget)
+                    self.dt_items_force_conflict(
+                        &new_items, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                    )
                 })
             }
             _ => {
@@ -688,12 +896,21 @@ impl Solver {
                 // does not recurse into further Boolean structure for these
                 // kinds, so calling it on just `t` extracts exactly this
                 // node's own contribution (if any) and nothing more.
-                let mut throwaway_pos_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
-                let mut throwaway_neg_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+                let mut throwaway_pos_testers: FxHashMap<TermId, Vec<String>> =
+                    FxHashMap::default();
+                let mut throwaway_neg_testers: FxHashMap<TermId, Vec<String>> =
+                    FxHashMap::default();
                 let mut throwaway_ctor_eqs: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
-                let mut throwaway_neg_ctor_eqs: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
+                let mut throwaway_neg_ctor_eqs: FxHashMap<TermId, Vec<String>> =
+                    FxHashMap::default();
                 let mut new_var_eqs: Vec<(TermId, TermId)> = Vec::new();
                 let mut new_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+                // #419 item 2 — this leaf's own raw `sel(t) = t2` fact
+                // contribution (if any), now THREADED into `h_sel` (no
+                // longer discarded) so the leaf-time closure call above can
+                // resolve it once the rest of this branch's hypothesis is
+                // known.
+                let mut new_sel_eqs: Vec<(TermId, TermId)> = Vec::new();
                 self.collect_dt_constraints_v2(
                     t,
                     manager,
@@ -703,16 +920,23 @@ impl Solver {
                     &mut throwaway_neg_ctor_eqs,
                     &mut new_var_eqs,
                     &mut new_ctor_eqs,
+                    &mut new_sel_eqs,
                     ctx,
                 );
-                if new_var_eqs.is_empty() && new_ctor_eqs.is_empty() {
-                    self.dt_items_force_conflict(rest, h_var, h_ctor, manager, ctor_terms, budget)
+                if new_var_eqs.is_empty() && new_ctor_eqs.is_empty() && new_sel_eqs.is_empty() {
+                    self.dt_items_force_conflict(
+                        rest, h_var, h_ctor, h_sel, manager, ctor_terms, budget,
+                    )
                 } else {
                     let mut h_var2 = h_var.to_vec();
                     h_var2.extend(new_var_eqs);
                     let mut h_ctor2 = h_ctor.to_vec();
                     h_ctor2.extend(new_ctor_eqs);
-                    self.dt_items_force_conflict(rest, &h_var2, &h_ctor2, manager, ctor_terms, budget)
+                    let mut h_sel2 = h_sel.to_vec();
+                    h_sel2.extend(new_sel_eqs);
+                    self.dt_items_force_conflict(
+                        rest, &h_var2, &h_ctor2, &h_sel2, manager, ctor_terms, budget,
+                    )
                 }
             }
         }
@@ -759,13 +983,23 @@ impl Solver {
     /// `add_dt_indirect_var_reduction_axioms`'s doc comment), never on this
     /// map's contents, which is why rebuilding it fresh every check-sat is
     /// always safe regardless of push/pop history.
-    pub(super) fn collect_var_ctor_bindings(&self, manager: &TermManager) -> FxHashMap<TermId, TermId> {
+    ///
+    /// #419 — now RETURNS the full [`DtEqualityClosure`] (not just the
+    /// picked-one-per-class map its name still describes): the closure
+    /// subsumes the old first-wins union-find exactly (a class with a single
+    /// distinct ctor binding degenerates to the same `primary_bindings`
+    /// entry this function always produced), while ALSO exposing the
+    /// injectivity-transitivity (item 1) and selector-chase-derived (item 2)
+    /// facts the old version silently dropped. See
+    /// `compute_dt_equality_closure`'s doc comment for the algorithm.
+    pub(super) fn collect_var_ctor_bindings(&self, manager: &TermManager) -> DtEqualityClosure {
         let mut constructor_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         let mut negative_testers: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         let mut constructor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         let mut negative_ctor_equalities: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
         let mut dt_var_equalities: Vec<(TermId, TermId)> = Vec::new();
         let mut var_ctor_term_eqs: Vec<(TermId, TermId)> = Vec::new();
+        let mut sel_eqs: Vec<(TermId, TermId)> = Vec::new();
 
         for &assertion in &self.assertions {
             self.collect_dt_constraints_v2(
@@ -777,14 +1011,148 @@ impl Solver {
                 &mut negative_ctor_equalities,
                 &mut dt_var_equalities,
                 &mut var_ctor_term_eqs,
+                &mut sel_eqs,
                 true,
             );
         }
 
-        // Union-Find over TermId — the exact same tiny shape as
-        // `check_dt_acyclicity`'s (kept separate/local here rather than
-        // shared to avoid coupling the two; both are cheap to rebuild and
-        // bounded by formula size).
+        let mut closure_budget = DT_CLOSURE_STEP_BUDGET;
+        self.compute_dt_equality_closure(
+            &dt_var_equalities,
+            &var_ctor_term_eqs,
+            &sel_eqs,
+            manager,
+            &mut closure_budget,
+        )
+    }
+
+    /// #419 items 1 & 2 — the shared iterative equality/binding closure that
+    /// underlies both the injectivity-transitivity fix (item 1) and the
+    /// acyclicity/`resolve_dt_normal_form` composition fix (item 2).
+    ///
+    /// # Inputs
+    ///
+    /// All three inputs are the SAME collections `check_dt_constraints`'s
+    /// acyclicity check and the old `collect_var_ctor_bindings` already
+    /// trusted, unmodified: `base_var_eqs` (`dt_var_equalities`, DT
+    /// variable-to-variable equalities), `base_ctor_bindings`
+    /// (`var_ctor_term_eqs`, DT variable-to-manifest-constructor-application
+    /// equalities), and `base_sel_eqs` (raw `sel(t) = t2` facts, #419 item
+    /// 2's new collection). All three are already filtered to
+    /// genuinely-asserted-POSITIVE facts by `collect_dt_constraints_v2`'s
+    /// existing And/Or/Not polarity threading — the closure below does NO
+    /// polarity reasoning of its own, it only ever combines/derives from
+    /// facts already known to hold unconditionally.
+    ///
+    /// # Algorithm (iterative fixpoint)
+    ///
+    /// Maintains one growing list `eqs` of generic `(TermId, TermId)` pairs,
+    /// seeded with `base_var_eqs ++ base_ctor_bindings` (a "ctor binding"
+    /// `(v, c)` IS itself just an equality `v = c`, so folding both into one
+    /// list is exact, not an approximation). Each round:
+    ///
+    ///   a. Union-find over the CURRENT `eqs` (freshly rebuilt every round,
+    ///      so a fact derived THIS round is visible to steps (b)/(c) starting
+    ///      NEXT round — a fixpoint over "one rule-application pass" is
+    ///      equivalent to eagerly propagating within a round, just possibly a
+    ///      few extra (bounded) iterations, which is fine given the
+    ///      step-budget below).
+    ///   b. **Item 1**: group every term with kind `DtConstructor` appearing
+    ///      anywhere in `eqs` by its class root. For any two DISTINCT such
+    ///      terms in the SAME class sharing the SAME constructor NAME (a
+    ///      class can easily hold 2+ once several separate assertions each
+    ///      bind the same variable — or two variables later found equal — to
+    ///      their OWN ctor application), add the equality `c1 = c2` between
+    ///      the ctor terms THEMSELVES. This is always a SOUND consequence:
+    ///      `v = c1 ∧ v = c2 ⊢ c1 = c2` by ordinary equality transitivity,
+    ///      true regardless of what `c1`/`c2` even denote. Two bindings to
+    ///      DIFFERENT constructor names are deliberately NOT unioned or
+    ///      otherwise acted on here — that is a direct ground conflict
+    ///      already caught elsewhere (the name-keyed cross-checks earlier in
+    ///      `check_dt_constraints`), not this closure's job to duplicate.
+    ///      `encode.rs::add_dt_multi_binding_selector_reduction_axioms`
+    ///      SEPARATELY re-runs the audited selector-reduction walk per extra
+    ///      binding to produce ACTUAL SAT-level ground facts for a formula
+    ///      that mentions a selector — this closure's OWN copy of the same
+    ///      derivation (step (b2) below) exists for a different consumer:
+    ///      the STATIC pre-solving acyclicity check (`check_dt_acyclicity`
+    ///      via `check_dt_constraints`, and `dt_items_force_conflict`'s
+    ///      per-branch cycle check), which never reaches the SAT solver at
+    ///      all when it fires, so it cannot rely on that separate,
+    ///      SAT-clause-level mechanism.
+    ///   b2. **Item 1 follow-up — constructor injectivity, field-decomposed**
+    ///      (found by this integration pass's own 1000-seed z3-differential
+    ///      re-verification of the already-landed items above, NOT part of
+    ///      the original #419 task text): for the SAME `(c1, c2)` pair step
+    ///      (b) just confirmed share a constructor — whether the whole-term
+    ///      pair was freshly derived THIS round or came straight from
+    ///      `base_ctor_bindings` in an EARLIER round — zip their argument
+    ///      lists and add `args1[i] = args2[i]` for every field `i` where
+    ///      the two differ. Without this, a same-constructor pair only ever
+    ///      contributed an OPAQUE whole-term fact to `eqs`: invisible to
+    ///      `cycle_exists_given`'s class-based edges (which key cycles off
+    ///      which term-ARGUMENTS' classes coincide, not off opaque
+    ///      container-level equalities) and invisible to a LATER round's own
+    ///      step (c) (which needs a genuine per-field equality to chase a
+    ///      selector through). E.g. `x = C(a, ...)` and `x = C(b, ...,
+    ///      C(c, ..., a))` derives, on decomposition, `a = C(c, ..., a)` — a
+    ///      direct well-foundedness cycle only reachable by first performing
+    ///      THIS decomposition. Sound for the same reason step (b) itself is
+    ///      (`C(x1..xn) = C(y1..yn)` denoting the SAME free-algebra value
+    ///      forces `xi = yi` for every field — ordinary constructor
+    ///      injectivity, the identical consequence
+    ///      `DatatypeRewriter::rewrite_constructor_eq` already draws when a
+    ///      ctor=ctor equality reaches the simplifier, drawn here too,
+    ///      directly inside this closure's own abstract equality set).
+    ///   c. **Item 2**: for each raw `(sel_term, other)` pair in
+    ///      `base_sel_eqs` (destructuring `sel_term` as `DtSelector {
+    ///      selector, arg }`), attempt `resolve_dt_normal_form(arg,
+    ///      hint_map)` using a `hint_map` built from THIS round's classes (one
+    ///      arbitrary — "primary" — ctor-term binding per class, mirroring
+    ///      exactly what `resolve_dt_normal_form`'s contract expects). If
+    ///      `arg` resolves to a manifest `C(args…)` and `selector` names one
+    ///      of `C`'s own fields at index `i`, add the equality `args[i] =
+    ///      other`. Sound for the identical reason `resolve_dt_normal_form`
+    ///      itself is sound (a chain of congruence + the standard selector-
+    ///      of-its-own-constructor axiom + transitivity with the raw fact) —
+    ///      see that function's doc comment.
+    ///
+    /// Repeats a–c (through b2) until a round adds nothing new. Termination: `eqs` only
+    /// ever grows by pairs drawn from a FINITE universe (`TermId` pairs
+    /// bounded by the term arena's size), each added at most once (`seen_pairs`
+    /// dedup), so the loop is bounded by the arena's size regardless of the
+    /// budget below; the budget is a pure defensive safety valve (mirroring
+    /// `DT_OR_CASE_SPLIT_BUDGET`'s spirit) against pathological/adversarial
+    /// input, and exceeding it can only mean "stop deriving more" (an
+    /// incomplete but always-safe outcome — the returned closure is simply a
+    /// SUBSET of the true full closure, never a superset, so nothing
+    /// spuriously conflicts).
+    ///
+    /// # Budget
+    ///
+    /// `budget` is an EXTERNALLY-owned step counter (see
+    /// `DT_CLOSURE_STEP_BUDGET`'s doc comment for why this is a caller-
+    /// supplied `&mut u32` rather than an internal constant): the two
+    /// flat/once-per-check-sat call sites each pass a dedicated fresh
+    /// `DT_CLOSURE_STEP_BUDGET`-sized counter, while the OR-branch
+    /// case-split call site threads its OWN already-in-flight
+    /// `DT_OR_CASE_SPLIT_BUDGET` work-list counter through instead, so
+    /// closure-fixpoint rounds and case-split work-list pops draw from one
+    /// shared total-work pool there. Either way, running out of budget mid-
+    /// fixpoint just stops the loop early — same safe-subset guarantee as
+    /// above.
+    ///
+    /// # Outputs
+    ///
+    /// See [`DtEqualityClosure`]'s field docs.
+    pub(super) fn compute_dt_equality_closure(
+        &self,
+        base_var_eqs: &[(TermId, TermId)],
+        base_ctor_bindings: &[(TermId, TermId)],
+        base_sel_eqs: &[(TermId, TermId)],
+        manager: &TermManager,
+        budget: &mut u32,
+    ) -> DtEqualityClosure {
         fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
             let p = *parent.entry(x).or_insert(x);
             if p == x {
@@ -802,38 +1170,289 @@ impl Solver {
                 parent.insert(ra, rb);
             }
         }
-
-        let mut parent: FxHashMap<TermId, TermId> = FxHashMap::default();
-        for &(a, b) in &dt_var_equalities {
-            union(&mut parent, a, b);
-        }
-
-        let mut root_to_ctor: FxHashMap<TermId, TermId> = FxHashMap::default();
-        for &(v, c) in &var_ctor_term_eqs {
-            let root = find(&mut parent, v);
-            root_to_ctor.entry(root).or_insert(c);
-        }
-
-        let mut all_vars: FxHashSet<TermId> = FxHashSet::default();
-        for &(a, b) in &dt_var_equalities {
-            all_vars.insert(a);
-            all_vars.insert(b);
-        }
-        for &(v, _) in &var_ctor_term_eqs {
-            all_vars.insert(v);
-        }
-
-        let mut bindings: FxHashMap<TermId, TermId> = FxHashMap::default();
-        for v in all_vars {
-            let root = find(&mut parent, v);
-            if let Some(&c) = root_to_ctor.get(&root) {
-                bindings.insert(v, c);
+        fn canon(a: TermId, b: TermId) -> (TermId, TermId) {
+            if a.raw() <= b.raw() {
+                (a, b)
+            } else {
+                (b, a)
             }
         }
-        bindings
+        fn ctor_name(manager: &TermManager, t: TermId) -> Option<String> {
+            match manager.get(t).map(|d| &d.kind) {
+                Some(TermKind::DtConstructor { constructor, .. }) => {
+                    Some(manager.resolve_str(*constructor).to_string())
+                }
+                _ => None,
+            }
+        }
+        // Post-landing follow-up (found by this session's own differential
+        // re-verification, NOT part of the original #419 task text — see
+        // `compute_dt_equality_closure`'s doc comment, "Step (b2)", for the
+        // full story): extract a manifest `DtConstructor` application's own
+        // argument list, owned (not borrowed), so step (b2) below can zip two
+        // same-constructor terms' fields without fighting the borrow checker
+        // over `manager.get(..)`'s temporary `Ref`.
+        fn ctor_args(manager: &TermManager, t: TermId) -> Option<Vec<TermId>> {
+            match manager.get(t).map(|d| &d.kind) {
+                Some(TermKind::DtConstructor { args, .. }) => {
+                    Some(args.iter().copied().collect())
+                }
+                _ => None,
+            }
+        }
+
+        let mut eqs: Vec<(TermId, TermId)> =
+            Vec::with_capacity(base_var_eqs.len() + base_ctor_bindings.len());
+        eqs.extend_from_slice(base_var_eqs);
+        eqs.extend_from_slice(base_ctor_bindings);
+
+        let mut seen_pairs: FxHashSet<(TermId, TermId)> =
+            eqs.iter().map(|&(a, b)| canon(a, b)).collect();
+        let mut derived_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+
+        loop {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
+            let mut changed = false;
+
+            let mut parent: FxHashMap<TermId, TermId> = FxHashMap::default();
+            for &(a, b) in &eqs {
+                union(&mut parent, a, b);
+            }
+
+            let mut terms_in_play: FxHashSet<TermId> = FxHashSet::default();
+            for &(a, b) in &eqs {
+                terms_in_play.insert(a);
+                terms_in_play.insert(b);
+            }
+
+            // Group manifest ctor-application members by class root.
+            let mut root_ctors: FxHashMap<TermId, Vec<TermId>> = FxHashMap::default();
+            for &t in &terms_in_play {
+                if matches!(
+                    manager.get(t).map(|d| &d.kind),
+                    Some(TermKind::DtConstructor { .. })
+                ) {
+                    let r = find(&mut parent, t);
+                    let bucket = root_ctors.entry(r).or_default();
+                    if !bucket.contains(&t) {
+                        bucket.push(t);
+                    }
+                }
+            }
+
+            // --- Step (b): item 1 — same-constructor-name pairwise
+            // equalities within one class. ---
+            for terms in root_ctors.values() {
+                if terms.len() < 2 {
+                    continue;
+                }
+                for i in 0..terms.len() {
+                    for j in (i + 1)..terms.len() {
+                        let (c1, c2) = (terms[i], terms[j]);
+                        let n1 = ctor_name(manager, c1);
+                        if n1.is_none() || n1 != ctor_name(manager, c2) {
+                            continue;
+                        }
+                        let key = canon(c1, c2);
+                        if seen_pairs.insert(key) {
+                            eqs.push(key);
+                            derived_ctor_eqs.push(key);
+                            changed = true;
+                        }
+                        // --- Step (b2), post-landing follow-up: constructor
+                        // INJECTIVITY field decomposition. `c1`/`c2` are two
+                        // manifest applications of the SAME constructor
+                        // (`n1 == ctor_name(c2)` just above) found in one
+                        // class, so `c1 = c2` (whether that whole-term pair
+                        // was already known or is the one just pushed above)
+                        // entails, field-by-field, `args1[k] = args2[k]` for
+                        // every field `k` — ordinary constructor injectivity,
+                        // exactly the same sound consequence
+                        // `DatatypeRewriter::rewrite_constructor_eq` already
+                        // draws when a ctor=ctor equality reaches the
+                        // simplifier (see `inject_dt_derived_ctor_equalities`'s
+                        // doc comment) — but drawn HERE too, directly inside
+                        // the abstract equality set this closure computes,
+                        // unconditionally (not gated behind `seen_pairs.
+                        // insert(key)` above): a same-class pair from an
+                        // EARLIER round (e.g. straight from `base_ctor_
+                        // bindings`, already recorded before this closure
+                        // ever ran) must still get its fields decomposed the
+                        // FIRST time this loop is reached, not only when the
+                        // whole-term pair itself is freshly discovered.
+                        // Without this step, a derived/base same-constructor
+                        // binding pair contributes only an OPAQUE whole-term
+                        // fact to `eqs` — invisible to `cycle_exists_given`'s
+                        // graph, which keys cycles off which term-arguments'
+                        // classes coincide, and invisible to a LATER round's
+                        // own selector-resolution step (c), both of which
+                        // need the per-field equality itself, not just the
+                        // container equality. (Confirmed load-bearing by a
+                        // 1000-seed z3-differential re-run turning up exactly
+                        // this composition gap post-landing — a 2-binding
+                        // `x=C(a,...); x=C(b,...,C(c,...,x-again-shaped))`
+                        // minimized repro whose forced field-level cycle was
+                        // invisible without this step; see
+                        // `dt_equality_closure_field_decomp_regression.rs`.)
+                        if let (Some(a1), Some(a2)) = (ctor_args(manager, c1), ctor_args(manager, c2))
+                        {
+                            for (&fa, &fb) in a1.iter().zip(a2.iter()) {
+                                if fa == fb {
+                                    continue;
+                                }
+                                let fkey = canon(fa, fb);
+                                if seen_pairs.insert(fkey) {
+                                    eqs.push(fkey);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Step (c): item 2 — selector-shaped equality resolution,
+            // using ONE arbitrary ("primary") binding per class as this
+            // round's resolution hint. ---
+            let mut hint_map: FxHashMap<TermId, TermId> = FxHashMap::default();
+            for (&root, terms) in &root_ctors {
+                if let Some(&primary) = terms.first() {
+                    for &t in &terms_in_play {
+                        if t != primary && find(&mut parent, t) == root {
+                            hint_map.insert(t, primary);
+                        }
+                    }
+                }
+            }
+
+            let mut memo: FxHashMap<TermId, Option<TermId>> = FxHashMap::default();
+            let mut in_progress: FxHashSet<TermId> = FxHashSet::default();
+            for &(sel_term, other) in base_sel_eqs {
+                let Some(td) = manager.get(sel_term) else {
+                    continue;
+                };
+                let TermKind::DtSelector { selector, arg } = &td.kind else {
+                    continue;
+                };
+                let selector = *selector;
+                let arg = *arg;
+                let Some(resolved_arg) = Solver::resolve_dt_normal_form(
+                    arg,
+                    &hint_map,
+                    &mut memo,
+                    &mut in_progress,
+                    manager,
+                ) else {
+                    continue;
+                };
+                let Some(argd) = manager.get(resolved_arg) else {
+                    continue;
+                };
+                let (dt_sort, constructor, ctor_args) = match &argd.kind {
+                    TermKind::DtConstructor { constructor, args } => {
+                        (argd.sort, *constructor, args)
+                    }
+                    _ => continue,
+                };
+                let Some(layouts) = manager.sorts.datatype_ctor_layouts(dt_sort) else {
+                    continue;
+                };
+                let cname = manager.resolve_str(constructor).to_string();
+                let sname = manager.resolve_str(selector).to_string();
+                let Some((_, fields)) = layouts.iter().find(|(c, _)| *c == cname) else {
+                    continue;
+                };
+                let Some(idx) = fields.iter().position(|(s, _)| *s == sname) else {
+                    continue;
+                };
+                let Some(&field_term) = ctor_args.get(idx) else {
+                    continue;
+                };
+                if field_term == other {
+                    continue;
+                }
+                let key = canon(field_term, other);
+                if seen_pairs.insert(key) {
+                    eqs.push(key);
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        // Final pass: derive `primary_bindings` (var -> one representative
+        // ctor term per class, the same shape/contract the pre-#419 code
+        // always returned) and `extra_by_class` (#419 item 1's wiring input
+        // — every OTHER same-constructor binding beyond the primary one,
+        // paired with every DT VARIABLE in that class so a selector/tester
+        // applied to ANY synonym is covered).
+        let mut parent: FxHashMap<TermId, TermId> = FxHashMap::default();
+        for &(a, b) in &eqs {
+            union(&mut parent, a, b);
+        }
+        let mut terms_in_play: FxHashSet<TermId> = FxHashSet::default();
+        for &(a, b) in &eqs {
+            terms_in_play.insert(a);
+            terms_in_play.insert(b);
+        }
+        let mut root_ctors: FxHashMap<TermId, Vec<TermId>> = FxHashMap::default();
+        for &t in &terms_in_play {
+            if matches!(
+                manager.get(t).map(|d| &d.kind),
+                Some(TermKind::DtConstructor { .. })
+            ) {
+                let r = find(&mut parent, t);
+                let bucket = root_ctors.entry(r).or_default();
+                if !bucket.contains(&t) {
+                    bucket.push(t);
+                }
+            }
+        }
+
+        let mut primary_bindings: FxHashMap<TermId, TermId> = FxHashMap::default();
+        let mut extra_by_class: Vec<(Vec<TermId>, Vec<TermId>)> = Vec::new();
+        for (&root, terms) in &root_ctors {
+            // Deterministic ordering (by raw TermId) so which binding is
+            // "primary" doesn't depend on FxHashMap iteration order —
+            // doesn't affect soundness (any true binding is as good as any
+            // other as a resolution hint), only reproducibility.
+            let mut sorted_terms = terms.clone();
+            sorted_terms.sort_by_key(|t| t.raw());
+            let primary = sorted_terms[0];
+
+            let mut class_vars: Vec<TermId> = Vec::new();
+            for &t in &terms_in_play {
+                if find(&mut parent, t) == root
+                    && t != primary
+                    && matches!(manager.get(t).map(|d| &d.kind), Some(TermKind::Var(_)))
+                {
+                    primary_bindings.insert(t, primary);
+                    class_vars.push(t);
+                }
+            }
+
+            if sorted_terms.len() > 1 && !class_vars.is_empty() {
+                let extras: Vec<TermId> = sorted_terms[1..].to_vec();
+                extra_by_class.push((class_vars, extras));
+            }
+        }
+
+        DtEqualityClosure {
+            closed_eqs: eqs,
+            primary_bindings,
+            extra_by_class,
+            derived_ctor_eqs,
+        }
     }
 
     /// Collect datatype constraints from a term (version 2 with negative testers and var equalities)
+    #[allow(clippy::too_many_arguments)]
     fn collect_dt_constraints_v2(
         &self,
         term: TermId,
@@ -844,6 +1463,15 @@ impl Solver {
         negative_ctor_equalities: &mut FxHashMap<TermId, Vec<String>>,
         dt_var_equalities: &mut Vec<(TermId, TermId)>,
         var_ctor_term_eqs: &mut Vec<(TermId, TermId)>,
+        // #419 item 2 — raw, positively-asserted `sel(t) = t2` / `t2 = sel(t)`
+        // facts (a `DtSelector` application equated to ANYTHING, no
+        // `is_dt_variable` gating on the other side — unlike
+        // `var_ctor_term_eqs`, the "variable" here isn't required, since the
+        // point is to feed `compute_dt_equality_closure`'s iterative
+        // selector-resolution step, which may only become resolvable once
+        // OTHER derived bindings arrive). One entry per selector-shaped
+        // operand; a doubly-selector-shaped equality contributes both.
+        sel_eqs: &mut Vec<(TermId, TermId)>,
         in_positive_context: bool,
     ) {
         let Some(term_data) = manager.get(term) else {
@@ -894,6 +1522,30 @@ impl Solver {
                     // Check for DT variable equality: x = y where both are DT variables
                     if self.is_dt_variable(*lhs, manager) && self.is_dt_variable(*rhs, manager) {
                         dt_var_equalities.push((*lhs, *rhs));
+                    }
+
+                    // #419 item 2 — also record a raw `sel(t) = t2` /
+                    // `t2 = sel(t)` fact whenever one operand is a
+                    // `DtSelector` application, with NO `is_dt_variable`
+                    // gating on the other side (unlike `var_ctor_term_eqs`
+                    // above): `compute_dt_equality_closure` is what decides,
+                    // iteratively, whether `t` (the selector's own argument)
+                    // ever becomes resolvable to a manifest constructor
+                    // application — that may only happen once OTHER derived
+                    // bindings have already landed, so this collector must
+                    // hand over the raw fact unconditionally and let the
+                    // closure do the (repeated) resolution attempts.
+                    if manager
+                        .get(*lhs)
+                        .is_some_and(|d| matches!(d.kind, TermKind::DtSelector { .. }))
+                    {
+                        sel_eqs.push((*lhs, *rhs));
+                    }
+                    if manager
+                        .get(*rhs)
+                        .is_some_and(|d| matches!(d.kind, TermKind::DtSelector { .. }))
+                    {
+                        sel_eqs.push((*rhs, *lhs));
                     }
                 } else {
                     // #399 — a NEGATED equality to a NULLARY constructor excludes
@@ -993,6 +1645,7 @@ impl Solver {
                             negative_ctor_equalities,
                             dt_var_equalities,
                             var_ctor_term_eqs,
+                            sel_eqs,
                             in_positive_context,
                         );
                     }
@@ -1016,6 +1669,7 @@ impl Solver {
                             negative_ctor_equalities,
                             dt_var_equalities,
                             var_ctor_term_eqs,
+                            sel_eqs,
                             in_positive_context,
                         );
                     }
@@ -1032,6 +1686,7 @@ impl Solver {
                     negative_ctor_equalities,
                     dt_var_equalities,
                     var_ctor_term_eqs,
+                    sel_eqs,
                     !in_positive_context,
                 );
             }

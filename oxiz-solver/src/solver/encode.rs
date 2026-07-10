@@ -1259,6 +1259,277 @@ impl Solver {
         self.add_dt_tester_reduction_axioms_over(&roots, var_ctor_bindings, manager);
     }
 
+    /// #419 item 1 — the mechanism that actually closes the
+    /// injectivity-transitivity repro (`x=cons(a,b); x=cons(c,d); (not (=
+    /// (hd x) c))` → must be `unsat`).
+    ///
+    /// `check_dt.rs::compute_dt_equality_closure` already identifies every
+    /// equivalence class with 2+ DISTINCT same-constructor ctor-term
+    /// bindings (`extra_by_class`); its `primary_bindings` map picks
+    /// arbitrarily ONE of them per class as the resolution hint
+    /// `add_dt_indirect_var_reduction_axioms` already runs with. That alone
+    /// is not enough: injecting a lone `(= (hd x) a)` fact says nothing
+    /// about `c`, so `(not (= (hd x) c))` never conflicts with anything.
+    ///
+    /// The fix is NOT to hand-roll constructor-argument decomposition —
+    /// it is to notice that `x` is not just equal to `cons(a,b)`, it is
+    /// EQUALLY, SIMULTANEOUSLY, provably equal to `cons(c,d)` too, so the
+    /// SAME audited selector-reduction walk
+    /// (`add_dt_selector_reduction_axioms_over` /
+    /// `resolve_dt_normal_form`) is re-run once per EXTRA binding, with
+    /// that one class's entries in the resolution map overridden to the
+    /// extra value. For the repro: the first run (via
+    /// `add_dt_indirect_var_reduction_axioms`) derives `(= (hd x) a)`; this
+    /// pass's run with `x -> cons(c,d)` derives `(= (hd x) c)` — a SEPARATE
+    /// ground fact, injected as its own unit clause. That directly
+    /// contradicts the user's `(not (= (hd x) c))` assertion — an ordinary
+    /// SAT-level conflict the normal CDCL/theory-propagation loop finds on
+    /// its own, no bespoke injectivity reasoning required. (Where the
+    /// closure's `derived_ctor_eqs` ground fact `cons(a,b) = cons(c,d)`,
+    /// injected separately by `inject_dt_derived_ctor_equalities`, is
+    /// insufficient BY ITSELF: plain congruence closure only derives
+    /// `f(a)=f(b)` FROM `a=b` — datatype constructors are not, in this
+    /// solver, treated as axiomatically injective at the EUF level, so
+    /// nothing derives `hd(cons(c,d))` from `cons(a,b)=cons(c,d)` unless
+    /// `hd` is actually APPLIED to it somewhere, which this pass is what
+    /// does.)
+    ///
+    /// # Why re-running the whole walk (not a narrower query) is safe
+    ///
+    /// Overriding ALL of a class's DT-variable synonyms together (not just
+    /// the one variable that happened to receive the extra binding)
+    /// ensures a selector applied to ANY synonym (`hd(y)` where `y = x`)
+    /// is covered too. Every OTHER class keeps its normal primary binding
+    /// in the override map, so this pass's resolution behaves IDENTICALLY
+    /// to the primary pass for anything unrelated to the class being
+    /// varied — it can only ADD extra, independently-sound ground facts
+    /// (see `compute_dt_equality_closure`'s doc comment for why `x =
+    /// extra_val` is just as true as `x = primary_val`; resolve_dt_normal_form
+    /// never claims uniqueness, only that its result is SOME provably-equal
+    /// value), never retract or alter anything the primary pass already
+    /// established.
+    ///
+    /// # Scope
+    ///
+    /// A class with only 1 distinct binding (`extra_by_class` has no entry
+    /// for it) is entirely unaffected — this pass is a no-op for the
+    /// overwhelming majority of formulas, exactly the pre-#419 behavior.
+    /// A combined scenario where TWO DIFFERENT classes each need their own
+    /// extra pick selected SIMULTANEOUSLY to complete ONE selector chain
+    /// (e.g. `hd(tl(x))` where BOTH `x`'s and `tl(x)`'s classes have
+    /// multiple bindings) is not attempted — each extra pick from
+    /// `extra_by_class` is tried independently, one class at a time. This
+    /// is a deliberate, documented completeness boundary (never a soundness
+    /// concern — an unexplored combination just means a case stays
+    /// unconstrained, the always-safe direction), out of scope for the
+    /// repros #419 was scoped against.
+    pub(super) fn add_dt_multi_binding_selector_reduction_axioms(
+        &mut self,
+        primary_bindings: &FxHashMap<TermId, TermId>,
+        extra_by_class: &[(Vec<TermId>, Vec<TermId>)],
+        manager: &mut TermManager,
+    ) {
+        if extra_by_class.is_empty() {
+            return;
+        }
+        let roots: Vec<TermId> = self.assertions.clone();
+        for (class_vars, extras) in extra_by_class {
+            for &extra_val in extras {
+                let mut override_map = primary_bindings.clone();
+                for &v in class_vars {
+                    override_map.insert(v, extra_val);
+                }
+                self.add_dt_selector_reduction_axioms_extra(&roots, &override_map, manager);
+            }
+        }
+    }
+
+    /// Shared walk behind `add_dt_multi_binding_selector_reduction_axioms` —
+    /// structurally identical to `add_dt_selector_reduction_axioms_over`
+    /// (see that function's doc comment for the resolve/layout-matching
+    /// logic this mirrors exactly), but keyed by a SEPARATE dedup
+    /// set/trail-op (`dt_selector_extra_reduced` /
+    /// `TrailOp::DtSelectorExtraReduced`), keyed by the PAIR `(selector_term,
+    /// field_value)` rather than `selector_term` alone. This is the one
+    /// deliberate divergence from the primary pass: the SAME selector term
+    /// legitimately resolves to SEVERAL DIFFERENT, EQUALLY-TRUE field values
+    /// here (one per extra binding tried), and every one of them needs its
+    /// own ground fact injected — deduping by term alone (like the primary
+    /// pass, which only ever has ONE resolution per term) would silently
+    /// drop every reduction after the first.
+    fn add_dt_selector_reduction_axioms_extra(
+        &mut self,
+        roots: &[TermId],
+        var_ctor_bindings: &FxHashMap<TermId, TermId>,
+        manager: &mut TermManager,
+    ) {
+        let mut stack: Vec<TermId> = roots.to_vec();
+        let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        let mut memo: FxHashMap<TermId, Option<TermId>> = FxHashMap::default();
+        let mut in_progress: FxHashSet<TermId> = FxHashSet::default();
+        let mut reductions: Vec<(TermId, TermId)> = Vec::new();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let Some(td) = manager.get(t) else { continue };
+            if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                continue;
+            }
+            for c in oxiz_core::ast::get_children(&td.kind) {
+                stack.push(c);
+            }
+            let (selector, arg) = match &td.kind {
+                TermKind::DtSelector { selector, arg } => (*selector, *arg),
+                _ => continue,
+            };
+            let Some(resolved_arg) = Self::resolve_dt_normal_form(
+                arg,
+                var_ctor_bindings,
+                &mut memo,
+                &mut in_progress,
+                manager,
+            ) else {
+                continue;
+            };
+            let Some(argd) = manager.get(resolved_arg) else {
+                continue;
+            };
+            let (dt_sort, constructor, ctor_args) = match &argd.kind {
+                TermKind::DtConstructor { constructor, args } => (argd.sort, *constructor, args),
+                _ => continue,
+            };
+            let Some(layouts) = manager.sorts.datatype_ctor_layouts(dt_sort) else {
+                continue;
+            };
+            let ctor_name = manager.resolve_str(constructor).to_string();
+            let sel_name = manager.resolve_str(selector).to_string();
+            let Some((_, fields)) = layouts.iter().find(|(c, _)| *c == ctor_name) else {
+                continue;
+            };
+            let Some(idx) = fields.iter().position(|(s, _)| *s == sel_name) else {
+                continue;
+            };
+            if let Some(&field_term) = ctor_args.get(idx) {
+                reductions.push((t, field_term));
+            }
+        }
+        for (t, field_term) in reductions {
+            let key = (t, field_term);
+            if self.dt_selector_extra_reduced.contains(&key) {
+                continue;
+            }
+            // A duplicate of what the PRIMARY pass already asserted (the
+            // extra binding happened to produce the same field value) is
+            // harmless — SAT solvers tolerate a repeated unit clause — so no
+            // cross-check against `dt_selector_reduced` is needed here.
+            let eq = manager.mk_eq(t, field_term);
+            let lit = self.encode(eq, manager);
+            self.sat.add_clause([lit]);
+            self.dt_selector_extra_reduced.insert(key);
+            self.trail.push(TrailOp::DtSelectorExtraReduced {
+                term: t,
+                field: field_term,
+            });
+        }
+    }
+
+    /// #419 item 1 — inject the ground equality axiom `(= binding1
+    /// binding2)` for every DISTINCT pair of same-constructor ctor-term
+    /// bindings `check_dt.rs::compute_dt_equality_closure` found within one
+    /// equivalence class (`DtEqualityClosure::derived_ctor_eqs`). Always a
+    /// SOUND consequence (see that struct's field doc for why) —
+    /// unconditionally safe to assert.
+    ///
+    /// # Why this MUST go through the simplifier, not a bare `encode`
+    ///
+    /// `C(args1) = C(args2)` for two manifest, SAME-constructor applications
+    /// is not itself something EUF's plain congruence closure decomposes —
+    /// congruence closure only derives `f(a)=f(b)` FROM `a=b` (forward),
+    /// never the reverse (general uninterpreted functions are not
+    /// injective, so there is no generic "reverse congruence" rule to
+    /// apply). What actually implements datatype-constructor injectivity in
+    /// this codebase is a TERM-LEVEL REWRITE:
+    /// `oxiz_core::rewrite::datatype::DatatypeRewriter::rewrite_constructor_eq`,
+    /// registered in the default simplifier pipeline and applied by
+    /// `Solver::assert`/`assert_named` via `self.simplifier.simplify(...)`
+    /// BEFORE encoding — it rewrites `C(a1..an) = C(b1..bn)` directly into
+    /// `a1=b1 ∧ … ∧ an=bn` (or `false` for two DIFFERENT constructors).
+    /// Encoding the raw `Eq(a, b)` node directly (as an earlier version of
+    /// this function did) skips that rewrite entirely: the equality becomes
+    /// an opaque congruence fact between two "function applications" (the
+    /// constructor name as the function symbol, per
+    /// `theory_manager::intern_term_for_congruence`), and nothing under it
+    /// is ever forced equal — silently losing the very case this function
+    /// exists for whenever the repro mentions NO selector application at
+    /// all (see the regression test
+    /// `three_way_binding_bare_no_selector_forces_pairwise_equality`, which
+    /// caught exactly this during verification: a bare `(not (= a e))`
+    /// probe, with no `hd`/`tl` anywhere, stayed spuriously `sat` until this
+    /// function started routing through `self.simplifier.simplify`).
+    ///
+    /// Trail-undone via a dedicated dedup set/trail-op
+    /// (`dt_ctor_eq_injected` / `TrailOp::DtCtorEqInjected`), the same
+    /// idiom as every other per-check-sat axiom-injection pass in this
+    /// file.
+    pub(super) fn inject_dt_derived_ctor_equalities(
+        &mut self,
+        derived_ctor_eqs: &[(TermId, TermId)],
+        manager: &mut TermManager,
+    ) {
+        for &(a, b) in derived_ctor_eqs {
+            if a == b {
+                continue;
+            }
+            let key = if a.raw() <= b.raw() { (a, b) } else { (b, a) };
+            if self.dt_ctor_eq_injected.contains(&key) {
+                continue;
+            }
+            let eq = manager.mk_eq(key.0, key.1);
+            let to_encode = if self.config.simplify {
+                self.simplifier.simplify(eq, manager)
+            } else {
+                eq
+            };
+            match manager.get(to_encode).map(|t| &t.kind) {
+                Some(TermKind::True) => {
+                    // Rewritten to a tautology (e.g. two nullary-constructor
+                    // bindings) — nothing left to assert.
+                }
+                Some(TermKind::False) => {
+                    // The rewrite itself proved these two bindings can NEVER
+                    // be equal (different constructors sharing a class) — a
+                    // genuine ground conflict. Sound regardless: the rewrite
+                    // is a validity-preserving equivalence, so `false` here
+                    // means the ORIGINAL ground fact was already
+                    // unsatisfiable, not that this pass fabricated anything.
+                    if !self.has_false_assertion {
+                        self.has_false_assertion = true;
+                        self.trail.push(TrailOp::FalseAssertionSet);
+                    }
+                }
+                _ => {
+                    // Mirror `Solver::assert`'s pipeline for whatever the
+                    // rewrite produced (e.g. the decomposed field-equality
+                    // conjunction) so any FURTHER datatype structure it
+                    // contains (nested datatypes in the fields) still gets
+                    // cover/selector/tester axioms, exactly as if the user
+                    // had written this fact directly.
+                    let lit = self.encode(to_encode, manager);
+                    self.sat.add_clause([lit]);
+                    self.add_dt_cover_axioms(to_encode, manager);
+                    self.add_dt_selector_reduction_axioms(to_encode, manager);
+                    self.add_dt_tester_reduction_axioms(to_encode, manager);
+                }
+            }
+            self.dt_ctor_eq_injected.insert(key);
+            self.trail.push(TrailOp::DtCtorEqInjected {
+                a: key.0,
+                b: key.1,
+            });
+        }
+    }
+
     /// Assert a named term (for unsat core tracking)
     pub fn assert_named(&mut self, term: TermId, name: &str, manager: &mut TermManager) {
         let index = self.assertions.len();

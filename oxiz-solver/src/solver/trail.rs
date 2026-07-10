@@ -41,6 +41,22 @@ pub(crate) enum TrailOp {
     /// (see `Solver::add_dt_tester_reduction_axioms`, #406) — undone so a
     /// later scope re-emits the unit clause the SAT-level pop discarded.
     DtTesterReduced { term: TermId },
+    /// #419 item 1 — an EXTRA ground selector-reduction fact `(= (sel arg)
+    /// field)` was encoded for this `DtSelector` term against a NON-primary
+    /// ctor-term binding (see
+    /// `Solver::add_dt_multi_binding_selector_reduction_axioms`) — undone so
+    /// a later scope re-emits the unit clause the SAT-level pop discarded.
+    /// Keyed by `(term, field)` (not `term` alone, unlike
+    /// `DtSelectorReduced`): the same selector term can legitimately have
+    /// SEVERAL distinct extra reductions live at once (one per extra
+    /// binding), each its own trail entry.
+    DtSelectorExtraReduced { term: TermId, field: TermId },
+    /// #419 item 1 — the ground equality axiom `(= a b)` between two
+    /// distinct same-constructor ctor-term bindings discovered within one
+    /// equivalence class (see `Solver::inject_dt_derived_ctor_equalities`)
+    /// was encoded — undone so a later scope re-emits the unit clause the
+    /// SAT-level pop discarded.
+    DtCtorEqInjected { a: TermId, b: TermId },
     /// A datatype-variable-to-constructor binding was recorded in
     /// `dt_var_constructors` (the mutual-exclusivity cache in
     /// `Solver::assert`/`assert_named` that flags `x = C1(...)` then
