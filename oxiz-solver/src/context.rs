@@ -875,6 +875,17 @@ impl Context {
                 config.proof = value == "true";
                 self.solver.set_config(config);
             }
+            // #423 item 3 — wire the SMT-LIB/CLI front end's `(set-option
+            // :simplify ..)` / `--preset minimal` (`ctx.set_option("simplify",
+            // "false")`) through to `SolverConfig::simplify`. Previously this
+            // fell through to the `_ => {}` no-op default: `simplify` was only
+            // ever settable via direct Rust `SolverConfig` struct construction,
+            // so the CLI's own minimal-preset call silently did nothing.
+            "simplify" => {
+                let mut config = self.solver.config().clone();
+                config.simplify = value == "true";
+                self.solver.set_config(config);
+            }
             "produce-unsat-cores" => {
                 self.solver.set_produce_unsat_cores(value == "true");
             }
