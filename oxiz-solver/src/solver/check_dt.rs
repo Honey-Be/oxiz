@@ -7,9 +7,11 @@
 //! z3-differential re-verification of the already-landed #419 items (NOT
 //! newly introduced by that session's own changes) and are recorded here,
 //! historically, as **CLOSED by #422** — see that task's own three landed
-//! fixes for the mechanism each one uses. The section is kept (rather than
-//! deleted) to match this file's existing convention of a permanent,
-//! append-only residual log.
+//! fixes for the mechanism each one uses. Items 4-5 are **CLOSED by #423**
+//! (item 4 narrows/closes item 1's own honest residual; item 5 is a new,
+//! previously-undocumented gap). The section is kept (rather than deleted)
+//! to match this file's existing convention of a permanent, append-only
+//! residual log.
 //!
 //! 1. **CLOSED (#422) — OR-branch non-cycle conflicts.**
 //!    `dt_items_force_conflict` (the `#418`/`#419` OR-branch case-split
@@ -29,11 +31,10 @@
 //!    `forces_disequality_conflict` check reusing the closure
 //!    `check_dt_constraints` already computes (see that function's #422
 //!    doc note). See `dt_or_case_split_regression.rs`'s `#422` test
-//!    section, including its HONEST documented residual: the flat path's
-//!    disequality-source collection (from `Eq`'s negative arm) is
-//!    DT-SORT-GATED (item 2 below never gates), so a `simplify: false` +
-//!    non-DT-sorted-field + `(not (= ..))` (rather than `distinct`)
-//!    combination is NOT closed by this pass — narrowed, not eliminated.
+//!    section for the original tests; its HONEST documented residual
+//!    (the flat path's disequality-source collection from `Eq`'s negative
+//!    arm was DT-SORT-GATED, unlike `distinct`'s unconditional push) is now
+//!    **CLOSED (#423 item 1)** — see item 4 below.
 //! 2. **CLOSED (#422) — `distinct` not recognized in any polarity.**
 //!    `collect_dt_constraints_v2` had NO `TermKind::Distinct` arm at all —
 //!    neither a positive `(distinct a b)` (a disequality) nor a negated
@@ -59,6 +60,46 @@
 //!    every call site before the closure call (`compute_dt_equality_
 //!    closure`'s own signature is unchanged — both slices were already
 //!    treated identically inside it).
+//! 4. **CLOSED (#423) — `Eq`'s negative arm was narrower than `distinct`.**
+//!    `collect_dt_constraints_v2`'s `Eq` negative-context arm only pushed
+//!    into `dt_diseq_pairs` when `both_dt_sorted(lhs, rhs, manager)` held —
+//!    a plain `(not (= a c))` between two Int-sorted terms was never
+//!    recorded as a disequality candidate, unlike the sibling `Distinct`
+//!    positive-context arm (#422), which already pushed unconditionally.
+//!    Reachable under DEFAULT config (not just `simplify: false`): the
+//!    OR-branch case-split evaluator (`dt_items_force_conflict`) has no
+//!    SAT-level fallback at all, so a formula like `(or (and (= x (cons a
+//!    b)) (= x (cons c b)) (not (= a c))) ...)` with Int-sorted `a`/`c` read
+//!    spurious `sat` under default settings even though the FLAT path was
+//!    masked by `inject_dt_derived_ctor_equalities`'s `simplify`-gated
+//!    fallback. Fixed by deleting the `both_dt_sorted` gate (and the
+//!    now-fully-dead `both_dt_sorted` helper itself) — the identical
+//!    "always safe" argument `Distinct`'s unconditional push already relies
+//!    on applies verbatim to `Eq`'s negative arm. See
+//!    `dt_or_case_split_regression.rs`'s `#423` test section (including the
+//!    flipped `flat_injectivity_forced_noteq_intfields_simplify_false_*`
+//!    test, now closed rather than a documented residual) and
+//!    `dt_distinct_regression.rs`'s updated cross-reference comment.
+//! 5. **CLOSED (#423) — nullary-constructor tester implied no equality.**
+//!    `(is-c0 x) ∧ (is-c0 y) ∧ (distinct x y)` read spurious `sat`: a
+//!    NULLARY constructor `C` (zero fields) has exactly ONE possible value,
+//!    so `is-C(arg) ⟺ arg = C()` is a TRUE EQUIVALENCE — but
+//!    `collect_dt_constraints_v2`'s `DtTester` arm only ever accumulated
+//!    constructor-name-tag strings (`constructor_testers`/
+//!    `negative_testers`), never an equality/disequality fact, regardless
+//!    of arity. Fixed by a new `record_dt_nullary_tester_eq_fact` helper,
+//!    called alongside the existing tag bookkeeping: on a POSITIVE nullary
+//!    tester, pushes `(arg, c_term)` into `var_ctor_term_eqs`; on a
+//!    NEGATIVE one, pushes `(arg, c_term)` into `dt_diseq_pairs`. `c_term`
+//!    is looked up via the new `&self`-only `TermManager::
+//!    find_nullary_dt_constructor_term`, and the constructor's arity via
+//!    `manager.sorts.datatype_constructors_of` — comparing constructor
+//!    NAMES as strings (never raw `Spur`s across the term-manager /
+//!    sort-manager interner boundary, the exact cross-interner mistake
+//!    that caused a real #399 bug). See
+//!    `dt_nullary_tester_equality_regression.rs` for the full test suite,
+//!    including composition with #419's injectivity machinery and an
+//!    arity>0 control confirming non-nullary testers stay unaffected.
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -1816,6 +1857,90 @@ impl Solver {
         }
     }
 
+    /// #423 item 2 — nullary-constructor tester ⟺ equality derivation.
+    ///
+    /// `collect_dt_constraints_v2`'s `DtTester` arm previously ONLY
+    /// accumulated constructor-name-tag strings into `constructor_testers`/
+    /// `negative_testers` (used elsewhere for pairwise-tester-conflict and
+    /// `#399`'s exhaustiveness checks) — it never derived an equality/
+    /// disequality fact from a tester, regardless of arity. Called
+    /// ALONGSIDE that existing bookkeeping (not in place of it).
+    ///
+    /// # Soundness
+    ///
+    /// A NULLARY constructor `C` (zero fields) has exactly ONE possible
+    /// value, so `is-C(arg) ⟺ arg = C()` is a TRUE EQUIVALENCE, not merely
+    /// an implication — `C()` is the unique value of shape `C`, and
+    /// constructor injectivity/distinctness (already pervasively trusted by
+    /// this file's `#419`/`#422` machinery) makes "not C-shaped" exactly
+    /// "not equal to `C()`". This does NOT depend on exhaustiveness or any
+    /// assumption beyond what `compute_dt_equality_closure` already trusts:
+    ///   - POSITIVE `is-C(arg)` known true ⟹ `arg = C()` — an equality fact,
+    ///     pushed into `var_ctor_term_eqs` (the SAME pipeline #422 item 3
+    ///     already built for direct ctor=ctor equalities).
+    ///   - NEGATIVE `¬is-C(arg)` known true ⟹ `arg ≠ C()` — a disequality
+    ///     fact, pushed into `dt_diseq_pairs`.
+    ///
+    /// A non-nullary tester contributes NOTHING here (arity is checked
+    /// below) — `is-C(arg)` for a field-bearing `C` does not pin `arg` to
+    /// any single ground value, so no equality/disequality follows.
+    ///
+    /// # Cross-interner discipline
+    ///
+    /// `constructor` is a `Spur` from the TERM MANAGER's interner (the same
+    /// interner `find_nullary_dt_constructor_term`'s cache lookup uses — see
+    /// that method's doc comment), so reusing it directly there is correct.
+    /// `manager.sorts.datatype_constructors_of` returns constructor names as
+    /// already-resolved `String`s from the SORT manager's OWN (different)
+    /// interner — comparing those two Spur spaces directly would be the
+    /// exact cross-interner mistake that caused a real `#399` bug, so the
+    /// arity lookup below compares constructor NAMES as strings, never raw
+    /// `Spur`s across the two interners.
+    ///
+    /// # Safety on miss
+    ///
+    /// Any lookup miss — unresolved sort, non-nullary arity, or a
+    /// `find_nullary_dt_constructor_term` cache miss (the nullary
+    /// constructor term was never actually interned) — silently skips the
+    /// derivation. A missed derivation is always safe (at worst, a
+    /// completeness gap); nothing here can fabricate a fact.
+    #[allow(clippy::too_many_arguments)]
+    fn record_dt_nullary_tester_eq_fact(
+        &self,
+        constructor: oxiz_core::interner::Spur,
+        arg: TermId,
+        manager: &TermManager,
+        in_positive_context: bool,
+        var_ctor_term_eqs: &mut Vec<(TermId, TermId)>,
+        dt_diseq_pairs: &mut Vec<(TermId, TermId)>,
+    ) {
+        let Some(arg_sort) = manager.get(arg).map(|d| d.sort) else {
+            return;
+        };
+        let Some(ctors) = manager.sorts.datatype_constructors_of(arg_sort) else {
+            return;
+        };
+        let cons_name = manager.resolve_str(constructor);
+        let Some(&(_, arity)) = ctors.iter().find(|(name, _)| name == cons_name) else {
+            return;
+        };
+        if arity != 0 {
+            // Non-nullary tester: `is-C(arg)` does not pin `arg` to a single
+            // ground value — no equality/disequality follows. Safe to skip.
+            return;
+        }
+        let Some(c_term) = manager.find_nullary_dt_constructor_term(constructor) else {
+            // The nullary constructor term was never interned — no fact to
+            // derive from (safe: a missed derivation, never fabricated).
+            return;
+        };
+        if in_positive_context {
+            var_ctor_term_eqs.push((arg, c_term));
+        } else {
+            dt_diseq_pairs.push((arg, c_term));
+        }
+    }
+
     /// Collect datatype constraints from a term (version 2 with negative testers and var equalities)
     ///
     /// # #422 — `Distinct` polarity mapping (soundness note)
@@ -1909,6 +2034,20 @@ impl Solver {
                     // Negative: (not ((_ is Constructor) var))
                     negative_testers.entry(*arg).or_default().push(cons_name);
                 }
+                // #423 item 2 — independent derivation ALONGSIDE the
+                // name-tag bookkeeping above (does not replace it): a
+                // NULLARY constructor's tester is an equality/disequality
+                // in its own right, not just a name tag. See
+                // `record_dt_nullary_tester_eq_fact`'s doc comment for the
+                // full soundness argument.
+                self.record_dt_nullary_tester_eq_fact(
+                    *constructor,
+                    *arg,
+                    manager,
+                    in_positive_context,
+                    var_ctor_term_eqs,
+                    dt_diseq_pairs,
+                );
             }
             TermKind::Eq(lhs, rhs) => {
                 if in_positive_context {
@@ -1937,22 +2076,28 @@ impl Solver {
                         negative_ctor_equalities,
                         negative_testers,
                     );
-                    // #422 item 1 — a NEGATIVE equality between two
-                    // datatype-sorted terms is a genuine disequality source
-                    // for `forces_disequality_conflict`, regardless of
-                    // whether either side is a plain variable (unlike
+                    // #422 item 1 / #423 item 1 — a NEGATIVE equality
+                    // between two terms is a genuine disequality source for
+                    // `forces_disequality_conflict`, regardless of whether
+                    // either side is a plain variable (unlike
                     // `record_dt_negative_eq_fact` above, which only ever
                     // fires for a variable-vs-manifest-ctor shape): a direct
                     // `C(..) ≠ D(..)` between two constructor applications,
                     // or `x ≠ y` between two DT variables, both belong here.
-                    // Gated on the equality's ACTUAL resolved sort (not a
-                    // heuristic) so a plain-Int/Bool disequality is never
-                    // added — this theory's job is datatype conflicts only;
-                    // non-DT sorts already have their own (EUF/arith) theory
-                    // reasoning for equality/disequality conflicts.
-                    if Self::both_dt_sorted(*lhs, *rhs, manager) {
-                        dt_diseq_pairs.push((*lhs, *rhs));
-                    }
+                    //
+                    // Unconditional (no DT-sort gate — #423 removed the
+                    // `both_dt_sorted` gate this arm used to have): `(not (=
+                    // lhs rhs))` is ALWAYS a genuine disequality between
+                    // exactly these two terms regardless of their sort —
+                    // `forces_disequality_conflict`'s union-find only ever
+                    // fires if `lhs`/`rhs` are ACTUALLY unioned via a
+                    // genuinely-derived `closed_eqs` pair (itself always
+                    // sound), so recording every negative `Eq` here can only
+                    // ever help completeness, never fabricate a conflict —
+                    // the EXACT SAME argument the sibling `Distinct` arm's
+                    // unconditional push already relies on (see that arm's
+                    // doc comment below), now identical for both arms.
+                    dt_diseq_pairs.push((*lhs, *rhs));
                 }
 
                 // Do NOT recurse into the equality's operands: they are not
@@ -2087,24 +2232,6 @@ impl Solver {
             }
             _ => {}
         }
-    }
-
-    /// #422 items 1+2 — is `t`'s own resolved sort a datatype sort? Used by
-    /// `collect_dt_constraints_v2`'s negative-`Eq` arm to gate
-    /// `dt_diseq_pairs` on the equality's ACTUAL sort rather than a
-    /// syntactic heuristic (e.g. `is_dt_variable`, which only recognizes a
-    /// bare variable and would miss `C(..) ≠ D(..)` between two manifest
-    /// constructor applications). A term with no resolvable sort (shouldn't
-    /// happen for a well-formed term, but defensively) is treated as
-    /// NOT datatype-sorted — the safe direction (fewer pairs collected, at
-    /// worst a missed conflict, never a fabricated one).
-    fn both_dt_sorted(lhs: TermId, rhs: TermId, manager: &TermManager) -> bool {
-        let lhs_sort = manager.get(lhs).map(|d| d.sort);
-        let rhs_sort = manager.get(rhs).map(|d| d.sort);
-        matches!(
-            (lhs_sort, rhs_sort),
-            (Some(ls), Some(rs)) if manager.sorts.is_datatype(ls) && manager.sorts.is_datatype(rs)
-        )
     }
 
     /// Collect datatype constraints from a term

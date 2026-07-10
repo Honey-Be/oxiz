@@ -9,6 +9,7 @@ use crate::interner::{Rodeo, Spur};
 use crate::prelude::*;
 use crate::sort::{Sort, SortId, SortManager};
 use portable_atomic::{AtomicU32, Ordering};
+use smallvec::SmallVec;
 
 mod builder;
 mod query;
@@ -161,6 +162,28 @@ impl TermManager {
     #[must_use]
     pub fn get(&self, id: TermId) -> Option<&Term> {
         self.terms.get(id.0 as usize)
+    }
+
+    /// #423 item 2 — read-only lookup for the (already-interned) manifest
+    /// NULLARY `DtConstructor` term for `constructor`, if one has ever been
+    /// built. `&self`-only (not `&mut`) so callers holding only a shared
+    /// `&TermManager` (e.g. `check_dt.rs`'s constraint collector) can use it
+    /// without threading `&mut TermManager` through their whole call chain.
+    ///
+    /// A nullary constructor's own hash-cons KEY is exactly `TermKind::
+    /// DtConstructor { constructor, args: <empty> }` — the cache has no
+    /// separate sort component (`self.cache: FxHashMap<TermKind, TermId>`,
+    /// see its field doc), so this lookup is valid with no sort argument.
+    /// Returns `None` on a miss — defensively safe: a nullary constructor
+    /// term not yet interned (in practice, always already present via
+    /// `encode.rs`'s eager cover-axiom construction whenever the datatype is
+    /// used at all) simply means the caller's derivation is skipped, never
+    /// fabricated from nothing.
+    #[must_use]
+    pub fn find_nullary_dt_constructor_term(&self, constructor: Spur) -> Option<TermId> {
+        self.cache
+            .get(&TermKind::DtConstructor { constructor, args: SmallVec::new() })
+            .copied()
     }
 
     /// Intern a string, returning its key

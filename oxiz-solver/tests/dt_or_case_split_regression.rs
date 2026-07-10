@@ -34,6 +34,15 @@
 //! force_conflict`'s "#419 — equality closure wiring" doc section, for the
 //! full design (branch isolation + shared step-budget with the case-split
 //! work-list).
+//!
+//! Extended for #422 item 1 (non-cycle, disequality-forced conflicts — see
+//! the `#422 item 1` test section) and #423 item 1 (the `Eq` negative arm's
+//! `dt_diseq_pairs` push is no longer DT-sort-gated — see the `#423 item 1`
+//! test section): this evaluator has NO SAT-level fallback of its own, so
+//! it is the shape where the `both_dt_sorted` gate's removal has the most
+//! severe, DEFAULT-config-reachable impact (the flat path was already
+//! masked under default settings by the SAT-level `simplify`-gated
+//! injection — see the `#422 item 1 — FLAT PATH` section below).
 
 use oxiz_core::ast::TermManager;
 use oxiz_core::sort::DataTypeConstructor;
@@ -470,6 +479,69 @@ fn or_branch_injectivity_forced_disequality_other_branch_not_stays_sat() {
 }
 
 // ---------------------------------------------------------------------
+// #423 item 1 — the MORE SEVERE manifestation: `dt_items_force_conflict`
+// (this OR-branch evaluator) has NO SAT-level fallback at all (unlike the
+// flat path, which the FLAT path's `simplify: true`-gated
+// `inject_dt_derived_ctor_equalities` happens to mask under default
+// settings). Before #423, a plain `(not (= a c))` between Int-sorted fields
+// was invisible to `dt_diseq_pairs` (the `Eq` negative arm's push was
+// DT-SORT-GATED), so this exact shape read spurious `sat` under DEFAULT
+// config — no `simplify: false`, no special preset, just the ordinary
+// `Context`/SMT-LIB front end. This is a STRICTLY BROADER-reach repro than
+// `or_branch_injectivity_forced_disequality_dtfields_is_unsat` above (which
+// used DT-sorted fields specifically to stay reachable through the old
+// gate) — confirms #423 item 1 closes the gap for the common `=`/`not`
+// surface syntax, not just `distinct`.
+// ---------------------------------------------------------------------
+
+/// #423 item 1's literal motivating repro: an `or` where branch 1
+/// (injectivity-forced disequality over Int-sorted fields, `(not (= a
+/// c))`) has no SAT-level fallback, and branch 2 is an ordinary
+/// already-supported flat cycle. Pre-#423: `sat` (branch 1's conflict was
+/// invisible to `dt_diseq_pairs`). z3/cvc5: `unsat`.
+#[test]
+fn or_branch_injectivity_forced_noteq_intfields_is_unsat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((MyPair423 0)) (((cons423 (hd423 Int) (tl423 Int)))))\n\
+        (declare-datatypes ((Lst423 0)) (((nil423) (lcons423 (lhd423 Int) (ltl423 Lst423)))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const x MyPair423) (declare-const a Int) (declare-const b Int)\n\
+         (declare-const c Int)\n\
+         (declare-const w Lst423) (declare-const wi Int)\n\
+         (assert (or\n\
+           (and (= x (cons423 a b)) (= x (cons423 c b)) (not (= a c)))\n\
+           (= w (lcons423 wi w))\n\
+         ))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// SAT-CONTROL sibling of the test above: the SAME always-injectivity-forced
+/// first branch, but the second branch is replaced with an ORDINARY
+/// satisfiable fact (no cycle) instead of another forced conflict — NOT
+/// every branch is conflict-forced, so the whole `or` must stay `sat`,
+/// confirming #423 item 1's ungated push doesn't over-fire (e.g. by somehow
+/// making the evaluator treat the `or` as conjunctive).
+#[test]
+fn or_branch_injectivity_forced_noteq_intfields_other_branch_not_stays_sat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((MyPair423b 0)) (((cons423b (hd423b Int) (tl423b Int)))))\n\
+        (declare-datatypes ((Lst423b 0)) (((nil423b) (lcons423b (lhd423b Int) (ltl423b Lst423b)))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const x MyPair423b) (declare-const a Int) (declare-const b Int)\n\
+         (declare-const c Int)\n\
+         (declare-const w Lst423b) (declare-const wi Int)\n\
+         (assert (or\n\
+           (and (= x (cons423b a b)) (= x (cons423b c b)) (not (= a c)))\n\
+           (= w (lcons423b wi nil423b))\n\
+         ))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "sat");
+}
+
+// ---------------------------------------------------------------------
 // #422 item 1 — FLAT PATH, `:simplify false` INDEPENDENCE (STEP 6). The
 // task's own motivating concern: the flat (non-OR) path used to catch this
 // conflict "for free" only once the derived ctor=ctor fact was injected as
@@ -481,12 +553,16 @@ fn or_branch_injectivity_forced_disequality_other_branch_not_stays_sat() {
 // forces_disequality_conflict(&dt_diseq_pairs)` call (STEP 6) closes this
 // regardless.
 //
-// The SMT-LIB front end (`Context::set_option("simplify", ...)`) does not
-// currently wire through to `SolverConfig::simplify` (a separate,
-// pre-existing, unrelated gap this pass does not touch), so this is tested
-// via the public `Solver::with_config`/`Solver::assert`/`Solver::check` API
-// directly (mirroring `clean_mbqi_wiring.rs`'s pattern) rather than through
-// `Context::execute_script`, to get a genuine `simplify: false` run.
+// At the time these tests were written, the SMT-LIB front end
+// (`Context::set_option("simplify", ...)`) did not wire through to
+// `SolverConfig::simplify` at all — #423 item 3 fixed that separately (see
+// `oxiz-solver/src/context.rs`'s `simplify` match arm and
+// `context_simplify_option_wiring.rs`). These tests still use the public
+// `Solver::with_config`/`Solver::assert`/`Solver::check` API directly
+// (mirroring `clean_mbqi_wiring.rs`'s pattern) rather than
+// `Context::execute_script`, since that remains the more direct way to get
+// a genuine `simplify: false` run without depending on the CLI/SMT-LIB
+// option-parsing layer.
 // ---------------------------------------------------------------------
 
 /// Item 1's repro with DT-SORTED fields (the literal Eq-negative-arm target
@@ -584,24 +660,20 @@ fn flat_injectivity_forced_distinct_intfields_simplify_false_is_unsat() {
     assert_eq!(r, SolverResult::Unsat);
 }
 
-/// HONEST, DOCUMENTED RESIDUAL (not a regression — this shape was NEVER
-/// caught before #422 either; #422 narrows but does not eliminate it): the
-/// SAME flat repro, disequality expressed as plain `(not (= a c))` over
-/// Int-sorted (non-DT-sorted) fields, under `simplify: false`. The `Eq`
-/// negative arm's `dt_diseq_pairs` push is DT-SORT-GATED (STEP 2's literal
-/// instruction — `both_dt_sorted`), so this specific combination (non-DT
-/// sort AND `simplify: false` AND expressed via `=`/`not` rather than
-/// `distinct`) is NOT closed by this pass. This stays `Sat` here — the
-/// SAFE direction (a missed conflict, never a fabricated one). With
-/// `simplify: true` (the default in every real front end — CLI, SMT-LIB
-/// `Context`), the SAT-level `inject_dt_derived_ctor_equalities` +
-/// simplifier-decomposition route from #419 already closes this case (see
-/// `dt_equality_closure_regression.rs`'s
-/// `three_way_binding_bare_no_selector_forces_pairwise_equality_is_unsat`
-/// and siblings), so this residual is reachable ONLY via the (currently
-/// unwired, separately-tracked) `simplify: false` config path.
+/// CLOSED, #423 (previously a documented residual under #422 — this shape
+/// was NEVER caught before #422, and #422 only narrowed, not eliminated,
+/// it): the SAME flat repro, disequality expressed as plain `(not (= a
+/// c))` over Int-sorted (non-DT-sorted) fields, under `simplify: false`.
+/// The `Eq` negative arm's `dt_diseq_pairs` push used to be DT-SORT-GATED
+/// (via the now-DELETED `both_dt_sorted` helper), so this exact combination
+/// (non-DT sort AND `simplify: false` AND expressed via `=`/`not` rather
+/// than `distinct`) was not closed. #423 item 1 removed that gate — the
+/// push is now unconditional, identical to `Distinct`'s own always-safe
+/// argument (see `check_dt.rs::collect_dt_constraints_v2`'s `Eq` negative
+/// arm doc comment) — so this is now `Unsat`, matching z3/cvc5, with no
+/// dependency on `config.simplify` at all.
 #[test]
-fn flat_injectivity_forced_noteq_intfields_simplify_false_documented_residual_stays_sat() {
+fn flat_injectivity_forced_noteq_intfields_simplify_false_is_unsat() {
     let mut cfg = SolverConfig::default();
     cfg.simplify = false;
     let mut s = Solver::with_config(cfg);
@@ -635,17 +707,18 @@ fn flat_injectivity_forced_noteq_intfields_simplify_false_documented_residual_st
     let r = s.check(&mut m);
     assert_eq!(
         r,
-        SolverResult::Sat,
-        "documented residual — see this test's doc comment; must stay a SAFE \
-         (not fabricated-unsat) miss, not flip to unsat by accident either"
+        SolverResult::Unsat,
+        "#423 item 1 closed this — the Eq negative arm's dt_diseq_pairs push \
+         is no longer DT-sort-gated, so this is unsat regardless of \
+         config.simplify"
     );
 }
 
-/// CONTROL confirming the residual above is specific to `simplify: false`:
-/// the IDENTICAL repro with the DEFAULT config (`simplify: true`) already
-/// correctly reads `unsat` via the pre-existing #419 SAT-level injection
-/// mechanism — confirming #422 introduces no regression on the default
-/// (every real front end's) configuration.
+/// CONTROL — the IDENTICAL repro with the DEFAULT config (`simplify:
+/// true`), via the pre-existing #419 SAT-level injection mechanism
+/// (independent of #423 item 1's Rust-level pre-pass fix above). Both
+/// configs now agree (`unsat`), confirming #423 introduces no regression on
+/// the default (every real front end's) configuration.
 #[test]
 fn flat_injectivity_forced_noteq_intfields_simplify_true_default_is_unsat() {
     let mut s = Solver::new();

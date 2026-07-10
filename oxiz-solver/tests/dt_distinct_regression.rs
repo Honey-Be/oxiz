@@ -244,17 +244,20 @@ fn distinct_nary4_negative_guard_prevents_spurious_unsat() {
 // ---------------------------------------------------------------------
 
 /// `distinct` combined with POSITIVE testers pinning both variables to the
-/// SAME constructor — a direct conflict (`is-c0 x`, `is-c0 y` force `x=y`
-/// via a DIFFERENT, pre-existing and unrelated completeness gap — nullary
-/// tester does not yet directly force ITS value in this collector's
-/// tester-conflict cross-checks — see this test's note). Recorded honestly:
-/// confirmed via z3/cvc5 to be `unsat`, but this specific combination
-/// currently reads `sat` in BOTH the pre-#422 and post-#422 binaries (i.e.
-/// NOT a regression, NOT one of #422's three items, and NOT touched by this
-/// pass) — a separate, pre-existing "nullary tester implies exact value"
-/// completeness gap, out of scope here.
+/// SAME NULLARY constructor — `is-c0 x`, `is-c0 y` force `x=y` (a nullary
+/// constructor's tester is a true equivalence, `is-C(arg) ⟺ arg = C()` —
+/// see `record_dt_nullary_tester_eq_fact`'s doc comment), contradicting
+/// `(distinct x y)`.
+///
+/// CLOSED, #423 item 2 (this is the item's own literal motivating repro,
+/// discovered by re-auditing this file's tests during #423 — it was
+/// previously recorded here as `distinct_with_same_ctor_testers_pre_
+/// existing_gap_not_regressed`, an honest "sat in both pre- and post-#422
+/// binaries" residual note for the THEN-separate "nullary tester implies
+/// exact value" gap; #423 item 2 is exactly that gap's fix). z3/cvc5:
+/// `unsat`.
 #[test]
-fn distinct_with_same_ctor_testers_pre_existing_gap_not_regressed() {
+fn distinct_with_same_nullary_ctor_testers_is_unsat() {
     let v = verdict(&format!(
         "{D2}(declare-const x D2) (declare-const y D2)\n\
          (assert ((_ is c0) x))\n\
@@ -262,11 +265,7 @@ fn distinct_with_same_ctor_testers_pre_existing_gap_not_regressed() {
          (assert (distinct x y))\n\
          (check-sat)\n"
     ));
-    // z3/cvc5 both say `unsat` here; oxiz currently reads `sat` both BEFORE
-    // and AFTER #422 (a distinct, pre-existing, unrelated gap — recorded so
-    // any FUTURE accidental fix or regression on this exact shape is
-    // visible, not silently gained or lost).
-    assert_eq!(v, "sat");
+    assert_eq!(v, "unsat");
 }
 
 /// `distinct` combined with a tester on only ONE variable — genuinely
@@ -340,8 +339,10 @@ fn distinct_negative_or_wrapped_other_branch_sat_stays_sat() {
 
 /// `distinct` between two manifest constructor applications directly (no
 /// mediating variable at all) — composes item 2 (disequality collection,
-/// ungated by sort since `Distinct`'s push doesn't gate on
-/// `both_dt_sorted`) with item 3 (`dt_ctor_ctor_eqs`, since NEITHER side
+/// unconditional/ungated by sort — `Distinct`'s push was always
+/// unconditional; #423 item 1 later made the sibling `Eq` negative arm
+/// unconditional too, so both arms are now identically ungated, not a
+/// contrast anymore) with item 3 (`dt_ctor_ctor_eqs`, since NEITHER side
 /// here is a variable, only the `Eq` positive arm's ctor-ctor collection —
 /// exercised via the OTHER assertion below — feeds the closure). `x=cons(a,
 /// b)`, `x=cons(c,b)` forces `a=c` (injectivity); `(distinct a c)` directly
