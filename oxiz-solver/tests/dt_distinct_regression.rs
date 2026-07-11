@@ -421,3 +421,237 @@ fn distinct_conflict_does_not_leak_across_pop() {
          to constrain the later, unrelated (not (= x y)) scope"
     );
 }
+
+// ---------------------------------------------------------------------
+// #424 item 2 — POSITIVE-context N-ARY `distinct` (arity >= 3) decomposition.
+//
+// The `args.len() == 2` arm's own doc comment explicitly left this
+// generalization "for a separate, distinctly-scoped follow-up... to keep
+// this diff small" — this section is that follow-up. A new sibling arm,
+// `TermKind::Distinct(args) if args.len() >= 3 && in_positive_context`,
+// decomposes `distinct(a,b,c,...)` into ALL `C(n,2)` pairwise disequalities
+// (a sound CONJUNCTION, unlike the negative-context N-ary case, which stays
+// a genuine DISJUNCTION and remains completely unhandled forever — see the
+// guard tests already above, unaffected by this section).
+//
+// Every "forced conflict" test below uses constructor INJECTIVITY (two
+// bindings of the SAME variable to the SAME constructor with a differing
+// field) to force an equality that is invisible to plain EUF/congruence
+// closure — unlike simply asserting `x = C(7)` twice with a LITERAL
+// argument (hash-consed to the identical term, which core equality
+// reasoning already closes with no help from this arm at all). This is
+// confirmed by a live pre-fix/post-fix differential: every "forced conflict"
+// test below reads spurious `sat` on the pre-#424 binary and correctly
+// `unsat` after the fix (cross-checked against z3/cvc5 too).
+// ---------------------------------------------------------------------
+
+const PAIR_INT_DT: &str = "(set-logic ALL)\n\
+     (declare-datatypes ((PairID 0)) (((consI (hdI Int) (tlI Int)))))\n";
+
+/// 3-ary positive `distinct`, injectivity-forced conflict at the ADJACENT
+/// pair (indices 0,1): `distinct(a, c, q)` where `a`/`c` are forced equal by
+/// injectivity through a shared `xw` binding. z3/cvc5: `unsat`.
+#[test]
+fn distinct_nary3_positive_forces_conflict_adjacent_pair_is_unsat() {
+    let v = verdict(&format!(
+        "{PAIR_INT_DT}(declare-const xw PairID) (declare-const a Int)\n\
+         (declare-const b Int) (declare-const c Int) (declare-const q Int)\n\
+         (assert (= xw (consI a b)))\n\
+         (assert (= xw (consI c b)))\n\
+         (assert (distinct a c q))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// SAME shape, `:simplify false` — isolates the pre-check machinery this
+/// item actually touches from the SAT-level `DatatypeRewriter`-driven
+/// decomposition (`config.simplify`-gated), which alone would otherwise
+/// mask the gap. This is the TRUE pre-fix/post-fix differential: `sat`
+/// (spurious) on the pre-#424 binary, `unsat` after.
+#[test]
+fn distinct_nary3_positive_forces_conflict_adjacent_pair_simplify_false_is_unsat() {
+    let v = verdict(&format!(
+        "{PAIR_INT_DT}(set-option :simplify false)\n\
+         (declare-const xw PairID) (declare-const a Int)\n\
+         (declare-const b Int) (declare-const c Int) (declare-const q Int)\n\
+         (assert (= xw (consI a b)))\n\
+         (assert (= xw (consI c b)))\n\
+         (assert (distinct a c q))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// 4-ary positive `distinct`, injectivity-forced conflict at a NON-ADJACENT
+/// pair (indices 1,3): `distinct(p, a, q, c)` — `a`/`c` (positions 1 and 3,
+/// skipping both `p` at 0 and `q` at 2) are the forced-equal pair. This is
+/// the decisive off-by-one discriminator: a loop that hard-coded
+/// `args[0]`/`args[1]` (copy-paste from the 2-ary arm) instead of genuinely
+/// iterating `args[i]`/`args[j]` would MISS this pair entirely and wrongly
+/// stay `sat`. `:simplify false` isolates this arm specifically. z3/cvc5:
+/// `unsat`.
+#[test]
+fn distinct_nary4_positive_forces_conflict_nonadjacent_pair_simplify_false_is_unsat() {
+    let v = verdict(&format!(
+        "{PAIR_INT_DT}(set-option :simplify false)\n\
+         (declare-const xw PairID) (declare-const a Int) (declare-const b Int)\n\
+         (declare-const c Int) (declare-const p Int) (declare-const q Int)\n\
+         (assert (= xw (consI a b)))\n\
+         (assert (= xw (consI c b)))\n\
+         (assert (distinct p a q c))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// SAME 4-ary non-adjacent shape, DEFAULT `simplify: true` — confirms no
+/// regression on the already-working SAT-level route (which independently
+/// closes this via `DatatypeRewriter`), matching z3/cvc5.
+#[test]
+fn distinct_nary4_positive_forces_conflict_nonadjacent_pair_default_simplify_is_unsat() {
+    let v = verdict(&format!(
+        "{PAIR_INT_DT}(declare-const xw PairID) (declare-const a Int) (declare-const b Int)\n\
+         (declare-const c Int) (declare-const p Int) (declare-const q Int)\n\
+         (assert (= xw (consI a b)))\n\
+         (assert (= xw (consI c b)))\n\
+         (assert (distinct p a q c))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// EXHAUSTIVENESS-COMPOSITION control: a positive 4-ary `distinct` alone
+/// (no injectivity forcing anything) over a 4-element enum datatype must
+/// stay `sat` — a genuine no-conflict baseline, confirming the new arm
+/// doesn't fabricate anything on its own.
+#[test]
+fn distinct_nary4_positive_alone_no_forcing_stays_sat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((D4b 0)) (((e0) (e1) (e2) (e3))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const a D4b) (declare-const b D4b) (declare-const c D4b)\n\
+         (declare-const d D4b)\n\
+         (assert (distinct a b c d))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "sat");
+}
+
+/// EXHAUSTIVENESS-COMPOSITION control #2: the SAME 4-ary `distinct`, but the
+/// underlying datatype only has 3 elements — a genuine PIGEONHOLE conflict,
+/// independent of this item's own injectivity-decomposition target (already
+/// covered by `distinct_nary_positive_pigeonhole_is_unsat` at arity 3;
+/// re-confirmed at arity 4 here since the new arm now ALSO decomposes this
+/// shape into pairwise facts — must still agree with the pre-existing
+/// cardinality machinery, not conflict with or duplicate-miscount it).
+#[test]
+fn distinct_nary4_positive_pigeonhole_is_unsat() {
+    let v = verdict(&format!(
+        "{D3}(declare-const a D3) (declare-const b D3) (declare-const c D3)\n\
+         (declare-const d D3)\n\
+         (assert (distinct a b c d))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// NULLARY-CTOR-EXCLUSION special case, triggered at the NON-(0,1) pair
+/// (indices 1,2): `distinct(a, b, N)` where `N` is a NULLARY constructor —
+/// `record_dt_negative_eq_fact`'s nullary-exclusion branch fires for the
+/// `(b, N)` pair (index 1 vs 2), excluding `b` from the whole `N` class;
+/// combined with an independently-asserted `(is-N b)`, this is a direct
+/// conflict. `:simplify false` isolates the FLAT pre-check path this
+/// special case actually feeds (`negative_ctor_equalities`/exhaustiveness),
+/// confirmed as a true pre-fix(spurious sat)/post-fix(unsat) differential.
+/// z3/cvc5: `unsat`.
+#[test]
+fn distinct_nary3_nullary_exclusion_at_nonzero_one_index_simplify_false_is_unsat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((DNul 0)) (((Cf (fld Int)) (N))))\n";
+    let v = verdict(&format!(
+        "{dt}(set-option :simplify false)\n\
+         (declare-const a DNul) (declare-const b DNul)\n\
+         (assert ((_ is N) b))\n\
+         (assert (distinct a b N))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// CONTROL for the test above: identical shape, WITHOUT the forcing
+/// `(is-N b)` assertion — genuinely satisfiable (`b` simply takes the OTHER
+/// constructor, `Cf`, and the `N` in the `distinct` triple is its own
+/// distinct value). Confirms the nullary-exclusion arm doesn't fabricate a
+/// conflict from the `distinct` fact alone.
+#[test]
+fn distinct_nary3_nullary_exclusion_control_without_forcing_stays_sat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((DNul2 0)) (((Cf2 (fld Int)) (N2))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const a DNul2) (declare-const b DNul2)\n\
+         (assert (distinct a b N2))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "sat");
+}
+
+/// TESTER-SHAPE special case (`#404 phase 2`'s `v ≠ C(sel_{C,0}(v), ...)` ≡
+/// `¬is-C(v)` recognizer, reused by `record_dt_negative_eq_fact`), triggered
+/// at the NON-(0,1) pair (indices 1,2): `distinct(a, b, C(fld(b)))` — the
+/// `(b, C(fld(b)))` pair (index 1 vs 2) matches the tester shape, deriving
+/// `¬is-C(b)`; combined with the independently-asserted `b = C(7)` (which
+/// makes `is-C(b)` true), this is a direct conflict. Cross-checked against
+/// z3 AND cvc5 (`unsat` on both).
+#[test]
+fn distinct_nary3_tester_shape_at_nonzero_one_index_is_unsat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((DTs 0)) (((Ct (fld Int)) (Nt))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const a DTs) (declare-const b DTs)\n\
+         (assert (distinct a b (Ct (fld b))))\n\
+         (assert (= b (Ct 7)))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "unsat");
+}
+
+/// CONTROL for the test above: identical shape, WITHOUT the forcing `b =
+/// C(7)` assertion — genuinely satisfiable.
+#[test]
+fn distinct_nary3_tester_shape_control_without_forcing_stays_sat() {
+    let dt = "(set-logic ALL)\n\
+        (declare-datatypes ((DTs2 0)) (((Ct2 (fld Int)) (Nt2))))\n";
+    let v = verdict(&format!(
+        "{dt}(declare-const a DTs2) (declare-const b DTs2)\n\
+         (assert (distinct a b (Ct2 (fld b))))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(v, "sat");
+}
+
+/// NEGATIVE-CONTEXT N-ARY CONTROL — re-confirms, byte-for-byte, the EXACT
+/// SAME guard scenario as `distinct_nary_negative_guard_prevents_spurious_
+/// unsat` above (unaffected by this item: the new arm's own `&&
+/// in_positive_context` guard structurally excludes the negative context,
+/// so this MUST stay whatever it was before this change — `sat`, never a
+/// fabricated `unsat`). Kept as its own explicitly-#424-scoped test (rather
+/// than relying solely on the pre-existing test above) so a future reader
+/// auditing #424's diff sees the negative-context invariant re-verified
+/// right alongside the new positive-context tests it sits next to.
+#[test]
+fn distinct_nary_negative_context_still_unhandled_no_regression() {
+    let v = verdict(&format!(
+        "{D3}(declare-const a D3) (declare-const b D3) (declare-const c D3)\n\
+         (assert (not (distinct a b c)))\n\
+         (assert (distinct a b))\n\
+         (assert (distinct a c))\n\
+         (check-sat)\n"
+    ));
+    assert_eq!(
+        v, "sat",
+        "#424 item 2 only adds a POSITIVE-context N-ary arm; the negative-\
+         context N-ary case must remain completely unhandled (safe, if \
+         incomplete) — exactly as before this change"
+    );
+}

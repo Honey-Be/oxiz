@@ -9,9 +9,16 @@
 //! historically, as **CLOSED by #422** — see that task's own three landed
 //! fixes for the mechanism each one uses. Items 4-5 are **CLOSED by #423**
 //! (item 4 narrows/closes item 1's own honest residual; item 5 is a new,
-//! previously-undocumented gap). The section is kept (rather than deleted)
-//! to match this file's existing convention of a permanent, append-only
-//! residual log.
+//! previously-undocumented gap). Items 6-8 are **CLOSED by #424** (three
+//! side-findings from #423's own adversarial-verification pass: item 6 is
+//! the positive-context N-ary generalization item 2's own doc comment
+//! explicitly deferred; item 7 is a NEW literal-vs-literal completeness gap;
+//! item 8 is a parser-level architectural fix, not a `check_dt.rs`
+//! completeness gap at all, but recorded here too since it closes the SAME
+//! underlying "two different values silently treated as one" failure
+//! pattern this whole log tracks). The section is kept (rather than
+//! deleted) to match this file's existing convention of a permanent,
+//! append-only residual log.
 //!
 //! 1. **CLOSED (#422) — OR-branch non-cycle conflicts.**
 //!    `dt_items_force_conflict` (the `#418`/`#419` OR-branch case-split
@@ -100,6 +107,74 @@
 //!    `dt_nullary_tester_equality_regression.rs` for the full test suite,
 //!    including composition with #419's injectivity machinery and an
 //!    arity>0 control confirming non-nullary testers stay unaffected.
+//! 6. **CLOSED (#424) — positive-context N-ary `distinct` (arity >= 3) never
+//!    decomposed.** `collect_dt_constraints_v2`'s `Distinct` arm was guarded
+//!    `args.len() == 2` — the arm's own doc comment ("N-ARY GUARD")
+//!    explicitly left the POSITIVE-context N-ary generalization ("`distinct
+//!    (a,b,c,...)` = a CONJUNCTION of all pairwise disequalities, safe to
+//!    decompose") "for a separate, distinctly-scoped follow-up... to keep
+//!    this diff small" — this item is that follow-up. The NEGATIVE-context
+//!    N-ary case (a genuine DISJUNCTION) remains completely, permanently
+//!    unhandled — untouched by this item. Fixed by a new sibling arm,
+//!    `TermKind::Distinct(args) if args.len() >= 3 && in_positive_context`,
+//!    placed right after the 2-ary arm (which it does not modify): for
+//!    every pair `(i, j)` with `i < j` (mirroring `compute_dt_equality_
+//!    closure`'s own `for i in 0.. / for j in (i+1)..` pairwise-loop shape),
+//!    it does exactly what the 2-ary arm's positive branch does per pair —
+//!    the dual `record_dt_negative_eq_fact` call plus a `dt_diseq_pairs`
+//!    push. See `dt_distinct_regression.rs`'s `#424 item 2` section for the
+//!    full test suite, including adjacent- vs non-adjacent-pair forcing
+//!    (the decisive off-by-one discriminator for the loop generalization),
+//!    the nullary-exclusion and tester-shape special cases each re-exercised
+//!    at a non-(0,1) index, and a re-confirmation that the negative-context
+//!    guard is completely untouched.
+//! 7. **CLOSED (#424) — literal-vs-literal forced-equal conflicts invisible
+//!    to the closure.** `compute_dt_equality_closure`'s injectivity-
+//!    decomposition step derives per-field equalities as raw `(TermId,
+//!    TermId)` pairs pushed DIRECTLY into the closure's own equality list,
+//!    WITHOUT ever building a term-level `Eq` node via `manager.mk_eq` — so
+//!    `mk_eq`'s constant-folding (which only fires when an actual `Eq` TERM
+//!    is built) never got a chance to notice that two forced field VALUES
+//!    are different literals. `(assert (= x (C 7 d))) (assert (= x (C 9
+//!    d)))` under `:simplify false` read spurious `sat` (z3/cvc5: `unsat`) —
+//!    nothing checked "does the closure force two DIFFERENT literal
+//!    constants into the same class" as an INTRINSIC, always-true conflict
+//!    (independent of any user-asserted disequality). Fixed by: (a)
+//!    extracting the union-find construction previously inlined in
+//!    `forces_disequality_conflict` into a shared `DtEqualityClosure::
+//!    build_parent` helper (a PURE, behavior-preserving refactor); (b) a new
+//!    `DtEqualityClosure::has_intrinsic_literal_conflict(&self, manager:
+//!    &TermManager) -> bool`, which groups the closure's classes by root and
+//!    scans EACH class independently (literal-tracking state declared/reset
+//!    INSIDE the per-class loop — see that method's own doc comment for why
+//!    hoisting it out would be the single highest soundness risk in this
+//!    item) for two different `IntConst`/`RealConst`/`BitVecConst`
+//!    (same-width only)/`True`+`False` members; (c) wired via `||` into
+//!    BOTH existing `forces_disequality_conflict` call sites. See
+//!    `dt_literal_conflict_regression.rs` for the full test suite, including
+//!    a live mutation-tested per-class-scoping control (verified to actually
+//!    flip to a fabricated `unsat` when the state is deliberately hoisted
+//!    out of the loop, then reverted).
+//! 8. **CLOSED (#424) — cross-datatype constructor/selector name collision
+//!    (architectural, parser-level — NOT a `check_dt.rs` completeness gap,
+//!    recorded here for cross-reference only since it closes the same
+//!    underlying failure pattern this log tracks: two different values
+//!    silently treated as one).** `TermManager::intern`'s general cache keys
+//!    purely on `TermKind`, and `TermKind::DtConstructor` carries no sort
+//!    field, so two DIFFERENT datatypes' same-named constructor collapsed to
+//!    ONE term; separately, the parser's flat `dt_constructors`/
+//!    `dt_selectors` maps had no duplicate-name check, so a second
+//!    datatype's same-named constructor/selector silently overwrote the
+//!    first's entry. Fixed, in `oxiz-core/src/smtlib/parser/commands.rs`, by
+//!    a new `Parser::check_dt_group_no_name_collisions` (mirroring #418's
+//!    `check_dt_group_well_founded`'s check-before-any-registration
+//!    pattern), rejecting a `declare-datatypes`/`declare-datatype` that
+//!    reuses an earlier-declared datatype's constructor or selector name as
+//!    a parse-time error — intentionally MORE restrictive than z3/cvc5
+//!    (which accept the bare declaration and only reject a later ambiguous
+//!    bare reference, a sort-based overload resolution mechanism oxiz does
+//!    not implement). See `oxiz-core/tests/dt_cross_datatype_name_collision_
+//!    regression.rs` for the full test suite.
 
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -486,7 +561,9 @@ impl Solver {
         // result is simplify-independent by construction, so this closes the
         // gap even under `--preset minimal` / `simplify=false` configs. See
         // `DtEqualityClosure::forces_disequality_conflict`'s doc comment.
-        if closure.forces_disequality_conflict(&dt_diseq_pairs) {
+        if closure.forces_disequality_conflict(&dt_diseq_pairs)
+            || closure.has_intrinsic_literal_conflict(manager)
+        {
             return true;
         }
 
@@ -944,7 +1021,8 @@ impl Solver {
             // this branch's closed hypothesis exhibits (see this function's
             // "#422 — beyond acyclicity-only" doc section above).
             return self.cycle_exists_given(&closure.closed_eqs, &[], ctor_terms, manager)
-                || closure.forces_disequality_conflict(h_diseq);
+                || closure.forces_disequality_conflict(h_diseq)
+                || closure.has_intrinsic_literal_conflict(manager);
         };
 
         let Some(td) = manager.get(t) else {
@@ -1659,6 +1737,34 @@ impl DtEqualityClosure {
                 root
             }
         }
+
+        let mut parent = self.build_parent();
+        diseq_pairs
+            .iter()
+            .any(|&(a, b)| find(&mut parent, a) == find(&mut parent, b))
+    }
+
+    /// #424 item 3 step 1 (PURE refactor, no behavior change) — the
+    /// union-find CONSTRUCTION previously inlined at the top of
+    /// `forces_disequality_conflict`, extracted so
+    /// `has_intrinsic_literal_conflict` (#424 item 3 step 2, below) can reuse
+    /// the identical class structure instead of hand-duplicating it. Same
+    /// find/union path-compression semantics, byte-for-byte —
+    /// `forces_disequality_conflict`'s own OBSERVABLE BEHAVIOR (including its
+    /// subsequent `find` calls on `diseq_pairs`' terms, which may not yet be
+    /// in `parent` and so get inserted there as fresh singleton roots) is
+    /// unchanged by this extraction.
+    fn build_parent(&self) -> FxHashMap<TermId, TermId> {
+        fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
+            let p = *parent.entry(x).or_insert(x);
+            if p == x {
+                x
+            } else {
+                let root = find(parent, p);
+                parent.insert(x, root);
+                root
+            }
+        }
         fn union(parent: &mut FxHashMap<TermId, TermId>, a: TermId, b: TermId) {
             let ra = find(parent, a);
             let rb = find(parent, b);
@@ -1671,9 +1777,119 @@ impl DtEqualityClosure {
         for &(a, b) in &self.closed_eqs {
             union(&mut parent, a, b);
         }
-        diseq_pairs
-            .iter()
-            .any(|&(a, b)| find(&mut parent, a) == find(&mut parent, b))
+        parent
+    }
+
+    /// #424 item 3 step 2 — does this closure's equality classes force TWO
+    /// DIFFERENT LITERAL CONSTANTS of the same base sort into one class? This
+    /// is an INTRINSIC conflict, independent of any user-asserted
+    /// disequality: two different literal VALUES of the same sort (e.g. `3`
+    /// and `9`, or `#b101` and `#b110` at the SAME width) are trivially,
+    /// definitionally distinct — no external "distinct"/"not (= ...)" fact is
+    /// needed to know that.
+    ///
+    /// Motivating gap: `compute_dt_equality_closure`'s injectivity
+    /// decomposition step derives per-field equalities as raw `(TermId,
+    /// TermId)` pairs pushed directly into the closure's own equality list,
+    /// WITHOUT ever building a term-level `Eq` node via `manager.mk_eq` — so
+    /// `mk_eq`'s constant-folding (which only fires when an actual `Eq` TERM
+    /// is built) never gets a chance to notice that two forced field values
+    /// are different literals. `(assert (= x (C 7 d))) (assert (= x (C 9
+    /// d)))` under `:simplify false` therefore closed `7 = 9` inside
+    /// `closed_eqs` without that ever being flagged as a conflict.
+    ///
+    /// Builds ONE union-find via [`Self::build_parent`] (the SAME class
+    /// structure `forces_disequality_conflict` uses), groups every term that
+    /// appears in `closed_eqs` by its class root, then scans EACH class
+    /// independently for a literal/literal conflict. Returns `true` on the
+    /// first conflict found in any class.
+    pub(super) fn has_intrinsic_literal_conflict(&self, manager: &TermManager) -> bool {
+        fn find(parent: &mut FxHashMap<TermId, TermId>, x: TermId) -> TermId {
+            let p = *parent.entry(x).or_insert(x);
+            if p == x {
+                x
+            } else {
+                let root = find(parent, p);
+                parent.insert(x, root);
+                root
+            }
+        }
+
+        let mut parent = self.build_parent();
+
+        let mut terms_in_play: FxHashSet<TermId> = FxHashSet::default();
+        for &(a, b) in &self.closed_eqs {
+            terms_in_play.insert(a);
+            terms_in_play.insert(b);
+        }
+
+        let mut classes: FxHashMap<TermId, Vec<TermId>> = FxHashMap::default();
+        for &t in &terms_in_play {
+            let r = find(&mut parent, t);
+            classes.entry(r).or_default().push(t);
+        }
+
+        for members in classes.values() {
+            // Per-class literal-tracking state — declared/reset HERE, INSIDE
+            // the per-class loop, on purpose: hoisting any of these out to
+            // the enclosing scope would leak a literal value observed in one
+            // class into the scan of a completely UNRELATED class,
+            // fabricating a conflict between two literals that were NEVER
+            // actually unioned by any real derivation. This is the single
+            // highest soundness risk in this method.
+            let mut seen_int: Option<&num_bigint::BigInt> = None;
+            let mut seen_real: Option<&num_rational::Rational64> = None;
+            // Different bit-vector WIDTHS are different sorts — never
+            // compared against each other. Keyed by width so only
+            // same-width values are ever compared.
+            let mut seen_bv: FxHashMap<u32, &num_bigint::BigInt> = FxHashMap::default();
+            let mut seen_true = false;
+            let mut seen_false = false;
+
+            for &t in members {
+                let Some(data) = manager.get(t) else {
+                    continue;
+                };
+                match &data.kind {
+                    TermKind::IntConst(v) => {
+                        if let Some(prev) = seen_int {
+                            if prev != v {
+                                return true;
+                            }
+                        } else {
+                            seen_int = Some(v);
+                        }
+                    }
+                    TermKind::RealConst(v) => {
+                        if let Some(prev) = seen_real {
+                            if prev != v {
+                                return true;
+                            }
+                        } else {
+                            seen_real = Some(v);
+                        }
+                    }
+                    TermKind::BitVecConst { value, width } => {
+                        if let Some(prev) = seen_bv.get(width) {
+                            if *prev != value {
+                                return true;
+                            }
+                        } else {
+                            seen_bv.insert(*width, value);
+                        }
+                    }
+                    TermKind::True => seen_true = true,
+                    TermKind::False => seen_false = true,
+                    _ => {}
+                }
+            }
+
+            if seen_true && seen_false {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -2160,6 +2376,53 @@ impl Solver {
                 // `distinct` is never itself Bool-ARGUMENT-sorted the way an
                 // `=` between two Bools can be an iff, the operands here are
                 // still not independently-asserted facts).
+            }
+            TermKind::Distinct(args) if args.len() >= 3 && in_positive_context => {
+                // #424 item 2 — the POSITIVE-context N-ary follow-up the
+                // 2-ary arm's own doc comment left for later: `distinct(a,b,
+                // c,...)` asserted POSITIVELY is a CONJUNCTION of all
+                // pairwise disequalities (`a≠b ∧ a≠c ∧ b≠c ∧ ...`), safe to
+                // decompose into `C(n,2)` independent pairwise facts —
+                // unlike the NEGATIVE-context N-ary case (`¬distinct(a,b,c)
+                // ≡ a=b ∨ a=c ∨ b=c`, a genuine DISJUNCTION), which stays
+                // completely unhandled here FOREVER: this arm's own
+                // `&& in_positive_context` guard structurally excludes it,
+                // exactly like the 2-ary arm's own `else` branch never runs
+                // for arity ≥ 3 (that branch is only reachable via the
+                // separate `args.len() == 2` arm above, which this arm does
+                // not touch).
+                //
+                // For every pair `(i, j)` with `i < j`, do EXACTLY what the
+                // 2-ary positive arm above does for its single pair: same
+                // dual-call `record_dt_negative_eq_fact` (both directions)
+                // plus the same unconditional `dt_diseq_pairs` push, with the
+                // identical "can only ever help completeness, never
+                // fabricate a conflict" argument applying per-pair (each
+                // pair is independently a genuine disequality; `forces_
+                // disequality_conflict`'s union-find only fires on an
+                // ACTUALLY-derived equality).
+                for i in 0..args.len() {
+                    for j in (i + 1)..args.len() {
+                        let (a, b) = (args[i], args[j]);
+                        self.record_dt_negative_eq_fact(
+                            a,
+                            b,
+                            manager,
+                            negative_ctor_equalities,
+                            negative_testers,
+                        );
+                        self.record_dt_negative_eq_fact(
+                            b,
+                            a,
+                            manager,
+                            negative_ctor_equalities,
+                            negative_testers,
+                        );
+                        dt_diseq_pairs.push((a, b));
+                    }
+                }
+                // Do NOT recurse into the operands — same discipline as the
+                // 2-ary arm above.
             }
             TermKind::And(args) => {
                 // A conjunction contributes its children only when the And
