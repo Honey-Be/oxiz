@@ -224,6 +224,30 @@ impl<'a> Parser<'a> {
             }
             "reset" => {
                 self.expect_rparen()?;
+                // #424 item 1 follow-up: `(reset)` erases ALL prior
+                // declarations per SMT-LIB semantics (`Context::reset`,
+                // executed later, mirrors this for the rest of solver
+                // state) — but `check_dt_group_no_name_collisions` consults
+                // `self.dt_constructors`/`self.dt_selectors` directly, and
+                // those maps are otherwise monotonic across an entire
+                // parse (both within one `parse_script`/
+                // `parse_script_with_env` call, which parses the WHOLE
+                // script into a `Vec<Command>` before any command
+                // executes, and across separate calls via `ParserEnv`).
+                // Without this, two datatypes separated by a `(reset)` that
+                // happen to reuse a constructor/selector name are wrongly
+                // rejected even though z3/cvc5 both accept them (the reset
+                // genuinely makes the two declarations unrelated). Clearing
+                // here — the instant `Command::Reset` is produced, so it
+                // takes effect before any later command in this same parse
+                // call is parsed — closes that false-rejection gap. Scoped
+                // to exactly these two maps (not `constants`/`functions`/
+                // `sort_aliases`/`function_defs`, which have no analogous
+                // duplicate-rejection check and whose cross-reset accrual
+                // is pre-existing, unrelated parser behavior, untouched
+                // here).
+                self.dt_constructors.clear();
+                self.dt_selectors.clear();
                 Command::Reset
             }
             "reset-assertions" => {
@@ -516,6 +540,11 @@ impl<'a> Parser<'a> {
         let position = self.lexer.position();
         Self::check_dt_group_well_founded(position, &datatype_names, &raw_groups)?;
 
+        // #424 item 1 — cross-datatype constructor/selector name collision
+        // check, also BEFORE any registration (see the function's doc
+        // comment for the full rationale).
+        self.check_dt_group_no_name_collisions(position, &raw_groups)?;
+
         // Pre-create every declared datatype's SORT before resolving the
         // constructor groups' field sorts, so a selector of a MUTUALLY-
         // recursive sibling (or a self-reference) resolves to the datatype
@@ -662,6 +691,94 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// #424 item 1 — cross-datatype constructor/selector name collision
+    /// check, mirroring [`check_dt_group_well_founded`]'s "raw
+    /// pre-registration structure, check-before-commit" pattern.
+    ///
+    /// Two independent bugs stack when the same constructor or selector name
+    /// is (re)used by a SECOND, different datatype: (a)
+    /// `TermManager::intern`'s general cache keys purely on `TermKind`, and
+    /// `TermKind::DtConstructor` carries no sort field, so
+    /// `mk_dt_constructor("c0", [], sortA)` followed by
+    /// `mk_dt_constructor("c0", [], sortB)` collapse to ONE term — `sortB`'s
+    /// binding is silently discarded; (b) the parser's own flat
+    /// `dt_constructors`/`dt_selectors` maps have no duplicate-name check and
+    /// a later `declare-datatype`/`declare-datatypes` silently OVERWRITES an
+    /// earlier entry. z3/cvc5 instead accept the bare declaration and only
+    /// reject a later AMBIGUOUS bare reference (e.g. `c0` when two sibling
+    /// datatypes both declare it), requiring `(as c0 A)` to disambiguate —
+    /// oxiz implements no such sort-based overload resolution, so this is
+    /// intentionally MORE restrictive: it rejects the declaration itself,
+    /// closing both bugs by construction (a rejected declaration never
+    /// reaches either `mk_dt_constructor` or the `dt_constructors`/
+    /// `dt_selectors` map insertion).
+    ///
+    /// Checks WITHIN-NAMESPACE only: constructor names are checked against
+    /// other constructor names (both `self.dt_constructors` as it stands
+    /// before this command, AND every other constructor already seen earlier
+    /// in the SAME group/command being processed here), and likewise
+    /// selector names against selector names. A constructor name colliding
+    /// with an unrelated datatype's SELECTOR name (or vice versa) is
+    /// deliberately NOT checked here — that's a separate, pre-existing
+    /// routing quirk in `terms.rs`'s selector-before-constructor lookup
+    /// order, out of scope for this check.
+    ///
+    /// Must be called strictly BEFORE any registration
+    /// (`SortManager`/`dt_constructors`/`dt_selectors`/`TermManager`) happens
+    /// for the current command, exactly like the well-foundedness check —
+    /// re-registering partial state on a later rejection would defeat the
+    /// purpose of checking at all.
+    fn check_dt_group_no_name_collisions(
+        &self,
+        position: usize,
+        groups: &[Vec<(String, Vec<(String, String)>)>],
+    ) -> Result<()> {
+        let mut seen_ctors: FxHashSet<&str> = FxHashSet::default();
+        let mut seen_sels: FxHashSet<&str> = FxHashSet::default();
+
+        for group in groups {
+            for (ctor_name, selectors) in group {
+                if self.dt_constructors.contains_key(ctor_name.as_str())
+                    || seen_ctors.contains(ctor_name.as_str())
+                {
+                    return Err(OxizError::ParseError {
+                        position,
+                        message: format!(
+                            "duplicate datatype constructor name: '{ctor_name}' is already \
+                             used by a previously declared datatype (or earlier in this same \
+                             declaration) — oxiz does not support sort-based overload \
+                             resolution for ambiguous bare constructor references, so \
+                             cross-datatype constructor name reuse is rejected at \
+                             declaration time"
+                        ),
+                    });
+                }
+                seen_ctors.insert(ctor_name.as_str());
+
+                for (sel_name, _sel_sort) in selectors {
+                    if self.dt_selectors.contains_key(sel_name.as_str())
+                        || seen_sels.contains(sel_name.as_str())
+                    {
+                        return Err(OxizError::ParseError {
+                            position,
+                            message: format!(
+                                "duplicate datatype selector name: '{sel_name}' is already \
+                                 used by a previously declared datatype (or earlier in this \
+                                 same declaration) — oxiz does not support sort-based overload \
+                                 resolution for ambiguous bare selector references, so \
+                                 cross-datatype selector name reuse is rejected at declaration \
+                                 time"
+                            ),
+                        });
+                    }
+                    seen_sels.insert(sel_name.as_str());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Parse `(declare-datatype name (...))` — single-datatype form
     fn parse_declare_datatype(&mut self) -> Result<Command> {
         let name = self.expect_symbol()?;
@@ -713,6 +830,11 @@ impl<'a> Parser<'a> {
             std::slice::from_ref(&name),
             std::slice::from_ref(&constructors),
         )?;
+
+        // #424 item 1 — cross-datatype constructor/selector name collision
+        // check, also BEFORE any registration (see the function's doc
+        // comment for the full rationale).
+        self.check_dt_group_no_name_collisions(position, std::slice::from_ref(&constructors))?;
 
         let dt_sort = self.manager.sorts.mk_datatype_sort(&name);
         for (ctor_name, _selectors) in &constructors {
