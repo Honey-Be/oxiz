@@ -1698,3 +1698,225 @@ fn test_lazy_eval_eq_reflexive() {
     solver.assert(eq, &mut manager);
     assert_eq!(solver.check(&mut manager), SolverResult::Sat);
 }
+
+/// Bug B (nested-reverification budget) — the clamp arithmetic's grace-floor
+/// case, tested directly against the crate-private fields.
+///
+/// An ALREADY-EXPIRED `mbqi_deadline_override` must NOT collapse the
+/// effective deadline to zero (a pure remaining-time clamp would): the clamp
+/// `min(fresh, max(override, now + ms/4))` guarantees the `ms/4` grace floor.
+/// With `timeout_ms = 4000` the floor is 1 s.
+///
+/// Vehicle: `∀x {f(x)}. f(x) > f(f(x))` plus ground `f(c) > 0` — genuinely
+/// SAT over Int (an infinite strictly-descending chain), but each instance
+/// mints the next `f`-tower trigger, so MBQI keeps generating fresh ground
+/// terms without converging and the solve runs to whatever deadline it is
+/// given (measured: full 4 s without an override, on this exact formula).
+/// The elapsed window therefore reads the effective deadline directly:
+///   - `>= 500 ms` proves the floor was granted (a pure clamp on the expired
+///     override would return in ~0 ms), and
+///   - `< 2500 ms` proves the override clamped away the 4 s fresh grant.
+/// And the verdict must be sound (never `unsat`). Deterministic: no races,
+/// just the deadline math.
+#[cfg(feature = "std")]
+#[test]
+fn mbqi_expired_deadline_override_still_gets_grace_floor() {
+    use std::time::{Duration, Instant};
+
+    let config = SolverConfig {
+        clean_mbqi: true,
+        timeout_ms: 4000,
+        ..SolverConfig::default()
+    };
+    let mut solver = Solver::with_config(config);
+    let mut manager = TermManager::new();
+    let int_sort = manager.sorts.int_sort;
+
+    // Axiom: forall x. f(x) > f(f(x))   (pattern: f(x) — the matching loop)
+    let x = manager.mk_var("x", int_sort);
+    let f_x = manager.mk_apply("f", [x], int_sort);
+    let f_f_x = manager.mk_apply("f", [f_x], int_sort);
+    let body = manager.mk_gt(f_x, f_f_x);
+    let pattern: smallvec::SmallVec<[_; 2]> = smallvec::smallvec![f_x];
+    let patterns: smallvec::SmallVec<[_; 2]> = smallvec::smallvec![pattern];
+    let axiom = manager.mk_forall_with_patterns([("x", int_sort)], body, patterns);
+    solver.assert(axiom, &mut manager);
+
+    // Ground seed: f(c) > 0 — starts the f-tower.
+    let c = manager.mk_apply("c", [], int_sort);
+    let f_c = manager.mk_apply("f", [c], int_sort);
+    let zero = manager.mk_int(0);
+    let f_c_gt_0 = manager.mk_gt(f_c, zero);
+    solver.assert(f_c_gt_0, &mut manager);
+
+    // Inject an ALREADY-EXPIRED override (as if the outer solve had consumed
+    // its entire budget before reaching the nested re-verification).
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(50))
+        .unwrap_or_else(Instant::now);
+    solver.mbqi_deadline_override = Some(expired);
+
+    let start = Instant::now();
+    let result = solver.check(&mut manager);
+    let elapsed = start.elapsed();
+
+    // Floor granted: the non-converging solve is deadline-bound, so an
+    // instant return would mean the expired override zeroed the budget.
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "expired override must still grant the ms/4 grace floor (~1s), returned in {elapsed:?}"
+    );
+    // Fresh grant clamped: ~1 s (4000/4), NOT the full 4 s. Generous slop for
+    // a loaded machine — the run is deadline-bound, so load cannot stretch it
+    // much past the floor.
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "expired override must clamp to the ms/4 grace floor (~1s), took {elapsed:?}"
+    );
+    // Soundness: the formula is genuinely SAT; a deadline can only ever
+    // downgrade to Unknown, never fabricate an unsat.
+    assert_ne!(
+        result,
+        SolverResult::Unsat,
+        "genuinely-SAT non-converging problem must never come back unsat"
+    );
+}
+
+/// Bug B clamp tests — shared non-converging vehicle (see
+/// `mbqi_expired_deadline_override_still_gets_grace_floor` for the analysis):
+/// `∀x {f(x)}. f(x) > f(f(x))` plus ground `f(c) > 0` is genuinely SAT over
+/// Int but each instance mints the next `f`-tower trigger, so the solve is
+/// deadline-bound at ANY budget — elapsed wall-clock reads the effective
+/// deadline directly.
+#[cfg(feature = "std")]
+fn assert_descending_chain_vehicle(solver: &mut Solver, manager: &mut TermManager) {
+    let int_sort = manager.sorts.int_sort;
+    let x = manager.mk_var("x", int_sort);
+    let f_x = manager.mk_apply("f", [x], int_sort);
+    let f_f_x = manager.mk_apply("f", [f_x], int_sort);
+    let body = manager.mk_gt(f_x, f_f_x);
+    let pattern: smallvec::SmallVec<[_; 2]> = smallvec::smallvec![f_x];
+    let patterns: smallvec::SmallVec<[_; 2]> = smallvec::smallvec![pattern];
+    let axiom = manager.mk_forall_with_patterns([("x", int_sort)], body, patterns);
+    solver.assert(axiom, manager);
+    let c = manager.mk_apply("c", [], int_sort);
+    let f_c = manager.mk_apply("f", [c], int_sort);
+    let zero = manager.mk_int(0);
+    let f_c_gt_0 = manager.mk_gt(f_c, zero);
+    solver.assert(f_c_gt_0, manager);
+}
+
+/// Bug B clamp, case "override sooner than fresh but later than the floor":
+/// the nested solve must get EXACTLY the remaining outer time (the override),
+/// not the `ms/4` floor (1 s here) and not the full fresh grant (4 s here).
+#[cfg(feature = "std")]
+#[test]
+fn mbqi_future_override_clamps_to_remaining_outer_time() {
+    use std::time::{Duration, Instant};
+
+    let config = SolverConfig {
+        clean_mbqi: true,
+        timeout_ms: 4000,
+        ..SolverConfig::default()
+    };
+    let mut solver = Solver::with_config(config);
+    let mut manager = TermManager::new();
+    assert_descending_chain_vehicle(&mut solver, &mut manager);
+
+    // floor (now+1s) < override (now+2s) < fresh (now+4s) ⇒ d = override.
+    solver.mbqi_deadline_override = Some(Instant::now() + Duration::from_millis(2000));
+
+    let start = Instant::now();
+    let result = solver.check(&mut manager);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "a not-yet-expired override must win over the ms/4 floor (~1s), returned in {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(3200),
+        "an override sooner than fresh must clamp the 4s fresh grant to ~2s, took {elapsed:?}"
+    );
+    assert_ne!(
+        result,
+        SolverResult::Unsat,
+        "genuinely-SAT non-converging problem must never come back unsat"
+    );
+}
+
+/// Bug B clamp, case "override beyond the fresh grant": `min()` must pick the
+/// solver's OWN fresh budget — a far-future override never EXTENDS the solve.
+#[cfg(feature = "std")]
+#[test]
+fn mbqi_override_beyond_fresh_keeps_own_budget() {
+    use std::time::{Duration, Instant};
+
+    let config = SolverConfig {
+        clean_mbqi: true,
+        timeout_ms: 1200,
+        ..SolverConfig::default()
+    };
+    let mut solver = Solver::with_config(config);
+    let mut manager = TermManager::new();
+    assert_descending_chain_vehicle(&mut solver, &mut manager);
+
+    // floor (now+300ms) < fresh (now+1.2s) < override (now+5s) ⇒ d = fresh.
+    solver.mbqi_deadline_override = Some(Instant::now() + Duration::from_millis(5000));
+
+    let start = Instant::now();
+    let result = solver.check(&mut manager);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "an override beyond fresh must leave the full own budget (~1.2s), returned in {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2600),
+        "an override beyond fresh must never EXTEND the budget past fresh (~1.2s), took {elapsed:?}"
+    );
+    assert_ne!(
+        result,
+        SolverResult::Unsat,
+        "genuinely-SAT non-converging problem must never come back unsat"
+    );
+}
+
+/// Bug B clamp, case "no override": byte-identical to pre-fix behavior — the
+/// full fresh grant. Also the CONTROL for the beyond-fresh case above: same
+/// vehicle, same 1.2s budget, same elapsed window (a far-future override must
+/// be indistinguishable from no override at all).
+#[cfg(feature = "std")]
+#[test]
+fn mbqi_no_override_gets_full_fresh_budget() {
+    use std::time::{Duration, Instant};
+
+    let config = SolverConfig {
+        clean_mbqi: true,
+        timeout_ms: 1200,
+        ..SolverConfig::default()
+    };
+    let mut solver = Solver::with_config(config);
+    let mut manager = TermManager::new();
+    assert_descending_chain_vehicle(&mut solver, &mut manager);
+    assert_eq!(solver.mbqi_deadline_override, None, "outer solvers never carry an override");
+
+    let start = Instant::now();
+    let result = solver.check(&mut manager);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "no override ⇒ the untouched fresh grant (~1.2s), returned in {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2600),
+        "no override ⇒ the untouched fresh grant (~1.2s), took {elapsed:?}"
+    );
+    assert_ne!(
+        result,
+        SolverResult::Unsat,
+        "genuinely-SAT non-converging problem must never come back unsat"
+    );
+}

@@ -128,3 +128,165 @@ fn bounded_pigeonhole_is_unsat_via_resolve() {
     });
     assert_eq!(verdict, Some("unsat"), "bounded pigeonhole box is jointly unsat, got {out:?}");
 }
+
+#[test]
+fn nested_reverify_does_not_double_the_budget() {
+    // Bug B (nested-reverification budget): `fresh_ground_resolve` builds a
+    // fresh verifier from `config.clone()`, whose `check_level` used to
+    // recompute a FULL fresh MBQI deadline from the cloned `timeout_ms` —
+    // every `verify_clean_saturated`/`verify_clean_unsat` re-solve granted
+    // itself a whole second budget, ~2× the configured guard per check-sat.
+    // The fix injects the outer check's absolute deadline and clamps the
+    // nested budget to `min(fresh, max(outer, now + own_ms/4))`.
+    //
+    // Vehicle: a LARGE bounded pigeonhole (63 holes in [1,62]) at
+    // timeout_ms = 1500. The outer MBQI phase needs ~1.1 s to enumerate and
+    // encode the ~3.9k box instances before it `Saturated`s, and the fresh
+    // single-shot ground re-solve of that box does not converge inside any
+    // budget this test grants — so the total wall-clock reads the nested
+    // grant directly: pre-fix ≈ outer + full fresh 1.5 s ≈ 2.7 s (measured
+    // 2.71 s); post-fix the clamp caps the nested at the remaining outer
+    // budget (floored at 375 ms) ≈ 1.5–1.9 s total. Assert only the
+    // egregious multiple (< 2.6 s) so a loaded machine does not flake.
+    //
+    // The box is genuinely UNSAT, so the only acceptable verdicts are
+    // `unsat` (if a future ground core refutes it in time) or the sound
+    // `unknown` — never `sat`.
+    //
+    // Runs on a big-stack thread: ~3.9k encoded instances overflow the
+    // default 2 MiB test-thread stack (a pre-existing recursion-depth
+    // limitation, unrelated to the budget fix).
+    let n = 62usize;
+    let mut script = String::from("(set-logic UFLIA)(declare-fun hole (Int) Int)");
+    for i in 0..=n {
+        script.push_str(&format!(
+            "(assert (and (>= (hole {i}) 1) (<= (hole {i}) {n})))"
+        ));
+    }
+    script.push_str(&format!(
+        "(assert (forall ((i Int) (j Int)) \
+           (=> (and (>= i 0) (<= i {n}) (>= j 0) (<= j {n}) (not (= i j))) \
+               (not (= (hole i) (hole j))))))"
+    ));
+    script.push_str("(check-sat)");
+
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut ctx = Context::new();
+            ctx.set_clean_mbqi(true);
+            ctx.set_timeout_ms(1500);
+            let start = std::time::Instant::now();
+            let out = ctx.execute_script(&script).expect("script runs");
+            (out, start.elapsed())
+        })
+        .expect("spawn big-stack test thread");
+    let (out, elapsed) = handle.join().expect("no panic in solver thread");
+
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_ne!(
+        verdict,
+        Some("sat"),
+        "PHP box is jointly unsat — `sat` would be a soundness bug, got {out:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(2600),
+        "nested re-verify must not grant itself a second full budget \
+         (pre-fix ≈2.7 s, post-fix ≤ ~1.9 s), took {elapsed:?}"
+    );
+}
+
+#[test]
+fn reused_context_second_check_gets_full_fresh_budget() {
+    // Bug B staleness guard — the reason the fix uses TWO fields
+    // (`mbqi_deadline_override` written only externally on the throwaway
+    // nested verifier; `check_deadline` overwritten by every check that
+    // reaches the MBQI deadline block) instead of one: writing the effective
+    // deadline back into a single override field would leave a STALE,
+    // long-expired cap on a `Context`-reused solver, silently flooring every
+    // LATER check-sat's budget at ms/4 (or instant-`unknown` without the
+    // floor).
+    //
+    // Check 1 (inside a push/pop frame): the small bounded pigeonhole —
+    // drives `Saturated` → `verify_clean_saturated` → `fresh_ground_resolve`,
+    // which records this check's effective deadline in the solver and injects
+    // it into the nested verifier. Completes in milliseconds and returns the
+    // real `unsat`.
+    //
+    // Then wall-clock is deliberately slept PAST check 1's absolute deadline
+    // — that is the staleness condition: any cap left over from check 1 is
+    // now expired. (Without the sleep a written-back cap would still lie in
+    // the future and be indistinguishable from a fresh grant; verified by
+    // mutation: a single-field write-back passes this test without the sleep
+    // and fails it with the sleep.)
+    //
+    // Check 2, SAME context: a non-converging genuinely-SAT axiom that runs
+    // to whatever deadline it is given. A full fresh budget runs ≈1.2 s; a
+    // leaked stale expired cap would return in ≤ ~300 ms (the ms/4 floor) —
+    // the elapsed lower bound discriminates.
+    let mut ctx = Context::new();
+    ctx.set_clean_mbqi(true);
+    ctx.set_timeout_ms(1200);
+
+    let php = "\
+        (set-logic UFLIA)\
+        (push 1)\
+        (declare-fun hole (Int) Int)\
+        (assert (and (>= (hole 0) 1) (<= (hole 0) 2)))\
+        (assert (and (>= (hole 1) 1) (<= (hole 1) 2)))\
+        (assert (and (>= (hole 2) 1) (<= (hole 2) 2)))\
+        (assert (forall ((i Int) (j Int)) \
+            (=> (and (>= i 0) (<= i 2) (>= j 0) (<= j 2) (not (= i j))) \
+                (not (= (hole i) (hole j))))))\
+        (check-sat)\
+        (pop 1)";
+    let out1 = ctx.execute_script(php).expect("script 1 runs");
+    let verdict1 = out1.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    // Precondition: the fresh_ground_resolve verify path actually ran (a
+    // bounded-∀ `unsat` is only ever reported via that single-shot re-solve).
+    assert_eq!(verdict1, Some("unsat"), "bounded pigeonhole must unsat via the re-solve, got {out1:?}");
+
+    // Sleep past check 1's absolute deadline (1200 ms from its start) so any
+    // leftover cap is genuinely EXPIRED by the time check 2 computes its own.
+    std::thread::sleep(std::time::Duration::from_millis(1400));
+
+    let chain = "\
+        (declare-fun f (Int) Int)\
+        (declare-fun c () Int)\
+        (assert (forall ((x Int)) (! (> (f x) (f (f x))) :pattern ((f x)))))\
+        (assert (> (f c) 0))\
+        (check-sat)";
+    let start = std::time::Instant::now();
+    let out2 = ctx.execute_script(chain).expect("script 2 runs");
+    let elapsed = start.elapsed();
+    let verdict2 = out2.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_ne!(
+        verdict2,
+        Some("unsat"),
+        "genuinely-SAT non-converging problem must never come back unsat, got {out2:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "second check on a reused context must get a FULL fresh budget \
+         (~1.2 s), not a stale expired cap leaked from the first check, returned in {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(2600),
+        "second check must still honour its own 1.2 s budget, took {elapsed:?}"
+    );
+}

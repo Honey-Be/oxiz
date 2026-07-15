@@ -249,6 +249,36 @@ pub struct Solver {
     pub(super) tracked_compound_terms: FxHashSet<TermId>,
     /// Cache for FP constraint checking results.
     pub(super) fp_constraint_cache: FxHashMap<TermId, FpConstraintData>,
+    /// Bug B (nested-reverification budget): the OUTER solve's absolute check
+    /// deadline, injected by [`Self::fresh_ground_resolve`] into the NESTED
+    /// verifier it constructs. Set ONLY externally (on the nested verifier);
+    /// [`Self::check_level`] never writes it. When present, `check_level`
+    /// clamps its freshly-computed MBQI deadline to
+    /// `min(fresh, max(override, now + own_ms/4))` — the `own_ms/4` grace
+    /// floor guarantees a nested re-verification keeps a useful slice of
+    /// budget even when the outer solve consumed its whole guard (a PURE
+    /// remaining-time clamp would starve a nested verify that genuinely
+    /// needs ~guard/6 and flip a verified row to unknown).
+    ///
+    /// DELIBERATELY a separate field from [`check_deadline`]: writing the
+    /// effective deadline back into a single field would leave a STALE,
+    /// already-expired cap on a solver reused across multiple `check-sat`
+    /// calls (`Context` reuses the solver), causing spurious instant
+    /// `Unknown`s — the sibling of the assert-time-populated-cache/stale-state
+    /// bug class this project hit three times recently.
+    ///
+    /// [`check_deadline`]: Self::check_deadline
+    #[cfg(feature = "std")]
+    pub(super) mbqi_deadline_override: Option<std::time::Instant>,
+    /// Bug B (nested-reverification budget): THIS check's effective MBQI
+    /// deadline, OVERWRITTEN on every [`Self::check_level`] entry that
+    /// reaches the MBQI loop. Read only by [`Self::fresh_ground_resolve`]
+    /// (within the same `check_level` invocation, so it can never be stale
+    /// there) to seed the nested verifier's
+    /// [`mbqi_deadline_override`](Self::mbqi_deadline_override) — see that
+    /// field's doc comment for why the two fields must stay split.
+    #[cfg(feature = "std")]
+    pub(super) check_deadline: Option<std::time::Instant>,
 }
 
 impl Default for Solver {
@@ -333,6 +363,10 @@ impl Solver {
             arith_parse_cache: FxHashMap::default(),
             tracked_compound_terms: FxHashSet::default(),
             fp_constraint_cache: FxHashMap::default(),
+            #[cfg(feature = "std")]
+            mbqi_deadline_override: None,
+            #[cfg(feature = "std")]
+            check_deadline: None,
         }
     }
 
@@ -466,14 +500,36 @@ impl Solver {
     /// theory wiring (it misses the EUF↔LIA combination that refutes
     /// pigeonhole), so an unsat re-solve would spuriously come back `sat`/
     /// `unknown`. `set_logic` both records the logic and runs its theory setup.
+    ///
+    /// BUDGET (Bug B fix): the nested `check` recomputes its own MBQI deadline
+    /// from the cloned `timeout_ms`/guard, so without intervention every
+    /// re-verification grants itself a FULL fresh budget (~2× the guard per
+    /// check-sat). We inject the outer check's absolute deadline as
+    /// `mbqi_deadline_override`; the nested `check_level` clamps to
+    /// `min(fresh, max(override, now + own_ms/4))` — see the deadline block.
+    /// KNOWN RESIDUAL (deliberately NOT fixed here): `minimize_unsat_core` has
+    /// the same class of un-deadlined nested solves (N greedy delta-debug
+    /// iterations, each a fresh `Solver::new()` + `check`), gated on
+    /// `produce_unsat_cores` and not on the corpus path.
     fn fresh_ground_resolve(
         &self,
         instances: &[TermId],
         manager: &mut TermManager,
     ) -> SolverResult {
+        // NOTE: `timeout_ms` stays cloned as-is — the deadline clamp min()s
+        // the nested budget against the outer deadline anyway, and zeroing it
+        // would silently switch the nested budget source to the env/4s-default
+        // guard when a user set a LARGER timeout.
         let mut config = self.config.clone();
         config.clean_mbqi = false;
         let mut verifier = Solver::with_config(config);
+        // Bug B: hand the nested verifier the outer check's absolute deadline
+        // (recorded at this check's own deadline block) so its freshly
+        // recomputed budget is clamped rather than a full second grant.
+        #[cfg(feature = "std")]
+        {
+            verifier.mbqi_deadline_override = self.check_deadline;
+        }
         verifier.set_logic(self.logic.as_deref().unwrap_or("ALL"));
         // #347 — abstract every quantifier node (top-level OR nested in the
         // boolean spine) to a FRESH Bool proposition, the SAME proposition per
@@ -757,7 +813,27 @@ impl Solver {
                     .filter(|&v| v > 0)
                     .unwrap_or(MBQI_NONTERMINATION_GUARD_MS)
             };
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(ms))
+            let now = std::time::Instant::now();
+            let fresh = now + std::time::Duration::from_millis(ms);
+            // Bug B (nested-reverification budget): a NESTED verifier built by
+            // `fresh_ground_resolve` used to recompute a FULL fresh budget here
+            // (`config.clone()` copies `timeout_ms`), so every clean-engine
+            // re-verification granted itself another whole guard — ~2× the
+            // configured budget per check-sat. Clamp to the outer solve's
+            // absolute deadline when one was injected, but never below a
+            // `ms/4` grace floor: `o.max(now + ms/4)` guarantees that even an
+            // ALREADY-EXPIRED override still yields the floor (a pure
+            // remaining-time clamp would starve a nested verify the outer left
+            // no time for, flipping verified rows to unknown). Total
+            // wall-clock is thus bounded by ~1.25× the guard. Only ever a
+            // SAFE-direction change: a long-running re-verify may now return
+            // `Unknown` sooner; no genuine `Sat`/`Unsat` is ever flipped.
+            let d = match self.mbqi_deadline_override {
+                Some(o) => fresh.min(o.max(now + std::time::Duration::from_millis(ms / 4))),
+                None => fresh,
+            };
+            self.check_deadline = Some(d);
+            Some(d)
         };
 
         // The clean-room quantifier engine (`oxiz-mbqi`), built lazily on the
