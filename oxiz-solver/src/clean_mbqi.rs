@@ -103,13 +103,44 @@ pub struct EufCongruence<'a> {
     /// [`with_ground_index`](Self::with_ground_index) when the P4 verdict-flip is
     /// armed — so the common path pays nothing.
     ground_by_sort: FxHashMap<SortId, Vec<TermId>>,
+    /// Lazily-built `root → class-member node indices` index replacing the O(n)
+    /// [`EufSolver::class_members`] scan per [`Congruence::class`] query
+    /// (measured 50–76% of pattern-A round time; ~1.4 useful members per
+    /// full-graph scan).
+    ///
+    /// Why NO invalidation logic is needed: this wrapper holds `&'a EufSolver`
+    /// for its whole lifetime (one MBQI round — built fresh per round in
+    /// `solver/mod.rs` and dropped before any re-solve), so the borrow checker
+    /// freezes the E-graph while the index is live; the EUF has no interior
+    /// mutability and every oracle reader is a true `&self`. Union and `pop()`
+    /// can only happen after the wrapper is gone — the cache dies with the
+    /// round, which is exactly what keeps it out of the assert-time-cache /
+    /// pop-scrub bug class. Lazy (`OnceCell`, one O(n) pass on first `class()`
+    /// query) so rounds that never consult the oracle (`ccfv_ematch` off) pay
+    /// nothing.
+    ///
+    /// Equivalence contract: built by one ascending pass over
+    /// `all_node_indices()`, so each entry's `Vec` is ascending — byte-identical
+    /// to the ascending `0..n` scan order of [`EufSolver::class_members`]
+    /// (checked by a `debug_assert_eq!` on every cached hit in debug builds).
+    ///
+    /// Note: the single-threaded `OnceCell` (not `std::sync::OnceLock`) makes
+    /// `EufCongruence` `!Sync`. That is deliberate — the wrapper is a
+    /// block-local per-round object that never crosses threads, and nothing in
+    /// the workspace requires `Sync` here; swap to `OnceLock` if that ever
+    /// changes rather than working around it at a use site.
+    class_index: core::cell::OnceCell<FxHashMap<u32, Vec<u32>>>,
 }
 
 impl<'a> EufCongruence<'a> {
     /// Wrap an immutable borrow of the EUF solver as a congruence oracle (no
     /// by-sort witness index — the matching/CDQI path never needs it).
     pub fn new(euf: &'a EufSolver) -> Self {
-        EufCongruence { euf, ground_by_sort: FxHashMap::default() }
+        EufCongruence {
+            euf,
+            ground_by_sort: FxHashMap::default(),
+            class_index: core::cell::OnceCell::new(),
+        }
     }
 
     /// As [`new`](Self::new), plus the by-sort ground-term index the P4
@@ -120,7 +151,22 @@ impl<'a> EufCongruence<'a> {
         euf: &'a EufSolver,
         ground_by_sort: FxHashMap<SortId, Vec<TermId>>,
     ) -> Self {
-        EufCongruence { euf, ground_by_sort }
+        EufCongruence { euf, ground_by_sort, class_index: core::cell::OnceCell::new() }
+    }
+
+    /// The lazily-built `root → class members` index over the borrow-frozen
+    /// E-graph (see the [`class_index`](Self::class_index) field docs for the
+    /// lifecycle argument). One ascending O(n) pass on first use — roughly the
+    /// cost of a single [`EufSolver::class_members`] scan — then O(1) amortized
+    /// per [`Congruence::class`] query.
+    fn class_index(&self) -> &FxHashMap<u32, Vec<u32>> {
+        self.class_index.get_or_init(|| {
+            let mut index: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+            for node in self.euf.all_node_indices() {
+                index.entry(self.euf.find_immutable(node)).or_default().push(node);
+            }
+            index
+        })
     }
 }
 
@@ -164,11 +210,26 @@ impl Congruence<OxizSig> for EufCongruence<'_> {
         match self.euf.term_to_node(t) {
             Some(node) => {
                 let r = self.euf.find_immutable(node);
-                self.euf
-                    .class_members(r)
-                    .into_iter()
-                    .filter_map(|idx| self.euf.node_term(idx))
-                    .collect()
+                if let Some(cached) = self.class_index().get(&r) {
+                    // Debug builds cross-check every cached hit against the
+                    // reference O(n) scan — exact `Vec` equality, order
+                    // included. Compiled out in release.
+                    debug_assert_eq!(
+                        *cached,
+                        self.euf.class_members(r),
+                        "class_index diverged from EufSolver::class_members for root {r}"
+                    );
+                    cached.iter().filter_map(|&idx| self.euf.node_term(idx)).collect()
+                } else {
+                    // Unreachable for a live node (every live index lands in
+                    // some index entry); kept so equivalence with the uncached
+                    // path is trivially true.
+                    self.euf
+                        .class_members(r)
+                        .into_iter()
+                        .filter_map(|idx| self.euf.node_term(idx))
+                        .collect()
+                }
             }
             None => vec![t],
         }
@@ -4844,5 +4905,248 @@ mod ccfv_congruence_tests {
         assert_eq!(cong.rep(x), x);
         assert_eq!(cong.class(x), vec![x]);
         assert!(cong.apps_like(x).is_empty());
+    }
+
+    /// The uncached reference path `class()` replaced: root via
+    /// `find_immutable`, members via the O(n) `class_members` scan, mapped
+    /// through `node_term`. Kept verbatim so the cache tests compare against
+    /// exactly what shipped before the index existed.
+    fn class_uncached(euf: &EufSolver, t: TermId) -> Vec<TermId> {
+        match euf.term_to_node(t) {
+            Some(node) => euf
+                .class_members(euf.find_immutable(node))
+                .into_iter()
+                .filter_map(|idx| euf.node_term(idx))
+                .collect(),
+            None => vec![t],
+        }
+    }
+
+    /// Fresh-wrapper equivalence check over EVERY given term — mimics the
+    /// per-round `EufCongruence::new` rebuild in `solver/mod.rs`. Exact `Vec`
+    /// equality (order included): the cached index must be byte-identical to
+    /// the uncached scan, not merely set-equal.
+    fn assert_class_cache_equivalent(euf: &EufSolver, terms: &[TermId], ctx: &str) {
+        let cong = EufCongruence::new(euf);
+        for &t in terms {
+            let cached = cong.class(t);
+            let uncached = class_uncached(euf, t);
+            assert_eq!(cached, uncached, "cached class(t) diverged [{ctx}] t={t:?}");
+            // Second query through the SAME wrapper (index now warm) must
+            // agree with the first.
+            assert_eq!(cong.class(t), cached, "warm-cache re-query diverged [{ctx}] t={t:?}");
+        }
+    }
+
+    /// Deterministic cache-focused case on the textbook congruence graph:
+    /// `f(a), f(b)` with `a = b` — cached `class()` must equal the uncached
+    /// scan for every term, before and after the merge (fresh wrapper each
+    /// time, as per the per-round lifecycle).
+    #[test]
+    fn class_index_matches_uncached_scan_textbook() {
+        let mut euf = EufSolver::new();
+        let terms =
+            [TermId::new(1), TermId::new(2), TermId::new(3), TermId::new(4), TermId::new(99)];
+        let (a_t, b_t, fa_t, fb_t) = (terms[0], terms[1], terms[2], terms[3]);
+        let a = euf.intern(a_t);
+        let b = euf.intern(b_t);
+        let _fa = euf.intern_app(fa_t, 0, [a]);
+        let _fb = euf.intern_app(fb_t, 0, [b]);
+
+        assert_class_cache_equivalent(&euf, &terms, "pre-merge");
+
+        euf.merge(a, b, TermId::new(0)).unwrap();
+        assert_class_cache_equivalent(&euf, &terms, "post-merge");
+
+        // Congruence-closed class is fully enumerated through the cache.
+        let cong = EufCongruence::new(&euf);
+        let class_fa = cong.class(fa_t);
+        assert!(class_fa.contains(&fa_t) && class_fa.contains(&fb_t));
+    }
+
+    /// Randomized equivalence: seed-driven E-graphs with random unions AND
+    /// push/pop cycles. After every mutation batch a FRESH wrapper (the
+    /// per-round snapshot rebuild) must produce classes byte-identical to the
+    /// uncached scan — including immediately after `pop()`, where a stale
+    /// cross-round cache would be exactly the pop-scrub bug class this design
+    /// avoids by construction.
+    #[test]
+    fn class_index_matches_uncached_scan_randomized() {
+        use oxiz_theories::Theory;
+
+        // xorshift32 — deterministic, no rand dependency.
+        fn next(s: &mut u32) -> u32 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *s = x;
+            x
+        }
+
+        for seed in 1u32..=25 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9) | 1;
+            let mut euf = EufSolver::new();
+            let mut nodes: Vec<u32> = Vec::new();
+            let mut terms: Vec<TermId> = Vec::new();
+            let mut next_tid = 1u32;
+
+            // Leaves.
+            let n_leaves = 6 + (next(&mut s) % 6) as usize;
+            for _ in 0..n_leaves {
+                let t = TermId::new(next_tid);
+                next_tid += 1;
+                nodes.push(euf.intern(t));
+                terms.push(t);
+            }
+            // Unary apps over random existing nodes (3 function symbols).
+            for _ in 0..n_leaves {
+                let t = TermId::new(next_tid);
+                next_tid += 1;
+                let arg = nodes[(next(&mut s) as usize) % nodes.len()];
+                nodes.push(euf.intern_app(t, next(&mut s) % 3, [arg]));
+                terms.push(t);
+            }
+            // One never-interned term: class must be the singleton {t}.
+            terms.push(TermId::new(9999));
+
+            assert_class_cache_equivalent(&euf, &terms, &format!("seed {seed} initial"));
+
+            // Interleave merge batches with balanced push/pop cycles.
+            for round in 0..6u32 {
+                if round % 2 == 0 {
+                    euf.push();
+                }
+                for _ in 0..3 {
+                    let a = nodes[(next(&mut s) as usize) % nodes.len()];
+                    let b = nodes[(next(&mut s) as usize) % nodes.len()];
+                    euf.merge(a, b, TermId::new(0)).unwrap();
+                }
+                assert_class_cache_equivalent(
+                    &euf,
+                    &terms,
+                    &format!("seed {seed} round {round} post-merge"),
+                );
+                if round % 2 == 1 {
+                    euf.pop();
+                    assert_class_cache_equivalent(
+                        &euf,
+                        &terms,
+                        &format!("seed {seed} round {round} post-pop"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Adversarial strengthening of the randomized test above (written by the
+    /// verification pass): fresh-wrapper equivalence is asserted after EVERY
+    /// SINGLE operation — each intern, merge, push, and pop, not per batch —
+    /// over random op sequences that add multi-arity apps (congruence
+    /// propagation through 1/2/3-ary signatures), nested scopes (depth ≤ 3),
+    /// and the classic stale-cache killers: post-pop node-index reuse (new
+    /// interns recycle truncated indices) and re-interning of TermIds whose
+    /// nodes were popped. Queried terms include every term ever created, so
+    /// popped terms also exercise the `term_to_node == None → vec![t]` arm on
+    /// both paths.
+    #[test]
+    fn class_index_adversarial_every_op_randomized() {
+        use oxiz_theories::Theory;
+
+        // xorshift32 — deterministic, no rand dependency.
+        fn next(s: &mut u32) -> u32 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *s = x;
+            x
+        }
+
+        for seed in 1u32..=40 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9) | 1;
+            let mut euf = EufSolver::new();
+            // Live node indices (mirror truncated on pop; `intern_app` may
+            // hash-cons onto an older index — a duplicate entry is harmless,
+            // it only feeds the merge-candidate pool).
+            let mut nodes: Vec<u32> = Vec::new();
+            // Mirror-length checkpoint per open scope.
+            let mut scope_marks: Vec<usize> = Vec::new();
+            // Every term ever created — queried after every op, live or not.
+            let mut terms: Vec<TermId> = vec![TermId::new(9999)];
+            let mut next_tid = 1u32;
+
+            // Seed leaves so merges have material from op 0.
+            for _ in 0..4 {
+                let t = TermId::new(next_tid);
+                next_tid += 1;
+                nodes.push(euf.intern(t));
+                terms.push(t);
+            }
+            assert_class_cache_equivalent(&euf, &terms, &format!("seed {seed} seeded"));
+
+            for op in 0..120u32 {
+                let ctx = format!("seed {seed} op {op}");
+                match next(&mut s) % 10 {
+                    // Merge two random live nodes (40%): congruence closure
+                    // can cascade through the app layers.
+                    0..=3 => {
+                        let a = nodes[(next(&mut s) as usize) % nodes.len()];
+                        let b = nodes[(next(&mut s) as usize) % nodes.len()];
+                        euf.merge(a, b, TermId::new(0)).unwrap();
+                    }
+                    // Intern a fresh leaf (10%) — after a pop this recycles a
+                    // truncated node index.
+                    4 => {
+                        let t = TermId::new(next_tid);
+                        next_tid += 1;
+                        nodes.push(euf.intern(t));
+                        terms.push(t);
+                    }
+                    // Intern an app of random arity 1..=3 over random live
+                    // nodes (20%), 4 function symbols.
+                    5..=6 => {
+                        let t = TermId::new(next_tid);
+                        next_tid += 1;
+                        let arity = 1 + (next(&mut s) % 3) as usize;
+                        let args: Vec<u32> = (0..arity)
+                            .map(|_| nodes[(next(&mut s) as usize) % nodes.len()])
+                            .collect();
+                        nodes.push(euf.intern_app(t, next(&mut s) % 4, args));
+                        terms.push(t);
+                    }
+                    // Re-intern some currently NON-LIVE TermId as a leaf
+                    // (10%): same TermId, brand-new (recycled) node index.
+                    7 => {
+                        let start = (next(&mut s) as usize) % terms.len();
+                        if let Some(&t) = terms[start..]
+                            .iter()
+                            .chain(terms[..start].iter())
+                            .find(|&&t| euf.term_to_node(t).is_none())
+                        {
+                            nodes.push(euf.intern(t));
+                        }
+                    }
+                    // Push (10%), nested up to depth 3.
+                    8 => {
+                        if scope_marks.len() < 3 {
+                            euf.push();
+                            scope_marks.push(nodes.len());
+                        }
+                    }
+                    // Pop (10%): truncate the mirror to the scope mark.
+                    _ => {
+                        if let Some(mark) = scope_marks.pop() {
+                            euf.pop();
+                            nodes.truncate(mark);
+                        }
+                    }
+                }
+                // THE invariant: after every single operation a fresh
+                // per-round wrapper is byte-identical to the uncached scan
+                // for every term ever seen.
+                assert_class_cache_equivalent(&euf, &terms, &ctx);
+            }
+        }
     }
 }
