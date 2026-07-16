@@ -178,3 +178,171 @@ fn frontier_survives_a_cdqi_short_circuited_round() {
     }
     assert_eq!(e.rejected(), 0);
 }
+
+// ── engine wall-clock deadline (set_deadline → budget_hit → BudgetExhausted) ──
+
+/// A PARSED-trigger quantifier `∀x. p(x) :pattern (p x)` with a ground seed
+/// `p(a)` the trigger genuinely matches (so e-matching WOULD find the
+/// instance), plus a model that can NOT verify the quantifier. Distinct from
+/// `fuel_quant`: the trigger is the user's `:pattern`, so at saturation the
+/// quantifier is EXEMPT from the per-quant model-verify loop — its `Sat`
+/// rests entirely on "e-matching added nothing".
+fn parsed_trigger_quant(t: &mut Toy) -> (Tid, Tid) {
+    const INT: u32 = 2;
+    const P: u32 = 40;
+    let a = t.konst(P + 100, INT);
+    let pa = t.app(P, &[a], BOOL); // ground seed p(a)
+    let x = t.var(600, INT);
+    let px = t.app(P, &[x], BOOL);
+    let pat: &[Tid] = &[px];
+    let q = t.forall(&[(600, INT)], &[pat], px, BOOL); // parsed :pattern (p x)
+    (q, pa)
+}
+
+/// THE SOUNDNESS PIN for the deadline fix. Without a deadline this scenario
+/// saturates to `Sat` by parsed-trigger semantics (round 1 emits the `p(a)`
+/// instance, round 2's e-match adds nothing). With an ALREADY-EXPIRED deadline
+/// the e-match work is aborted — and the verdict MUST be `BudgetExhausted`
+/// (host: `Unknown`), NEVER `Saturated`/`Sat`: the per-quant verify loop skips
+/// parsed-trigger quantifiers, and the host's `verify_clean_saturated`
+/// re-solve does not re-run e-matching, so a silently-skipped e-match would
+/// sail through as a spurious `Sat` with the violating instance undiscovered.
+#[test]
+fn expired_deadline_never_saturates_a_parsed_trigger_quantifier() {
+    // Control: no deadline ⇒ the parsed-trigger path saturates to Sat with
+    // exactly the one e-matched instance (the behaviour the pin protects).
+    let mut t = Toy::new();
+    let (q, pa) = parsed_trigger_quant(&mut t);
+    let mut e = Engine::new(Config::default());
+    e.assert(&t, pa);
+    e.assert(&t, q);
+    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: false });
+    assert_eq!(verdict, "Sat", "control: parsed-trigger saturation");
+    assert_eq!(lemmas, 1, "control: the p(a) instance was e-matched");
+
+    // Pin: the same scenario with an expired deadline must abort, not saturate.
+    let mut t = Toy::new();
+    let (q, pa) = parsed_trigger_quant(&mut t);
+    let mut e = Engine::new(Config::default());
+    e.assert(&t, pa);
+    e.assert(&t, q);
+    e.set_deadline(Some(std::time::Instant::now() - std::time::Duration::from_millis(1)));
+    let m = Gated { active: true, verifies: false };
+    // Single-round shape: zero lemmas + BudgetExhausted (never Saturated).
+    assert!(
+        matches!(e.round_with(&mut t, &m), Verdict::BudgetExhausted),
+        "expired deadline ⇒ BudgetExhausted, never Saturated"
+    );
+    // And through the host-shaped harness: "Unknown" with zero-or-partial
+    // lemmas — the harness loops, so this also pins that NO later round can
+    // sneak to Saturated while the deadline stays expired.
+    let (verdict, lemmas) = run(&mut e, &mut t, &m);
+    assert_eq!(verdict, "Unknown", "aborted e-match must surface as Unknown");
+    assert_eq!(lemmas, 0, "zero-or-partial lemmas on the aborted path");
+}
+
+/// A parsed-trigger quantifier with TWO genuine matches (`p(a)`, `p(b)`) but
+/// `max_match_substs = 1`: the matcher truncates to one substitution and
+/// raises the abort signal. Round 1 emits the one kept instance → `NewLemmas`
+/// (with `budget_hit` set but overridden by the lemmas, by design). Round 2
+/// re-runs the SAME e-match over the un-advanced watermark span, truncates to
+/// the SAME substitution, which `seen`-dedups to ZERO lemmas — and the verdict
+/// MUST be `BudgetExhausted`, never `Saturated`: the dropped `p(b)` match is
+/// still undiscovered, so "e-matching added nothing" is a lie here.
+///
+/// This is the ONE deterministic shape where the `ematch_aborted ⇒ budget_hit`
+/// line in `round_with_cong` stands ALONE between an abort and a spurious
+/// `Sat` (an expired DEADLINE is also caught by the per-quant loop-head check,
+/// so `expired_deadline_never_saturates_a_parsed_trigger_quantifier` does not
+/// exercise that line; a `max_match_substs` abort reaches it exclusively).
+/// It equally pins the watermark NON-advance on abort: had `scanned[qi]`
+/// advanced in round 1, round 2 would see an empty frontier, e-match would
+/// return (∅, aborted=false), and the round would sail to `Saturated`.
+#[test]
+fn max_substs_abort_with_all_lemmas_deduped_never_saturates() {
+    const INT: u32 = 2;
+    const P: u32 = 40;
+    let mut t = Toy::new();
+    let a = t.konst(P + 100, INT);
+    let b = t.konst(P + 101, INT);
+    let pa = t.app(P, &[a], BOOL);
+    let pb = t.app(P, &[b], BOOL);
+    let x = t.var(600, INT);
+    let px = t.app(P, &[x], BOOL);
+    let pat: &[Tid] = &[px];
+    let q = t.forall(&[(600, INT)], &[pat], px, BOOL); // parsed :pattern (p x)
+
+    let mut e = Engine::new(Config { max_match_substs: 1, ..Config::default() });
+    e.assert(&t, pa);
+    e.assert(&t, pb);
+    e.assert(&t, q);
+    let m = Gated { active: true, verifies: false };
+
+    // Round 1: truncated match set (1 of 2) still emits its kept instance.
+    match e.round_with(&mut t, &m) {
+        Verdict::NewLemmas(ls) => assert_eq!(ls.len(), 1, "one truncated-set instance"),
+        _ => panic!("round 1 must be NewLemmas(1)"),
+    }
+    // Round 2: same truncated set dedups to zero lemmas — the abort signal is
+    // now the ONLY thing standing between the dropped p(b) match and a
+    // spurious Saturated/Sat.
+    assert!(
+        matches!(e.round_with(&mut t, &m), Verdict::BudgetExhausted),
+        "a max_match_substs abort with zero net lemmas must be BudgetExhausted, never Saturated"
+    );
+
+    // Control (exactly-at-cap): cap == the true match count ⇒ nothing dropped,
+    // NO abort, the watermark advances, and saturation is genuinely earned.
+    let mut t2 = Toy::new();
+    let a2 = t2.konst(P + 100, INT);
+    let b2 = t2.konst(P + 101, INT);
+    let pa2 = t2.app(P, &[a2], BOOL);
+    let pb2 = t2.app(P, &[b2], BOOL);
+    let x2 = t2.var(600, INT);
+    let px2 = t2.app(P, &[x2], BOOL);
+    let pat2: &[Tid] = &[px2];
+    let q2 = t2.forall(&[(600, INT)], &[pat2], px2, BOOL);
+    let mut e2 = Engine::new(Config { max_match_substs: 2, ..Config::default() });
+    e2.assert(&t2, pa2);
+    e2.assert(&t2, pb2);
+    e2.assert(&t2, q2);
+    let (verdict, lemmas) = run(&mut e2, &mut t2, &m);
+    assert_eq!(verdict, "Sat", "len == max_substs with nothing dropped must NOT abort");
+    assert_eq!(lemmas, 2, "both instances emitted at the exact cap");
+}
+
+/// No stale-deadline residue: an expired deadline aborts the round, and
+/// clearing it (set_deadline(None)) restores full normal behaviour on the
+/// SAME engine — the persistence property the per-round `set_deadline` call
+/// in the host relies on.
+#[test]
+fn deadline_cleared_after_expiry_restores_normal_rounds() {
+    let mut t = Toy::new();
+    let (q, pa) = parsed_trigger_quant(&mut t);
+    let mut e = Engine::new(Config::default());
+    e.assert(&t, pa);
+    e.assert(&t, q);
+    let m = Gated { active: true, verifies: false };
+
+    // Expired deadline: aborted round, no lemmas.
+    e.set_deadline(Some(std::time::Instant::now() - std::time::Duration::from_millis(1)));
+    assert!(matches!(e.round_with(&mut t, &m), Verdict::BudgetExhausted));
+
+    // Cleared: the SAME engine now e-matches the seed and saturates normally.
+    e.set_deadline(None);
+    let (verdict, lemmas) = run(&mut e, &mut t, &m);
+    assert_eq!(verdict, "Sat", "no stale-deadline residue after set_deadline(None)");
+    assert_eq!(lemmas, 1, "the p(a) instance is found once the deadline is lifted");
+    assert_eq!(e.rejected(), 0);
+
+    // And a FUTURE deadline behaves like no deadline for fast rounds.
+    let mut t2 = Toy::new();
+    let (q2, pa2) = parsed_trigger_quant(&mut t2);
+    let mut e2 = Engine::new(Config::default());
+    e2.assert(&t2, pa2);
+    e2.assert(&t2, q2);
+    e2.set_deadline(Some(std::time::Instant::now() + std::time::Duration::from_secs(600)));
+    let (verdict2, lemmas2) = run(&mut e2, &mut t2, &m);
+    assert_eq!(verdict2, "Sat", "a far-future deadline does not perturb fast rounds");
+    assert_eq!(lemmas2, 1);
+}

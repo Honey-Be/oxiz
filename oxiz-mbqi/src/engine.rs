@@ -45,6 +45,16 @@ pub enum Verdict<T> {
 pub struct Config {
     pub max_instances: usize,
     pub max_tuples_per_quant: usize,
+    /// Per-`ematch_all`-call cap on the raw CCFV substitution set (passed to
+    /// [`ccfv::match_trigger`]/[`ccfv::match_trigger_multi`] as `max_substs`).
+    /// A multi-pattern join over a large ground index is a PRODUCT of seed
+    /// sets, so its match set can dwarf `max_instances` before a single lemma
+    /// is emitted; this bounds that memory/time blow-up at the source. Hitting
+    /// the cap truncates the match set and ABORTS the e-match (the abort flag
+    /// routes into `budget_hit` → `Verdict::BudgetExhausted` → the host's
+    /// `Unknown`) — it never silently drops matches, which could otherwise
+    /// surface as a spurious `Saturated`/`Sat`.
+    pub max_match_substs: usize,
     /// Whether trigger e-matching runs **modulo congruence**. CCFV is the sole
     /// matcher either way; this flag only selects the *oracle* `ematch_all`
     /// passes it: the real congruence (congruence-aware — fires modulo `E`) when
@@ -78,6 +88,7 @@ impl Default for Config {
         Config {
             max_instances: 100_000,
             max_tuples_per_quant: 4_096,
+            max_match_substs: 100_000,
             ccfv_ematch: false,
             ccfv_model_compl: false,
         }
@@ -93,6 +104,15 @@ pub struct Engine<S: Sig> {
     scanned: Vec<u32>,
     emitted: usize,
     rejected: usize,
+    /// Wall-clock deadline for round work (set by the host per round via
+    /// [`set_deadline`](Self::set_deadline); `None` = unbounded). Checked at
+    /// the per-quant loop head and threaded into the CCFV matchers so a
+    /// pathological e-match aborts instead of overshooting the host's guard.
+    /// Any deadline abort routes into `budget_hit` →
+    /// [`Verdict::BudgetExhausted`] — NEVER a silent skip, which could
+    /// surface as a spurious `Saturated`/`Sat` (a parsed-trigger quantifier's
+    /// saturation rests entirely on "e-matching added nothing").
+    deadline: Option<std::time::Instant>,
     cfg: Config,
 }
 
@@ -105,12 +125,28 @@ impl<S: Sig> Engine<S> {
             scanned: Vec::new(),
             emitted: 0,
             rejected: 0,
+            deadline: None,
             cfg,
         }
     }
 
     pub fn rejected(&self) -> usize {
         self.rejected
+    }
+
+    /// Set (or clear) the wall-clock deadline the next round(s) honour. The
+    /// host should call this before EVERY round — the engine persists across
+    /// rounds (and potentially across check-sats), so a stale deadline from an
+    /// earlier check would otherwise linger (the assert-time-populated-cache /
+    /// stale-state bug class). Idempotent and cheap.
+    pub fn set_deadline(&mut self, d: Option<std::time::Instant>) {
+        self.deadline = d;
+    }
+
+    #[inline]
+    fn deadline_hit(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     /// Register an asserted top-level term: index its ground subterms and
@@ -233,6 +269,16 @@ impl<S: Sig> Engine<S> {
                 budget_hit = true;
                 break;
             }
+            // Wall-clock guard at the loop head: bounds the between-quant work
+            // (CDQI, enumeration, lazy trigger inference) as well as the
+            // e-match itself. MUST route through `budget_hit` — a bare `break`
+            // with zero lemmas would fall through to the saturation verdict
+            // and a parsed-trigger quantifier that never got its e-match this
+            // round would be read as saturated → spurious `Sat`.
+            if self.deadline_hit() {
+                budget_hit = true;
+                break;
+            }
             // Relevance gating: skip quantifiers whose `Q` is not asserted true
             // in the current model (respects the guard; vacuously satisfied).
             if !model.is_active(lang, self.quants[qi].term) {
@@ -324,7 +370,18 @@ impl<S: Sig> Engine<S> {
             // chain. E-matching is frontier-filtered and terminates, so the
             // divergence-defusing role of the short-circuit is not needed.
             if !self.quants[qi].triggers.is_empty() {
-                let bindings = self.ematch_all(lang, qi, cong);
+                let (bindings, ematch_aborted) = self.ematch_all(lang, qi, cong);
+                // Deadline/`max_match_substs` abort: the match set is PARTIAL.
+                // Route it into `budget_hit` (→ `BudgetExhausted` when the
+                // round yields no lemmas) so an aborted e-match can never be
+                // read as "added nothing ⇒ saturated" — THE spurious-Sat risk
+                // (parsed-trigger quantifiers are exempt from the per-quant
+                // saturation verify loop below, and the host's
+                // `verify_clean_saturated` re-solve does not re-run
+                // e-matching, so nothing downstream would catch it).
+                if ematch_aborted {
+                    budget_hit = true;
+                }
                 // #404 — the frontier watermark advances HERE, in the branch
                 // that actually CONSUMED the frontier, not in a blanket
                 // end-of-round sweep. The old sweep advanced `scanned[qi]`
@@ -337,7 +394,18 @@ impl<S: Sig> Engine<S> {
                 // sweeps past the seed terms, every later `ematch_all` sees
                 // an empty frontier). Re-scans after a skipped round are
                 // idempotent — `emit` dedups by `(qi, tuple)`.
-                self.scanned[qi] = round_start;
+                //
+                // On an ABORTED e-match the watermark must NOT advance: the
+                // frontier was only PARTIALLY consumed, and sweeping past the
+                // unscanned seeds would lose their matches forever — a later
+                // round (same check, e.g. after a `max_match_substs` abort
+                // whose lemmas kept the solve alive) would then see an empty
+                // frontier, add nothing, and saturate with a violating
+                // instance still undiscovered → spurious `Sat`. Re-scanning
+                // the whole span next round is idempotent (`emit` dedups).
+                if !ematch_aborted {
+                    self.scanned[qi] = round_start;
+                }
                 if std::env::var_os("OXIZ_MBQI_DBG").is_some() {
                     eprintln!(
                         "[mbqi-dbg] quant {qi}: ematch_all -> {} binding(s), emitted so far {}",
@@ -493,18 +561,25 @@ impl<S: Sig> Engine<S> {
     /// EVERY bound variable (an instance must be fully ground — the same fullness
     /// filter the syntactic matcher applied; the canonical order also keeps the
     /// `seen` dedup tuple aligned with CDQI/enumeration).
+    ///
+    /// The second return value is the ABORT flag: `true` when any group's CCFV
+    /// match was cut short by the engine deadline or `cfg.max_match_substs`
+    /// (the bindings are then a PARTIAL match set). The caller MUST fold it
+    /// into `budget_hit` and, on abort, must NOT advance the frontier
+    /// watermark — see the call site in [`round_with_cong`](Self::round_with_cong).
     fn ematch_all<L: TermLang<Sig = S>, C: Congruence<S>>(
         &self,
         lang: &L,
         qi: usize,
         cong: &C,
-    ) -> Vec<Vec<(S::VarName, S::Term)>> {
+    ) -> (Vec<Vec<(S::VarName, S::Term)>>, bool) {
         let q = &self.quants[qi];
         let watermark = self.scanned[qi];
         let holes: Vec<S::VarName> = q.vars.iter().map(|(n, _)| *n).collect();
         let mut out = Vec::new();
+        let mut aborted = false;
         for group in &q.triggers {
-            let raw: Vec<ccfv::Subst<S>> = if group.len() == 1 {
+            let (raw, group_aborted): (Vec<ccfv::Subst<S>>, bool) = if group.len() == 1 {
                 // Frontier filter: only match against ground terms (with the
                 // trigger head) that are NEW since this quantifier last scanned.
                 // Matches whose candidate is old were already found in a prior
@@ -524,9 +599,25 @@ impl<S: Sig> Engine<S> {
                 // it also fires when the pattern matches a candidate *modulo
                 // congruence*; with `NoCong` it is exactly syntactic.
                 if self.cfg.ccfv_ematch {
-                    ccfv::match_trigger(cong, lang, group[0], &holes, &cands)
+                    ccfv::match_trigger(
+                        cong,
+                        lang,
+                        group[0],
+                        &holes,
+                        &cands,
+                        self.deadline,
+                        self.cfg.max_match_substs,
+                    )
                 } else {
-                    ccfv::match_trigger(&NoCong, lang, group[0], &holes, &cands)
+                    ccfv::match_trigger(
+                        &NoCong,
+                        lang,
+                        group[0],
+                        &holes,
+                        &cands,
+                        self.deadline,
+                        self.cfg.max_match_substs,
+                    )
                 }
             } else {
                 // Multi-pattern join: per-pattern candidate seeds (the ground
@@ -548,11 +639,28 @@ impl<S: Sig> Engine<S> {
                     continue;
                 }
                 if self.cfg.ccfv_ematch {
-                    ccfv::match_trigger_multi(cong, lang, group, &holes, &seeds)
+                    ccfv::match_trigger_multi(
+                        cong,
+                        lang,
+                        group,
+                        &holes,
+                        &seeds,
+                        self.deadline,
+                        self.cfg.max_match_substs,
+                    )
                 } else {
-                    ccfv::match_trigger_multi(&NoCong, lang, group, &holes, &seeds)
+                    ccfv::match_trigger_multi(
+                        &NoCong,
+                        lang,
+                        group,
+                        &holes,
+                        &seeds,
+                        self.deadline,
+                        self.cfg.max_match_substs,
+                    )
                 }
             };
+            aborted |= group_aborted;
             // Normalise to `q.vars` order; drop any binding that is not fully ground.
             for s in &raw {
                 let mut binding: Vec<(S::VarName, S::Term)> = Vec::with_capacity(q.vars.len());
@@ -571,7 +679,7 @@ impl<S: Sig> Engine<S> {
                 }
             }
         }
-        out
+        (out, aborted)
     }
 
     fn enumerate<L: TermLang<Sig = S>>(

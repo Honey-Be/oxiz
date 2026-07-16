@@ -48,23 +48,54 @@ fn subst_get<S: Sig>(s: &Subst<S>, name: S::VarName) -> Option<S::Term> {
 /// `seeds`, modulo the congruence `cong`. Returns every substitution `σ` with
 /// `E ⊨ pat·σ ≃ g` for some `g ∈ seeds`. (For trigger e-matching the seeds are
 /// the ground applications sharing `pat`'s head — supplied by the caller, P2.)
+///
+/// **Budget/abort contract (SOUNDNESS-CRITICAL for the caller):** the search is
+/// bounded by an optional wall-clock `deadline` and a `max_substs` cap on the
+/// result set, polled every 1024 seed iterations (one iteration = one top-level
+/// `unify` call, measured mean 1.4–7.5 µs, max < 3 ms — so the poll blind spot
+/// is ~10 ms and the poll overhead is ≪ 1 %). The returned bool is the **abort
+/// signal**: `true` means the result is PARTIAL (the deadline passed or the
+/// result was truncated to `max_substs`). A partial match set means "e-matching
+/// added nothing" can no longer be read as saturation — the engine MUST route
+/// an abort into `budget_hit` → `Verdict::BudgetExhausted` → `Unknown`, never
+/// `Saturated`/`Sat`. Pass `(None, usize::MAX)` for the exact unbounded
+/// behaviour (always `false`). Every returned substitution is a genuine match
+/// (truncation only DROPS matches, it never fabricates one), so using the
+/// partial set for instantiation stays sound.
 pub fn match_trigger<S, C, L>(
     cong: &C,
     host: &L,
     pat: S::Term,
     holes: &[S::VarName],
     seeds: &[S::Term],
-) -> Vec<Subst<S>>
+    deadline: Option<std::time::Instant>,
+    max_substs: usize,
+) -> (Vec<Subst<S>>, bool)
 where
     S: Sig,
     C: Congruence<S>,
     L: TermLang<Sig = S>,
 {
     let mut out = Vec::new();
-    for &g in seeds {
+    let mut aborted = false;
+    for (i, &g) in seeds.iter().enumerate() {
+        if i & 0x3FF == 0
+            && (out.len() >= max_substs
+                || deadline.is_some_and(|d| std::time::Instant::now() >= d))
+        {
+            aborted = true;
+            break;
+        }
         out.extend(unify(cong, host, pat, g, holes, Subst::<S>::new()));
     }
-    out
+    // Enforce the cap between polls too: a truncated result MUST carry the
+    // abort signal (dropping matches silently would let the engine read a
+    // partial e-match as saturation — the spurious-Sat risk this exists for).
+    if out.len() > max_substs {
+        out.truncate(max_substs);
+        aborted = true;
+    }
+    (out, aborted)
 }
 
 /// Match a **multi-pattern** trigger group: every pattern in `patterns` must
@@ -83,40 +114,82 @@ where
 /// NOT require the first pattern to bind every variable — partial bindings are
 /// threaded forward and completed by the remaining patterns — so a genuine
 /// multi-pattern `((f x) (g y))` that no single pattern fully covers now matches.
+///
+/// **Budget/abort contract:** same as [`match_trigger`] — `deadline` and
+/// `max_substs` are polled every 1024 iterations (one iteration = one `unify`
+/// call, counted across the seeding loop AND the acc × seeds join loop, whose
+/// product is where the corpus blow-ups live). The returned bool is the abort
+/// signal; on abort the result is PARTIAL: substitutions from an interrupted
+/// join level satisfy only the patterns joined so far. That is still SOUND to
+/// instantiate with (any ground tuple is a sound instance of a universal —
+/// triggers are relevance heuristics, and the fullness filter in the engine
+/// drops under-bound substitutions anyway), but it is NOT the full match set,
+/// so the caller MUST route the abort into `budget_hit`, never `Saturated`.
+/// Pass `(None, usize::MAX)` for the exact unbounded behaviour.
 pub fn match_trigger_multi<S, C, L>(
     cong: &C,
     host: &L,
     patterns: &[S::Term],
     holes: &[S::VarName],
     seeds: &[Vec<S::Term>],
-) -> Vec<Subst<S>>
+    deadline: Option<std::time::Instant>,
+    max_substs: usize,
+) -> (Vec<Subst<S>>, bool)
 where
     S: Sig,
     C: Congruence<S>,
     L: TermLang<Sig = S>,
 {
     if patterns.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
+    }
+    let mut iters = 0usize;
+    let mut aborted = false;
+    // One poll per 1024 unify calls, shared across the seeding and join loops.
+    macro_rules! poll {
+        ($len:expr) => {
+            iters & 0x3FF == 0
+                && ($len >= max_substs
+                    || deadline.is_some_and(|d| std::time::Instant::now() >= d))
+        };
     }
     // Seed with the first pattern's matches (each a fresh accumulator).
     let mut accs: Vec<Subst<S>> = Vec::new();
     for &g in seeds.first().map(Vec::as_slice).unwrap_or(&[]) {
+        if poll!(accs.len()) {
+            aborted = true;
+            break;
+        }
+        iters += 1;
         accs.extend(unify(cong, host, patterns[0], g, holes, Subst::<S>::new()));
     }
     // Filter-extend by each remaining pattern, threading the substitution.
-    for (i, &p) in patterns.iter().enumerate().skip(1) {
-        let mut next = Vec::new();
-        for acc in &accs {
-            for &g in seeds.get(i).map(Vec::as_slice).unwrap_or(&[]) {
-                next.extend(unify(cong, host, p, g, holes, acc.clone()));
+    if !aborted {
+        for (i, &p) in patterns.iter().enumerate().skip(1) {
+            let mut next = Vec::new();
+            'join: for acc in &accs {
+                for &g in seeds.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+                    if poll!(next.len()) {
+                        aborted = true;
+                        break 'join;
+                    }
+                    iters += 1;
+                    next.extend(unify(cong, host, p, g, holes, acc.clone()));
+                }
+            }
+            accs = next;
+            if aborted || accs.is_empty() {
+                break;
             }
         }
-        accs = next;
-        if accs.is_empty() {
-            break;
-        }
     }
-    accs
+    // Enforce the cap between polls too (see `match_trigger`): a truncated
+    // result MUST carry the abort signal.
+    if accs.len() > max_substs {
+        accs.truncate(max_substs);
+        aborted = true;
+    }
+    (accs, aborted)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -385,6 +458,11 @@ where
         // An application `f(p̄)`: `g`'s congruence class must contain an
         // `f`-application `f(t̄)` of the same arity; DECOMPOSE into the arguments.
         // Iterating the class members that match the head is the SPLIT branch.
+        // (Future throughput optimization, deliberately NOT part of the
+        // deadline/max_substs budget fix: `cong.class(g)` allocates a fresh
+        // member Vec per call — caching class members per (class-rep,
+        // congruence-generation) would cut the dominant allocation in hot
+        // e-match loops. Excluded from the minimal viable fix on purpose.)
         TermView::App { sym } => {
             let p_args = host.children(pat);
             let mut results = Vec::new();
@@ -513,7 +591,7 @@ mod tests {
         let fx = h.app(10, &[x], S);
 
         let cong = ToyCong::new(vec![]); // trivial congruence
-        let res = match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa]);
+        let res = match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa], None, usize::MAX).0;
         assert_eq!(res.len(), 1);
         assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
     }
@@ -534,13 +612,13 @@ mod tests {
 
         // c ≡ g(a)
         let cong = ToyCong::new(vec![vec![c, ga]]);
-        let res = match_trigger::<ToySig, _, _>(&cong, &h, fgx, &[X], &[fc]);
+        let res = match_trigger::<ToySig, _, _>(&cong, &h, fgx, &[X], &[fc], None, usize::MAX).0;
         assert_eq!(res.len(), 1, "congruence match should find x ↦ a");
         assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
 
         // control: without the congruence (c alone) the same match fails.
         let cong0 = ToyCong::new(vec![]);
-        assert!(match_trigger::<ToySig, _, _>(&cong0, &h, fgx, &[X], &[fc]).is_empty());
+        assert!(match_trigger::<ToySig, _, _>(&cong0, &h, fgx, &[X], &[fc], None, usize::MAX).0.is_empty());
     }
 
     #[test]
@@ -557,11 +635,11 @@ mod tests {
 
         // a ≡ b, but d apart.
         let cong = ToyCong::new(vec![vec![a, b]]);
-        let r1 = match_trigger::<ToySig, _, _>(&cong, &h, fxx, &[X], &[fab]);
+        let r1 = match_trigger::<ToySig, _, _>(&cong, &h, fxx, &[X], &[fab], None, usize::MAX).0;
         assert_eq!(r1.len(), 1, "f(x,x) ~ f(a,b) with a≡b");
         assert_eq!(subst_get::<ToySig>(&r1[0], X), Some(a));
 
-        let r2 = match_trigger::<ToySig, _, _>(&cong, &h, fxx, &[X], &[fad]);
+        let r2 = match_trigger::<ToySig, _, _>(&cong, &h, fxx, &[X], &[fad], None, usize::MAX).0;
         assert!(r2.is_empty(), "f(x,x) ≁ f(a,d) with a≢d");
     }
 
@@ -579,7 +657,7 @@ mod tests {
 
         // f(a) ≡ f(b) (one class); match the pattern against that class.
         let cong = ToyCong::new(vec![vec![fa, fb]]);
-        let res = match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa]);
+        let res = match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa], None, usize::MAX).0;
         let binds: Vec<u32> = res.iter().filter_map(|s| subst_get::<ToySig>(s, X)).collect();
         assert_eq!(res.len(), 2, "SPLIT over the two class members");
         assert!(binds.contains(&a) && binds.contains(&b));
@@ -594,7 +672,7 @@ mod tests {
         let ha = h.app(99, &[a], S);
         let fx = h.app(10, &[x], S);
         let cong = ToyCong::new(vec![]);
-        assert!(match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[ha]).is_empty());
+        assert!(match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[ha], None, usize::MAX).0.is_empty());
     }
 
     const Y: u32 = 101; // a second hole name
@@ -618,7 +696,7 @@ mod tests {
 
         let cong = ToyCong::new(vec![]); // syntactic (NoCong-equivalent)
         let res =
-            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![gb]]);
+            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![gb]], None, usize::MAX).0;
         assert_eq!(res.len(), 1, "the two patterns join into one substitution");
         assert_eq!(subst_get::<ToySig>(&res[0], X), Some(a));
         assert_eq!(subst_get::<ToySig>(&res[0], Y), Some(b));
@@ -641,14 +719,14 @@ mod tests {
         // a ≡ c ⟹ consistent, one match x↦a (rep of the class).
         let cong = ToyCong::new(vec![vec![a, c]]);
         let r1 =
-            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gx], &[X], &[vec![fa], vec![gc]]);
+            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gx], &[X], &[vec![fa], vec![gc]], None, usize::MAX).0;
         assert_eq!(r1.len(), 1, "shared hole consistent under a≡c");
         assert_eq!(subst_get::<ToySig>(&r1[0], X), Some(a));
 
         // a ≢ c ⟹ no consistent binding for the shared hole.
         let cong0 = ToyCong::new(vec![]);
         let r2 =
-            match_trigger_multi::<ToySig, _, _>(&cong0, &h, &[fx, gx], &[X], &[vec![fa], vec![gc]]);
+            match_trigger_multi::<ToySig, _, _>(&cong0, &h, &[fx, gx], &[X], &[vec![fa], vec![gc]], None, usize::MAX).0;
         assert!(r2.is_empty(), "shared hole inconsistent under a≢c");
     }
 
@@ -664,7 +742,7 @@ mod tests {
         let gy = h.app(20, &[y], S);
         let cong = ToyCong::new(vec![]);
         assert!(
-            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![]])
+            match_trigger_multi::<ToySig, _, _>(&cong, &h, &[fx, gy], &[X, Y], &[vec![fa], vec![]], None, usize::MAX).0
                 .is_empty()
         );
     }
@@ -755,5 +833,166 @@ mod tests {
         let c = Constraint { cubes: vec![vec![Lit::Eq(fx, gx)]] };
         let res = solve::<ToySig, _, _>(&cong, &h, &c, &[(X, S)], 64);
         assert_eq!(res.len(), 1, "an undecidable literal is kept (superset), not dropped");
+    }
+
+    // ── deadline / max_substs budget-abort contract ─────────────────────────
+    // THE soundness-critical property: an interrupted match MUST come back
+    // with `aborted == true` so the engine can route it into `budget_hit` →
+    // `BudgetExhausted` → the host's `Unknown` (a silently-partial result
+    // would be read as "e-matching added nothing" ⇒ spurious `Saturated`/Sat).
+
+    /// The SPLIT scenario (two matches) with an ALREADY-EXPIRED deadline: the
+    /// iteration-0 poll fires before any unify runs ⇒ empty partial result +
+    /// the mandatory abort signal.
+    #[test]
+    fn expired_deadline_aborts_match_trigger_with_abort_signal() {
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let fa = h.app(10, &[a], S);
+        let fb = h.app(10, &[b], S);
+        let fx = h.app(10, &[x], S);
+        let cong = ToyCong::new(vec![vec![fa, fb]]);
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let (res, aborted) =
+            match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa], Some(expired), usize::MAX);
+        assert!(aborted, "expired deadline MUST raise the abort signal");
+        assert!(res.is_empty(), "aborted at iteration 0 ⇒ empty partial result");
+    }
+
+    /// Same scenario with `max_substs = 1` (< the 2 genuine matches): the
+    /// result is truncated to EXACTLY `max_substs` and the abort signal is
+    /// raised — truncation must never be silent.
+    #[test]
+    fn max_substs_truncates_to_exactly_the_cap_and_aborts() {
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let fa = h.app(10, &[a], S);
+        let fb = h.app(10, &[b], S);
+        let fx = h.app(10, &[x], S);
+        let cong = ToyCong::new(vec![vec![fa, fb]]);
+        let (res, aborted) =
+            match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa], None, 1);
+        assert!(aborted, "truncation MUST raise the abort signal");
+        assert_eq!(res.len(), 1, "truncated to exactly max_substs");
+        // The one kept substitution is still a genuine match (a or b).
+        let bind = subst_get::<ToySig>(&res[0], X);
+        assert!(bind == Some(a) || bind == Some(b));
+    }
+
+    /// The 1024-iteration poll cadence, not just the iteration-0 poll: 1300
+    /// seeds each yielding one substitution with `max_substs = 100` aborts at
+    /// the i = 1024 poll and truncates to exactly 100.
+    #[test]
+    fn max_substs_poll_fires_at_the_1024_cadence() {
+        let mut h = Toy::new();
+        let x = h.var(X, S);
+        let fx = h.app(10, &[x], S);
+        let seeds: Vec<u32> = (0..1300u32)
+            .map(|i| {
+                let c = h.konst(1000 + i, S);
+                h.app(10, &[c], S)
+            })
+            .collect();
+        let cong = ToyCong::new(vec![]);
+        let (res, aborted) =
+            match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &seeds, None, 100);
+        assert!(aborted, "cap exceeded at the 1024-iteration poll ⇒ abort");
+        assert_eq!(res.len(), 100, "truncated to exactly max_substs");
+    }
+
+    /// `(None, usize::MAX)` is the exact pre-fix behaviour: the SPLIT scenario
+    /// yields EXACTLY the pinned substitution set {x↦a, x↦b}, never aborted.
+    #[test]
+    fn unbounded_control_is_identical_to_pre_fix_pinned_set() {
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let fa = h.app(10, &[a], S);
+        let fb = h.app(10, &[b], S);
+        let fx = h.app(10, &[x], S);
+        let cong = ToyCong::new(vec![vec![fa, fb]]);
+        let (res, aborted) =
+            match_trigger::<ToySig, _, _>(&cong, &h, fx, &[X], &[fa], None, usize::MAX);
+        assert!(!aborted, "(None, usize::MAX) never aborts");
+        let binds: Vec<u32> = res.iter().filter_map(|s| subst_get::<ToySig>(s, X)).collect();
+        assert_eq!(res.len(), 2, "the pinned pre-fix result: both SPLIT matches");
+        assert!(binds.contains(&a) && binds.contains(&b), "pinned set {{x↦a, x↦b}}");
+    }
+
+    /// Multi-pattern: expired deadline aborts the join with the signal set.
+    #[test]
+    fn expired_deadline_aborts_match_trigger_multi() {
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let x = h.var(X, S);
+        let y = h.var(Y, S);
+        let fa = h.app(10, &[a], S);
+        let gb = h.app(20, &[b], S);
+        let fx = h.app(10, &[x], S);
+        let gy = h.app(20, &[y], S);
+        let cong = ToyCong::new(vec![]);
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let (res, aborted) = match_trigger_multi::<ToySig, _, _>(
+            &cong,
+            &h,
+            &[fx, gy],
+            &[X, Y],
+            &[vec![fa], vec![gb]],
+            Some(expired),
+            usize::MAX,
+        );
+        assert!(aborted, "expired deadline MUST raise the abort signal (multi)");
+        assert!(res.is_empty(), "aborted at iteration 0 ⇒ empty partial result");
+    }
+
+    /// Multi-pattern: `max_substs` truncates the joined result to exactly the
+    /// cap and aborts. `((f x) (g y))` over 2×2 seeds yields 4 joined
+    /// substitutions unbounded; capped at 2 it returns exactly 2 + aborted.
+    #[test]
+    fn max_substs_truncates_match_trigger_multi_and_aborts() {
+        let mut h = Toy::new();
+        let a = h.konst(1, S);
+        let b = h.konst(2, S);
+        let c = h.konst(3, S);
+        let d = h.konst(4, S);
+        let x = h.var(X, S);
+        let y = h.var(Y, S);
+        let fa = h.app(10, &[a], S);
+        let fb = h.app(10, &[b], S);
+        let gc = h.app(20, &[c], S);
+        let gd = h.app(20, &[d], S);
+        let fx = h.app(10, &[x], S);
+        let gy = h.app(20, &[y], S);
+        let cong = ToyCong::new(vec![]);
+        // Control: unbounded yields the full 2×2 join.
+        let (all, ab0) = match_trigger_multi::<ToySig, _, _>(
+            &cong,
+            &h,
+            &[fx, gy],
+            &[X, Y],
+            &[vec![fa, fb], vec![gc, gd]],
+            None,
+            usize::MAX,
+        );
+        assert!(!ab0);
+        assert_eq!(all.len(), 4, "pinned pre-fix join: 2×2 substitutions");
+        // Capped: exactly max_substs survive, with the abort signal.
+        let (res, aborted) = match_trigger_multi::<ToySig, _, _>(
+            &cong,
+            &h,
+            &[fx, gy],
+            &[X, Y],
+            &[vec![fa, fb], vec![gc, gd]],
+            None,
+            2,
+        );
+        assert!(aborted, "truncation MUST raise the abort signal (multi)");
+        assert_eq!(res.len(), 2, "truncated to exactly max_substs");
     }
 }

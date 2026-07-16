@@ -1067,6 +1067,21 @@ impl Solver {
                             } else {
                                 EufCongruence::new(&self.euf)
                             };
+                            // Thread THIS check's effective MBQI deadline (Bug B's
+                            // clamped `check_deadline`, so nested re-verifiers stay
+                            // consistent for free) into the engine so a single
+                            // pathological e-match aborts in-guard instead of
+                            // overshooting it (the between-round loop-top check
+                            // cannot interrupt a running `ematch_all`). Set EVERY
+                            // round, not once at engine build: the engine persists
+                            // (idempotent + cheap), and a one-shot write would be
+                            // the stale-deadline sibling of the
+                            // assert-time-populated-cache bug class. An engine
+                            // deadline abort routes through `budget_hit` →
+                            // `BudgetExhausted` → the sound `Unknown`, never a
+                            // silently-partial `Saturated`.
+                            #[cfg(feature = "std")]
+                            eng.set_deadline(self.check_deadline);
                             eng.round_with_cong(&mut host, &model, &cong)
                         };
                         match verdict {

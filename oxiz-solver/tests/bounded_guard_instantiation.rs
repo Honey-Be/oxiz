@@ -202,6 +202,125 @@ fn nested_reverify_does_not_double_the_budget() {
 }
 
 #[test]
+fn multi_pattern_join_blowup_returns_unknown_in_guard() {
+    // The e-match deadline fix, end-to-end. A multi-pattern trigger
+    // `:pattern ((f x) (g x))` over N ground f- and g-applications makes the
+    // CCFV join scan the N×N acc × seeds product INSIDE ONE `ematch_all` call
+    // — N = 2000 measured >45 s pre-fix (the between-round loop-top deadline
+    // check can't interrupt a running e-match, so the 1 s guard was overshot
+    // >45×; the dm2/sv2 corpus rows are the same shape). Post-fix the matcher
+    // polls the deadline every 1024 unify calls, aborts the join in-guard,
+    // routes the abort through `budget_hit`, and the solver returns the sound
+    // `unknown` — total wall ≈ guard + bounded emit, asserted with GENEROUS
+    // slop (6 s for a 1 s guard) so a loaded machine does not flake.
+    //
+    // Soundness edge: the aborted e-match yields a PARTIAL match set, so the
+    // verdict must be `unknown` — `sat` here would mean a truncated match set
+    // was read as saturation (the exact spurious-Sat risk the abort signal
+    // exists to prevent).
+    let n = 1200usize;
+    let mut script =
+        String::from("(set-logic UFLIA)(declare-fun f (Int) Int)(declare-fun g (Int) Int)(declare-fun h (Int) Int)");
+    for i in 0..n {
+        script.push_str(&format!("(assert (>= (f {i}) 0))(assert (>= (g {i}) 0))"));
+    }
+    script.push_str(
+        "(assert (forall ((x Int)) (! (>= (h x) 0) :pattern ((f x) (g x)))))(check-sat)",
+    );
+
+    // Big-stack thread: thousands of encoded assertions overflow the default
+    // 2 MiB test-thread stack (pre-existing recursion-depth limitation,
+    // unrelated to this fix — same workaround as
+    // `nested_reverify_does_not_double_the_budget`).
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut ctx = Context::new();
+            ctx.set_clean_mbqi(true);
+            ctx.set_timeout_ms(1000);
+            let start = std::time::Instant::now();
+            let out = ctx.execute_script(&script).expect("script runs");
+            (out, start.elapsed())
+        })
+        .expect("spawn big-stack test thread");
+    let (out, elapsed) = handle.join().expect("no panic in solver thread");
+
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_eq!(
+        verdict,
+        Some("unknown"),
+        "aborted (partial) e-match must be the sound unknown — sat would be \
+         the spurious-Saturated soundness bug, unsat a fabrication, got {out:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "the 1 s guard must bound the e-match join (pre-fix: >45 s), took {elapsed:?}"
+    );
+}
+
+#[test]
+fn early_lemma_then_mid_round_ematch_abort_is_caught_by_loop_top() {
+    // The NewLemmas leg of the abort contract, driven through the FULL
+    // Solver/Context API. Round 1: an EARLIER cheap quantifier
+    // (`:pattern (q x)`, one ground seed) e-matches and emits its lemma
+    // BEFORE the deadline expires; then the LATER quantifier's N×N
+    // multi-pattern join aborts mid-e-match. The round therefore returns
+    // `NewLemmas` (lemmas win over `budget_hit` by design) — the engine
+    // verdict alone does NOT surface the abort. What catches it is the
+    // solver's loop-top deadline check on the NEXT iteration → the sound
+    // `unknown`. A `sat` here would mean the aborted (partial) join was read
+    // as saturation; pre-fix this shape overshot the guard by >45×.
+    let n = 1200usize;
+    let mut script = String::from(
+        "(set-logic UFLIA)(declare-fun f (Int) Int)(declare-fun g (Int) Int)\
+         (declare-fun h (Int) Int)(declare-fun q (Int) Int)(declare-fun h2 (Int) Int)\
+         (assert (>= (q 0) 0))\
+         (assert (forall ((x Int)) (! (>= (h2 x) 0) :pattern ((q x)))))",
+    );
+    for i in 0..n {
+        script.push_str(&format!("(assert (>= (f {i}) 0))(assert (>= (g {i}) 0))"));
+    }
+    script.push_str(
+        "(assert (forall ((x Int)) (! (>= (h x) 0) :pattern ((f x) (g x)))))(check-sat)",
+    );
+
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut ctx = Context::new();
+            ctx.set_clean_mbqi(true);
+            ctx.set_timeout_ms(1000);
+            let start = std::time::Instant::now();
+            let out = ctx.execute_script(&script).expect("script runs");
+            (out, start.elapsed())
+        })
+        .expect("spawn big-stack test thread");
+    let (out, elapsed) = handle.join().expect("no panic in solver thread");
+
+    let verdict = out.iter().rev().find_map(|l| match l.trim() {
+        "sat" => Some("sat"),
+        "unsat" => Some("unsat"),
+        "unknown" => Some("unknown"),
+        _ => None,
+    });
+    assert_eq!(
+        verdict,
+        Some("unknown"),
+        "NewLemmas-with-abort must be caught by the solver loop-top deadline \
+         check next round — sat would be the spurious-Saturated bug, got {out:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "the 1 s guard must bound the round (loop-top catch), took {elapsed:?}"
+    );
+}
+
+#[test]
 fn reused_context_second_check_gets_full_fresh_budget() {
     // Bug B staleness guard — the reason the fix uses TWO fields
     // (`mbqi_deadline_override` written only externally on the throwaway
