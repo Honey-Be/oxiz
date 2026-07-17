@@ -298,7 +298,7 @@ impl EufSolver {
     }
 
     /// Canonicalize arguments for commutative functions
-    fn canonicalize_args(&mut self, func: u32, args: &[u32]) -> SmallVec<[u32; 4]> {
+    fn canonicalize_args(&self, func: u32, args: &[u32]) -> SmallVec<[u32; 4]> {
         let props = self.get_function_props(func);
         self.canonicalize_args_with_props(&props, args)
     }
@@ -306,7 +306,7 @@ impl EufSolver {
     /// Canonicalize arguments given pre-fetched function properties.
     /// Used in hot paths to hoist the `get_function_props` hashmap lookup out of inner loops.
     fn canonicalize_args_with_props(
-        &mut self,
+        &self,
         props: &FunctionProperties,
         args: &[u32],
     ) -> SmallVec<[u32; 4]> {
@@ -326,8 +326,11 @@ impl EufSolver {
     /// For commutative functions the results are sorted in-place.
     ///
     /// This is the allocation-free variant used in the hot inner loop of `propagate`.
+    /// Takes `&self`: its only self-use is `UnionFind::find_no_compress`, which is
+    /// immutable — this lets callers pass `&self.nodes[..].args` directly without
+    /// an intermediate copy.
     fn canonicalize_args_with_props_into(
-        &mut self,
+        &self,
         props: &FunctionProperties,
         args: &[u32],
         buf: &mut SmallVec<[u32; 4]>,
@@ -532,19 +535,19 @@ impl EufSolver {
                 }
                 let func = node_func_val;
 
-                // Read args by index to avoid cloning the SmallVec
-                let args_len = self.nodes[user as usize].args.len();
-                let mut args_copy: SmallVec<[u32; 4]> = SmallVec::with_capacity(args_len);
-                for j in 0..args_len {
-                    args_copy.push(self.nodes[user as usize].args[j]);
-                }
-
                 // Fetch function properties once per use-list entry (per unique func),
                 // then pass to canonicalize_args_with_props_into to avoid repeated lookups.
                 let props = self.get_function_props(func);
 
-                // Canonicalize arguments into the reusable buffer (avoids per-iteration alloc).
-                self.canonicalize_args_with_props_into(&props, &args_copy, &mut canon_buf);
+                // Canonicalize arguments into the reusable buffer (avoids per-iteration
+                // alloc).  The node's args are borrowed in place — the canonicalizer is
+                // `&self` and writes only into the caller-local `canon_buf`, so no
+                // intermediate args copy is needed.
+                self.canonicalize_args_with_props_into(
+                    &props,
+                    &self.nodes[user as usize].args,
+                    &mut canon_buf,
+                );
 
                 // --- Optimization 3: Fingerprint pre-filter ---
                 // Compute the new fingerprint for the updated canonical args
@@ -555,10 +558,13 @@ impl EufSolver {
                 // If no entry with this fingerprint exists in fingerprint_table, skip
                 // the sig lookup — but still update sig_updates and the node fingerprint
                 // so the invariant (fingerprint_table tracks all live fps) is maintained.
+                // `canon_buf` is MOVED into the batched entry (it is cleared and refilled
+                // at the top of canonicalize_args_with_props_into, so handing over a
+                // freshly-empty buffer to the next iteration is fine).
                 if !self.fingerprint_table.contains_key(&new_fp) {
                     sig_updates.push(SigUpdateEntry {
                         func,
-                        args: canon_buf.clone(),
+                        args: mem::take(&mut canon_buf),
                         node: user,
                         fp: new_fp,
                     });
@@ -566,9 +572,13 @@ impl EufSolver {
                     continue;
                 }
 
-                // Check signature table for congruence match
-                let sig = (func, canon_buf.clone());
+                // Check signature table for congruence match.  The key takes
+                // ownership of canon_buf (no clone); on a HIT the buffer is
+                // recovered below so later iterations keep reusing its backing.
+                let sig = (func, mem::take(&mut canon_buf));
                 if let Some(&existing) = self.sig_table.get(&sig) {
+                    // Recover the buffer for the next iteration.
+                    canon_buf = sig.1;
                     if !self.uf.same_no_compress(user, existing) {
                         // Congruence detected: record proof edges
                         self.push_proof_edge(
@@ -596,10 +606,11 @@ impl EufSolver {
                     }
                 } else {
                     // No congruence match; batch the signature update for later.
-                    // We must clone canon_buf here because it is reused on the next iteration.
+                    // The already-owned key buffer is moved into the entry (no clone);
+                    // canon_buf stays freshly-empty for the next iteration.
                     sig_updates.push(SigUpdateEntry {
                         func,
-                        args: canon_buf.clone(),
+                        args: sig.1,
                         node: user,
                         fp: new_fp,
                     });
@@ -2007,5 +2018,115 @@ mod tests {
             "leaf node func should be NO_FUNC sentinel"
         );
         assert!(node.args.is_empty(), "leaf node should have no args");
+    }
+
+    /// Behavior-identity pin for the batched sig_table update path in
+    /// `propagate()`.  The expected values below were generated by running this
+    /// exact scenario against the pre-optimization code (commit 40da216, before
+    /// the E1/E2 clone-elimination restructure); the restructure must keep the
+    /// insertion SET and ORDER into sig_table/fingerprint_table — and the
+    /// pending-merge processing sequence — exactly unchanged.
+    ///
+    /// Scenario A (duplicate-signature batch, "last insert wins"):
+    ///   h(a,b) and h(b,a) both re-canonicalize to h([r,r]) in ONE use-list scan
+    ///   after merge(a,b).  Both take the fingerprint-miss branch (the batch is
+    ///   not applied mid-scan), so no congruence fires in-burst, and the batch
+    ///   apply overwrites sig_table[(h,[r,r])] — the LAST batched node wins.
+    ///   A later intern_app with the same signature must return that winner.
+    ///
+    /// Scenario B (multi-congruence burst, LIFO processing):
+    ///   f(a),g(a),f(b),g(b); merge(a,b) discovers BOTH congruences in one
+    ///   use-list scan, queues them in scan order, and processes them LIFO
+    ///   (pending is a stack).  The resulting union-find orientation pins the
+    ///   processing order.
+    #[test]
+    fn test_propagate_burst_pins_sig_insertion_order_and_merge_sequence() {
+        // ---- Scenario A ----
+        let mut s = EufSolver::new();
+        let a = s.intern(TermId::new(1)); // node 0
+        let b = s.intern(TermId::new(2)); // node 1
+        let h = 7u32; // NOT commutative
+        let hab = s.intern_app(TermId::new(10), h, [a, b]); // node 2
+        let hba = s.intern_app(TermId::new(11), h, [b, a]); // node 3
+        assert_eq!((a, b, hab, hba), (0, 1, 2, 3));
+
+        s.merge(a, b, TermId::new(20)).expect("merge a=b");
+
+        // Union orientation: equal ranks -> b becomes child of a; rep is a (0).
+        assert_eq!(s.uf.find_no_compress(b), a, "b's class rep must be a");
+
+        // Pre-existing batching quirk (must be preserved bit-for-bit): both
+        // users take the fingerprint-miss branch in the same scan, so no
+        // congruence between h(a,b) and h(b,a) fires in this burst.
+        assert!(
+            !s.are_equal(hab, hba),
+            "batched updates must not detect the in-burst hab/hba collision"
+        );
+
+        // sig_table winner pin: the batch applied (h,[0,0])->hab THEN
+        // (h,[0,0])->hba, so the LAST insert (hba = node 3) owns the slot.
+        let key: (u32, SmallVec<[u32; 4]>) = (h, SmallVec::from_slice(&[0u32, 0u32]));
+        assert_eq!(
+            s.sig_table.get(&key).copied(),
+            Some(hba),
+            "last batched insert must win the sig_table slot"
+        );
+
+        // Fingerprint bucket order pin: pushed in scan order [hab, hba].
+        let fp = ENodeFingerprint::compute(h, &[0, 0]);
+        assert_eq!(
+            s.fingerprint_table.get(&fp).map(|v| v.as_slice()),
+            Some(&[hab, hba][..]),
+            "fingerprint bucket must list nodes in scan order"
+        );
+
+        // Publicly observable consequence: a new application with the same
+        // canonical signature resolves to the sig_table winner.
+        let joined = s.intern_app(TermId::new(12), h, [a, b]);
+        assert_eq!(joined, hba, "intern_app must return the sig_table winner");
+
+        // ---- Scenario B ----
+        let mut s = EufSolver::new();
+        let a = s.intern(TermId::new(1)); // node 0
+        let b = s.intern(TermId::new(2)); // node 1
+        let f = 100u32;
+        let g = 200u32;
+        let fa = s.intern_app(TermId::new(10), f, [a]); // node 2
+        let ga = s.intern_app(TermId::new(11), g, [a]); // node 3
+        let fb = s.intern_app(TermId::new(12), f, [b]); // node 4
+        let gb = s.intern_app(TermId::new(13), g, [b]); // node 5
+
+        s.merge(a, b, TermId::new(30)).expect("merge a=b");
+
+        assert!(s.are_equal(fa, fb), "congruence f(a)=f(b) must fire");
+        assert!(s.are_equal(ga, gb), "congruence g(a)=g(b) must fire");
+
+        // Scan order over use_list[b] is [fb, gb]; both hit sig_table and are
+        // queued in that order; pending is popped LIFO so (gb,ga) is unioned
+        // FIRST, then (fb,fa).  With equal ranks union makes the second
+        // argument's root a child of the first (user wins), so the class reps
+        // are the b-side application nodes.
+        assert_eq!(s.uf.find_no_compress(a), a);
+        assert_eq!(s.uf.find_no_compress(b), a);
+        assert_eq!(
+            s.uf.find_no_compress(fa),
+            fb,
+            "f-class rep pins union orientation of the congruence merge"
+        );
+        assert_eq!(
+            s.uf.find_no_compress(ga),
+            gb,
+            "g-class rep pins union orientation of the congruence merge"
+        );
+
+        // Explanation-sequence pin: exact reason vector (order included) for a
+        // conflict routed through the congruence edge.
+        s.assert_diseq(fa, fb, TermId::new(40));
+        let conflict = s.check_conflicts().expect("fa=fb conflicts with diseq");
+        assert_eq!(
+            conflict,
+            vec![TermId::new(30), TermId::new(40)],
+            "explanation reason sequence must be stable"
+        );
     }
 }

@@ -1071,7 +1071,10 @@ impl Simplex {
                     has_stale_ref = true;
                     break;
                 }
-                val += self.assignment[v_idx] * *c;
+                // Fused `val += assignment[v] * c` with bit-identical zero fast
+                // paths (skips the delta lane entirely for values coming from
+                // non-strict bounds — the dominant case).
+                val.add_mul(&self.assignment[v_idx], c);
             }
 
             if !has_stale_ref {

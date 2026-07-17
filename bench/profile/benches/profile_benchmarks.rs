@@ -1,6 +1,6 @@
 use bench_profile::{parser_script, run_script, sat_propagation_script, theory_check_script};
 use criterion::{Criterion, criterion_group, criterion_main};
-use num_rational::Rational64;
+use oxiz_theories::ArithRat;
 use oxiz_core::RewriteContext;
 use oxiz_core::ast::{TermId, TermManager};
 use oxiz_core::profiling::{ProfilingCategory, ProfilingStats};
@@ -163,14 +163,14 @@ fn build_simplex() -> Simplex {
     let mut simplex = Simplex::new();
     let x0 = simplex.new_var();
     let x1 = simplex.new_var();
-    simplex.set_lower(x0, Rational64::new(0, 1), 0);
-    simplex.set_upper(x0, Rational64::new(2, 1), 1);
-    simplex.set_lower(x1, Rational64::new(0, 1), 2);
-    simplex.set_upper(x1, Rational64::new(2, 1), 3);
+    simplex.set_lower(x0, ArithRat::new(0, 1), 0);
+    simplex.set_upper(x0, ArithRat::new(2, 1), 1);
+    simplex.set_lower(x1, ArithRat::new(0, 1), 2);
+    simplex.set_upper(x1, ArithRat::new(2, 1), 3);
     let mut expr = LinExpr::new();
-    expr.add_term(x0, Rational64::new(1, 1));
-    expr.add_term(x1, Rational64::new(1, 1));
-    expr.add_constant(Rational64::new(-3, 1));
+    expr.add_term(x0, ArithRat::new(1, 1));
+    expr.add_term(x1, ArithRat::new(1, 1));
+    expr.add_constant(ArithRat::new(-3, 1));
     simplex.add_ge(expr, 4);
     simplex
 }

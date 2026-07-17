@@ -7,7 +7,7 @@
 //!   - `bench_pivot_hot_path` — isolated pivot() microbenchmark (2-variable tableau)
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use num_rational::Rational64;
+use oxiz_theories::ArithRat;
 use oxiz_theories::arithmetic::{LinExpr, Simplex};
 use std::hint::black_box;
 
@@ -20,7 +20,7 @@ use std::hint::black_box;
 ///
 ///   for i in 0..n-1:  x[i] - x[i+1] <= 1
 ///   x[0] >= 0
-///   x[n-1] <= n as Rational64
+///   x[n-1] <= n as ArithRat
 ///
 /// This creates a feasible LP that the primal simplex must solve by finding
 /// a basic feasible solution along the chain.
@@ -31,17 +31,17 @@ fn build_chain_lp(n: u32) -> Simplex {
     let vars: Vec<u32> = (0..n).map(|_| simplex.new_var()).collect();
 
     // x[0] >= 0
-    simplex.set_lower(vars[0], Rational64::new(0, 1), 0);
+    simplex.set_lower(vars[0], ArithRat::new(0, 1), 0);
     // x[n-1] <= n (gives the simplex something to push against)
-    simplex.set_upper(vars[n as usize - 1], Rational64::new(n as i64, 1), 1);
+    simplex.set_upper(vars[n as usize - 1], ArithRat::new(i128::from(n), 1), 1);
 
     // Add chain constraints: x[i] - x[i+1] <= 1  (i.e. x[i] - x[i+1] + slack = 1, slack >= 0)
     for i in 0..(n as usize - 1) {
         let mut expr = LinExpr::new();
-        expr.add_term(vars[i], Rational64::new(1, 1));
-        expr.add_term(vars[i + 1], Rational64::new(-1, 1));
+        expr.add_term(vars[i], ArithRat::new(1, 1));
+        expr.add_term(vars[i + 1], ArithRat::new(-1, 1));
         // expr <= 1  <=>  expr - 1 <= 0
-        expr.add_constant(Rational64::new(-1, 1));
+        expr.add_constant(ArithRat::new(-1, 1));
         simplex.add_le(expr, (i + 2) as u32);
     }
 
@@ -49,9 +49,9 @@ fn build_chain_lp(n: u32) -> Simplex {
     // (adds density to the tableau and forces more pivots)
     for i in 0..(n as usize).saturating_sub(2) {
         let mut expr = LinExpr::new();
-        expr.add_term(vars[i], Rational64::new(1, 1));
-        expr.add_term(vars[i + 1], Rational64::new(-1, 1));
-        expr.add_constant(Rational64::new(-2, 1));
+        expr.add_term(vars[i], ArithRat::new(1, 1));
+        expr.add_term(vars[i + 1], ArithRat::new(-1, 1));
+        expr.add_constant(ArithRat::new(-2, 1));
         simplex.add_le(expr, n + i as u32 + 10);
     }
 
@@ -73,22 +73,22 @@ fn build_pivot_bench() -> Simplex {
     let x1 = simplex.new_var();
 
     // x0 in [0, 2], x1 in [0, 2]
-    simplex.set_lower(x0, Rational64::new(0, 1), 0);
-    simplex.set_upper(x0, Rational64::new(2, 1), 1);
-    simplex.set_lower(x1, Rational64::new(0, 1), 2);
-    simplex.set_upper(x1, Rational64::new(2, 1), 3);
+    simplex.set_lower(x0, ArithRat::new(0, 1), 0);
+    simplex.set_upper(x0, ArithRat::new(2, 1), 1);
+    simplex.set_lower(x1, ArithRat::new(0, 1), 2);
+    simplex.set_upper(x1, ArithRat::new(2, 1), 3);
 
     // x0 + x1 >= 3  (only satisfiable at the boundary, forces pivoting)
     let mut expr = LinExpr::new();
-    expr.add_term(x0, Rational64::new(1, 1));
-    expr.add_term(x1, Rational64::new(1, 1));
-    expr.add_constant(Rational64::new(-3, 1));
+    expr.add_term(x0, ArithRat::new(1, 1));
+    expr.add_term(x1, ArithRat::new(1, 1));
+    expr.add_constant(ArithRat::new(-3, 1));
     simplex.add_ge(expr, 4);
 
     // Additional tight constraint: x0 - x1 <= 0
     let mut expr2 = LinExpr::new();
-    expr2.add_term(x0, Rational64::new(1, 1));
-    expr2.add_term(x1, Rational64::new(-1, 1));
+    expr2.add_term(x0, ArithRat::new(1, 1));
+    expr2.add_term(x1, ArithRat::new(-1, 1));
     simplex.add_le(expr2, 5);
 
     simplex

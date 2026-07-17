@@ -135,6 +135,30 @@ impl DeltaRational {
             real_ceil
         }
     }
+
+    /// Fused multiply-add: `self += x * c`, without materializing the
+    /// intermediate `DeltaRational` product.
+    ///
+    /// Zero fast paths — each skip is BIT-IDENTICAL to the unfused
+    /// `self += x * c` sequence, because `num-rational` keeps every `Ratio`
+    /// in reduced form (denominator positive, gcd(numer, denom) = 1), so
+    /// `a + 0/1` reproduces `a` exactly and `0/1 * c` produces exactly `0/1`:
+    /// - `c == 0` or `x == 0`: the product is `0/1` in both lanes and adding
+    ///   zero is the identity — skip the whole term.
+    /// - `x.real == 0`: the real lane contributes `0/1` — skip its gcd/reduce.
+    /// - `x.delta == 0` (the dominant case: values from non-strict bounds have
+    ///   no infinitesimal part): the delta lane contributes `0/1` — skip it.
+    pub fn add_mul(&mut self, x: &DeltaRational, c: &ArithRat) {
+        if c.is_zero() || x.is_zero() {
+            return;
+        }
+        if !x.real.is_zero() {
+            self.real += x.real * c;
+        }
+        if !x.delta.is_zero() {
+            self.delta += x.delta * c;
+        }
+    }
 }
 
 impl From<ArithRat> for DeltaRational {
@@ -197,8 +221,16 @@ impl Add for DeltaRational {
 
 impl AddAssign for DeltaRational {
     fn add_assign(&mut self, rhs: Self) {
-        self.real += rhs.real;
-        self.delta += rhs.delta;
+        // Zero fast paths: on reduced `Ratio`s, `a + 0/1` yields `a` with the
+        // exact same (reduced) representation, so skipping the lane op when the
+        // corresponding rhs component is zero is bit-identical to performing it
+        // — it merely avoids the gcd/reduce work.
+        if !rhs.real.is_zero() {
+            self.real += rhs.real;
+        }
+        if !rhs.delta.is_zero() {
+            self.delta += rhs.delta;
+        }
     }
 }
 
@@ -224,9 +256,20 @@ impl Mul<ArithRat> for DeltaRational {
     type Output = Self;
 
     fn mul(self, rhs: ArithRat) -> Self::Output {
+        // Zero fast paths: `0/1 * c` produces exactly `0/1` (num-rational
+        // reduces `0/d` to `0/1`), so returning the zero component unchanged is
+        // bit-identical to performing the multiply.  Likewise `x * 0` yields
+        // `0/1` in both lanes — exactly `Self::zero()`.
+        if rhs.is_zero() {
+            return Self::zero();
+        }
         Self {
             real: self.real * rhs,
-            delta: self.delta * rhs,
+            delta: if self.delta.is_zero() {
+                self.delta
+            } else {
+                self.delta * rhs
+            },
         }
     }
 }
@@ -295,6 +338,53 @@ mod tests {
         let five_point_five = DeltaRational::from_rational(ArithRat::new(11, 2));
         assert_eq!(five_point_five.floor(), 5);
         assert_eq!(five_point_five.ceil(), 6);
+    }
+
+    /// Exactness proof for the zero fast paths in `Mul<ArithRat>`, `AddAssign`,
+    /// and `add_mul`: over a grid that exercises every skip branch (zero reals,
+    /// zero deltas, zero multipliers, negatives, non-integer ratios), the
+    /// results must match the RAW lane-wise `ArithRat` operations (the original,
+    /// fast-path-free semantics) in exact reduced representation — numerator and
+    /// denominator compared directly, not just by value.
+    #[test]
+    fn test_zero_fast_paths_bit_identical_to_unfused_lanes() {
+        let rats = [
+            ArithRat::new(-5, 3),
+            -ArithRat::one(),
+            ArithRat::zero(),
+            ArithRat::new(1, 2),
+            ArithRat::from_integer(7),
+            ArithRat::new(22, 7),
+        ];
+        let assert_lane = |got: ArithRat, want: ArithRat, what: &str| {
+            assert_eq!(got.numer(), want.numer(), "{what}: numer mismatch");
+            assert_eq!(got.denom(), want.denom(), "{what}: denom mismatch");
+        };
+        for &xr in &rats {
+            for &xd in &rats {
+                let x = DeltaRational::new(xr, xd);
+                for &c in &rats {
+                    // Mul<ArithRat> vs raw lanes
+                    let prod = x * c;
+                    assert_lane(prod.real, xr * c, "mul real");
+                    assert_lane(prod.delta, xd * c, "mul delta");
+                    for &ar in &rats {
+                        for &ad in &rats {
+                            // AddAssign vs raw lanes
+                            let mut acc = DeltaRational::new(ar, ad);
+                            acc += x;
+                            assert_lane(acc.real, ar + xr, "add_assign real");
+                            assert_lane(acc.delta, ad + xd, "add_assign delta");
+                            // Fused add_mul vs raw unfused `acc += x * c` lanes
+                            let mut fused = DeltaRational::new(ar, ad);
+                            fused.add_mul(&x, &c);
+                            assert_lane(fused.real, ar + xr * c, "add_mul real");
+                            assert_lane(fused.delta, ad + xd * c, "add_mul delta");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
