@@ -987,6 +987,44 @@ impl Solver {
     /// per branch, never a shared mutable reference) accumulates every
     /// disequality-source pair (`dt_diseq_pairs`) each leaf contributes; the
     /// leaf now also checks `closure.forces_disequality_conflict(h_diseq)`.
+    ///
+    /// # Iterative, not recursive (stack-overflow regression, 2026-07-17)
+    ///
+    /// This evaluator was originally written as a self-recursive function
+    /// whose LINEAR continuation ("process the rest of the work-list after
+    /// consuming one item") was itself a recursive call — so the native
+    /// stack depth scaled with the total item count (assertions + emitted
+    /// MBQI lemmas), not just with case-split nesting. On lemma-heavy
+    /// corpus rows (`datatypes-match-2/ob07`: SIGSEGV at ~8.4s, ~40%
+    /// reproduction rate, gdb showed thousands of frames all at the same
+    /// call site) that overflowed the 8 MiB main-thread stack — the third
+    /// instance of this exact bug class (cf. `EufSolver::explain_equality`'s
+    /// worklist rewrite, and `check_dt_acyclicity`'s deliberately iterative
+    /// DFS). The recursion pre-dated the EUF/simplex perf work; the speedup
+    /// merely let more lemmas accumulate before this pre-pass runs, making
+    /// the depth reachable.
+    ///
+    /// Now: the linear continuation is a plain in-place loop over ONE
+    /// reversed work-list `Vec` (pop = next logical item), and only GENUINE
+    /// case splits (`Or` under positive / `And` under negative polarity)
+    /// push per-branch evaluation units onto an explicit heap `Vec` — native
+    /// stack depth is O(1) regardless of formula size or branch nesting.
+    /// Semantics are exactly the recursive version's:
+    /// - the overall result is the AND over every leaf check across the
+    ///   whole branch tree (a linear step is identity; a split is
+    ///   conflict-forced only if EVERY branch is), short-circuiting to
+    ///   `false` on the first non-conflicted leaf — identical to how a
+    ///   `false` return propagated unconditionally up the recursive chain;
+    /// - branch isolation is preserved: each pushed unit owns CLONES of the
+    ///   remaining work-list and the four hypothesis accumulators, exactly
+    ///   like each recursive branch call cloned them before;
+    /// - units are pushed in REVERSE branch order (and spliced children in
+    ///   reverse child order) so pop order reproduces the recursive
+    ///   version's depth-first, left-to-right evaluation order — which
+    ///   keeps budget consumption order, and therefore budget-limited
+    ///   outcomes, bit-identical;
+    /// - the budget is checked-then-decremented once per consumed item and
+    ///   once per leaf check, exactly the old one-decrement-per-call.
     fn dt_items_force_conflict(
         &self,
         items: &[(TermId, bool)],
@@ -998,171 +1036,211 @@ impl Solver {
         ctor_terms: &[(TermId, Vec<TermId>)],
         budget: &mut u32,
     ) -> bool {
-        if *budget == 0 {
-            // Safety valve only — never claims a conflict past this point,
-            // so exceeding the budget can only make us MISS a conflict
-            // (stay sat/unknown), never fabricate one.
-            return false;
+        /// One pending branch-combination to evaluate: a (reversed)
+        /// work-list plus the hypothesis accumulated at its split point.
+        /// `rev_items` is stored back-to-front so `pop()` yields the next
+        /// logical item in O(1) (the recursive version rebuilt a fresh
+        /// front-spliced `Vec` per step instead).
+        struct Unit {
+            rev_items: Vec<(TermId, bool)>,
+            h_var: Vec<(TermId, TermId)>,
+            h_ctor: Vec<(TermId, TermId)>,
+            h_sel: Vec<(TermId, TermId)>,
+            h_diseq: Vec<(TermId, TermId)>,
         }
-        *budget -= 1;
 
-        let Some((&(t, ctx), rest)) = items.split_first() else {
-            // Fully assembled hypothesis for this combination of branch
-            // choices — #419: close it (item 1 same-constructor-binding
-            // ctor=ctor derivations + item 2 selector-resolution
-            // derivations) before checking for a cycle, so a branch whose
-            // conflict only becomes visible after closing its OWN hypothesis
-            // is detected too. `budget` is deliberately reused (not a fresh
-            // `DT_CLOSURE_STEP_BUDGET` pool) so pop-steps and closure-fixpoint
-            // steps draw from the SAME shared total-work bound — see the
-            // "#419 — equality closure wiring" doc section above.
-            let closure = self.compute_dt_equality_closure(h_var, h_ctor, h_sel, manager, budget);
-            // #422 — acyclicity OR a forced disequality conflict, whichever
-            // this branch's closed hypothesis exhibits (see this function's
-            // "#422 — beyond acyclicity-only" doc section above).
-            return self.cycle_exists_given(&closure.closed_eqs, &[], ctor_terms, manager)
-                || closure.forces_disequality_conflict(h_diseq)
-                || closure.has_intrinsic_literal_conflict(manager);
-        };
+        let mut units: Vec<Unit> = vec![Unit {
+            rev_items: items.iter().rev().copied().collect(),
+            h_var: h_var.to_vec(),
+            h_ctor: h_ctor.to_vec(),
+            h_sel: h_sel.to_vec(),
+            h_diseq: h_diseq.to_vec(),
+        }];
 
-        let Some(td) = manager.get(t) else {
-            return self.dt_items_force_conflict(
-                rest, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-            );
-        };
+        while let Some(mut unit) = units.pop() {
+            // The linear continuation: consume this unit's work-list
+            // in place until it either leaf-checks (empty list), spawns a
+            // case split (per-branch units pushed, this unit ends), or the
+            // shared budget runs out.
+            loop {
+                if *budget == 0 {
+                    // Safety valve only — never claims a conflict past this
+                    // point, so exceeding the budget can only make us MISS a
+                    // conflict (stay sat/unknown), never fabricate one.
+                    // (Matches the recursive version exactly: once the
+                    // budget hits zero every remaining evaluation would have
+                    // returned `false`, making the overall AND `false`.)
+                    return false;
+                }
+                *budget -= 1;
 
-        match &td.kind {
-            TermKind::Not(inner) => {
-                let mut new_items = Vec::with_capacity(rest.len() + 1);
-                new_items.push((*inner, !ctx));
-                new_items.extend_from_slice(rest);
-                self.dt_items_force_conflict(
-                    &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-                )
-            }
-            TermKind::And(children) if ctx => {
-                // Conjunctive: all children are asserted true too.
-                let mut new_items = Vec::with_capacity(rest.len() + children.len());
-                new_items.extend(children.iter().map(|&c| (c, true)));
-                new_items.extend_from_slice(rest);
-                self.dt_items_force_conflict(
-                    &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-                )
-            }
-            TermKind::Or(children) if !ctx => {
-                // Conjunctive (De Morgan): all children are asserted false too.
-                let mut new_items = Vec::with_capacity(rest.len() + children.len());
-                new_items.extend(children.iter().map(|&c| (c, false)));
-                new_items.extend_from_slice(rest);
-                self.dt_items_force_conflict(
-                    &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-                )
-            }
-            TermKind::Or(children) if ctx => {
-                // Disjunctive case split: EVERY branch must independently
-                // force a conflict (combined with the unchanged rest of the
-                // work-list) for the whole thing to be conflict-forced.
-                children.iter().all(|&b| {
-                    let mut new_items = Vec::with_capacity(rest.len() + 1);
-                    new_items.push((b, true));
-                    new_items.extend_from_slice(rest);
-                    self.dt_items_force_conflict(
-                        &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-                    )
-                })
-            }
-            TermKind::And(children) if !ctx => {
-                // Disjunctive case split (De Morgan — ¬(A∧B) ≡ ¬A∨¬B): EVERY
-                // branch (negated) must independently force a conflict.
-                children.iter().all(|&b| {
-                    let mut new_items = Vec::with_capacity(rest.len() + 1);
-                    new_items.push((b, false));
-                    new_items.extend_from_slice(rest);
-                    self.dt_items_force_conflict(
-                        &new_items, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-                    )
-                })
-            }
-            _ => {
-                // A leaf w.r.t. the Boolean skeleton (`Eq`, `DtTester`, or
-                // anything else): delegate to the audited single-node
-                // extraction already in `collect_dt_constraints_v2` — it
-                // does not recurse into further Boolean structure for these
-                // kinds, so calling it on just `t` extracts exactly this
-                // node's own contribution (if any) and nothing more.
-                let mut throwaway_pos_testers: FxHashMap<TermId, Vec<String>> =
-                    FxHashMap::default();
-                let mut throwaway_neg_testers: FxHashMap<TermId, Vec<String>> =
-                    FxHashMap::default();
-                let mut throwaway_ctor_eqs: FxHashMap<TermId, Vec<String>> = FxHashMap::default();
-                let mut throwaway_neg_ctor_eqs: FxHashMap<TermId, Vec<String>> =
-                    FxHashMap::default();
-                let mut new_var_eqs: Vec<(TermId, TermId)> = Vec::new();
-                let mut new_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
-                // #419 item 2 — this leaf's own raw `sel(t) = t2` fact
-                // contribution (if any), now THREADED into `h_sel` (no
-                // longer discarded) so the leaf-time closure call above can
-                // resolve it once the rest of this branch's hypothesis is
-                // known.
-                let mut new_sel_eqs: Vec<(TermId, TermId)> = Vec::new();
-                // #422 item 3 — this leaf's own `C(..) = D(..)` ctor-ctor
-                // contribution (if any); folded into `h_ctor2` below (the
-                // SAME accumulator `var_ctor_term_eqs`-shaped facts use — no
-                // separate persistent thread needed, mirroring the flat-path
-                // call sites' `.extend()` merge).
-                let mut new_ctor_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
-                // #422 items 1+2 — this leaf's own disequality-source
-                // contribution (if any); THIS one DOES need its own
-                // persistent thread (`h_diseq`), since it is not folded into
-                // `var_ctor_term_eqs`/`compute_dt_equality_closure` at all —
-                // it is consumed separately by `forces_disequality_conflict`.
-                let mut new_diseq_pairs: Vec<(TermId, TermId)> = Vec::new();
-                self.collect_dt_constraints_v2(
-                    t,
-                    manager,
-                    &mut throwaway_pos_testers,
-                    &mut throwaway_neg_testers,
-                    &mut throwaway_ctor_eqs,
-                    &mut throwaway_neg_ctor_eqs,
-                    &mut new_var_eqs,
-                    &mut new_ctor_eqs,
-                    &mut new_sel_eqs,
-                    &mut new_ctor_ctor_eqs,
-                    &mut new_diseq_pairs,
-                    ctx,
-                );
-                // #422 — extend the early-return emptiness check to ALSO
-                // cover the two new lists: a leaf whose ONLY contribution is
-                // a disequality/ctor-ctor fact (no var/ctor/sel fact at all)
-                // must still extend the hypothesis, not be silently dropped.
-                if new_var_eqs.is_empty()
-                    && new_ctor_eqs.is_empty()
-                    && new_sel_eqs.is_empty()
-                    && new_ctor_ctor_eqs.is_empty()
-                    && new_diseq_pairs.is_empty()
-                {
-                    self.dt_items_force_conflict(
-                        rest, h_var, h_ctor, h_sel, h_diseq, manager, ctor_terms, budget,
-                    )
-                } else {
-                    let mut h_var2 = h_var.to_vec();
-                    h_var2.extend(new_var_eqs);
-                    let mut h_ctor2 = h_ctor.to_vec();
-                    h_ctor2.extend(new_ctor_eqs);
-                    // #422 item 3 — fold this leaf's ctor-ctor facts into the
-                    // SAME `var_ctor_term_eqs`-shaped accumulator
-                    // `compute_dt_equality_closure` consumes as `h_ctor`.
-                    h_ctor2.extend(new_ctor_ctor_eqs);
-                    let mut h_sel2 = h_sel.to_vec();
-                    h_sel2.extend(new_sel_eqs);
-                    let mut h_diseq2 = h_diseq.to_vec();
-                    h_diseq2.extend(new_diseq_pairs);
-                    self.dt_items_force_conflict(
-                        rest, &h_var2, &h_ctor2, &h_sel2, &h_diseq2, manager, ctor_terms, budget,
-                    )
+                let Some((t, ctx)) = unit.rev_items.pop() else {
+                    // Fully assembled hypothesis for this combination of
+                    // branch choices — #419: close it (item 1
+                    // same-constructor-binding ctor=ctor derivations + item
+                    // 2 selector-resolution derivations) before checking for
+                    // a cycle, so a branch whose conflict only becomes
+                    // visible after closing its OWN hypothesis is detected
+                    // too. `budget` is deliberately reused (not a fresh
+                    // `DT_CLOSURE_STEP_BUDGET` pool) so pop-steps and
+                    // closure-fixpoint steps draw from the SAME shared
+                    // total-work bound — see the "#419 — equality closure
+                    // wiring" doc section above.
+                    let closure = self.compute_dt_equality_closure(
+                        &unit.h_var,
+                        &unit.h_ctor,
+                        &unit.h_sel,
+                        manager,
+                        budget,
+                    );
+                    // #422 — acyclicity OR a forced disequality conflict,
+                    // whichever this branch's closed hypothesis exhibits
+                    // (see this function's "#422 — beyond acyclicity-only"
+                    // doc section above).
+                    let conflicted = self
+                        .cycle_exists_given(&closure.closed_eqs, &[], ctor_terms, manager)
+                        || closure.forces_disequality_conflict(&unit.h_diseq)
+                        || closure.has_intrinsic_literal_conflict(manager);
+                    if !conflicted {
+                        // One branch combination is satisfiable-looking →
+                        // the whole formula is not conflict-forced. This is
+                        // the exact global short-circuit the recursive
+                        // version had (a `false` propagated unconditionally
+                        // through every enclosing `all()` and linear frame).
+                        return false;
+                    }
+                    // This branch combination is conflicted; evaluate the
+                    // next pending one.
+                    break;
+                };
+
+                let Some(td) = manager.get(t) else {
+                    continue;
+                };
+
+                match &td.kind {
+                    TermKind::Not(inner) => {
+                        unit.rev_items.push((*inner, !ctx));
+                    }
+                    TermKind::And(children) if ctx => {
+                        // Conjunctive: all children are asserted true too.
+                        // (Reversed so pop order = original child order.)
+                        unit.rev_items.extend(children.iter().rev().map(|&c| (c, true)));
+                    }
+                    TermKind::Or(children) if !ctx => {
+                        // Conjunctive (De Morgan): all children are asserted
+                        // false too.
+                        unit.rev_items
+                            .extend(children.iter().rev().map(|&c| (c, false)));
+                    }
+                    TermKind::Or(children) if ctx => {
+                        // Disjunctive case split: EVERY branch must
+                        // independently force a conflict (combined with the
+                        // unchanged rest of the work-list) for the whole
+                        // thing to be conflict-forced. Each branch gets its
+                        // OWN clone of the remaining work-list and the
+                        // hypothesis (branch isolation); pushed in reverse
+                        // so evaluation order matches the recursive
+                        // left-to-right `all()`.
+                        for &b in children.iter().rev() {
+                            let mut rev_items = unit.rev_items.clone();
+                            rev_items.push((b, true));
+                            units.push(Unit {
+                                rev_items,
+                                h_var: unit.h_var.clone(),
+                                h_ctor: unit.h_ctor.clone(),
+                                h_sel: unit.h_sel.clone(),
+                                h_diseq: unit.h_diseq.clone(),
+                            });
+                        }
+                        // An empty `Or` under positive polarity is an
+                        // asserted `false` → vacuously conflict-forced
+                        // (pushes no units), same as the recursive
+                        // `all()` over an empty iterator.
+                        break;
+                    }
+                    TermKind::And(children) if !ctx => {
+                        // Disjunctive case split (De Morgan — ¬(A∧B) ≡
+                        // ¬A∨¬B): EVERY branch (negated) must independently
+                        // force a conflict.
+                        for &b in children.iter().rev() {
+                            let mut rev_items = unit.rev_items.clone();
+                            rev_items.push((b, false));
+                            units.push(Unit {
+                                rev_items,
+                                h_var: unit.h_var.clone(),
+                                h_ctor: unit.h_ctor.clone(),
+                                h_sel: unit.h_sel.clone(),
+                                h_diseq: unit.h_diseq.clone(),
+                            });
+                        }
+                        break;
+                    }
+                    _ => {
+                        // A leaf w.r.t. the Boolean skeleton (`Eq`,
+                        // `DtTester`, or anything else): delegate to the
+                        // audited single-node extraction already in
+                        // `collect_dt_constraints_v2` — it does not recurse
+                        // into further Boolean structure for these kinds, so
+                        // calling it on just `t` extracts exactly this
+                        // node's own contribution (if any) and nothing more.
+                        let mut throwaway_pos_testers: FxHashMap<TermId, Vec<String>> =
+                            FxHashMap::default();
+                        let mut throwaway_neg_testers: FxHashMap<TermId, Vec<String>> =
+                            FxHashMap::default();
+                        let mut throwaway_ctor_eqs: FxHashMap<TermId, Vec<String>> =
+                            FxHashMap::default();
+                        let mut throwaway_neg_ctor_eqs: FxHashMap<TermId, Vec<String>> =
+                            FxHashMap::default();
+                        let mut new_var_eqs: Vec<(TermId, TermId)> = Vec::new();
+                        let mut new_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+                        // #419 item 2 — this leaf's own raw `sel(t) = t2`
+                        // fact contribution (if any), THREADED into `h_sel`
+                        // so the leaf-time closure call above can resolve it
+                        // once the rest of this branch's hypothesis is known.
+                        let mut new_sel_eqs: Vec<(TermId, TermId)> = Vec::new();
+                        // #422 item 3 — this leaf's own `C(..) = D(..)`
+                        // ctor-ctor contribution (if any); folded into the
+                        // SAME accumulator `var_ctor_term_eqs`-shaped facts
+                        // use (`h_ctor`), mirroring the flat-path call
+                        // sites' `.extend()` merge.
+                        let mut new_ctor_ctor_eqs: Vec<(TermId, TermId)> = Vec::new();
+                        // #422 items 1+2 — this leaf's own
+                        // disequality-source contribution (if any); consumed
+                        // separately by `forces_disequality_conflict`, hence
+                        // its own accumulator.
+                        let mut new_diseq_pairs: Vec<(TermId, TermId)> = Vec::new();
+                        self.collect_dt_constraints_v2(
+                            t,
+                            manager,
+                            &mut throwaway_pos_testers,
+                            &mut throwaway_neg_testers,
+                            &mut throwaway_ctor_eqs,
+                            &mut throwaway_neg_ctor_eqs,
+                            &mut new_var_eqs,
+                            &mut new_ctor_eqs,
+                            &mut new_sel_eqs,
+                            &mut new_ctor_ctor_eqs,
+                            &mut new_diseq_pairs,
+                            ctx,
+                        );
+                        // Extending with empty vecs is a no-op, so the
+                        // recursive version's "all empty → reuse the parent
+                        // slices unchanged" special case collapses into the
+                        // same unconditional extends here.
+                        unit.h_var.extend(new_var_eqs);
+                        unit.h_ctor.extend(new_ctor_eqs);
+                        unit.h_ctor.extend(new_ctor_ctor_eqs);
+                        unit.h_sel.extend(new_sel_eqs);
+                        unit.h_diseq.extend(new_diseq_pairs);
+                    }
                 }
             }
         }
+
+        // Every branch combination leaf-checked as conflicted (or a
+        // positive-polarity empty `Or` made a unit vacuously conflicted).
+        true
     }
 
     /// #418 item 2 — build a TRANSITIVELY-CLOSED variable→constructor-

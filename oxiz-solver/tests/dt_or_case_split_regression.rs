@@ -752,3 +752,41 @@ fn flat_injectivity_forced_noteq_intfields_simplify_true_default_is_unsat() {
     let r = s.check(&mut m);
     assert_eq!(r, SolverResult::Unsat);
 }
+
+// ---------------------------------------------------------------------------
+// 2026-07-17 — stack-overflow regression: `dt_items_force_conflict` was a
+// self-recursive evaluator whose LINEAR continuation (consume one work-list
+// item, recurse on the rest) grew the native stack with the total item count
+// (assertions + emitted MBQI lemmas), not just case-split nesting. On the
+// lemma-heavy corpus row `datatypes-match-2/ob07` it overflowed the 8 MiB
+// main-thread stack (SIGSEGV ~8.4s, ~40% reproduction — timing-dependent via
+// the MBQI guard). Third instance of the "pre-existing unbounded recursion
+// newly reached" class (cf. `EufSolver::explain_equality`'s worklist rewrite
+// and `check_dt_acyclicity`'s deliberately iterative DFS). Fixed by
+// rewriting the evaluator iteratively: the linear continuation is an
+// in-place loop, only genuine case splits push heap-allocated units.
+//
+// This test runs on a DEFAULT test thread (2 MiB stack): the old recursive
+// code overflows it at a few thousand frames, the iterative version handles
+// tens of thousands of work-list items in O(1) native stack. Verified as a
+// genuine differential: with only check_dt.rs reverted to the recursive
+// version (`git stash push -- oxiz-solver/src/solver/check_dt.rs`), this
+// test dies with SIGSEGV/stack-overflow; with the rewrite it passes.
+// ---------------------------------------------------------------------------
+
+/// 25k flat Bool assertions = 25k linear work-list items for the case-split
+/// evaluator, well within `DT_OR_CASE_SPLIT_BUDGET` (200k) so the whole
+/// chain is actually walked before the leaf check. Old code: ~25k-deep
+/// native recursion -> overflows the 2 MiB test-thread stack. New code:
+/// bounded native stack, verdict `sat`.
+#[test]
+fn deep_linear_worklist_does_not_overflow_the_stack() {
+    let n = 25_000;
+    let mut script = String::with_capacity(n * 40 + 64);
+    script.push_str("(set-logic ALL)\n");
+    for i in 0..n {
+        script.push_str(&format!("(declare-const dlb{i} Bool)\n(assert dlb{i})\n"));
+    }
+    script.push_str("(check-sat)\n");
+    assert_eq!(verdict(&script), "sat");
+}
