@@ -20,6 +20,8 @@ pub struct SimplexConfig {
     pub enable_bound_tightening: bool,
     /// Enable coefficient normalization
     pub enable_normalization: bool,
+    /// Backtracking strategy for `push`/`pop` (see [`BacktrackMode`])
+    pub backtrack: BacktrackMode,
 }
 
 impl Default for SimplexConfig {
@@ -29,8 +31,41 @@ impl Default for SimplexConfig {
             pivoting_rule: PivotingRule::Bland,
             enable_bound_tightening: true,
             enable_normalization: true,
+            backtrack: BacktrackMode::default(),
         }
     }
+}
+
+/// Backtracking strategy for the simplex `push`/`pop` scope machinery.
+///
+/// Profiling on saturator-shaped MBQI workloads showed the snapshot scheme
+/// dominating wall time (up to ~46% of samples under `Simplex::push`+`pop`:
+/// the `tableau.clone()` on every push plus the wholesale restore + stale-row
+/// `retain` scrub on every pop). [`BacktrackMode::Trail`] replaces the clones
+/// with an undo trail of the row/flag/bound mutations actually performed in
+/// the scope, replayed LIFO on pop for a bit-identical restore.
+/// DEFAULT: `Snapshot`. The trail scheme removes the clone/scrub cost
+/// entirely (push+pop containment 46% → ~0%, RSS −39% on the profiled
+/// saturator) but the freed throughput is REINVESTED by guard-bound MBQI
+/// rows into more instantiation per window, which drowned 5 fuel-recursion
+/// corpus rows (3 canonical regressions) in the 2026-07-19 A/B while
+/// closing 2 simplex-bound ones (sv2/ob03, dm3/ob05). Until round emission
+/// is work-bounded rather than deadline-bounded, `Trail` stays opt-in
+/// (`OXIZ_SIMPLEX_TRAIL=1` or config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BacktrackMode {
+    /// Legacy scheme (default): full `tableau`/`basic` snapshot cloned at
+    /// `push`, wholesale restore (plus stale-row scrub) at `pop`. Env
+    /// `OXIZ_SIMPLEX_SNAPSHOT=1` forces it at construction.
+    #[default]
+    Snapshot,
+    /// Undo-trail scheme (opt-in: `OXIZ_SIMPLEX_TRAIL=1` or config): each
+    /// scope records the first touch of every tableau row
+    /// (save-once-per-scope epochs), every basic-flag flip, and every
+    /// bound/var mutation into one scoped undo log; `pop` replays the log
+    /// LIFO, restoring the exact pre-push state without ever cloning the
+    /// tableau.
+    Trail,
 }
 
 /// Pivoting rule for simplex algorithm
@@ -186,6 +221,7 @@ impl TheoryConfig {
                 pivoting_rule: PivotingRule::Dantzig,
                 enable_bound_tightening: true,
                 enable_normalization: true,
+                backtrack: BacktrackMode::default(),
             },
             lia: LiaConfig {
                 max_depth: 5000,
@@ -222,6 +258,7 @@ impl TheoryConfig {
                 pivoting_rule: PivotingRule::Bland,
                 enable_bound_tightening: false,
                 enable_normalization: false,
+                backtrack: BacktrackMode::default(),
             },
             lia: LiaConfig {
                 max_depth: 100,

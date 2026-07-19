@@ -1,13 +1,20 @@
 //! Simplex algorithm implementation
 
 use super::delta::DeltaRational;
-use crate::config::{PivotingRule, SimplexConfig};
+use crate::config::{BacktrackMode, PivotingRule, SimplexConfig};
 #[allow(unused_imports)]
 use crate::prelude::*;
 use crate::ArithRat;
 use num_traits::{One, Signed, Zero};
 #[cfg(feature = "profiling")]
 use oxiz_core::profiling::{ProfilingCategory, ScopedTimer};
+// The scoped undo spine (single funnel for bounds, var allocs, rows, flags) —
+// same pattern as the oxiz-sat clause-id ledger. Traits brought in as `_`
+// (only their methods are needed); `Checkpoint` is named (it is the mark type).
+use portable_collection_primitives::{
+    Checkpoint, Container as _, Push as _, ScopedRollback as _, ScopedStack as _,
+};
+use portable_queues::VecScopedStack;
 use smallvec::SmallVec;
 
 /// Variable index
@@ -164,9 +171,13 @@ pub struct PropagatedBound {
     pub reasons: SmallVec<[u32; 4]>,
 }
 
-/// An undo entry for reverting a bound change
+/// An undo entry for reverting a scope's mutation — the single-funnel record
+/// type of the scoped undo spine. Bound and variable-allocation arms are
+/// recorded in BOTH backtrack modes; the row/flag arms are recorded only in
+/// [`BacktrackMode::Trail`] (snapshot mode restores rows/flags wholesale from
+/// the tableau snapshot instead).
 #[derive(Debug, Clone)]
-enum BoundUndo {
+enum SimplexUndo {
     /// Lower bound was None, now has a value
     LowerWasNone(VarId),
     /// Lower bound was Some, save old value
@@ -179,6 +190,18 @@ enum BoundUndo {
     NewVar,
     /// A new slack variable was added
     NewSlack(VarId),
+    /// (Trail mode) A tableau row keyed by this variable was inserted where
+    /// none existed at the scope's first touch — undo: `tableau.remove`.
+    RowInserted(VarId),
+    /// (Trail mode) The pre-scope row of this variable, saved verbatim at the
+    /// scope's first touch (covers both removal and in-place modification) —
+    /// undo: `tableau.insert` of the saved row (exact `SmallVec` term order
+    /// preserved by the clone).
+    RowReplaced(VarId, LinExpr),
+    /// (Trail mode) The basic flag of this variable flipped; the old value is
+    /// saved — undo: `basic[v] = old`. Recorded on EVERY flip (2 per pivot),
+    /// so LIFO replay restores the exact pre-push flag.
+    BasicFlag(VarId, bool),
 }
 
 /// Simplex tableau state
@@ -202,16 +225,41 @@ pub struct Simplex {
     infeasible: Option<VarId>,
     /// Pending propagated bounds
     propagated: Vec<PropagatedBound>,
-    /// Trail of undo operations
-    trail: Vec<BoundUndo>,
-    /// Trail size at each decision level
-    trail_limits: Vec<usize>,
+    /// Backtracking strategy (fixed at construction; see [`BacktrackMode`])
+    backtrack: BacktrackMode,
+    /// Pivot-victim selection: `false` = legacy first-in-map-iteration-order
+    /// (layout-dependent, byte-identical to the pre-trail trunk — the
+    /// Snapshot-mode default), `true` = smallest violating `VarId` (Bland's
+    /// leaving rule; layout-INdependent — required by `Trail`, whose pop
+    /// keeps the grown table while a snapshot restore reinstalls the
+    /// push-time clone, so map layouts legitimately diverge between modes
+    /// with bit-identical contents). Derived from the mode at construction.
+    deterministic_violating: bool,
+    /// The scoped undo spine: ONE append-only log for every undoable mutation
+    /// (bounds, var allocs, and — in trail mode — rows and basic flags).
+    /// `push` records a checkpoint mark; `pop` drains the suffix LIFO.
+    undo_stack: VecScopedStack<SimplexUndo>,
+    /// Per-scope `(checkpoint mark, scope epoch)` pairs, innermost last.
+    /// Snapshot mode carries a permanent base entry (mirroring the legacy
+    /// `trail_limits = vec![0]` initialisation byte-for-byte, including the
+    /// undo-everything unmatched-pop behavior); trail mode starts empty, so
+    /// recording is skipped entirely at base level (nothing can pop it).
+    undo_marks: Vec<(Checkpoint, u64)>,
+    /// Monotone scope-epoch counter: incremented on every push, NEVER reused
+    /// (so a stale `row_save_epoch` stamp can never collide with a live scope).
+    push_epoch: u64,
+    /// (Trail mode) Per-variable epoch of the scope that last saved this
+    /// variable's row (indexed by `VarId`, grown in `new_var`/`new_slack`,
+    /// kept in lock-step with `assignment`). A row's FIRST touch in a scope
+    /// records exactly one undo entry and stamps the scope epoch here; later
+    /// touches in the same scope compare equal and skip.
+    row_save_epoch: Vec<u64>,
     /// Cached assignments for warm-starting (basis caching)
     /// Saves assignment state at each decision level for faster incremental solving
     cached_assignments: Vec<Vec<DeltaRational>>,
-    /// Saved tableau snapshots for correct restoration on pop.
-    /// Pivoting during check() modifies the tableau rows in-place; without saving
-    /// the full tableau at push time, pop() cannot restore the correct basis.
+    /// (Snapshot mode) Saved tableau snapshots for wholesale restoration on
+    /// pop. Trail mode never populates this: pivots inside the scope are
+    /// undone row-by-row from the undo spine instead.
     saved_tableaux: Vec<(FxHashMap<VarId, LinExpr>, Vec<bool>)>,
     /// Pivoting rule to use
     pivoting_rule: PivotingRule,
@@ -241,6 +289,21 @@ impl Simplex {
     /// Create a new Simplex instance with custom configuration
     #[must_use]
     pub fn with_config(config: SimplexConfig) -> Self {
+        #[allow(unused_mut)]
+        let mut backtrack = config.backtrack;
+        // Env overrides (convention of `OXIZ_MBQI_GUARD_MS`; unset ⇒ config
+        // wins, byte-identical at rest): `OXIZ_SIMPLEX_TRAIL=1` opts into the
+        // trail scheme, `OXIZ_SIMPLEX_SNAPSHOT=1` forces the legacy snapshot
+        // scheme; snapshot wins if both are set (the conservative direction).
+        #[cfg(feature = "std")]
+        {
+            if std::env::var("OXIZ_SIMPLEX_TRAIL").is_ok_and(|v| v == "1") {
+                backtrack = BacktrackMode::Trail;
+            }
+            if std::env::var("OXIZ_SIMPLEX_SNAPSHOT").is_ok_and(|v| v == "1") {
+                backtrack = BacktrackMode::Snapshot;
+            }
+        }
         Self {
             num_vars: 0,
             num_slack: 0,
@@ -251,14 +314,77 @@ impl Simplex {
             basic: Vec::new(),
             infeasible: None,
             propagated: Vec::new(),
-            trail: Vec::new(),
-            trail_limits: vec![0],
+            backtrack,
+            deterministic_violating: matches!(backtrack, BacktrackMode::Trail),
+            undo_stack: VecScopedStack::new(),
+            undo_marks: Self::initial_marks(backtrack),
+            push_epoch: 0,
+            row_save_epoch: Vec::new(),
             cached_assignments: Vec::new(),
             saved_tableaux: Vec::new(),
             pivoting_rule: config.pivoting_rule,
             max_pivots: config.max_pivots,
             incomplete: false,
         }
+    }
+
+    /// Initial `undo_marks` for a mode: snapshot mode mirrors the legacy
+    /// `trail_limits = vec![0]` base entry (recording active at base level, and
+    /// an unmatched `pop` undoes everything, verbatim); trail mode starts with
+    /// no outstanding checkpoint (base-level recording skipped entirely).
+    fn initial_marks(backtrack: BacktrackMode) -> Vec<(Checkpoint, u64)> {
+        match backtrack {
+            BacktrackMode::Snapshot => vec![(Checkpoint::ORIGIN, 0)],
+            BacktrackMode::Trail => Vec::new(),
+        }
+    }
+
+    /// Record an undo entry if a scope can ever pop it. Snapshot mode always
+    /// carries its base mark (legacy behavior: base-level records exist and an
+    /// unmatched pop undoes them); trail mode records only inside a `push`ed
+    /// scope — at base level nothing can pop, so recording is skipped.
+    #[inline]
+    fn record(&mut self, undo: SimplexUndo) {
+        if !self.undo_marks.is_empty() {
+            self.undo_stack.push(undo);
+        }
+    }
+
+    /// (Trail mode) Record the FIRST in-scope touch of `var`'s tableau row —
+    /// `RowReplaced(old)` if a row is present, `RowInserted` if absent — and
+    /// stamp the scope epoch so later touches in the same scope skip. Must be
+    /// called BEFORE the mutation. No-op in snapshot mode or at base level.
+    #[inline]
+    fn record_row_touch(&mut self, var: VarId) {
+        if self.backtrack != BacktrackMode::Trail {
+            return;
+        }
+        let Some(&(_, epoch)) = self.undo_marks.last() else {
+            return;
+        };
+        let idx = var as usize;
+        if self.row_save_epoch[idx] == epoch {
+            return;
+        }
+        self.row_save_epoch[idx] = epoch;
+        match self.tableau.get(&var) {
+            Some(row) => self
+                .undo_stack
+                .push(SimplexUndo::RowReplaced(var, row.clone())),
+            None => self.undo_stack.push(SimplexUndo::RowInserted(var)),
+        }
+    }
+
+    /// (Trail mode) Record the current basic flag of `var` before a flip.
+    /// Recorded on EVERY flip (no epoch dedup): LIFO replay walks the flips
+    /// back to the exact pre-push value. No-op in snapshot mode / base level.
+    #[inline]
+    fn record_basic_flip(&mut self, var: VarId) {
+        if self.backtrack != BacktrackMode::Trail || self.undo_marks.is_empty() {
+            return;
+        }
+        self.undo_stack
+            .push(SimplexUndo::BasicFlag(var, self.basic[var as usize]));
     }
 
     /// Set the pivoting rule
@@ -285,7 +411,11 @@ impl Simplex {
         self.lower.push(None);
         self.upper.push(None);
         self.basic.push(false);
-        self.trail.push(BoundUndo::NewVar);
+        // Lock-step with `assignment` regardless of mode/recording (the stale
+        // stamp of a popped var can never equal a live scope's epoch — epochs
+        // are never reused — but keeping the arrays parallel is simplest).
+        self.row_save_epoch.push(0);
+        self.record(SimplexUndo::NewVar);
         id
     }
 
@@ -299,7 +429,8 @@ impl Simplex {
         self.lower.push(None);
         self.upper.push(None);
         self.basic.push(true); // Slack variables start basic
-        self.trail.push(BoundUndo::NewSlack(id));
+        self.row_save_epoch.push(0); // lock-step with `assignment` (see new_var)
+        self.record(SimplexUndo::NewSlack(id));
         id
     }
 
@@ -377,8 +508,8 @@ impl Simplex {
         if idx < self.lower.len() {
             // Track the old value for undo
             match self.lower[idx] {
-                None => self.trail.push(BoundUndo::LowerWasNone(var)),
-                Some(old) => self.trail.push(BoundUndo::LowerWasSome(var, old)),
+                None => self.record(SimplexUndo::LowerWasNone(var)),
+                Some(old) => self.record(SimplexUndo::LowerWasSome(var, old)),
             }
             self.lower[idx] = Some(Bound {
                 kind: BoundType::Lower,
@@ -394,8 +525,8 @@ impl Simplex {
         if idx < self.lower.len() {
             // Track the old value for undo
             match self.lower[idx] {
-                None => self.trail.push(BoundUndo::LowerWasNone(var)),
-                Some(old) => self.trail.push(BoundUndo::LowerWasSome(var, old)),
+                None => self.record(SimplexUndo::LowerWasNone(var)),
+                Some(old) => self.record(SimplexUndo::LowerWasSome(var, old)),
             }
             self.lower[idx] = Some(Bound {
                 kind: BoundType::Lower,
@@ -411,8 +542,8 @@ impl Simplex {
         if idx < self.upper.len() {
             // Track the old value for undo
             match self.upper[idx] {
-                None => self.trail.push(BoundUndo::UpperWasNone(var)),
-                Some(old) => self.trail.push(BoundUndo::UpperWasSome(var, old)),
+                None => self.record(SimplexUndo::UpperWasNone(var)),
+                Some(old) => self.record(SimplexUndo::UpperWasSome(var, old)),
             }
             self.upper[idx] = Some(Bound {
                 kind: BoundType::Upper,
@@ -428,8 +559,8 @@ impl Simplex {
         if idx < self.upper.len() {
             // Track the old value for undo
             match self.upper[idx] {
-                None => self.trail.push(BoundUndo::UpperWasNone(var)),
-                Some(old) => self.trail.push(BoundUndo::UpperWasSome(var, old)),
+                None => self.record(SimplexUndo::UpperWasNone(var)),
+                Some(old) => self.record(SimplexUndo::UpperWasSome(var, old)),
             }
             self.upper[idx] = Some(Bound {
                 kind: BoundType::Upper,
@@ -470,6 +601,10 @@ impl Simplex {
                 slack_expr.add_term(*var, -*coef);
             }
         }
+        // Trail mode: the fresh row needs a `RowInserted` undo (the slack's
+        // array entries are covered by the `NewSlack` undo popping the arrays,
+        // but the tableau row itself must be removed on pop).
+        self.record_row_touch(slack);
         self.tableau.insert(slack, slack_expr);
 
         // Mark slack as basic (it has a tableau row defining it in terms of non-basic vars)
@@ -527,6 +662,8 @@ impl Simplex {
                 slack_expr.add_term(*var, -*coef);
             }
         }
+        // Trail mode: fresh row → `RowInserted` undo (see add_le).
+        self.record_row_touch(slack);
         self.tableau.insert(slack, slack_expr);
 
         // Set slack > 0 (strict lower bound: slack >= 0 + δ)
@@ -766,25 +903,71 @@ impl Simplex {
         best_var
     }
 
-    /// Find a basic variable that violates its bounds
+    /// Find a basic variable that violates its bounds.
+    ///
+    /// Selection is CONTENT-deterministic (smallest violating `VarId`, i.e.
+    /// Bland's leaving-variable rule), NOT first-in-map-iteration-order: the
+    /// `FxHashMap` iteration order depends on the table's internal layout
+    /// (capacity/tombstone history), which is not part of the logical solver
+    /// state — two solvers with bit-identical contents can iterate their
+    /// tableaus differently (e.g. after a pop, a trail-mode backtrack keeps
+    /// the grown table while a snapshot restore returns to the push-time
+    /// clone's layout). The pivot sequence — and hence which of the many valid
+    /// feasible points `check()` lands on — must be a function of content
+    /// alone so that the trail/snapshot randomized differential can demand
+    /// bit-identical states after every operation.
     fn find_violating(&self) -> Option<(VarId, Bound)> {
+        if !self.deterministic_violating {
+            // Legacy trunk selection: first violating row in map-iteration
+            // order. Layout-dependent but byte-identical to the pre-trail
+            // engine — Snapshot mode keeps it so the default build's search
+            // trajectory is exactly the trunk's.
+            for var in self.tableau.keys() {
+                let idx = *var as usize;
+                let val = self.assignment[idx];
+                if let Some(lo) = self.lower[idx]
+                    && val < lo.value
+                {
+                    return Some((*var, lo));
+                }
+                if let Some(hi) = self.upper[idx]
+                    && val > hi.value
+                {
+                    return Some((*var, hi));
+                }
+            }
+            return None;
+        }
+        let mut best: Option<(VarId, Bound)> = None;
         for var in self.tableau.keys() {
+            if best.is_some_and(|(b, _)| b <= *var) {
+                continue;
+            }
             let idx = *var as usize;
             let val = self.assignment[idx];
 
             if let Some(lo) = self.lower[idx]
                 && val < lo.value
             {
-                return Some((*var, lo));
+                best = Some((*var, lo));
+                continue;
             }
 
             if let Some(hi) = self.upper[idx]
                 && val > hi.value
             {
-                return Some((*var, hi));
+                best = Some((*var, hi));
             }
         }
-        None
+        best
+    }
+
+    /// Test-only: force the layout-independent victim selection so a
+    /// Snapshot instance can be compared bit-identically against a Trail
+    /// twin (the cross-mode differential's precondition).
+    #[cfg(test)]
+    pub(crate) fn force_deterministic_violating(&mut self) {
+        self.deterministic_violating = true;
     }
 
     /// Find a non-basic variable to pivot with using the configured pivoting rule
@@ -990,6 +1173,9 @@ impl Simplex {
     pub(super) fn pivot(&mut self, basic_var: VarId, nonbasic_var: VarId) {
         #[cfg(feature = "profiling")]
         let _timer = ScopedTimer::new(ProfilingCategory::SimplexPivot);
+        // Trail mode: `basic_var`'s row is removed below — save it at first
+        // in-scope touch.
+        self.record_row_touch(basic_var);
         let expr = self
             .tableau
             .remove(&basic_var)
@@ -1014,8 +1200,18 @@ impl Simplex {
             }
         }
 
+        // Trail mode: rows modified in-place below must be saved at their
+        // first in-scope touch. Inlined epoch check (rather than
+        // `record_row_touch`) because the loop holds `&mut self.tableau`;
+        // `row_save_epoch`/`undo_stack` are disjoint fields.
+        let row_epoch = if self.backtrack == BacktrackMode::Trail {
+            self.undo_marks.last().map(|&(_, e)| e)
+        } else {
+            None
+        };
+
         // Substitute into other rows
-        for row in self.tableau.values_mut() {
+        for (var, row) in self.tableau.iter_mut() {
             let sub_coef = row
                 .terms
                 .iter()
@@ -1023,6 +1219,14 @@ impl Simplex {
                 .map(|(_, c)| *c);
 
             if let Some(sc) = sub_coef {
+                if let Some(epoch) = row_epoch {
+                    let idx = *var as usize;
+                    if self.row_save_epoch[idx] != epoch {
+                        self.row_save_epoch[idx] = epoch;
+                        self.undo_stack
+                            .push(SimplexUndo::RowReplaced(*var, row.clone()));
+                    }
+                }
                 row.terms.retain(|(v, _)| *v != nonbasic_var);
                 row.constant += sc * new_expr.constant;
                 for (v, c) in &new_expr.terms {
@@ -1031,8 +1235,15 @@ impl Simplex {
             }
         }
 
+        // Trail mode: `nonbasic_var` gains a row (it was non-basic, so absent
+        // → `RowInserted` at first touch; a same-scope earlier touch already
+        // holds the authoritative pre-scope record and is kept by the epoch
+        // skip — LIFO replay makes the EARLIEST record win).
+        self.record_row_touch(nonbasic_var);
         self.tableau.insert(nonbasic_var, new_expr);
+        self.record_basic_flip(basic_var);
         self.basic[basic_var as usize] = false;
+        self.record_basic_flip(nonbasic_var);
         self.basic[nonbasic_var as usize] = true;
 
         // Update assignment
@@ -1385,131 +1596,252 @@ impl Simplex {
         self.basic.clear();
         self.infeasible = None;
         self.propagated.clear();
-        self.trail.clear();
-        self.trail_limits.clear();
-        self.trail_limits.push(0);
+        self.undo_stack.clear();
+        self.undo_marks = Self::initial_marks(self.backtrack);
+        // `push_epoch` is deliberately NOT reset: epochs are never reused, so
+        // a stale `row_save_epoch` stamp surviving a reset (there are none —
+        // the vec is cleared — but belt-and-braces) can never match.
+        self.row_save_epoch.clear();
         self.cached_assignments.clear();
         self.saved_tableaux.clear();
     }
 
     /// Push a new decision level
     pub fn push(&mut self) {
-        self.trail_limits.push(self.trail.len());
+        // One checkpoint into the single undo funnel, tagged with a fresh
+        // scope epoch (monotone, never reused — see `row_save_epoch`).
+        self.push_epoch += 1;
+        self.undo_marks
+            .push((self.undo_stack.checkpoint(), self.push_epoch));
         // Cache current assignment for warm-starting on pop (basis caching).
+        // This snapshot STAYS in trail mode as the documented single-funnel
+        // exception: `DeltaRational` is `Copy`, so the clone is a memcpy (not
+        // the profiled cost), while `update_assignment` wholesale-rewrites
+        // every entry on each pivot — element-wise trailing of it would be
+        // pathological (one undo record per var per pivot).
         self.cached_assignments.push(self.assignment.clone());
-        // Save the full tableau snapshot so that pivots during check() inside
-        // the pushed scope can be correctly undone on pop().
-        self.saved_tableaux
-            .push((self.tableau.clone(), self.basic.clone()));
+        // Snapshot mode only: save the full tableau snapshot so that pivots
+        // during check() inside the pushed scope can be wholesale-undone on
+        // pop(). Trail mode undoes them row-by-row from the undo spine and
+        // skips this clone entirely (it was the dominant push cost).
+        if self.backtrack == BacktrackMode::Snapshot {
+            self.saved_tableaux
+                .push((self.tableau.clone(), self.basic.clone()));
+        }
     }
 
     /// Pop to previous decision level
     pub fn pop(&mut self) {
-        if let Some(limit) = self.trail_limits.pop() {
-            // Undo all operations since the limit (bounds and variable allocations).
-            while self.trail.len() > limit {
-                if let Some(undo) = self.trail.pop() {
-                    match undo {
-                        BoundUndo::LowerWasNone(var) => {
-                            self.lower[var as usize] = None;
-                        }
-                        BoundUndo::LowerWasSome(var, old) => {
-                            self.lower[var as usize] = Some(old);
-                        }
-                        BoundUndo::UpperWasNone(var) => {
-                            self.upper[var as usize] = None;
-                        }
-                        BoundUndo::UpperWasSome(var, old) => {
-                            self.upper[var as usize] = Some(old);
-                        }
-                        BoundUndo::NewVar => {
-                            self.num_vars -= 1;
-                            self.assignment.pop();
-                            self.lower.pop();
-                            self.upper.pop();
-                            self.basic.pop();
-                        }
-                        BoundUndo::NewSlack(id) => {
-                            self.num_slack -= 1;
-                            self.assignment.pop();
-                            self.lower.pop();
-                            self.upper.pop();
-                            self.basic.pop();
-                            // Tableau row removal handled by tableau snapshot restore below.
-                            let _ = id; // VarId noted but actual removal done below
-                        }
+        let Some((mark, _epoch)) = self.undo_marks.pop() else {
+            // Trail mode with no outstanding scope: nothing was recorded at
+            // base level, so an unmatched pop is a no-op. (Snapshot mode keeps
+            // its legacy base mark, so it reaches here only after ALREADY
+            // consuming that mark — matching the old `trail_limits`-empty
+            // no-op verbatim.)
+            return;
+        };
+
+        // Undo all operations since the mark, LIFO (`drain_since` yields
+        // reverse-push order — verified in the vendored VecScopedStack).
+        // Direct iteration is fine: the drain borrows only `self.undo_stack`;
+        // the arms touch disjoint fields.
+        for undo in self.undo_stack.drain_since(mark) {
+            match undo {
+                SimplexUndo::LowerWasNone(var) => {
+                    self.lower[var as usize] = None;
+                }
+                SimplexUndo::LowerWasSome(var, old) => {
+                    self.lower[var as usize] = Some(old);
+                }
+                SimplexUndo::UpperWasNone(var) => {
+                    self.upper[var as usize] = None;
+                }
+                SimplexUndo::UpperWasSome(var, old) => {
+                    self.upper[var as usize] = Some(old);
+                }
+                SimplexUndo::NewVar => {
+                    self.num_vars -= 1;
+                    self.assignment.pop();
+                    self.lower.pop();
+                    self.upper.pop();
+                    self.basic.pop();
+                    self.row_save_epoch.pop();
+                }
+                SimplexUndo::NewSlack(id) => {
+                    self.num_slack -= 1;
+                    self.assignment.pop();
+                    self.lower.pop();
+                    self.upper.pop();
+                    self.basic.pop();
+                    self.row_save_epoch.pop();
+                    // Tableau row removal: trail mode drains this scope's
+                    // `RowInserted(id)` BEFORE this arm (it was recorded
+                    // after `NewSlack` — LIFO); snapshot mode restores the
+                    // snapshot below.
+                    let _ = id;
+                }
+                SimplexUndo::RowInserted(var) => {
+                    // Trail mode only: the scope inserted a row where none
+                    // existed — remove it (the key may legitimately be absent
+                    // if a later same-scope pivot already removed it; those
+                    // later mutations were epoch-skipped, and this earliest
+                    // record is the authority).
+                    self.tableau.remove(&var);
+                }
+                SimplexUndo::RowReplaced(var, old_row) => {
+                    // Trail mode only: restore the pre-scope row verbatim
+                    // (clone preserved exact term order), overwriting any
+                    // in-scope replacement or re-creating a removed row.
+                    self.tableau.insert(var, old_row);
+                }
+                SimplexUndo::BasicFlag(var, old) => {
+                    // Trail mode only: walk the flip back. Every flip is
+                    // recorded, so the LIFO walk ends at the pre-push value.
+                    self.basic[var as usize] = old;
+                }
+            }
+        }
+
+        match self.backtrack {
+            BacktrackMode::Snapshot => {
+                // Restore the full tableau snapshot saved at push time.
+                // This correctly undoes any pivots performed during check() inside
+                // the pushed scope, which is critical for sound probe-and-pop operations
+                // (e.g., Nelson-Oppen equality detection).
+                if let Some((saved_tableau, saved_basic)) = self.saved_tableaux.pop() {
+                    self.tableau = saved_tableau;
+                    // Restore basic flags up to current length.
+                    let cur_len = self.basic.len();
+                    let restore_len = saved_basic.len().min(cur_len);
+                    self.basic[..restore_len].copy_from_slice(&saved_basic[..restore_len]);
+                    // Ensure any remaining entries are set to false (shouldn't happen normally).
+                    for item in self.basic.iter_mut().skip(restore_len) {
+                        *item = false;
+                    }
+                }
+                // Scrub stale-variable references from the restored tableau, for BOTH
+                // the snapshot and the no-snapshot paths. The trail undo above is the
+                // authority on which variables are live (it pops exactly this scope's
+                // `NewVar`/`NewSlack`), so `assignment.len()` is the live count. A
+                // restored tableau row keyed by — or whose expression references — a
+                // variable id `>= assignment.len()` is a leftover of a popped scope
+                // (the snapshot path can carry one in from a previously-dirty
+                // snapshot, propagating it forward). Dropping such rows enforces the
+                // invariant "the tableau only references live variables", without
+                // which a later `pivot` indexes the parallel arrays out of bounds —
+                // a hard panic on otherwise-valid push/pop input (surfaced by the
+                // persistent OxiZ delegation feeding a prelude-scale multi-`(push)`
+                // session: `simplex.rs` pivot OOB, `basic.len`=N vs a tableau var id
+                // `>N`). A popped variable is not a real variable, so dropping its
+                // (corrupt) row is sound.
+                //
+                // TRAIL MODE HAS NO FORWARD STALENESS CHANNEL and therefore no
+                // scrub (see the Trail arm below): every in-scope tableau/flag
+                // mutation flows through exactly one recorded funnel
+                // (`add_le`/`add_strict_lt` inserts, `pivot`
+                // remove/modify/insert/flips) and is exactly reverted by the
+                // LIFO drain above. By induction over scopes — if the
+                // invariant "tableau keys and row terms reference only live
+                // variables, and `basic` mirrors row ownership" held at push
+                // time, the drain restores that exact state at pop time —
+                // stale rows can never be created, carried in, or propagated
+                // forward. The snapshot path cannot make that argument
+                // precisely because a restored snapshot may predate (or
+                // outlive) trail-undone variable allocations, so it keeps the
+                // scrub.
+                let num_vars = self.assignment.len();
+                self.tableau.retain(|&var, expr| {
+                    (var as usize) < num_vars
+                        && expr.terms.iter().all(|(v, _)| (*v as usize) < num_vars)
+                });
+                // Keep the basic-flag vector consistent with the live variable set:
+                // size it to `num_vars`, and clear the flag of any variable no longer
+                // carrying a tableau row (it cannot be basic without one).
+                if self.basic.len() != num_vars {
+                    self.basic.resize(num_vars, false);
+                }
+                for i in 0..num_vars {
+                    if self.basic[i] && !self.tableau.contains_key(&(i as VarId)) {
+                        self.basic[i] = false;
+                    }
+                }
+
+                // Restore cached assignment for warm-starting.
+                if let Some(cached) = self.cached_assignments.pop() {
+                    let restore_len = cached.len().min(self.assignment.len());
+                    self.assignment[..restore_len].copy_from_slice(&cached[..restore_len]);
+                    for item in self.assignment.iter_mut().skip(restore_len) {
+                        *item = DeltaRational::zero();
+                    }
+                } else {
+                    for item in self.assignment.iter_mut() {
+                        *item = DeltaRational::zero();
                     }
                 }
             }
+            BacktrackMode::Trail => {
+                // No scrub needed (no forward staleness channel — see the
+                // induction argument in the Snapshot arm above). Debug builds
+                // verify the restored invariants with a full scan in the
+                // scrub's place:
+                #[cfg(debug_assertions)]
+                {
+                    let n = self.assignment.len();
+                    debug_assert_eq!(
+                        self.basic.len(),
+                        n,
+                        "trail pop: basic/assignment length desync"
+                    );
+                    for (var, expr) in &self.tableau {
+                        debug_assert!(
+                            (*var as usize) < n,
+                            "trail pop: stale tableau key {var} >= {n}"
+                        );
+                        for (v, _) in &expr.terms {
+                            debug_assert!(
+                                (*v as usize) < n,
+                                "trail pop: stale term var {v} in row {var} (n={n})"
+                            );
+                        }
+                    }
+                    for i in 0..n {
+                        debug_assert_eq!(
+                            self.basic[i],
+                            self.tableau.contains_key(&(i as VarId)),
+                            "trail pop: basic flag desync at var {i}"
+                        );
+                    }
+                }
 
-            // Restore the full tableau snapshot saved at push time.
-            // This correctly undoes any pivots performed during check() inside
-            // the pushed scope, which is critical for sound probe-and-pop operations
-            // (e.g., Nelson-Oppen equality detection).
-            if let Some((saved_tableau, saved_basic)) = self.saved_tableaux.pop() {
-                self.tableau = saved_tableau;
-                // Restore basic flags up to current length.
-                let cur_len = self.basic.len();
-                let restore_len = saved_basic.len().min(cur_len);
-                self.basic[..restore_len].copy_from_slice(&saved_basic[..restore_len]);
-                // Ensure any remaining entries are set to false (shouldn't happen normally).
-                for item in self.basic.iter_mut().skip(restore_len) {
-                    *item = false;
+                // Restore the push-time assignment (warm-start cache). The
+                // exact undo replay above already restored the allocation
+                // count, so the lengths must agree; move the cached vec in
+                // wholesale.
+                if let Some(cached) = self.cached_assignments.pop() {
+                    debug_assert_eq!(
+                        cached.len(),
+                        self.assignment.len(),
+                        "trail pop: cached assignment length desync"
+                    );
+                    self.assignment = cached;
                 }
             }
-            // Scrub stale-variable references from the restored tableau, for BOTH
-            // the snapshot and the no-snapshot paths. The trail undo above is the
-            // authority on which variables are live (it pops exactly this scope's
-            // `NewVar`/`NewSlack`), so `assignment.len()` is the live count. A
-            // restored tableau row keyed by — or whose expression references — a
-            // variable id `>= assignment.len()` is a leftover of a popped scope
-            // (the snapshot path can carry one in from a previously-dirty
-            // snapshot, propagating it forward). Dropping such rows enforces the
-            // invariant "the tableau only references live variables", without
-            // which a later `pivot` indexes the parallel arrays out of bounds —
-            // a hard panic on otherwise-valid push/pop input (surfaced by the
-            // persistent OxiZ delegation feeding a prelude-scale multi-`(push)`
-            // session: `simplex.rs` pivot OOB, `basic.len`=N vs a tableau var id
-            // `>N`). A popped variable is not a real variable, so dropping its
-            // (corrupt) row is sound.
-            let num_vars = self.assignment.len();
-            self.tableau.retain(|&var, expr| {
-                (var as usize) < num_vars
-                    && expr.terms.iter().all(|(v, _)| (*v as usize) < num_vars)
-            });
-            // Keep the basic-flag vector consistent with the live variable set:
-            // size it to `num_vars`, and clear the flag of any variable no longer
-            // carrying a tableau row (it cannot be basic without one).
-            if self.basic.len() != num_vars {
-                self.basic.resize(num_vars, false);
-            }
-            for i in 0..num_vars {
-                if self.basic[i] && !self.tableau.contains_key(&(i as VarId)) {
-                    self.basic[i] = false;
-                }
-            }
-
-            // Restore cached assignment for warm-starting.
-            if let Some(cached) = self.cached_assignments.pop() {
-                let restore_len = cached.len().min(self.assignment.len());
-                self.assignment[..restore_len].copy_from_slice(&cached[..restore_len]);
-                for item in self.assignment.iter_mut().skip(restore_len) {
-                    *item = DeltaRational::zero();
-                }
-            } else {
-                for item in self.assignment.iter_mut() {
-                    *item = DeltaRational::zero();
-                }
-            }
-
-            self.infeasible = None;
         }
+
+        self.infeasible = None;
     }
 
     /// Get the current decision level
     #[must_use]
     pub fn decision_level(&self) -> usize {
-        self.trail_limits.len().saturating_sub(1)
+        match self.backtrack {
+            // Trail mode: one mark per outstanding push, no base entry.
+            BacktrackMode::Trail => self.undo_marks.len(),
+            // Snapshot mode: legacy base entry occupies one slot (and can be
+            // consumed by an unmatched pop — `saturating_sub` mirrors the old
+            // `trail_limits` arithmetic byte-for-byte).
+            BacktrackMode::Snapshot => self.undo_marks.len().saturating_sub(1),
+        }
     }
 
     // ── Accessor helpers for the optimization extension (simplex_opt.rs) ─────
@@ -1608,6 +1940,453 @@ pub use super::simplex_opt::SimplexOptStatus;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Trail-vs-snapshot backtracking test rig ──────────────────────────────
+
+    /// One canonicalized tableau row: `(key, terms-in-stored-order, constant)`.
+    type CanonRow = (VarId, Vec<(VarId, ArithRat)>, ArithRat);
+
+    /// Canonicalized full solver state for bit-identical comparisons:
+    /// assignment, bounds (kind/value/reason), basic flags, tableau rows
+    /// sorted by key with per-row term order PRESERVED, the incomplete flag,
+    /// and the var counters.
+    type CanonState = (
+        Vec<DeltaRational>,
+        Vec<Option<(BoundType, DeltaRational, u32)>>,
+        Vec<Option<(BoundType, DeltaRational, u32)>>,
+        Vec<bool>,
+        Vec<CanonRow>,
+        bool,
+        usize,
+        usize,
+    );
+
+    fn canon_state(s: &Simplex) -> CanonState {
+        let canon_bounds = |v: &[Option<Bound>]| {
+            v.iter()
+                .map(|ob| ob.map(|b| (b.kind, b.value, b.reason)))
+                .collect::<Vec<_>>()
+        };
+        let mut rows: Vec<CanonRow> = s
+            .tableau
+            .iter()
+            .map(|(k, e)| (*k, e.terms.to_vec(), e.constant))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        (
+            s.assignment.clone(),
+            canon_bounds(&s.lower),
+            canon_bounds(&s.upper),
+            s.basic.clone(),
+            rows,
+            s.incomplete,
+            s.num_vars,
+            s.num_slack,
+        )
+    }
+
+    fn mode_config(backtrack: BacktrackMode) -> SimplexConfig {
+        SimplexConfig {
+            backtrack,
+            ..SimplexConfig::default()
+        }
+    }
+
+    /// xorshift64* — deterministic seeded RNG, no external dep.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// Signed value in `[-r, r]`, never 0 when `nonzero`.
+        fn coef(&mut self, r: i64, nonzero: bool) -> i64 {
+            loop {
+                let v = (self.below(2 * r as u64 + 1) as i64) - r;
+                if !nonzero || v != 0 {
+                    return v;
+                }
+            }
+        }
+    }
+
+    /// Drive one differential seed (paired Trail/Snapshot instances through an
+    /// identical randomized op sequence, comparing full state after every op);
+    /// returns the maximum push depth reached.
+    fn run_differential_seed(seed_i: u64, ops_per_seed: usize) -> usize {
+        const MAX_DEPTH: usize = 4;
+        const MAX_VARS: usize = 14;
+
+        let mut global_max_depth = 0usize;
+
+        {
+            let mut rng = XorShift((seed_i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut trail = Simplex::with_config(mode_config(BacktrackMode::Trail));
+            let mut snap = Simplex::with_config(mode_config(BacktrackMode::Snapshot));
+            // Cross-mode bit-identity needs layout-independent pivot choice.
+            snap.force_deterministic_violating();
+
+            let mut vars: Vec<VarId> = Vec::new();
+            for _ in 0..3 {
+                let a = trail.new_var();
+                let b = snap.new_var();
+                assert_eq!(a, b);
+                vars.push(a);
+            }
+            let mut depth = 0usize;
+            // `vars.len()` at each push. On pop, the solver deallocates the
+            // vars created inside the scope (ids get REUSED by later
+            // allocations), so the driver must drop them from its universe too
+            // — mirroring real callers (ArithSolver truncates its term<->var
+            // interner in lock-step with pop). Feeding a constraint that
+            // references a popped var violates the caller contract: snapshot
+            // mode happens to silently scrub the resulting garbage row on the
+            // next pop, trail mode debug-asserts it.
+            let mut var_marks: Vec<usize> = Vec::new();
+
+            for op_i in 0..ops_per_seed {
+                let reason = (seed_i as u32) << 8 | op_i as u32 & 0xFF;
+                match rng.below(16) {
+                    0 | 1 if vars.len() < MAX_VARS => {
+                        let a = trail.new_var();
+                        let b = snap.new_var();
+                        assert_eq!(a, b);
+                        vars.push(a);
+                    }
+                    2..=5 => {
+                        // Random constraint over 1-3 distinct declared vars.
+                        let nterms = 1 + rng.below(3) as usize;
+                        let mut expr = LinExpr::new();
+                        let mut used: Vec<VarId> = Vec::new();
+                        for _ in 0..nterms {
+                            let v = vars[rng.below(vars.len() as u64) as usize];
+                            if used.contains(&v) {
+                                continue;
+                            }
+                            used.push(v);
+                            expr.add_term(v, ArithRat::from_integer(rng.coef(3, true) as i128));
+                        }
+                        expr.add_constant(ArithRat::from_integer(rng.coef(10, false) as i128));
+                        match rng.below(5) {
+                            0 => {
+                                trail.add_le(expr.clone(), reason);
+                                snap.add_le(expr, reason);
+                            }
+                            1 => {
+                                trail.add_ge(expr.clone(), reason);
+                                snap.add_ge(expr, reason);
+                            }
+                            2 => {
+                                trail.add_eq(expr.clone(), reason);
+                                snap.add_eq(expr, reason);
+                            }
+                            3 => {
+                                trail.add_strict_lt(expr.clone(), reason);
+                                snap.add_strict_lt(expr, reason);
+                            }
+                            _ => {
+                                trail.add_strict_gt(expr.clone(), reason);
+                                snap.add_strict_gt(expr, reason);
+                            }
+                        }
+                    }
+                    6..=8 => {
+                        let v = vars[rng.below(vars.len() as u64) as usize];
+                        let val = ArithRat::from_integer(rng.coef(10, false) as i128);
+                        match rng.below(4) {
+                            0 => {
+                                trail.set_lower(v, val, reason);
+                                snap.set_lower(v, val, reason);
+                            }
+                            1 => {
+                                trail.set_upper(v, val, reason);
+                                snap.set_upper(v, val, reason);
+                            }
+                            2 => {
+                                trail.set_strict_lower(v, val, reason);
+                                snap.set_strict_lower(v, val, reason);
+                            }
+                            _ => {
+                                trail.set_strict_upper(v, val, reason);
+                                snap.set_strict_upper(v, val, reason);
+                            }
+                        }
+                    }
+                    9 | 10 if depth < MAX_DEPTH => {
+                        trail.push();
+                        snap.push();
+                        var_marks.push(vars.len());
+                        depth += 1;
+                        global_max_depth = global_max_depth.max(depth);
+                    }
+                    11 if depth > 0 => {
+                        trail.pop();
+                        snap.pop();
+                        vars.truncate(var_marks.pop().expect("var_marks in lock-step with depth"));
+                        depth -= 1;
+                    }
+                    12 | 13 => {
+                        let rt = trail.check();
+                        let rs = snap.check();
+                        assert_eq!(rt, rs, "seed {seed_i} op {op_i}: check() diverged");
+                    }
+                    14 => {
+                        trail.propagate_bounds();
+                        snap.propagate_bounds();
+                        assert_eq!(trail.get_propagated().len(), snap.get_propagated().len());
+                    }
+                    _ => {
+                        let v = vars[rng.below(vars.len() as u64) as usize];
+                        let ct = trail.tighten_bounds(v);
+                        let cs = snap.tighten_bounds(v);
+                        assert_eq!(ct, cs, "seed {seed_i} op {op_i}: tighten diverged");
+                    }
+                }
+
+                assert_eq!(trail.decision_level(), snap.decision_level());
+                assert_eq!(
+                    canon_state(&trail),
+                    canon_state(&snap),
+                    "seed {seed_i} op {op_i}: state diverged"
+                );
+            }
+
+            // Unwind every outstanding scope, comparing after each pop.
+            while depth > 0 {
+                trail.pop();
+                snap.pop();
+                vars.truncate(var_marks.pop().expect("var_marks in lock-step with depth"));
+                depth -= 1;
+                assert_eq!(
+                    canon_state(&trail),
+                    canon_state(&snap),
+                    "seed {seed_i}: state diverged on final unwind"
+                );
+            }
+        }
+
+        global_max_depth
+    }
+
+    /// THE gate: paired Trail/Snapshot instances driven through identical
+    /// randomized op sequences; after EVERY op the complete solver state and
+    /// every `check()` result (conflict vec included) must be bit-identical.
+    /// 128 seeds x 100 ops = 12,800 ops, push depth reaches >= 3.
+    #[test]
+    fn trail_vs_snapshot_differential_randomized() {
+        const SEEDS: u64 = 128;
+        const OPS_PER_SEED: usize = 100;
+
+        let mut global_max_depth = 0usize;
+        for seed_i in 0..SEEDS {
+            global_max_depth = global_max_depth.max(run_differential_seed(seed_i, OPS_PER_SEED));
+        }
+
+        assert!(
+            global_max_depth >= 3,
+            "differential never reached push depth 3 (got {global_max_depth}) — rebalance op weights"
+        );
+    }
+
+    /// Nested pushes with checks forcing pivots at each level; popping back
+    /// must restore the EXACT pre-push state (bit-identical canon compare) at
+    /// every level. Runs under the default (Trail) mode.
+    #[test]
+    fn pop_restores_after_multilevel_pivots() {
+        // Trail-mode pins: construct explicitly (the default is Snapshot).
+        let mut s = Simplex::with_config(mode_config(BacktrackMode::Trail));
+        assert_eq!(s.backtrack, BacktrackMode::Trail);
+
+        let x = s.new_var();
+        let y = s.new_var();
+        s.set_lower(x, ArithRat::zero(), 0);
+        s.set_lower(y, ArithRat::zero(), 1);
+        assert!(s.check().is_ok());
+        let s0 = canon_state(&s);
+
+        // Level 1: x + y >= 6 forces a pivot (crash basis sits at x=y=0).
+        s.push();
+        let mut e1 = LinExpr::new();
+        e1.add_term(x, ArithRat::one());
+        e1.add_term(y, ArithRat::one());
+        e1.add_constant(ArithRat::from_integer(-6));
+        s.add_ge(e1, 2);
+        assert!(s.check().is_ok());
+        assert!(
+            s.basic[x as usize] || s.basic[y as usize],
+            "level-1 check should have pivoted a declared var into the basis"
+        );
+        let s1 = canon_state(&s);
+
+        // Level 2: x + 2y >= 8 forces further pivoting (y enters the basis).
+        s.push();
+        let mut e2 = LinExpr::new();
+        e2.add_term(x, ArithRat::one());
+        e2.add_term(y, ArithRat::from_integer(2));
+        e2.add_constant(ArithRat::from_integer(-8));
+        s.add_ge(e2, 3);
+        assert!(s.check().is_ok());
+        assert!(
+            s.basic[x as usize] && s.basic[y as usize],
+            "both declared vars should be basic after the level-2 pivots"
+        );
+        let s2 = canon_state(&s);
+
+        // Level 3: deterministic conflict (trivially infeasible bound pair —
+        // a cap like x<=1 can drive the Bland loop to the pivot limit instead,
+        // which reports Ok+incomplete, i.e. Unknown, on trunk).
+        s.push();
+        s.set_lower(x, ArithRat::from_integer(70), 4);
+        s.set_upper(x, ArithRat::from_integer(60), 5);
+        assert!(s.check().is_err());
+
+        s.pop();
+        assert_eq!(canon_state(&s), s2, "pop to level 2 must restore exactly");
+        s.pop();
+        assert_eq!(canon_state(&s), s1, "pop to level 1 must restore exactly");
+        s.pop();
+        assert_eq!(canon_state(&s), s0, "pop to level 0 must restore exactly");
+        assert!(s.check().is_ok());
+    }
+
+    /// Reconstructs the pivot-OOB hazard shape (the reason the snapshot path
+    /// scrubs stale rows) in Trail mode: push, add slack rows, force pivots,
+    /// pop, then immediately add constraints and check at the outer level.
+    /// Must not panic and must produce the correct verdicts.
+    #[test]
+    fn pop_then_pivot_no_oob() {
+        // Trail-mode pins: construct explicitly (the default is Snapshot).
+        let mut s = Simplex::with_config(mode_config(BacktrackMode::Trail));
+        assert_eq!(s.backtrack, BacktrackMode::Trail);
+
+        let x = s.new_var();
+        let y = s.new_var();
+        s.set_lower(x, ArithRat::zero(), 0);
+        s.set_lower(y, ArithRat::zero(), 1);
+
+        // Inner scope: slack rows + forced pivots.
+        s.push();
+        let mut e1 = LinExpr::new();
+        e1.add_term(x, ArithRat::one());
+        e1.add_term(y, ArithRat::one());
+        e1.add_constant(ArithRat::from_integer(-6));
+        s.add_ge(e1, 2);
+        let mut e2 = LinExpr::new();
+        e2.add_term(x, ArithRat::one());
+        e2.add_term(y, ArithRat::from_integer(2));
+        e2.add_constant(ArithRat::from_integer(-8));
+        s.add_ge(e2, 3);
+        assert!(s.check().is_ok());
+        s.pop();
+
+        // Immediately add fresh constraints at the outer level and pivot again:
+        // any stale row/flag surviving the pop would index OOB here.
+        let mut e3 = LinExpr::new();
+        e3.add_term(x, ArithRat::one());
+        e3.add_term(y, ArithRat::one());
+        e3.add_constant(ArithRat::from_integer(-4));
+        s.add_ge(e3, 4); // x + y >= 4
+        assert!(s.check().is_ok(), "x+y>=4 with x,y>=0 is satisfiable");
+
+        // Deterministic conflict to also exercise the error path post-pop
+        // (trivial bound pair — Bland caps like x<=1 can end Ok+incomplete).
+        s.set_lower(x, ArithRat::from_integer(70), 5);
+        s.set_upper(x, ArithRat::from_integer(60), 6);
+        assert!(s.check().is_err(), "x in [70, 60] must conflict");
+    }
+
+    /// A row touched twice inside one scope must be saved exactly once
+    /// (save-once-per-scope epoch), and pop must restore the exact pre-push
+    /// state. Two deterministic sequential pivots in ONE scope: `x`'s row is
+    /// inserted by pivot 1 and removed by pivot 2 — the second touch is
+    /// epoch-skipped, leaving the single authoritative `RowInserted(x)`.
+    #[test]
+    fn row_touched_twice_single_restore() {
+        // Trail-mode pins: construct explicitly (the default is Snapshot).
+        let mut s = Simplex::with_config(mode_config(BacktrackMode::Trail));
+        assert_eq!(s.backtrack, BacktrackMode::Trail);
+
+        let x = s.new_var();
+        let y = s.new_var();
+        s.set_lower(x, ArithRat::zero(), 0);
+        s.set_lower(y, ArithRat::zero(), 1);
+
+        // Single constraint x + y >= 6: slack u1 = x + y - 6 >= 0, the sole
+        // tableau row, so every find_violating outcome is order-independent.
+        let mut e1 = LinExpr::new();
+        e1.add_term(x, ArithRat::one());
+        e1.add_term(y, ArithRat::one());
+        e1.add_constant(ArithRat::from_integer(-6));
+        s.add_ge(e1, 2);
+        let u1 = s.assignment.len() as VarId - 1; // slack of e1
+        assert_eq!(u1, 2);
+
+        // Base level: trail mode records nothing (nothing can pop it).
+        assert_eq!(s.undo_stack.as_slice().len(), 0);
+
+        let pre = canon_state(&s);
+        s.push();
+
+        // Pivot 1: u1 violated at the crash basis (x=y=0 -> u1=-6); Bland
+        // enters x (smallest eligible id). Touches: u1's row removed
+        // (RowReplaced), x's row inserted (RowInserted). x basic afterwards.
+        assert!(s.check().is_ok());
+        assert!(s.basic[x as usize], "pivot 1 must make x basic");
+
+        // Pivot 2 (same scope): cap x at 4 (x sits at 6) — the only eligible
+        // entering var in x's row (u1: +1 at its lower bound; y: -1, free
+        // above) is y. x's row is REMOVED: second touch of a row first touched
+        // by pivot 1's insert -> epoch-skipped. y's row inserted.
+        s.set_upper(x, ArithRat::from_integer(4), 3);
+        assert!(s.check().is_ok());
+        assert!(s.basic[y as usize], "pivot 2 must make y basic");
+        assert!(!s.basic[x as usize], "pivot 2 must make x non-basic");
+
+        // Exactly one row record per touched var, despite x's row being
+        // touched twice (inserted by pivot 1, removed by pivot 2).
+        let mut row_records_per_var: FxHashMap<VarId, usize> = FxHashMap::default();
+        let mut basic_flips = 0usize;
+        for u in s.undo_stack.iter() {
+            match u {
+                SimplexUndo::RowReplaced(v, _) | SimplexUndo::RowInserted(v) => {
+                    *row_records_per_var.entry(*v).or_insert(0) += 1;
+                }
+                SimplexUndo::BasicFlag(..) => basic_flips += 1,
+                _ => {}
+            }
+        }
+        for (v, n) in &row_records_per_var {
+            assert_eq!(*n, 1, "row of var {v} saved more than once in one scope");
+        }
+        assert_eq!(
+            row_records_per_var.get(&x),
+            Some(&1),
+            "x's row (touched twice) must have exactly one record"
+        );
+        assert!(
+            s.undo_stack
+                .iter()
+                .any(|u| matches!(u, SimplexUndo::RowInserted(v) if *v == x)),
+            "x's single record must be RowInserted (no row at scope entry)"
+        );
+        assert!(
+            s.undo_stack
+                .iter()
+                .any(|u| matches!(u, SimplexUndo::RowReplaced(v, _) if *v == u1)),
+            "u1's record must be RowReplaced (its row predates the scope)"
+        );
+        assert_eq!(basic_flips, 4, "two pivots record exactly 2 flips each");
+
+        s.pop();
+        assert_eq!(canon_state(&s), pre, "pop must restore the exact pre-push state");
+    }
 
     #[test]
     fn test_simplex_basic() {
