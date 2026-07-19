@@ -256,6 +256,27 @@ impl Default for EufSolver {
     }
 }
 
+/// E2a: report the find/hop counters to stderr when the solver instance is
+/// dropped and `OXIZ_EUF_STATS` is set (`var_os`, `OXIZ_MBQI_DBG` convention).
+/// One line per `EufSolver` instance — a process that rebuilds its EUF core
+/// prints one line per epoch. `std`-gated on top of the feature because both
+/// `std::env` and a real `eprintln!` need `std`.
+#[cfg(all(feature = "euf-find-stats", feature = "std"))]
+impl Drop for EufSolver {
+    fn drop(&mut self) {
+        if std::env::var_os("OXIZ_EUF_STATS").is_some() {
+            let (finds, hops) = self.uf.find_stats();
+            #[allow(clippy::cast_precision_loss)]
+            let avg = if finds == 0 {
+                0.0
+            } else {
+                hops as f64 / finds as f64
+            };
+            eprintln!("[euf-stats] finds={finds} hops={hops} avg={avg:.2}");
+        }
+    }
+}
+
 impl EufSolver {
     /// Create a new EUF solver
     #[must_use]
@@ -282,6 +303,20 @@ impl EufSolver {
             explain_parent: Vec::new(),
             expl_cache: crate::lru_cache::LruCache::new(EUF_EXPL_CACHE_CAPACITY),
         }
+    }
+
+    /// E2a: `(finds, hops)` accumulated by the union-find's `find_no_compress`
+    /// since solver creation (or the last `reset_find_stats`).
+    #[cfg(feature = "euf-find-stats")]
+    #[must_use]
+    pub fn find_stats(&self) -> (u64, u64) {
+        self.uf.find_stats()
+    }
+
+    /// E2a: zero the union-find's `find_no_compress` counters.
+    #[cfg(feature = "euf-find-stats")]
+    pub fn reset_find_stats(&self) {
+        self.uf.reset_find_stats();
     }
 
     /// Register a function with specific properties (for dynamic arity support)

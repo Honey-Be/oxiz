@@ -43,3 +43,10 @@ axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 rustc-hash = { workspace = true, features = ["std"] }
+
+[features]
+# E2a passthrough: EUF union-find find/hop counters (see oxiz-theories).
+# `cargo build --release -p oxiz-cli --features euf-find-stats` yields an
+# `oxiz` binary that prints "[euf-stats] finds=N hops=M avg=X.XX" to stderr
+# at solver drop when OXIZ_EUF_STATS is set.
+euf-find-stats = ["oxiz-solver/euf-find-stats"]

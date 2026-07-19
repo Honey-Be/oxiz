@@ -58,6 +58,14 @@ std = [
     "portable-collection-primitives/std",
 ]
 profiling = ["std", "oxiz-core/profiling", "oxiz-sat/profiling"]
+# E2a instrumentation: find/hop counters inside `UnionFind::find_no_compress`
+# to gate E2b (trailed path compression) on measured avg parent-chain depth.
+# NOT a default feature — every increment is behind `#[cfg]`, so the default
+# build is byte-identical at rest. Counters themselves are no_std-clean
+# (`core::sync::atomic::AtomicU64`, Relaxed — `&self` + `Sync`, which `Cell`
+# would break for `Theory: Send + Sync`); the stderr report at `EufSolver`
+# drop additionally requires `std` (gated `all(euf-find-stats, std)`).
+euf-find-stats = []
 
 [dev-dependencies]
 proptest = { workspace = true }

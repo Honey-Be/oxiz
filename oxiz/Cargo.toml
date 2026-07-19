@@ -50,3 +50,5 @@ spacer = ["dep:oxiz-spacer", "std"]
 proof = ["dep:oxiz-proof", "std"]
 standard = ["nlsat", "optimization", "proof"]
 full = ["standard", "spacer"]
+# E2a passthrough: EUF union-find find/hop counters (see oxiz-theories).
+euf-find-stats = ["oxiz-theories/euf-find-stats"]

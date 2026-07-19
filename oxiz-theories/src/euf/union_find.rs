@@ -3,6 +3,33 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+#[cfg(feature = "euf-find-stats")]
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// E2a: cumulative `find_no_compress` counters.
+///
+/// Atomics (not `Cell`) because `find_no_compress` takes `&self` and the
+/// containing solvers must stay `Sync` (`Theory: Send + Sync`); `Relaxed` is
+/// enough — these are monotone diagnostic counters, no ordering is consumed.
+#[cfg(feature = "euf-find-stats")]
+#[derive(Debug, Default)]
+struct FindStats {
+    /// Number of `find_no_compress` calls.
+    finds: AtomicU64,
+    /// Total parent-chain steps across all calls.
+    hops: AtomicU64,
+}
+
+#[cfg(feature = "euf-find-stats")]
+impl Clone for FindStats {
+    fn clone(&self) -> Self {
+        Self {
+            finds: AtomicU64::new(self.finds.load(Relaxed)),
+            hops: AtomicU64::new(self.hops.load(Relaxed)),
+        }
+    }
+}
+
 /// An undo entry for reverting a union operation
 #[derive(Debug, Clone, Copy)]
 pub struct UndoEntry {
@@ -27,6 +54,9 @@ pub struct UnionFind {
     trail: Vec<UndoEntry>,
     /// Trail size at each decision level
     trail_limits: Vec<usize>,
+    /// E2a: `find_no_compress` call/hop counters (cumulative; survive `clear`).
+    #[cfg(feature = "euf-find-stats")]
+    stats: FindStats,
 }
 
 impl UnionFind {
@@ -38,6 +68,8 @@ impl UnionFind {
             rank: vec![0; n],
             trail: Vec::new(),
             trail_limits: vec![0],
+            #[cfg(feature = "euf-find-stats")]
+            stats: FindStats::default(),
         }
     }
 
@@ -63,10 +95,37 @@ impl UnionFind {
     #[inline]
     #[must_use]
     pub fn find_no_compress(&self, mut x: u32) -> u32 {
+        #[cfg(feature = "euf-find-stats")]
+        let mut hops: u64 = 0;
         while self.parent[x as usize] != x {
             x = self.parent[x as usize];
+            #[cfg(feature = "euf-find-stats")]
+            {
+                hops += 1;
+            }
+        }
+        #[cfg(feature = "euf-find-stats")]
+        {
+            self.stats.finds.fetch_add(1, Relaxed);
+            self.stats.hops.fetch_add(hops, Relaxed);
         }
         x
+    }
+
+    /// E2a: `(finds, hops)` accumulated by `find_no_compress` since creation
+    /// (or the last `reset_find_stats`). Cumulative across `clear()` on purpose:
+    /// the drop-time report sizes the whole run, not one solver epoch.
+    #[cfg(feature = "euf-find-stats")]
+    #[must_use]
+    pub fn find_stats(&self) -> (u64, u64) {
+        (self.stats.finds.load(Relaxed), self.stats.hops.load(Relaxed))
+    }
+
+    /// E2a: zero the `find_no_compress` counters.
+    #[cfg(feature = "euf-find-stats")]
+    pub fn reset_find_stats(&self) {
+        self.stats.finds.store(0, Relaxed);
+        self.stats.hops.store(0, Relaxed);
     }
 
     /// Check if two elements are in the same set (immutable version)
@@ -356,6 +415,30 @@ mod tests {
         uf.pop();
         assert!(uf.same_no_compress(0, 1));
         assert!(!uf.same_no_compress(2, 3)); // Undone
+    }
+
+    /// E2a: one `find_no_compress` from the tail of the chain 0 <- 1 <- 2 <- 3
+    /// (parent[3]=2, parent[2]=1, parent[1]=0) walks exactly 3 parent steps.
+    #[cfg(feature = "euf-find-stats")]
+    #[test]
+    fn find_stats_counts_hops() {
+        let mut uf = UnionFind::new(4);
+        // Build the chain directly via parent pointers so the depth is
+        // deterministic (union-by-rank would flatten it to depth 1).
+        uf.parent[1] = 0;
+        uf.parent[2] = 1;
+        uf.parent[3] = 2;
+        uf.reset_find_stats();
+
+        assert_eq!(uf.find_no_compress(3), 0);
+        assert_eq!(uf.find_stats(), (1, 3));
+
+        // A find on the root itself is 1 find, 0 hops.
+        assert_eq!(uf.find_no_compress(0), 0);
+        assert_eq!(uf.find_stats(), (2, 3));
+
+        uf.reset_find_stats();
+        assert_eq!(uf.find_stats(), (0, 0));
     }
 
     #[test]

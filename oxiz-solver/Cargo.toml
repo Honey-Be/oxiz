@@ -45,6 +45,8 @@ std = [
 ]
 parallel-theories = ["rayon"]
 property-tests = []
+# E2a passthrough: EUF union-find find/hop counters (see oxiz-theories).
+euf-find-stats = ["oxiz-theories/euf-find-stats"]
 profiling = [
     "std",
     "oxiz-core/profiling",
