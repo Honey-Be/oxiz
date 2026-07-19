@@ -49,6 +49,10 @@ fn run(e: &mut Engine<ToySig>, t: &mut Toy, model: &impl ModelEval<Toy>) -> (&'s
         match e.round_with(t, model) {
             Verdict::NewLemmas(ls) => emitted += ls.len(),
             Verdict::Saturated => return ("Sat", emitted),
+            // #425 phase 2 confirm-but-never-sat: at the host it collapses to
+            // `Unknown` unless the ground confirm refutes — for these
+            // engine-level pins the "not Sat" half is what matters.
+            Verdict::SaturatedUnverified => return ("Unknown", emitted),
             Verdict::Inconclusive => return ("Unknown", emitted),
             Verdict::BudgetExhausted => return ("Unknown", emitted),
         }

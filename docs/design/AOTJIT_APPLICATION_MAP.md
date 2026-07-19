@@ -136,3 +136,25 @@ it to measure* whether the abductive-subset recurrence justifies the on-disk bak
 **conditional on a nonlinear-prelude recurrence the current Verus workload does
 not exhibit** — measure before building. No finding alters the native-codegen
 rejection.
+
+## Addendum 2026-07-19 — the 2026-06-30 ranking is SUPERSEDED
+
+The v2-era re-analysis measured the lukb per-obligation corpus end-to-end and
+found **~0.1 % front-end (parse + term construction) / ~99.9 % search** — the
+inverse of this map's core premise (the 2026-06-13 profile's ~75 % DAG
+construction was a prelude-scale artifact; the corpus obligations are
+search-bound, not construction-bound). The prioritized table above should not
+drive further work.
+
+**Surviving items:**
+- Delegation-layer verdict memo (rows 3-ish) — LANDED adsmt-side as D1.
+- Instantiation-trace replay (V1) — delegation-layer, planned.
+- fgr simplex warm-start — measure-gated, not yet justified.
+
+**Killed by the measurement:** prelude term-DAG bakes, command-journal replay,
+EUF e-graph bake, warm-Context clone, CDCL trace replay (§3.5 remains a
+delegation-layer mechanism, not an engine lever).
+
+**The actual path to the z3 gap** is the engine-algorithmics campaign:
+E1 instantiation selection (pattern validation / ever-fired gating / additive
+patterns, #425), S simplex trail, E2 EUF. The native-codegen rejection stands.

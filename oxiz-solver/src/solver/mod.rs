@@ -1022,6 +1022,16 @@ impl Solver {
                                 ccfv_ematch: self.config.ccfv_ematch,
                                 // CCFV (P4): opt-in model-completion verdict-flip.
                                 ccfv_model_compl: self.config.ccfv_model_compl,
+                                // E1 (#425): additive-patterns mode — config
+                                // flag, with the `OXIZ_MBQI_ADDITIVE` env
+                                // override for a no-recompile corpus A/B (the
+                                // `OXIZ_MBQI_GUARD_MS` convention).
+                                additive_patterns: self.config.mbqi_additive_patterns
+                                    || std::env::var("OXIZ_MBQI_ADDITIVE")
+                                        .ok()
+                                        .is_some_and(|v| {
+                                            v == "1" || v.eq_ignore_ascii_case("true")
+                                        }),
                                 ..CleanConfig::default()
                             });
                             {
@@ -1268,6 +1278,34 @@ impl Solver {
                                     self.unsat_core = None;
                                 }
                                 return level;
+                            }
+                            CleanVerdict::SaturatedUnverified => {
+                                // #425 phase 2 (confirm-but-never-sat).
+                                // E-matching closed and nothing was model-
+                                // REFUTED, but ≥1 quantifier could be neither
+                                // exempted (a never-fired / augmented parsed
+                                // trigger) nor model-verified — `sat` is off
+                                // the table. The accumulated instances are
+                                // still sound ground consequences, so run the
+                                // SAME single-shot confirm as `Saturated` and
+                                // trust ONLY its `unsat` half: this restores
+                                // the sound half of the pre-#425 early-stop
+                                // (unsat via the derived lemma set — the dm3
+                                // corpus rows) while keeping the phantom-sat
+                                // door closed. A ground `sat`/`unknown` — or
+                                // an empty instance set — is the sound
+                                // `Unknown`, never `sat`.
+                                if self.config.clean_mbqi && !clean_instances.is_empty() {
+                                    let reverify = SatLevel::from_definite(
+                                        self.verify_clean_saturated(&clean_instances, manager),
+                                    );
+                                    if reverify == SatLevel::DefiniteUnsat {
+                                        // Exactly `Saturated`'s unsat path:
+                                        // PossiblySat ⊓ DefiniteUnsat = DefiniteUnsat.
+                                        return SatLevel::PossiblySat.meet(reverify);
+                                    }
+                                }
+                                return SatLevel::Unknown;
                             }
                             CleanVerdict::Inconclusive | CleanVerdict::BudgetExhausted => {
                                 // A trigger-free axiom could not be verified, or

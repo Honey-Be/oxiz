@@ -28,7 +28,10 @@ fn drain(engine: &mut Engine<ToySig>, toy: &mut Toy) -> (usize, usize) {
     loop {
         match engine.round(toy) {
             Verdict::NewLemmas(ls) => total += ls.len(),
-            Verdict::Saturated | Verdict::Inconclusive | Verdict::BudgetExhausted => break,
+            Verdict::Saturated
+            | Verdict::SaturatedUnverified
+            | Verdict::Inconclusive
+            | Verdict::BudgetExhausted => break,
         }
     }
     (total, engine.rejected())
@@ -90,6 +93,8 @@ fn engine_has_no_unsat_verdict() {
         match v {
             Verdict::NewLemmas(_) => "lemmas",
             Verdict::Saturated => "saturated",
+            // #425 phase 2: confirm-but-never-sat — still no `Unsat` variant.
+            Verdict::SaturatedUnverified => "saturated-unverified",
             Verdict::Inconclusive => "inconclusive",
             Verdict::BudgetExhausted => "budget",
         }

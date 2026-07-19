@@ -39,6 +39,10 @@ fn drain(e: &mut Engine<ToySig>, t: &mut Toy) -> (Vec<Tid>, &'static str) {
         match e.round_with(t, &Active) {
             Verdict::NewLemmas(ls) => all.extend(ls),
             Verdict::Saturated => return (all, "Sat"),
+            // #425 phase 2 confirm-but-never-sat: at the host it collapses to
+            // `Unknown` unless the ground confirm refutes — for these
+            // engine-level pins the "not Sat" half is what matters.
+            Verdict::SaturatedUnverified => return (all, "Unknown"),
             Verdict::Inconclusive => return (all, "Unknown"),
             Verdict::BudgetExhausted => return (all, "Budget"),
         }

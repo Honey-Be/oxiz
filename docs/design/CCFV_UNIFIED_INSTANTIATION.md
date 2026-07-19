@@ -38,8 +38,9 @@ hand it**:
 
 One core, three call sites. The soundness firewall (`instantiate` →
 `emit`) is **unchanged**: CCFV is a smarter *source* of bindings behind the same
-gate, and the engine still `Verdict`s `NewLemmas | Saturated | Inconclusive |
-BudgetExhausted` — **never `Unsat`**.
+gate, and the engine still `Verdict`s `NewLemmas | Saturated | SaturatedUnverified
+| Inconclusive | BudgetExhausted` (the `SaturatedUnverified` confirm-but-never-sat
+variant was added by #425 phase 2) — **never `Unsat`**.
 
 ---
 

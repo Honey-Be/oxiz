@@ -36,6 +36,24 @@ pub struct Quant<S: Sig> {
     /// `&mut` host access registration does not have; and a FULLY-bounded
     /// quantifier must keep its complete finite-box enumeration instead).
     pub inference_tried: bool,
+    /// E1 ever-fired gate (#425): the quantifier's trigger e-match has yielded
+    /// at least one binding at some point. A parsed `:pattern` justifies the
+    /// trigger-semantics saturation exemption ONLY once it has actually fired:
+    /// a dead-symbol / ill-arity / never-matching pattern (not statically
+    /// decidable behind the `TermLang` view) otherwise silences its quantifier
+    /// forever and turns `Saturated` into a spurious `Sat`. Set at the
+    /// `ematch_all` call site (any non-empty binding set, even from an aborted
+    /// e-match); CDQI conflicts do NOT set it (they bypass the trigger, so
+    /// they say nothing about the pattern's matchability).
+    pub matched: bool,
+    /// E1 additive-patterns mode (#425): inferred trigger groups were APPENDED
+    /// to this quantifier's parsed ones (`Engine::augment_parsed_triggers`).
+    /// Set unconditionally once augmentation was attempted (so the additive
+    /// outer loop terminates), and — like `inferred` — it removes the
+    /// trigger-semantics saturation exemption: the author's `:pattern`
+    /// contract no longer describes the full trigger set, so the quantifier
+    /// must be model-verified at saturation.
+    pub augmented: bool,
     /// The matrix.
     pub body: S::Term,
     /// Universal? (Existentials are skolemized by the host before reaching us.)

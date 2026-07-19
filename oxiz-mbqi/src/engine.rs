@@ -33,10 +33,23 @@ pub enum Verdict<T> {
     /// every trigger-free one was model-verified `Some(true)` (M3). If the
     /// ground core is still SAT here, the host may report **`Sat`**.
     Saturated,
-    /// No new instances, but at least one trigger-free quantifier could NOT
-    /// be model-verified (`None`, or violated with no real-ground witness to
-    /// refute it). The host must report **`Unknown`** — never a guessed
-    /// `Sat`, never a fabricated `Unsat`.
+    /// **Confirm-but-never-sat** (#425 phase 2). E-matching is closed and
+    /// every VERIFIABLE obligation passed (no quantifier was model-REFUTED),
+    /// but ≥ 1 active universal could be neither *exempted* by trigger
+    /// semantics (a parsed `:pattern` that never fired, or an augmented /
+    /// inferred trigger set) nor *model-verified* (`eval_forall` returned
+    /// `None`). The caller MAY confirm the accumulated ground instance set —
+    /// the instances are sound ground consequences, so a ground **UNSAT**
+    /// over them is a real `unsat` — but must **NEVER conclude `sat`**: the
+    /// unverified quantifier may still be violated. This is the sound half of
+    /// the pre-#425 early-stop (`Saturated`'s confirm-then-unsat path)
+    /// without its `sat` half.
+    SaturatedUnverified,
+    /// No new instances, but at least one quantifier was model-REFUTED
+    /// (`eval_forall` = `Some(false)`) with no real-ground witness to make
+    /// progress on, or an unbounded existential could not be discharged. The
+    /// host must report **`Unknown`** — never a guessed `Sat`, never a
+    /// fabricated `Unsat`.
     Inconclusive,
     /// The per-check instantiation budget was hit → host reports `Unknown`.
     BudgetExhausted,
@@ -81,6 +94,20 @@ pub struct Config {
     /// the path is byte-identical. Set by the live solver from
     /// `SolverConfig::ccfv_model_compl`.
     pub ccfv_model_compl: bool,
+    /// **E1 additive-patterns mode (#425).** After a pass that would conclude
+    /// `Saturated`/`Inconclusive`, AUGMENT each parsed-trigger universal with
+    /// inferred trigger groups (a UNION — the author's groups are kept) and
+    /// re-pass, at most once per quantifier (`Quant::augmented`). This is the
+    /// z3-auto-config parity lever for under-triggered axioms (dead `:pattern`
+    /// symbols, ill-arity patterns): the parsed trigger alone never fires, and
+    /// the ever-fired gate then yields the sound `Unknown` — augmentation can
+    /// recover the real `unsat` instead. Augmented quantifiers LOSE the
+    /// trigger-semantics saturation exemption (model-verified like
+    /// inferred-trigger ones), so the mode only ever adds sound instances or
+    /// moves a verdict in the sound direction. **Default `false`** pending the
+    /// corpus A/B; set by the live solver from
+    /// `SolverConfig::mbqi_additive_patterns` / `OXIZ_MBQI_ADDITIVE`.
+    pub additive_patterns: bool,
 }
 
 impl Default for Config {
@@ -91,6 +118,7 @@ impl Default for Config {
             max_match_substs: 100_000,
             ccfv_ematch: false,
             ccfv_model_compl: false,
+            additive_patterns: false,
         }
     }
 }
@@ -161,8 +189,41 @@ impl<S: Sig> Engine<S> {
             TermView::Quant { forall, vars, body } => {
                 let mut vars = vars.to_vec();
                 let mut triggers = lang.patterns(t);
+                // E1 STATIC `:pattern` validation (#425). A parsed group is
+                // dropped only when PROVABLY unusable: a bare-`Var` member
+                // can never head an e-match, and a fully-ANALYZABLE group
+                // (every member and reached subterm classified by the view)
+                // whose union of covered bound vars falls short of `vars`
+                // can never yield an instance (`ematch_all`'s fullness
+                // filter drops partial bindings) — its ONLY effect was
+                // making `triggers` non-empty, which EXEMPTED the quantifier
+                // from model-verified saturation → spurious `Sat`; dropping
+                // it removes exactly that unsound exemption. Anything the
+                // view does NOT classify (`Opaque` — e.g. Dt constructor/
+                // selector applications under the OxiZ bridge) makes the
+                // group UNANALYZABLE and it is KEPT conservatively (never
+                // drop what the gate cannot reason about; a never-firing
+                // kept group loses its exemption at the dynamic ever-fired
+                // gate instead) — see `valid_pattern_group`. If EVERY group
+                // drops, `triggers` is empty and
+                // the existing lazy-inference path takes over unmodified
+                // (inference sets `inferred = true`, which keeps the
+                // quantifier model-verified at saturation). Dead symbols and
+                // ill-arity patterns are NOT statically decidable behind the
+                // `TermLang` view (no declaration table) — the dynamic
+                // ever-fired gate (`Quant::matched`) covers those.
+                if !triggers.is_empty() {
+                    let before = triggers.len();
+                    triggers.retain(|g| valid_pattern_group(lang, &vars, g));
+                    if triggers.len() < before && std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                        eprintln!(
+                            "[mbqi-dbg] collect_quants: dropped {} invalid :pattern group(s), {} kept",
+                            before - triggers.len(),
+                            triggers.len(),
+                        );
+                    }
+                }
                 let mut body = body;
-                let mut inferred = false;
                 if triggers.is_empty() {
                     // Flatten a same-polarity nested chain (`∀x.∀y.φ ≡ ∀x,y.φ`,
                     // `∃∃` likewise) so inference sees the true matrix and one
@@ -202,6 +263,8 @@ impl<S: Sig> Engine<S> {
                     triggers,
                     inferred,
                     inference_tried: false,
+                    matched: false,
+                    augmented: false,
                     body,
                     universal: forall,
                     var_domains: None, // computed lazily on first enumeration
@@ -249,6 +312,58 @@ impl<S: Sig> Engine<S> {
         model: &M,
         cong: &C,
     ) -> Verdict<S::Term>
+    where
+        L: TermLang<Sig = S>,
+        M: ModelEval<L>,
+        C: Congruence<S>,
+    {
+        // E1 (#425) pass loop. Each iteration is ONE full instantiation pass
+        // (the pre-E1 round body). With `additive_patterns` OFF (the default)
+        // the loop body runs exactly once — byte-identical behaviour. With it
+        // ON, a pass that would conclude `Saturated`/`SaturatedUnverified`/
+        // `Inconclusive` (the no-progress verdicts) first gets its
+        // parsed-trigger universals AUGMENTED with inferred groups
+        // (once per quantifier — `augment_parsed_triggers` returns `false`
+        // once nothing new can be appended, so the loop terminates).
+        //
+        // INVARIANT (checked EVERY pass, BEFORE saturation): a pass that hit
+        // any budget (instance cap, deadline, e-match abort) must return
+        // `BudgetExhausted` — falling through to the saturation verdict with
+        // a PARTIAL pass would read "added nothing" as saturation → spurious
+        // `Sat`.
+        loop {
+            let (lemmas, budget_hit) = self.instantiation_pass(lang, model, cong);
+            if !lemmas.is_empty() {
+                return Verdict::NewLemmas(lemmas);
+            }
+            if budget_hit {
+                return Verdict::BudgetExhausted;
+            }
+            let v = self.saturation_verdict(lang, model, cong);
+            if self.cfg.additive_patterns
+                && matches!(
+                    v,
+                    Verdict::Saturated | Verdict::SaturatedUnverified | Verdict::Inconclusive
+                )
+                && self.augment_parsed_triggers(lang)
+            {
+                continue; // re-pass: the appended groups rescan from zero
+            }
+            return v;
+        }
+    }
+
+    /// One full instantiation pass over every quantifier (CDQI → e-matching →
+    /// enumeration per quantifier — the pre-E1 `round_with_cong` body).
+    /// Returns the pass's `(lemmas, budget_hit)`; the caller owns the verdict
+    /// decision (see the pass-loop invariant in
+    /// [`round_with_cong`](Self::round_with_cong)).
+    fn instantiation_pass<L, M, C>(
+        &mut self,
+        lang: &mut L,
+        model: &M,
+        cong: &C,
+    ) -> (Vec<S::Term>, bool)
     where
         L: TermLang<Sig = S>,
         M: ModelEval<L>,
@@ -371,6 +486,18 @@ impl<S: Sig> Engine<S> {
             // divergence-defusing role of the short-circuit is not needed.
             if !self.quants[qi].triggers.is_empty() {
                 let (bindings, ematch_aborted) = self.ematch_all(lang, qi, cong);
+                // E1 ever-fired gate (#425): record that this quantifier's
+                // trigger has matched at least once. Any non-empty binding
+                // set counts — even from an ABORTED e-match (a match is a
+                // match; the abort only says the set is partial). CDQI
+                // conflict hits deliberately do NOT set this: they bypass
+                // the trigger entirely, so they say nothing about the
+                // pattern's matchability. A quantifier whose parsed trigger
+                // NEVER fires loses the trigger-semantics saturation
+                // exemption (see `saturation_verdict`).
+                if !bindings.is_empty() {
+                    self.quants[qi].matched = true;
+                }
                 // Deadline/`max_match_substs` abort: the match set is PARTIAL.
                 // Route it into `budget_hit` (→ `BudgetExhausted` when the
                 // round yields no lemmas) so an aborted e-match can never be
@@ -476,35 +603,72 @@ impl<S: Sig> Engine<S> {
                 self.rejected,
             );
         }
-        if !lemmas.is_empty() {
-            return Verdict::NewLemmas(lemmas);
-        }
-        if budget_hit {
-            return Verdict::BudgetExhausted;
-        }
-        // Saturated. A triggered quantifier is satisfied by trigger semantics
-        // once e-matching adds nothing; a trigger-free, ACTIVE one must be
-        // model-verified (inactive ones are vacuously satisfied). The host's
-        // synthetic witnesses never cross into the engine → nothing fabricated.
-        //
-        // NOTE: a bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`) is NOT
-        // auto-satisfied just because all its instances were emitted. The earlier
-        // "finite exhaustion ⇒ sat" shortcut trusted that `Saturated` implied the
-        // ground solve had a CONSISTENT model of those instances — but the
-        // incremental CDCL(T) can MISS a conflict that is GLOBAL across the
-        // instances (e.g. pigeonhole: `n+1` holes pairwise-distinct in `[1,n]` is
-        // unsat, yet the incremental model stays `sat`), so the shortcut reported
-        // a spurious `sat`. The bounded enumeration above still defuses the
-        // `f`-tower (no hang); the VERDICT now defers to `eval_forall`, which is
-        // sound (a bounded quantifier it cannot verify yields the sound
-        // `Unknown`, never a guessed `Sat`).
+        (lemmas, budget_hit)
+    }
+
+    /// The saturation verdict for a pass that emitted nothing and hit no
+    /// budget — NEVER anything that mints lemmas or a `Sat`/`Unsat`:
+    ///  * `Saturated` iff every non-exempt ACTIVE quantifier is
+    ///    model-verified (`Some(true)`);
+    ///  * `Inconclusive` (dominates) if any obligation is model-REFUTED
+    ///    (`Some(false)`) or an unbounded existential is undischargeable;
+    ///  * `SaturatedUnverified` (#425 phase 2) otherwise, when ≥ 1 obligation
+    ///    is merely UNVERIFIABLE (`eval_forall` = `None`) — nothing failed,
+    ///    but the exemption/verification ledger has a hole, so the host may
+    ///    confirm the accumulated ground set (trusting only a ground UNSAT)
+    ///    and must never conclude `sat`.
+    ///
+    /// A triggered quantifier is satisfied by trigger semantics once
+    /// e-matching adds nothing; a trigger-free, ACTIVE one must be
+    /// model-verified (inactive ones are vacuously satisfied). The host's
+    /// synthetic witnesses never cross into the engine → nothing fabricated.
+    ///
+    /// NOTE: a bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`) is NOT
+    /// auto-satisfied just because all its instances were emitted. The earlier
+    /// "finite exhaustion ⇒ sat" shortcut trusted that `Saturated` implied the
+    /// ground solve had a CONSISTENT model of those instances — but the
+    /// incremental CDCL(T) can MISS a conflict that is GLOBAL across the
+    /// instances (e.g. pigeonhole: `n+1` holes pairwise-distinct in `[1,n]` is
+    /// unsat, yet the incremental model stays `sat`), so the shortcut reported
+    /// a spurious `sat`. The bounded enumeration still defuses the
+    /// `f`-tower (no hang); the VERDICT defers to `eval_forall`, which is
+    /// sound (a bounded quantifier it cannot verify yields the sound
+    /// `Unknown`, never a guessed `Sat`).
+    fn saturation_verdict<L, M, C>(&self, lang: &L, model: &M, cong: &C) -> Verdict<S::Term>
+    where
+        L: TermLang<Sig = S>,
+        M: ModelEval<L>,
+        C: Congruence<S>,
+    {
+        // #425 phase 2: an `eval_forall` `None` no longer short-circuits into
+        // `Inconclusive` — it is RECORDED and the scan continues, so a later
+        // model-REFUTED obligation (`Some(false)`) still dominates with
+        // `Inconclusive`. Only at the end does "unverified but nothing
+        // failed" become `SaturatedUnverified`.
+        let mut unverified_seen = false;
         for qi in 0..self.quants.len() {
             let q = &self.quants[qi];
-            // An INFERRED trigger drives e-matching but is not a user
-            // contract — trigger semantics may only justify `Sat` for parsed
-            // `:pattern`s, so an inferred-trigger quantifier must still be
-            // model-verified here exactly like a trigger-free one.
-            if !((q.triggers.is_empty() || q.inferred) && model.is_active(lang, q.term)) {
+            // The trigger-semantics EXEMPTION (skip model verification) holds
+            // only for a PARSED, UNAUGMENTED trigger that has actually FIRED:
+            //  * an INFERRED trigger drives e-matching but is not a user
+            //    contract — trigger semantics may only justify `Sat` for
+            //    parsed `:pattern`s, so an inferred-trigger quantifier must
+            //    still be model-verified exactly like a trigger-free one;
+            //  * an AUGMENTED quantifier (E1 additive mode) carries inferred
+            //    groups alongside the parsed ones, so the author's contract
+            //    no longer describes its trigger set — model-verify;
+            //  * a NEVER-FIRED parsed trigger (#425: dead symbol, ill-arity,
+            //    shape matching no ground term — none statically decidable
+            //    here) justifies nothing: its quantifier was never
+            //    instantiated even once, so "e-matching added nothing" is
+            //    vacuous — model-verify. Sound-direction only: this can turn
+            //    a former `Saturated` into `SaturatedUnverified` (sat →
+            //    confirm-but-never-sat: the host may still trust a ground
+            //    UNSAT over the accumulated instances) or `Inconclusive`,
+            //    never mint a verdict.
+            if !((q.triggers.is_empty() || q.inferred || q.augmented || !q.matched)
+                && model.is_active(lang, q.term))
+            {
                 continue;
             }
             // A BOUNDED-FINITE quantifier emitted ALL its instances over the
@@ -534,19 +698,75 @@ impl<S: Sig> Engine<S> {
                     // over the total view `E_TOT` the final word. No conflict ⇒
                     // the completed model satisfies it (`Some(true)`) → this
                     // quantifier is satisfied. Any conflict / undecidable
-                    // lowering / unmet gate ⇒ `None` here too → the sound
-                    // `Unknown`. Gated (default off): with the flip disabled this
-                    // is exactly the old `None ⇒ Inconclusive`.
+                    // lowering / unmet gate ⇒ `None` here too → the unverified
+                    // bucket below. Gated (default off): with the flip disabled
+                    // this is exactly the plain `None ⇒ unverified` path.
                     if self.cfg.ccfv_model_compl
                         && model.model_completion(lang, cong, q.term) == Some(true)
                     {
                         continue;
                     }
-                    return Verdict::Inconclusive;
+                    // Could be neither exempted nor verified — but nothing
+                    // FAILED either. Record and keep scanning (a later
+                    // `Some(false)` must still dominate with `Inconclusive`).
+                    unverified_seen = true;
                 }
             }
         }
-        Verdict::Saturated
+        if unverified_seen {
+            Verdict::SaturatedUnverified
+        } else {
+            Verdict::Saturated
+        }
+    }
+
+    /// E1 additive-patterns augmentation (#425): for each PARSED-trigger
+    /// universal not yet augmented (and not inferred — inference already owns
+    /// those groups), run [`infer_triggers`] over its `(vars, body)` and
+    /// APPEND the groups not already present (dedup by exact term-vec
+    /// equality — hash-consed terms make that structural). The parsed groups
+    /// are never touched: the mode is strictly additive.
+    ///
+    /// `augmented` is set UNCONDITIONALLY (once per quantifier), even when
+    /// inference finds nothing or only duplicates — that bounds the
+    /// `round_with_cong` pass loop (a pass in which nothing was appended
+    /// returns `false`, and no quantifier is ever re-augmented).
+    ///
+    /// On any actual append, `scanned[qi]` is reset to 0 (MANDATORY): the
+    /// frontier watermark advanced past the ground seeds while only the
+    /// parsed (non-firing) groups were scanned, so the appended groups must
+    /// see the WHOLE index. The rescan is idempotent via `emit`'s
+    /// `(qi, tuple)` dedup.
+    fn augment_parsed_triggers<L: TermLang<Sig = S>>(&mut self, lang: &L) -> bool {
+        let mut appended_any = false;
+        let dbg = std::env::var_os("OXIZ_MBQI_DBG").is_some();
+        for qi in 0..self.quants.len() {
+            {
+                let q = &self.quants[qi];
+                if !q.universal || q.triggers.is_empty() || q.inferred || q.augmented {
+                    continue;
+                }
+            }
+            let trg = infer_triggers(lang, &self.quants[qi].vars, self.quants[qi].body);
+            self.quants[qi].augmented = true; // unconditionally — once per quant
+            let mut appended = 0usize;
+            for g in trg {
+                if !self.quants[qi].triggers.contains(&g) {
+                    self.quants[qi].triggers.push(g);
+                    appended += 1;
+                }
+            }
+            if appended > 0 {
+                self.scanned[qi] = 0;
+                appended_any = true;
+            }
+            if dbg {
+                eprintln!(
+                    "[mbqi-dbg] quant {qi}: additive augmentation appended {appended} inferred group(s)"
+                );
+            }
+        }
+        appended_any
     }
 
     /// E-match every trigger group of quantifier `qi` against the ground index,
@@ -858,6 +1078,102 @@ impl<S: Sig> Engine<S> {
                     <= self.cfg.max_tuples_per_quant
         })
     }
+}
+
+/// E1 static `:pattern` validation (#425): drop `group` only when it is
+/// PROVABLY unmatchable / provably useless for instantiation. Per-member
+/// classification, by one-level view:
+///
+///  * `Var` — a bare variable (a bound var of this quantifier, or a host
+///    constant modelled as a `Var` node) can never head an e-match
+///    (`ematch_all` fires only on `App`-viewing patterns), so the member is
+///    provably unmatchable → the GROUP is invalid (as before). A bare
+///    literal is equally unmatchable, but the generic view cannot
+///    distinguish a literal from an unclassified host node — both present as
+///    `Opaque` — so literals land in the conservative bucket below.
+///  * `App` — ANALYZABLE: its bound-var coverage is computed by the walk.
+///  * anything else (`Opaque` / unclassified — e.g. the datatype
+///    constructor/selector/tester applications the OxiZ bridge does not yet
+///    classify, which view as `Opaque` with no visible children) —
+///    UNANALYZABLE: the gate must NEVER drop what it cannot reason about.
+///    The group is KEPT, and the union-coverage requirement below is
+///    enforced ONLY when every member (and every subterm the walk reaches)
+///    is analyzable — an unanalyzable member/subterm may cover bound vars
+///    through children the bridge cannot see (the dm3 misdrop: 3 live
+///    Dt-headed groups viewed as `Opaque` leaves and were dropped).
+///    A kept-but-actually-unmatchable group costs NO soundness: it never
+///    fires, so the dynamic ever-fired gate (`Quant::matched`) strips its
+///    trigger-semantics saturation exemption → `SaturatedUnverified`, never
+///    a spurious `Sat`. The cost is completeness only (a kept group blocks
+///    the lazy-inference fallback; the additive mode recovers it).
+///
+/// When every member is fully analyzable, the group is retained iff the
+/// union of bound vars covered across the group equals the full `vars` set.
+/// An under-covering all-analyzable group can never yield an instance
+/// (`ematch_all`'s fullness filter drops partial bindings), so dropping it
+/// only removes its unsound saturation exemption. NOTE: an individual member
+/// MAY be hole-free (a ground `App` matches via the empty substitution) — a
+/// multipattern group is matchable as long as its UNION covers, so a
+/// per-member bound-var requirement would drop live groups and lose their
+/// instances (a soundness regression, not a conservative narrowing). Dead
+/// symbols and ill-arity patterns are NOT statically decidable here (no
+/// declaration table); the dynamic ever-fired gate covers those.
+///
+/// FOLLOW-UP (the principled upgrade): classify Dt constructor / selector /
+/// tester applications as `App` views WITH children in the OxiZ bridge
+/// (`clean_mbqi.rs` `view`/`children`) — real e-match capability for
+/// Dt-headed triggers instead of this conservative keep. That is a separate
+/// slice with its own corpus gate: the blast radius is the whole MBQI
+/// traversal (every `view`/`children` consumer — ground index, CCFV,
+/// inference, CDQI), not just this gate.
+fn valid_pattern_group<S: Sig, L: TermLang<Sig = S>>(
+    lang: &L,
+    vars: &[(S::VarName, S::Sort)],
+    group: &[S::Term],
+) -> bool {
+    if group.is_empty() {
+        return false;
+    }
+    let bound: FxHashSet<S::VarName> = vars.iter().map(|(n, _)| *n).collect();
+    let mut covered: FxHashSet<S::VarName> = FxHashSet::default();
+    let mut all_analyzable = true;
+    for &p in group {
+        match lang.view(p) {
+            // A bare variable can never head a match — provably unmatchable.
+            TermView::Var { .. } => return false,
+            TermView::App { .. } => {}
+            // Opaque / unclassified (incl. a pattern-level binder): the gate
+            // cannot reason about this member — conservative keep.
+            _ => {
+                all_analyzable = false;
+                continue;
+            }
+        }
+        let mut seen: FxHashSet<S::Term> = FxHashSet::default();
+        let mut stack: Vec<S::Term> = vec![p];
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            match lang.view(t) {
+                TermView::Var { name } if bound.contains(&name) => {
+                    covered.insert(name);
+                }
+                TermView::Var { .. } => {}
+                // A pattern containing a binder never matches a ground term;
+                // do not descend (mirrors `infer_triggers`).
+                TermView::Quant { .. } => {}
+                TermView::App { .. } => stack.extend(lang.children(t)),
+                // An unclassified SUBTERM taints the member too: `children`
+                // returns nothing for it, so bound vars may hide beneath
+                // (e.g. `(f (Cons x y))` under the OxiZ bridge — the `App`
+                // head is visible but the Dt-constructor child is an opaque
+                // wall). Coverage cannot be decided → do not enforce it.
+                _ => all_analyzable = false,
+            }
+        }
+    }
+    !all_analyzable || covered.len() == bound.len()
 }
 
 /// Infer `:pattern`-style trigger groups for a trigger-less UNIVERSAL — the

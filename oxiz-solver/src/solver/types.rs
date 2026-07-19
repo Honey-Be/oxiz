@@ -476,6 +476,20 @@ pub struct SolverConfig {
     /// §6). With the flag clear the backstop is never consulted, so the verdict
     /// path is byte-identical. Toggled by `(set-option :oxiz.ccfv-model-compl true)`.
     pub ccfv_model_compl: bool,
+    /// **E1 additive-patterns mode (#425).** After a clean-MBQI pass that
+    /// would conclude `Saturated`/`Inconclusive`, augment each parsed-trigger
+    /// universal with INFERRED trigger groups (a union — the author's groups
+    /// are kept) and re-pass, at most once per quantifier. Rescues
+    /// under-triggered axioms (dead `:pattern` symbols, ill-arity patterns)
+    /// that z3's auto-config would still instantiate. Augmented quantifiers
+    /// lose the trigger-semantics saturation exemption (they are
+    /// model-verified like inferred-trigger ones), so the mode only ever adds
+    /// sound instances or moves a verdict in the sound direction. **OFF by
+    /// default** pending the corpus A/B; also armed by the
+    /// `OXIZ_MBQI_ADDITIVE` env var (read where the engine config is built,
+    /// the `OXIZ_MBQI_GUARD_MS` convention) or
+    /// `(set-option :oxiz.mbqi-additive-patterns true)`.
+    pub mbqi_additive_patterns: bool,
 }
 
 impl Default for SolverConfig {
@@ -512,6 +526,7 @@ impl SolverConfig {
             use_hooks_driver: true,
             ccfv_ematch: true,
             ccfv_model_compl: false,
+            mbqi_additive_patterns: false,
         }
     }
 
@@ -542,6 +557,7 @@ impl SolverConfig {
             use_hooks_driver: true,
             ccfv_ematch: true,
             ccfv_model_compl: false,
+            mbqi_additive_patterns: false,
         }
     }
 
@@ -572,6 +588,7 @@ impl SolverConfig {
             use_hooks_driver: true,
             ccfv_ematch: true,
             ccfv_model_compl: false,
+            mbqi_additive_patterns: false,
         }
     }
 
@@ -602,6 +619,7 @@ impl SolverConfig {
             use_hooks_driver: true,
             ccfv_ematch: true,
             ccfv_model_compl: false,
+            mbqi_additive_patterns: false,
         }
     }
 

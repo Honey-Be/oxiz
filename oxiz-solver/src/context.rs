@@ -929,6 +929,17 @@ impl Context {
                 config.ccfv_model_compl = value == "true";
                 self.solver.set_config(config);
             }
+            // E1 (#425): additive-patterns mode — when a clean-MBQI pass would
+            // conclude `Saturated`/`Inconclusive`, augment parsed-trigger
+            // universals with inferred groups (union, once per quantifier) and
+            // re-pass. Sound-direction only (augmented quantifiers are
+            // model-verified at saturation); OFF by default pending the corpus
+            // A/B. Also armed by the `OXIZ_MBQI_ADDITIVE` env var.
+            "oxiz.mbqi-additive-patterns" => {
+                let mut config = self.solver.config().clone();
+                config.mbqi_additive_patterns = value == "true";
+                self.solver.set_config(config);
+            }
             // Output mode for `(check-sat)`: `z3` (default, the collapsed 3-valued
             // `sat`/`unsat`/`unknown`) or `full` (the un-collapsed 5-level verdict
             // `definite-sat`/`possibly-sat`/`unknown`/`possibly-unsat`/
