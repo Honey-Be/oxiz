@@ -110,16 +110,33 @@ impl SortMaxSolver {
             }
         }
 
+        // Seed `next_var` from the FULL problem (all hard AND all soft
+        // clause literals) before any fresh sorting-network/indicator
+        // variable is minted below. Without this, a soft-clause-only
+        // variable (e.g. a unit soft clause referencing a var that never
+        // appears in a hard clause) would never be reflected in
+        // `next_var`, so the sorting network's freshly-minted comparator
+        // variables could alias a real problem variable.
+        for clause in &self.hard_clauses {
+            for &lit in clause.iter() {
+                self.next_var = self.next_var.max(lit.var().0 + 1);
+            }
+        }
+        for clause in &self.soft_clauses {
+            for &lit in &clause.lits {
+                self.next_var = self.next_var.max(lit.var().0 + 1);
+            }
+        }
+
         // Create SAT solver
         let mut solver = SatSolver::new();
 
-        // Add hard clauses and track next var
+        // Add hard clauses
         for clause in &self.hard_clauses {
             for &lit in clause.iter() {
                 while solver.num_vars() <= lit.var().0 as usize {
                     solver.new_var();
                 }
-                self.next_var = self.next_var.max(lit.var().0 + 1);
             }
             solver.add_clause(clause.iter().copied());
         }
@@ -218,9 +235,17 @@ impl SortMaxSolver {
             solver.add_clause(clause.lits.iter().copied());
         }
 
-        // The sorted_outputs are in sorted order (smallest to largest)
-        // outputs[i] = true means "at least i+1 soft clauses are satisfied"
-        // We want to maximize satisfied, so we incrementally assert outputs from start
+        // The sorted_outputs are in ascending order (smallest to largest).
+        // `compare_exchange`'s ascending mode routes `min = a AND b` to the
+        // LOW index and `max = a OR b` to the HIGH index, so for N outputs:
+        //   outputs[j] == true  <=>  count(true inputs) >= N - j
+        // i.e. outputs[N-1] is the EASIEST threshold ("at least 1" — an OR),
+        // and outputs[0] is the HARDEST threshold ("at least N" — an AND).
+        // Padding (always-false) literals sort to the low indices, so the
+        // meaningful thresholds live in the top `num_soft_clauses` outputs.
+        // To maximize satisfied soft clauses we must therefore assert from
+        // the HIGH index down toward the LOW index, stopping at the first
+        // UNSAT threshold.
 
         // Find initial satisfying assignment
         match solver.solve() {
@@ -234,7 +259,7 @@ impl SortMaxSolver {
         // Count how many are currently satisfied (for informational purposes)
         let mut _num_satisfied = 0;
         if let Some(model) = &self.best_model {
-            for &output in &sorted_outputs {
+            for &output in sorted_outputs.iter().rev() {
                 let var_idx = output.var().0 as usize;
                 if var_idx < model.len() {
                     let val = model[var_idx];
@@ -243,32 +268,32 @@ impl SortMaxSolver {
                     if is_true {
                         _num_satisfied += 1;
                     } else {
-                        break; // Since sorted, remaining are all false
+                        break; // Since sorted, remaining (toward index 0) are all false
                     }
                 }
             }
         }
 
-        // Assert outputs incrementally
-        // outputs[i] means "at least i+1 soft clauses are satisfied"
-        // We only check up to num_soft_clauses (ignore padding from sorting network)
+        // Assert outputs incrementally from the high index (easiest: "at
+        // least 1") toward the low index (hardest: "at least N"). We only
+        // walk the top `num_soft_clauses` outputs (ignore padding from the
+        // sorting network, which occupies the low indices).
         let mut max_satisfied = 0;
+        let n = sorted_outputs.len();
 
-        for (idx, &output) in sorted_outputs
-            .iter()
-            .enumerate()
-            .take(num_soft_clauses.min(sorted_outputs.len()))
-        {
+        for offset in 0..num_soft_clauses.min(n) {
+            let idx = n - 1 - offset;
+            let output = sorted_outputs[idx];
             solver.add_clause([output]);
 
             match solver.solve() {
                 SolverResult::Sat => {
-                    // Can satisfy at least (idx + 1) soft clauses
+                    // Can satisfy at least (offset + 1) soft clauses
                     self.best_model = Some(solver.model().to_vec());
-                    max_satisfied = idx + 1;
+                    max_satisfied = offset + 1;
                 }
                 SolverResult::Unsat => {
-                    // Cannot satisfy (idx + 1) soft clauses
+                    // Cannot satisfy (offset + 1) soft clauses
                     // Maximum we can satisfy is max_satisfied (from previous iteration)
                     break;
                 }
@@ -354,7 +379,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SortMax algorithm needs indicator encoding refinement"]
     fn test_sortmax_simple() {
         let mut solver = SortMaxSolver::new();
 
@@ -394,7 +418,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SortMax algorithm needs indicator encoding refinement"]
     fn test_sortmax_all_satisfiable() {
         let mut solver = SortMaxSolver::new();
 

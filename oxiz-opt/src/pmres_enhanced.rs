@@ -128,11 +128,15 @@ pub struct PmresSolver {
     config: PmresConfig,
     /// Statistics.
     stats: PmresStats,
-    /// SAT solver.
+    /// SAT solver. Populated lazily by `build_solver`, once the full
+    /// problem (all hard + all soft clauses) is known — see `next_var`.
     sat_solver: SatSolver,
+    /// Hard clauses, buffered until `build_solver` runs.
+    hard_clauses: Vec<Vec<Lit>>,
     /// Soft clauses.
     soft_clauses: Vec<(Vec<Lit>, Weight)>,
-    /// Relaxation variables for each soft clause.
+    /// Relaxation variables for each soft clause. Empty until
+    /// `build_solver` has run.
     relax_vars: Vec<Lit>,
     /// Proof traces.
     #[allow(dead_code)]
@@ -141,10 +145,18 @@ pub struct PmresSolver {
     cost: Weight,
     /// Best model found.
     best_model: Option<Vec<LBool>>,
-    /// Next variable.
+    /// Next variable. Updated eagerly as clause literals are added so it
+    /// always reflects every literal seen so far; relaxation variables are
+    /// only ever minted from it in `build_solver`, once ALL `add_hard`/
+    /// `add_soft` calls are known to be done (i.e. at `solve()` time) —
+    /// never incrementally per-call. See Bug 1b in the fill-the-gap/maxsat
+    /// slice: minting a relax var per-call could alias a variable used by
+    /// a clause added later.
     next_var: u32,
     /// Permanently relaxed soft clauses (by index).
     permanently_relaxed: FxHashSet<usize>,
+    /// Whether `build_solver` has already populated `sat_solver`.
+    solver_built: bool,
 }
 
 impl PmresSolver {
@@ -159,6 +171,7 @@ impl PmresSolver {
             config,
             stats: PmresStats::default(),
             sat_solver: SatSolver::new(),
+            hard_clauses: Vec::new(),
             soft_clauses: Vec::new(),
             relax_vars: Vec::new(),
             proofs: Vec::new(),
@@ -166,6 +179,7 @@ impl PmresSolver {
             best_model: None,
             next_var: 0,
             permanently_relaxed: FxHashSet::default(),
+            solver_built: false,
         }
     }
 
@@ -185,7 +199,7 @@ impl PmresSolver {
             }
         }
 
-        self.sat_solver.add_clause(clause.iter().copied());
+        self.hard_clauses.push(clause);
     }
 
     /// Add a soft clause.
@@ -199,18 +213,43 @@ impl PmresSolver {
             }
         }
 
-        // Create relaxation variable
-        let relax_var = Var::new(self.next_var);
-        self.next_var += 1;
-        let relax_lit = Lit::pos(relax_var);
-        self.relax_vars.push(relax_lit);
-
-        // Add relaxed clause to SAT solver: clause \/ relax_var
-        let mut relaxed_clause = clause.clone();
-        relaxed_clause.push(relax_lit);
-        self.sat_solver.add_clause(relaxed_clause.iter().copied());
-
+        // NOTE: no relaxation variable is minted here. Minting must wait
+        // until the full problem (all hard + all soft clauses) is known,
+        // otherwise a relax var allocated here could alias a variable used
+        // by a hard/soft clause added by a later call. See `build_solver`.
         self.soft_clauses.push((clause, weight));
+    }
+
+    /// Build the SAT solver from the buffered hard clauses and mint one
+    /// relaxation variable per soft clause. Runs exactly once, lazily, the
+    /// first time `solve()` is called — at which point every `add_hard`/
+    /// `add_soft` call is known to have already updated `next_var`, so the
+    /// minted relax vars cannot alias a real problem variable.
+    fn build_solver(&mut self) {
+        if self.solver_built {
+            return;
+        }
+        self.solver_built = true;
+
+        let mut solver = SatSolver::new();
+        for clause in &self.hard_clauses {
+            solver.add_clause(clause.iter().copied());
+        }
+
+        self.relax_vars.reserve(self.soft_clauses.len());
+        for (clause, _weight) in &self.soft_clauses {
+            let relax_var = Var::new(self.next_var);
+            self.next_var += 1;
+            let relax_lit = Lit::pos(relax_var);
+            self.relax_vars.push(relax_lit);
+
+            // Add relaxed clause to SAT solver: clause \/ relax_var
+            let mut relaxed_clause = clause.clone();
+            relaxed_clause.push(relax_lit);
+            solver.add_clause(relaxed_clause.iter().copied());
+        }
+
+        self.sat_solver = solver;
     }
 
     /// Get current cost.
@@ -225,6 +264,8 @@ impl PmresSolver {
 
     /// Main solve method using PMRES algorithm.
     pub fn solve(&mut self) -> Result<MaxSatResult, MaxSatError> {
+        self.build_solver();
+
         if self.soft_clauses.is_empty() {
             // No soft clauses - just check satisfiability
             self.stats.sat_calls += 1;
