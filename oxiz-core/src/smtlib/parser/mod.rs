@@ -99,6 +99,46 @@ pub enum Command {
     SetInfo(String, String),
     /// Simplify (Z3 extension)
     Simplify(TermId),
+    /// Minimize an objective term (MaxSMT/OMT extension, z3-compatible
+    /// `(minimize <term>)` syntax; oxiz additionally tolerates a trailing
+    /// `:id <symbol>` that vanilla z3 does not accept).
+    Minimize {
+        /// The term to minimize
+        term: TermId,
+        /// Optional objective identifier, from a trailing `:id <symbol>`
+        id: Option<String>,
+    },
+    /// Maximize an objective term (MaxSMT/OMT extension); see [`Command::Minimize`].
+    Maximize {
+        /// The term to maximize
+        term: TermId,
+        /// Optional objective identifier, from a trailing `:id <symbol>`
+        id: Option<String>,
+    },
+    /// Assert a soft (weighted) constraint (MaxSMT extension, z3-compatible
+    /// `(assert-soft <term> :weight <numeral> [:id <symbol>])` syntax).
+    AssertSoft {
+        /// The soft constraint term
+        term: TermId,
+        /// The constraint's weight, as the numeral/decimal literal term
+        /// `:weight` parsed to (an `IntConst`/`RealConst` `TermId`) — reuses
+        /// the same numeral-literal-to-term construction every other
+        /// numeral/decimal token in the grammar goes through, rather than a
+        /// new bespoke weight type.
+        weight: TermId,
+        /// Soft-constraint group tag. z3 has exactly one keyword here,
+        /// `:id`, which doubles as both "this assertion's id" and "which
+        /// MaxSAT group it contributes to" — `group` and `id` are always
+        /// set together, from that single keyword.
+        group: Option<String>,
+        /// Same value as `group` (see its doc) — kept as a distinct field
+        /// for callers reasoning about "this soft assertion's id" without
+        /// caring about its dual use as a group tag.
+        id: Option<String>,
+    },
+    /// Get the values of all declared optimization objectives (MaxSMT/OMT
+    /// extension, `(get-objectives)`).
+    GetObjectives,
 }
 
 /// Parser state

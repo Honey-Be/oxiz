@@ -13,6 +13,9 @@ use smallvec::SmallVec;
 
 mod builder;
 mod query;
+mod transplant;
+
+pub use transplant::{TransplantError, transplant_term};
 
 /// Statistics for garbage collection
 #[derive(Debug, Clone, Default)]

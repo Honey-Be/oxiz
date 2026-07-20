@@ -12,7 +12,9 @@ use crate::maxsat::{MaxSatConfig, MaxSatError, MaxSatResult, Weight};
 use crate::objective::{Objective, ObjectiveId, ObjectiveKind};
 use crate::pareto::ParetoConfig;
 use num_bigint::BigInt;
+use num_integer::Integer as _;
 use num_rational::BigRational;
+use num_traits::Zero as _;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_solver::{OptimizationResult, Optimizer, Solver, SolverResult};
 use rustc_hash::FxHashMap;
@@ -169,7 +171,7 @@ pub struct OptStats {
 }
 
 /// Model value types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModelValue {
     /// Boolean value
     Bool(bool),
@@ -214,6 +216,33 @@ fn term_id_to_model_value(val: TermId, tm: &TermManager) -> Option<ModelValue> {
     }
 }
 
+/// Least common multiple of two positive `BigInt`s (via `gcd`). Used to
+/// find a common integer scale factor across every rational soft-
+/// constraint weight's denominator — see `optimize_maxsmt`'s doc.
+pub(crate) fn lcm_bigint(a: &BigInt, b: &BigInt) -> BigInt {
+    if a.is_zero() || b.is_zero() {
+        return BigInt::from(0);
+    }
+    (a / a.gcd(b)) * b
+}
+
+/// `weight`, scaled by `scale` and truncated to an exact integer —
+/// EXACT (not lossy) for `Weight::Int` and for any `Weight::Rational`
+/// whose denominator divides `scale` (guaranteed when `scale` was built
+/// via `lcm_bigint` over every rational weight actually present, as
+/// `optimize_maxsmt` does).
+pub(crate) fn scaled_weight(weight: &Weight, scale: &BigInt) -> BigInt {
+    match weight {
+        Weight::Int(n) => n * scale,
+        Weight::Rational(r) => {
+            let scaled = r * BigRational::from(scale.clone());
+            debug_assert!(scaled.is_integer(), "scale must be a multiple of every weight's denominator");
+            scaled.to_integer()
+        }
+        Weight::Infinite => BigInt::from(i64::MAX / 2),
+    }
+}
+
 /// Convert a `TermId` value term into a `Weight` (for storing objective bounds).
 fn term_id_to_weight(val: TermId, tm: &TermManager) -> Weight {
     let Some(t) = tm.get(val) else {
@@ -226,6 +255,93 @@ fn term_id_to_weight(val: TermId, tm: &TermManager) -> Weight {
             Weight::Rational(big_r)
         }
         _ => Weight::Infinite,
+    }
+}
+
+/// Evaluate `term` (from `tm`) to an EXACT rational value using `model` for
+/// atom lookups.
+///
+/// Used by `optimize_pareto` to recover each objective's real numeric value
+/// from the chosen Pareto point's model: unlike `optimize_single_objective`
+/// (which gets an exact `Weight` straight back from
+/// `oxiz_solver::Optimizer::optimize`), `optimize_pareto` only gets a
+/// variable-assignment model from `Optimizer::pareto_optimize` — nothing
+/// evaluates a (possibly compound) objective TERM against it. A prior
+/// version left `lower_bounds`/`upper_bounds` at their `Weight::Infinite`
+/// `add_objective`-time placeholder for every multi-objective run, so
+/// `get-objectives` always printed "∞" even for trivially bounded
+/// objectives (see the fill-the-gap/maxsat fixup pass's P0 finding).
+///
+/// Deliberately narrow, matching `transplant_term`'s own scope philosophy:
+/// supports constants, model-resolved atoms (`Var`/`Apply`), and
+/// `Neg`/`Add`/`Sub`/`Mul`/`Div` over those — the arithmetic fragment an
+/// objective term actually needs. Returns `None` (never a wrong number) for
+/// anything else, e.g. `Ite`, so the caller leaves the existing `Infinite`/
+/// `unknown` fallback in place rather than reporting a value that might be
+/// incorrect.
+pub(crate) fn evaluate_term_to_rational(
+    term: TermId,
+    tm: &TermManager,
+    model: &FxHashMap<TermId, ModelValue>,
+) -> Option<BigRational> {
+    if let Some(mv) = model.get(&term) {
+        return model_value_to_rational(mv);
+    }
+    let t = tm.get(term)?;
+    match &t.kind {
+        TermKind::IntConst(n) => Some(BigRational::from(n.clone())),
+        TermKind::RealConst(r) => {
+            Some(BigRational::new(BigInt::from(*r.numer()), BigInt::from(*r.denom())))
+        }
+        TermKind::Neg(a) => Some(-evaluate_term_to_rational(*a, tm, model)?),
+        TermKind::Add(args) => {
+            let mut sum = BigRational::from(BigInt::from(0));
+            for &a in args {
+                sum += evaluate_term_to_rational(a, tm, model)?;
+            }
+            Some(sum)
+        }
+        TermKind::Sub(l, r) => {
+            let lv = evaluate_term_to_rational(*l, tm, model)?;
+            let rv = evaluate_term_to_rational(*r, tm, model)?;
+            Some(lv - rv)
+        }
+        TermKind::Mul(args) => {
+            let mut prod = BigRational::from(BigInt::from(1));
+            for &a in args {
+                prod *= evaluate_term_to_rational(a, tm, model)?;
+            }
+            Some(prod)
+        }
+        TermKind::Div(l, r) => {
+            let rv = evaluate_term_to_rational(*r, tm, model)?;
+            if rv == BigRational::from(BigInt::from(0)) {
+                return None;
+            }
+            let lv = evaluate_term_to_rational(*l, tm, model)?;
+            Some(lv / rv)
+        }
+        _ => None,
+    }
+}
+
+fn model_value_to_rational(mv: &ModelValue) -> Option<BigRational> {
+    match mv {
+        ModelValue::Int(n) => Some(BigRational::from(n.clone())),
+        ModelValue::Rational(r) => Some(r.clone()),
+        ModelValue::Bool(_) | ModelValue::BitVec(_, _) => None,
+    }
+}
+
+/// Convert an exact rational result into the narrowest `Weight` that
+/// represents it exactly (an integer value becomes `Weight::Int`, matching
+/// how `term_id_to_weight`/`optimize_single_objective` already report exact
+/// integer objectives, rather than always widening to `Weight::Rational`).
+fn weight_from_rational(r: BigRational) -> Weight {
+    if r.is_integer() {
+        Weight::Int(r.to_integer())
+    } else {
+        Weight::Rational(r)
     }
 }
 
@@ -553,6 +669,31 @@ impl OptContext {
             return Ok(self.check_sat());
         }
 
+        // Fast, TRUSTED path: if the WHOLE problem (every hard constraint
+        // and every soft constraint's term) is expressible as pure
+        // propositional Boolean structure, solve it via a Tseitin-CNF +
+        // `PmresSolver` encoding instead of the general LIA-capable binary
+        // search below. See `bool_cnf_maxsat`'s module doc: the binary
+        // search below was found (z3/cvc5 differential, fill-the-gap/
+        // maxsat fixup pass) to trigger a false-UNSAT bug in
+        // `oxiz_solver`'s Bool/LIA integration on exactly the encoding it
+        // builds, and separately to silently truncate non-integer
+        // weights — this fast path is immune to both for the (extremely
+        // common) fragment it covers. Falls through unchanged to the
+        // existing encoding for anything outside that fragment (e.g. a
+        // hard constraint or soft term that touches Int/Real).
+        if let Some(outcome) = crate::bool_cnf_maxsat::try_optimize_maxsmt_boolean(
+            &self.hard_constraints,
+            &self.soft_constraints,
+            &self.terms,
+        ) {
+            self.stats.solver_calls += 1;
+            if let Some(model) = outcome.model {
+                self.best_model = Some(model);
+            }
+            return Ok(outcome.result.into());
+        }
+
         let int_sort = self.terms.sorts.int_sort;
         let bool_sort = self.terms.sorts.bool_sort;
 
@@ -564,15 +705,33 @@ impl OptContext {
         let mut selector_implications: Vec<TermId> = Vec::with_capacity(num_soft);
         let mut cost_defs: Vec<TermId> = Vec::with_capacity(num_soft * 2);
 
-        // Pre-compute total weight for upper bound of binary search.
+        // A common integer SCALE factor so every soft-constraint weight —
+        // including rational/decimal ones — is representable EXACTLY as
+        // an integer in the binary-search cost encoding below (which only
+        // ever works over `Int`). A prior version silently collapsed any
+        // non-integer weight to `1`, which could make the search pick a
+        // provably non-optimal set of violated soft constraints while
+        // still reporting the (real, untruncated) weight's sum as if it
+        // were the true optimum — see the fill-the-gap/maxsat fixup
+        // pass's weight-truncation finding. `Weight::Infinite` never
+        // contributes a denominator (it's handled specially below, same
+        // as before).
+        let scale: BigInt = self
+            .soft_constraints
+            .iter()
+            .filter_map(|sc| match &sc.weight {
+                Weight::Rational(r) => Some(r.denom().clone()),
+                Weight::Int(_) | Weight::Infinite => None,
+            })
+            .fold(BigInt::from(1), |acc, d| lcm_bigint(&acc, &d));
+
+        // Pre-compute total weight for upper bound of binary search (in
+        // SCALED units, so it stays an upper bound on the scaled cost sum
+        // built below).
         let total_weight: BigInt = self
             .soft_constraints
             .iter()
-            .map(|sc| match &sc.weight {
-                Weight::Int(n) => n.clone(),
-                Weight::Rational(_) => BigInt::from(1), // treat rational as 1 for bound
-                Weight::Infinite => BigInt::from(i64::MAX / 2),
-            })
+            .map(|sc| scaled_weight(&sc.weight, &scale))
             .fold(BigInt::from(0), |acc, w| acc + w);
 
         for sc in &self.soft_constraints {
@@ -590,13 +749,9 @@ impl OptContext {
             let implication = self.terms.mk_implies(sel, sc.term);
             selector_implications.push(implication);
 
-            // cost_i = ite(b_i, 0, w_i)
+            // cost_i = ite(b_i, 0, w_i) in SCALED units.
             // Encoded as two implications: b_i → cost_i = 0; ¬b_i → cost_i = w_i
-            let weight_int = match &sc.weight {
-                Weight::Int(n) => n.clone(),
-                Weight::Rational(_) => BigInt::from(1),
-                Weight::Infinite => BigInt::from(i64::MAX / 2),
-            };
+            let weight_int = scaled_weight(&sc.weight, &scale);
             let w_term = self.terms.mk_int(weight_int);
             let zero = self.terms.mk_int(0i64);
             let not_sel = self.terms.mk_not(sel);
@@ -822,6 +977,24 @@ impl OptContext {
             self.best_model = Some(last.clone());
         }
 
+        // Populate lower/upper bounds for each objective from the SELECTED
+        // point's model — see `evaluate_term_to_rational`'s doc for why
+        // this is needed (a prior version left every multi-objective
+        // `get-objectives` reporting `Weight::Infinite` unconditionally).
+        // Cloned once up front rather than borrowed, to sidestep multi-
+        // field-borrow gymnastics in a rarely-hot path.
+        if let Some(model) = self.best_model.clone() {
+            let obj_terms: Vec<(ObjectiveId, TermId)> =
+                self.objectives.iter().map(|o| (o.id, o.term)).collect();
+            for (id, term) in obj_terms {
+                if let Some(r) = evaluate_term_to_rational(term, &self.terms, &model) {
+                    let w = weight_from_rational(r);
+                    self.lower_bounds.insert(id, w.clone());
+                    self.upper_bounds.insert(id, w);
+                }
+            }
+        }
+
         Ok(OptResult::Optimal)
     }
 
@@ -977,6 +1150,40 @@ mod tests {
 
         ctx.pop();
         assert_eq!(ctx.num_hard(), 1);
+    }
+
+    #[test]
+    fn pareto_multi_objective_reports_real_bounds_not_infinite() {
+        // Regression test for a P0 finding (fill-the-gap/maxsat fixup
+        // pass): `optimize_pareto` never populated `lower_bounds`/
+        // `upper_bounds`, so `objective_value` returned the
+        // `add_objective`-time `Weight::Infinite` placeholder
+        // UNCONDITIONALLY for every multi-objective run, even for
+        // trivially bounded objectives.
+        let mut ctx = OptContext::new();
+        let x = ctx.terms.mk_var("x", ctx.terms.sorts.int_sort);
+        let y = ctx.terms.mk_var("y", ctx.terms.sorts.int_sort);
+        let zero = ctx.terms.mk_int(0i64);
+        let ten = ctx.terms.mk_int(10i64);
+        let c1 = ctx.terms.mk_ge(x, zero);
+        let c2 = ctx.terms.mk_le(x, ten);
+        let c3 = ctx.terms.mk_ge(y, zero);
+        let c4 = ctx.terms.mk_le(y, ten);
+        ctx.add_hard(c1);
+        ctx.add_hard(c2);
+        ctx.add_hard(c3);
+        ctx.add_hard(c4);
+
+        let id_x = ctx.maximize(x);
+        let id_y = ctx.maximize(y);
+
+        let result = ctx.optimize().expect("optimize should not error");
+        assert_eq!(result, OptResult::Optimal);
+
+        let vx = ctx.objective_value(id_x).expect("x should have a bound");
+        let vy = ctx.objective_value(id_y).expect("y should have a bound");
+        assert!(!vx.is_infinite(), "x's objective value must not be Infinite, got {vx:?}");
+        assert!(!vy.is_infinite(), "y's objective value must not be Infinite, got {vy:?}");
     }
 
     #[test]

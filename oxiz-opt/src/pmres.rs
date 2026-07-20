@@ -142,6 +142,15 @@ impl PmresSolver {
 
     /// Solve using PMRES algorithm
     pub fn solve(&mut self) -> Result<MaxSatResult, MaxSatError> {
+        // Seed `next_var` from the FULL problem (all hard + all soft clause
+        // literals) exactly once, before any relaxation variable is minted.
+        // Relaxation variables are allocated per weight-level (see
+        // `solve_level`) using clause subsets that may not cover the whole
+        // problem, so seeding lazily/per-level can mint a relax var that
+        // aliases a real problem variable from a clause outside that
+        // subset. See Bug 1 in the fill-the-gap/maxsat slice.
+        self.seed_next_var();
+
         // Check if trivially satisfiable
         if self.soft_clauses.is_empty() {
             return self.check_hard_satisfiable();
@@ -154,6 +163,24 @@ impl PmresSolver {
 
         // Main PMRES loop
         self.solve_pmres_main()
+    }
+
+    /// Compute the true starting `next_var` from every literal in every
+    /// hard AND soft clause of the whole problem (not just a per-level
+    /// subset). Must run once before any relaxation variable is minted.
+    fn seed_next_var(&mut self) {
+        let mut max_var = self.next_var;
+        for clause in &self.hard_clauses {
+            for &lit in clause.iter() {
+                max_var = max_var.max(lit.var().0 + 1);
+            }
+        }
+        for clause in &self.soft_clauses {
+            for &lit in &clause.lits {
+                max_var = max_var.max(lit.var().0 + 1);
+            }
+        }
+        self.next_var = max_var;
     }
 
     /// Check if soft clauses have different weights
@@ -245,7 +272,28 @@ impl PmresSolver {
                 .collect();
 
             if assumptions.is_empty() {
-                break;
+                // Every soft clause at this level has been permanently
+                // relaxed already (or there were none to begin with). We
+                // must still solve once, with no assumptions, to obtain a
+                // concrete model and the REAL cost from it. Previously
+                // this fell straight through to `Ok(Optimal)` at the end
+                // of the function without ever touching
+                // `self.lower_bound`/`self.best_model`, leaving them
+                // stale — e.g. still `Weight::zero()`, or carried over
+                // from a completely different weight level — which is
+                // unsound (silently under-reports cost).
+                self.stats.sat_calls += 1;
+                return match solver.solve() {
+                    SolverResult::Sat => {
+                        self.best_model = Some(solver.model().to_vec());
+                        let model = solver.model();
+                        self.lower_bound =
+                            Self::compute_relaxed_cost(model, soft_clauses, &level_relax_vars);
+                        Ok(MaxSatResult::Optimal)
+                    }
+                    SolverResult::Unsat => Err(MaxSatError::Unsatisfiable),
+                    SolverResult::Unknown => Ok(MaxSatResult::Unknown),
+                };
             }
 
             self.stats.sat_calls += 1;
@@ -259,16 +307,8 @@ impl PmresSolver {
                     // Compute actual cost from model: sum weights of violated soft clauses
                     // (those whose relaxation variables are true)
                     let model = solver.model();
-                    let mut actual_cost = Weight::zero();
-                    for clause in soft_clauses {
-                        if let Some(&relax_lit) = level_relax_vars.get(&clause.id) {
-                            let var_idx = relax_lit.var().0 as usize;
-                            if var_idx < model.len() && model[var_idx] == LBool::True {
-                                actual_cost = actual_cost.add(&clause.weight);
-                            }
-                        }
-                    }
-                    self.lower_bound = actual_cost;
+                    self.lower_bound =
+                        Self::compute_relaxed_cost(model, soft_clauses, &level_relax_vars);
 
                     return Ok(MaxSatResult::Optimal);
                 }
@@ -306,7 +346,10 @@ impl PmresSolver {
                         return Err(MaxSatError::Unsatisfiable);
                     }
 
-                    // Process core: add at-most-one constraint on relaxation vars
+                    // Process core: the core is a subset of the assumed
+                    // `~relax_lit` literals that, together with the hard
+                    // clauses, is UNSAT — i.e. at least one of these soft
+                    // clauses MUST be relaxed. Force that directly.
                     if core_soft_ids.len() > 1 {
                         self.add_core_constraint(&mut solver, &level_relax_vars, &core_soft_ids);
                     } else if core_soft_ids.len() == 1 {
@@ -317,8 +360,25 @@ impl PmresSolver {
                 SolverResult::Unknown => return Ok(MaxSatResult::Unknown),
             }
         }
+    }
 
-        Ok(MaxSatResult::Optimal)
+    /// Compute the cost of a model: the sum of weights of soft clauses
+    /// whose relaxation variable is true (i.e. violated) in the model.
+    fn compute_relaxed_cost(
+        model: &[LBool],
+        soft_clauses: &[SoftClause],
+        level_relax_vars: &FxHashMap<SoftId, Lit>,
+    ) -> Weight {
+        let mut actual_cost = Weight::zero();
+        for clause in soft_clauses {
+            if let Some(&relax_lit) = level_relax_vars.get(&clause.id) {
+                let var_idx = relax_lit.var().0 as usize;
+                if var_idx < model.len() && model[var_idx] == LBool::True {
+                    actual_cost = actual_cost.add(&clause.weight);
+                }
+            }
+        }
+        actual_cost
     }
 
     /// Main PMRES solving loop (non-stratified)
@@ -327,35 +387,32 @@ impl PmresSolver {
         self.solve_level(&soft_clauses)
     }
 
-    /// Add core constraint: at most one relaxation variable in core can be true
+    /// Add core constraint: at least one relaxation variable in the core
+    /// must be true (i.e. at least one soft clause in this UNSAT core must
+    /// be relaxed).
+    ///
+    /// The assumption `~relax_lit` for every clause in `core_soft_ids` was
+    /// just proven UNSAT together with the hard clauses, so that exact
+    /// all-relaxed-false combination must be forbidden going forward:
+    /// assert `relax_1 \/ relax_2 \/ ... \/ relax_k`. A prior version of
+    /// this method instead added an "at most one" (pairwise, or
+    /// all-must-be-false) constraint, which is backwards — it can forbid
+    /// solutions that legitimately need to relax more than one core member
+    /// simultaneously, forcing the search toward needlessly higher cost
+    /// (or even local infeasibility). Mirrors the already-correct
+    /// `pmres_enhanced.rs::process_core`.
     fn add_core_constraint(
         &mut self,
         solver: &mut SatSolver,
         relax_vars: &FxHashMap<SoftId, Lit>,
         core_soft_ids: &[SoftId],
     ) {
-        // For small cores, use pairwise encoding
-        if core_soft_ids.len() <= 5 {
-            for i in 0..core_soft_ids.len() {
-                for j in (i + 1)..core_soft_ids.len() {
-                    if let (Some(&lit_i), Some(&lit_j)) = (
-                        relax_vars.get(&core_soft_ids[i]),
-                        relax_vars.get(&core_soft_ids[j]),
-                    ) {
-                        // ~lit_i | ~lit_j (at most one can be true)
-                        solver.add_clause([lit_i.negate(), lit_j.negate()]);
-                    }
-                }
-            }
-        } else {
-            // For larger cores, add weaker constraint: at least one must be false
-            let clause: SmallVec<[Lit; 8]> = core_soft_ids
-                .iter()
-                .filter_map(|id| relax_vars.get(id).map(|lit| lit.negate()))
-                .collect();
-            if !clause.is_empty() {
-                solver.add_clause(clause.iter().copied());
-            }
+        let clause: SmallVec<[Lit; 8]> = core_soft_ids
+            .iter()
+            .filter_map(|id| relax_vars.get(id).copied())
+            .collect();
+        if !clause.is_empty() {
+            solver.add_clause(clause.iter().copied());
         }
     }
 
@@ -479,7 +536,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PMRES algorithm needs further tuning for simple cases"]
     fn test_pmres_all_satisfiable() {
         let mut solver = PmresSolver::new();
 

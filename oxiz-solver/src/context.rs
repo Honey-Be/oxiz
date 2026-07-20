@@ -19,6 +19,17 @@ use std::path::{Path, PathBuf};
 /// `oxiz_core::model` types into the public API of this file.
 pub type RawFuncInterp = (Vec<(Vec<String>, String)>, String, usize);
 
+/// Whether [`Context::execute_one`] should keep processing subsequent
+/// commands (`Continue`) or an `(exit)` command was seen (`Stop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "std")]
+pub enum CommandFlow {
+    /// Keep processing subsequent commands.
+    Continue,
+    /// An `(exit)` command was seen — stop processing.
+    Stop,
+}
+
 /// Whether `t` (or any subterm, including under quantifiers) contains an
 /// arithmetic operator the theory layer does NOT decide — integer `div`/`mod`,
 /// or one of the Int/Real conversion ops the parser keeps uninterpreted (`abs`,
@@ -1096,6 +1107,32 @@ impl Context {
         self.terms.sorts.intern(SortKind::Uninterpreted(key))
     }
 
+    /// `self.terms` and `self.parser_env` mutably, at once — exactly what
+    /// `oxiz_core::smtlib::parse_script_with_env` needs. Exposed (rather
+    /// than just `self.terms`, already `pub`, plus a separate
+    /// `parser_env_mut()`) because a caller from OUTSIDE this crate can't
+    /// split those two borrows itself: `self.terms` is a direct public
+    /// field, but a hypothetical `parser_env_mut(&mut self) -> &mut
+    /// ParserEnv` method's `&mut self` receiver would tie up ALL of
+    /// `self.ctx` for its return value's lifetime from the caller's point
+    /// of view, making it impossible to ALSO use `self.terms` at the same
+    /// time. This method does the splitting HERE, where the field layout
+    /// is visible, and hands back two independently-usable borrows.
+    ///
+    /// Exposed so an external driver that needs to intercept SOME commands
+    /// while delegating the rest to [`execute_one`](Context::execute_one)
+    /// can parse a script itself against the SAME persistent environment
+    /// `execute_script` would use (declared functions/consts/sorts/defined
+    /// funcs/datatype constructors — see the `parser_env` field doc),
+    /// rather than an empty one that would forget earlier declarations.
+    /// Today's motivating caller is `oxiz-opt`'s MaxSMT/OMT script runner
+    /// (see [`execute_one`](Context::execute_one)'s doc for why that
+    /// integration lives there rather than here).
+    #[cfg(feature = "std")]
+    pub fn terms_and_parser_env_mut(&mut self) -> (&mut TermManager, &mut ParserEnv) {
+        (&mut self.terms, &mut self.parser_env)
+    }
+
     /// Execute an SMT-LIB2 script
     #[cfg(feature = "std")]
     pub fn execute_script(&mut self, script: &str) -> Result<Vec<String>> {
@@ -1110,7 +1147,76 @@ impl Context {
         let mut output = Vec::new();
 
         for cmd in commands {
-            match cmd {
+            if self.execute_one(cmd, &mut output)? == CommandFlow::Stop {
+                break;
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Execute a single already-parsed SMT-LIB2 command, appending any
+    /// output line(s) it produces to `output`. `execute_script` is just
+    /// "parse, then call this in a loop" (see its body) — this is exposed
+    /// separately so an external driver that needs to intercept SOME
+    /// commands can delegate the REST here one at a time, reusing the exact
+    /// same per-command behavior, rather than duplicating this match.
+    ///
+    /// Today's motivating case: `Command::Minimize`/`Maximize`/
+    /// `AssertSoft`/`GetObjectives` (SMT-LIB2 MaxSMT/OMT extensions) need
+    /// `oxiz-opt`'s `OptContext` to mean anything. `oxiz-opt` already
+    /// depends on `oxiz-solver` (for the actual SAT/SMT solving its
+    /// optimization algorithms run on), so `oxiz-solver` depending back on
+    /// `oxiz-opt` would be a cyclic crate dependency — Cargo rejects that
+    /// unconditionally, regardless of feature flags, since the package
+    /// graph must be acyclic before features are even considered (confirmed
+    /// empirically while implementing this: `cargo build -p oxiz-solver`
+    /// fails immediately with "cyclic package dependency" the moment
+    /// `oxiz-opt` appears in this crate's `Cargo.toml` at all, optional or
+    /// not). So those four variants are handled OUTSIDE this crate, by
+    /// `oxiz-opt`'s script runner, which owns both a `Context` (via this
+    /// method) and an `OptContext`, and uses `oxiz_core::ast::
+    /// transplant_term` to bridge the two `TermManager`s. Called directly
+    /// here (i.e. through plain `execute_script`, not that runner), they
+    /// push a clear diagnostic instead of silently doing nothing — matching
+    /// the standing rule that a fallback must never look like a real
+    /// verdict.
+    #[cfg(feature = "std")]
+    pub fn execute_one(&mut self, cmd: Command, output: &mut Vec<String>) -> Result<CommandFlow> {
+        match cmd {
+            Command::Minimize { .. }
+            | Command::Maximize { .. }
+            | Command::AssertSoft { .. }
+            | Command::GetObjectives => {
+                output.push(
+                    "(error \"minimize/maximize/assert-soft/get-objectives require \
+                     oxiz-opt's MaxSMT/OMT script runner, not plain \
+                     oxiz_solver::Context::execute_script\")"
+                        .to_string(),
+                );
+                return Ok(CommandFlow::Continue);
+            }
+            Command::Exit => return Ok(CommandFlow::Stop),
+            _ => {}
+        }
+        self.execute_one_known(cmd, output);
+        Ok(CommandFlow::Continue)
+    }
+
+    /// The original per-command dispatch for every command
+    /// [`execute_one`](Context::execute_one) doesn't special-case above —
+    /// split out only so that method's early-return arms (the MaxSMT/OMT
+    /// diagnostics, `Exit`) read clearly; not meant to be called directly.
+    #[cfg(feature = "std")]
+    fn execute_one_known(&mut self, cmd: Command, output: &mut Vec<String>) {
+        match cmd {
+            Command::Minimize { .. }
+            | Command::Maximize { .. }
+            | Command::AssertSoft { .. }
+            | Command::GetObjectives
+            | Command::Exit => {
+                unreachable!("handled by execute_one before delegating here")
+            }
                 Command::SetLogic(logic) => {
                     self.set_logic(&logic);
                 }
@@ -1153,9 +1259,6 @@ impl Context {
                 }
                 Command::ResetAssertions => {
                     self.reset_assertions();
-                }
-                Command::Exit => {
-                    break;
                 }
                 Command::Echo(msg) => {
                     output.push(msg);
@@ -1252,9 +1355,6 @@ impl Context {
                     // Ignore these commands for now
                 }
             }
-        }
-
-        Ok(output)
     }
 
     /// Get solver statistics

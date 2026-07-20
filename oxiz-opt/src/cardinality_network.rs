@@ -380,9 +380,18 @@ pub fn encode_at_most_k_cardinality_network(
         CardinalityNetworkEncoding::Sorting => {
             let outputs = network.build_sorting_network(inputs);
             let clauses = network.take_clauses();
-            // at-most-k means: outputs[k+1] must be false (if it exists)
-            let assumption = if k + 1 < outputs.len() {
-                Some(outputs[k + 1].negate())
+            // `build_sorting_network` sorts ascending: for N outputs,
+            // outputs[j] == true  <=>  count(true inputs) >= N - j.
+            // (`compare_exchange`'s ascending mode routes the AND to the
+            // low index and the OR to the high index — see its doc
+            // comment.) So outputs[N-1] is "at least 1" and outputs[0] is
+            // "at least N". At-most-k means "at least k+1" must be false,
+            // i.e. outputs[N-1-k] must be false (if it exists) — NOT
+            // outputs[k+1], which indexes as though the array were sorted
+            // descending.
+            let n = outputs.len();
+            let assumption = if k < n {
+                Some(outputs[n - 1 - k].negate())
             } else {
                 None
             };
@@ -419,6 +428,7 @@ pub fn encode_at_most_k_cardinality_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxiz_sat::{Solver as SatSolver, SolverResult};
 
     fn var(v: u32) -> Var {
         Var(v)
@@ -426,6 +436,116 @@ mod tests {
 
     fn pos(v: u32) -> Lit {
         Lit::pos(var(v))
+    }
+
+    fn neg(v: u32) -> Lit {
+        Lit::neg(var(v))
+    }
+
+    /// Build a fresh solver from an at-most-k encoding's output and assert
+    /// the given fixed truth values for `inputs[0..fixed.len()]`.
+    fn solve_with_fixed(
+        clauses: &[CardinalityClause],
+        assumption: Option<Lit>,
+        next_var: u32,
+        fixed: &[Lit],
+    ) -> SolverResult {
+        let mut solver = SatSolver::new();
+        while solver.num_vars() < next_var as usize {
+            solver.new_var();
+        }
+        for c in clauses {
+            solver.add_clause(c.lits.iter().copied());
+        }
+        if let Some(a) = assumption {
+            solver.add_clause([a]);
+        }
+        for &lit in fixed {
+            solver.add_clause([lit]);
+        }
+        solver.solve()
+    }
+
+    /// Round-trips the Sorting-network at-most-k semantics through an
+    /// actual SAT solver: an assignment with exactly k true inputs must
+    /// stay SAT, and one with k+1 true inputs must become UNSAT. This is
+    /// the regression guard for Bug 2b (the `outputs[k+1]` vs.
+    /// `outputs[n-1-k]` indexing mixup) — `test_encode_at_most_k_sorting`
+    /// only checks non-emptiness and would not have caught it.
+    #[test]
+    fn test_encode_at_most_k_sorting_semantics() {
+        let inputs = vec![pos(0), pos(1), pos(2), pos(3)];
+        let k = 2;
+
+        // Exactly k=2 inputs true, 2 false: satisfies at-most-2, must be SAT.
+        let (clauses, assumption, next_var) = encode_at_most_k_cardinality_network(
+            &inputs,
+            k,
+            CardinalityNetworkEncoding::Sorting,
+            10,
+        );
+        let result = solve_with_fixed(
+            &clauses,
+            assumption,
+            next_var,
+            &[pos(0), pos(1), neg(2), neg(3)],
+        );
+        assert_eq!(
+            result,
+            SolverResult::Sat,
+            "at-most-{k} must allow exactly {k} true inputs"
+        );
+
+        // 3 inputs forced true: violates at-most-2, must be UNSAT.
+        let (clauses, assumption, next_var) = encode_at_most_k_cardinality_network(
+            &inputs,
+            k,
+            CardinalityNetworkEncoding::Sorting,
+            10,
+        );
+        let result = solve_with_fixed(&clauses, assumption, next_var, &[pos(0), pos(1), pos(2)]);
+        assert_eq!(
+            result,
+            SolverResult::Unsat,
+            "at-most-{k} must reject {} true inputs",
+            k + 1
+        );
+    }
+
+    /// Same round-trip, but for the Cardinality-network encoding path
+    /// (`outputs[k]` indexing), on a case where at-least one input is
+    /// forced false so the encoding cannot trivially degenerate.
+    #[test]
+    fn test_encode_at_most_k_cardinality_semantics() {
+        let inputs = vec![pos(0), pos(1), pos(2), pos(3)];
+        let k = 1;
+
+        let (clauses, assumption, next_var) = encode_at_most_k_cardinality_network(
+            &inputs,
+            k,
+            CardinalityNetworkEncoding::Cardinality,
+            10,
+        );
+        let result = solve_with_fixed(&clauses, assumption, next_var, &[pos(0), neg(1), neg(2)]);
+        assert_eq!(
+            result,
+            SolverResult::Sat,
+            "at-most-{k} must allow exactly {k} true input"
+        );
+
+        let (clauses, assumption, next_var) = encode_at_most_k_cardinality_network(
+            &inputs,
+            k,
+            CardinalityNetworkEncoding::Cardinality,
+            10,
+        );
+        let result = solve_with_fixed(&clauses, assumption, next_var, &[pos(0), pos(1)]);
+        assert_eq!(
+            result,
+            SolverResult::Unsat,
+            "at-most-{k} must reject {} true inputs",
+            k + 1
+        );
     }
 
     #[test]

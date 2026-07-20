@@ -104,6 +104,8 @@ mod simplify;
 pub mod skolemization;
 mod solver;
 
+#[cfg(feature = "std")]
+pub use context::CommandFlow;
 pub use context::Context;
 pub use nelson_oppen::{NelsonOppenCombiner, NelsonOppenStats, TheoryId};
 pub use optimization::{Objective, ObjectiveKind, OptimizationResult, Optimizer, ParetoPoint};

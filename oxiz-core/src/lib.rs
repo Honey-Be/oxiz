@@ -116,7 +116,7 @@ pub mod statistics;
 pub mod tactic;
 
 // === Always-available exports ===
-pub use ast::{Term, TermId, TermKind, TermManager};
+pub use ast::{Term, TermId, TermKind, TermManager, TransplantError, transplant_term};
 pub use config::{
     ClauseDeletionStrategy, Config, GeneralParams, PhaseSaving, ResourceLimits, SatParams,
     SimplifyParams,
