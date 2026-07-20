@@ -17,6 +17,7 @@ doc = false
 [dependencies]
 oxiz-core = { workspace = true, features = ["std"] }
 oxiz-solver = { workspace = true, features = ["std"] }
+oxiz-opt = { workspace = true }
 oxiz-proof = { workspace = true }
 oxiz-smtcomp = { workspace = true }
 clap = { workspace = true }

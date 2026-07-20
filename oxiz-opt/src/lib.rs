@@ -108,6 +108,7 @@
 //! - `optsmt.cpp` - Objective optimization
 //! - `opt_pareto.cpp` - Pareto optimization
 
+mod bool_cnf_maxsat;
 pub mod cardinality_network;
 pub mod context;
 pub mod hybrid;
@@ -126,6 +127,7 @@ pub mod portfolio;
 pub mod preprocess;
 pub mod rc2;
 pub mod rc2_enhanced;
+pub mod script;
 pub mod sls;
 pub mod smtlib;
 pub mod smtlib_commands;
@@ -187,6 +189,7 @@ pub use rc2::{Rc2Config, Rc2Error, Rc2Solver, Rc2Stats};
 pub use rc2_enhanced::{
     EnhancedRc2Config, EnhancedRc2Solver, EnhancedRc2Stats, StratificationStrategy,
 };
+pub use script::OptScriptRunner;
 pub use sls::{SlsConfig, SlsError, SlsSolver, SlsStats};
 pub use smtlib_commands::{
     CommandResponse, ObjectiveValue, ObjectiveValueKind, ObjectivesResponse, OptCommand,

@@ -1,13 +1,14 @@
 //! SMT-LIB2 command parsing
 
 use super::super::lexer::TokenKind;
-use super::{Command, Parser};
+use super::{Command, Parser, parse_decimal_to_rational};
 use crate::ast::{RoundingMode, TermId};
 use crate::error::{OxizError, Result};
 #[allow(unused_imports)]
 use crate::prelude::*;
 #[cfg(feature = "profiling")]
 use crate::profiling::{ProfilingCategory, ScopedTimer};
+use num_bigint::BigInt;
 
 impl<'a> Parser<'a> {
     /// Expect an opening parenthesis '('
@@ -407,6 +408,37 @@ impl<'a> Parser<'a> {
             }
             "declare-datatypes" => self.parse_declare_datatypes()?,
             "declare-datatype" => self.parse_declare_datatype()?,
+            "minimize" => {
+                let term = self.parse_term()?;
+                let (_weight, id) = self.parse_opt_objective_kwargs()?;
+                self.expect_rparen()?;
+                Command::Minimize { term, id }
+            }
+            "maximize" => {
+                let term = self.parse_term()?;
+                let (_weight, id) = self.parse_opt_objective_kwargs()?;
+                self.expect_rparen()?;
+                Command::Maximize { term, id }
+            }
+            "assert-soft" => {
+                let term = self.parse_term()?;
+                let (weight, group) = self.parse_opt_objective_kwargs()?;
+                let weight = weight.ok_or_else(|| OxizError::ParseError {
+                    position: self.lexer.position(),
+                    message: "assert-soft requires a :weight <numeral> argument".to_string(),
+                })?;
+                self.expect_rparen()?;
+                Command::AssertSoft {
+                    term,
+                    weight,
+                    group: group.clone(),
+                    id: group,
+                }
+            }
+            "get-objectives" => {
+                self.expect_rparen()?;
+                Command::GetObjectives
+            }
             _ => {
                 // Skip unknown command (balanced paren skipping)
                 let mut depth = 1;
@@ -423,6 +455,84 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Some(cmd))
+    }
+
+    /// Parse the trailing `:weight <numeral>` / `:id <symbol>` keyword
+    /// arguments shared by `minimize`/`maximize`/`assert-soft`, up to (not
+    /// consuming) the command's closing `)`. Mirrors `parse_attributes`'s
+    /// keyword-loop shape (peek a `TokenKind::Keyword`, consume it, consume
+    /// its value) rather than hand-rolling a new one, but is specialized to
+    /// this exact pair since neither value is ever a term/S-expression.
+    ///
+    /// Returns `(weight, id)`. `minimize`/`maximize` never emit a `:weight`
+    /// keyword in a well-formed script and so always get `None` back for
+    /// it; `assert-soft` requires one and its caller turns a `None` into a
+    /// parse error itself (a missing `:weight` is only an error in THAT
+    /// command's context, not this shared helper's).
+    fn parse_opt_objective_kwargs(&mut self) -> Result<(Option<TermId>, Option<String>)> {
+        let mut weight = None;
+        let mut id = None;
+        loop {
+            let Some(tok) = self.lexer.peek() else {
+                break;
+            };
+            let TokenKind::Keyword(kw) = &tok.kind else {
+                break;
+            };
+            match kw.as_str() {
+                "weight" => {
+                    self.lexer.next_token();
+                    weight = Some(self.parse_numeral_literal_term()?);
+                }
+                "id" => {
+                    self.lexer.next_token();
+                    id = Some(self.expect_symbol()?);
+                }
+                // An unrecognized keyword here is left for `expect_rparen`
+                // to report as a clear "expected ')'" error, rather than
+                // silently consuming it.
+                _ => break,
+            }
+        }
+        Ok((weight, id))
+    }
+
+    /// Parse a bare numeral/decimal literal token into a `TermId`, via the
+    /// exact same numeral-to-term construction (`mk_int`/`mk_real`) that
+    /// `parse_term` uses for a plain `<numeral>`/`<decimal>` token. A MaxSMT
+    /// `:weight` value is always one of these two token kinds per the
+    /// grammar — never a compound term — so this deliberately does not
+    /// delegate to the full `parse_term`.
+    fn parse_numeral_literal_term(&mut self) -> Result<TermId> {
+        let token = self
+            .lexer
+            .next_token()
+            .ok_or_else(|| OxizError::ParseError {
+                position: self.lexer.position(),
+                message: "expected a numeral or decimal weight, found end of input".to_string(),
+            })?;
+
+        match token.kind {
+            TokenKind::Numeral(n) => {
+                let value: BigInt = n.parse().map_err(|_| OxizError::ParseError {
+                    position: token.start,
+                    message: format!("invalid numeral: {n}"),
+                })?;
+                Ok(self.manager.mk_int(value))
+            }
+            TokenKind::Decimal(d) => {
+                let rational =
+                    parse_decimal_to_rational(&d).map_err(|e| OxizError::ParseError {
+                        position: token.start,
+                        message: format!("invalid decimal: {d} - {e}"),
+                    })?;
+                Ok(self.manager.mk_real(rational))
+            }
+            other => Err(OxizError::ParseError {
+                position: token.start,
+                message: format!("expected a numeral or decimal weight, found {other:?}"),
+            }),
+        }
     }
 
     /// Parse an optional numeral from the token stream; return `default` if none present
