@@ -134,6 +134,33 @@ impl Solver {
 
         // Remove subsumed clauses
         for cid in to_remove {
+            // Detach every watcher that still references this clause BEFORE
+            // freeing its slot — see the identical scrub in
+            // `reduce_clause_database`/`forget_learned_since`/the assertion-
+            // pop handler for the full mechanism: `ClauseDatabase::remove`
+            // pushes the id onto a free list the next `add_*` recycles,
+            // clearing the slot's `deleted` flag, so `propagate`'s "skip
+            // deleted clause" guard cannot catch a stale watcher once the id
+            // is reused — the recycled clause silently inherits the deleted
+            // clause's watchers and mis-propagates (the exact false-`unsat`
+            // mechanism regression #428 covers: `check_subsumption` was the
+            // one clause-removal site in this module that never scrubbed).
+            // A subsumed candidate here always has `lits.len() >= 3` (the
+            // `clause.lits.len() < new_clause.len()` guard above combined
+            // with `check_subsumption` only being called for `learnt_clause.
+            // len() >= 3` learned clauses rules out binary candidates), so a
+            // `binary_graph` scrub is currently unreachable dead weight —
+            // included anyway, mirroring the sibling call sites' `is_binary`
+            // guard, so this stays correct if that invariant ever changes.
+            if let Some(clause) = self.clauses.get(cid) {
+                let is_binary = clause.lits.len() == 2;
+                for &lit in &clause.lits {
+                    self.watches.remove_clause(lit.negate(), cid);
+                    if is_binary {
+                        self.binary_graph.remove(lit.negate(), cid);
+                    }
+                }
+            }
             // DRAT: log the deletion (learned clauses only) before removal.
             self.drat_delete_clause_id(cid);
             self.clauses.remove(cid);

@@ -1877,6 +1877,82 @@ impl Solver {
                         ) {
                             self.var_to_parsed_arith.insert(var, parsed);
                         }
+
+                        // Soundness: unconditionally add the trichotomy split
+                        // `Eq(lhs,rhs) OR Lt(lhs,rhs) OR Gt(lhs,rhs)` (a tautology
+                        // over Int/Real) right here, at the single choke-point
+                        // where EVERY Int/Real equality atom is first given its
+                        // Tseitin variable (`get_or_create_var` above hash-conses
+                        // by `term`, so this fires exactly once per distinct atom).
+                        //
+                        // `process_constraint`'s negative-`Eq` branch
+                        // (theory_manager.rs) only tells EUF about a disequality
+                        // when this atom is later decided FALSE by the SAT
+                        // search -- it never asserts `lhs != rhs` into the
+                        // arithmetic (simplex) solver, because simplex has no
+                        // native disequality primitive. The ONLY thing that makes
+                        // a decided-false Eq atom actually constrain arithmetic is
+                        // this trichotomy clause forcing `Lt` or `Gt` to become
+                        // true by unit propagation once `Eq` is false -- and
+                        // `Lt`/`Gt` DO reach the arithmetic solver via the normal
+                        // `Constraint::Lt`/`Constraint::Gt` positive branch.
+                        //
+                        // Previously this split was added only by a fragile,
+                        // syntactic AST pre-pass (`add_arith_diseq_split[_recursive]`,
+                        // still called separately below/at each `assert`) that
+                        // pattern-matches the *literal* shape `Not(Eq(a,b))`
+                        // reachable through a hand-picked subset of connectives
+                        // (`Not`, `And`, `Or`, the RHS of `Implies`, both branches
+                        // of `Ite`). Any Eq atom that can be driven false WITHOUT
+                        // that exact AST shape -- e.g. sitting bare as the
+                        // ANTECEDENT of an `Implies` (`(=> (= a b) ...)`), as the
+                        // CONDITION of an `Ite` (`(ite (= a b) ...)`), or bare
+                        // inside an `Or` alongside another true disjunct
+                        // (`(or (= a b) flag)` with `flag` true) -- was never
+                        // split, so the arithmetic solver could silently pick
+                        // `lhs = rhs` even though the SAT layer had decided the
+                        // atom false, shipping a model that contradicts the
+                        // solver's own Boolean assignment (confirmed false-`sat`,
+                        // e.g. `(assert (= (+ X1 X0) (+ X2 X0)))` `(assert (=>
+                        // (= X2 X1) (< 5 3)))`). Adding the split at the atom's
+                        // single encode choke-point closes the gap for every
+                        // syntactic position at once instead of enumerating more
+                        // AST shapes into the old walker. The redundant split the
+                        // old pass still (harmlessly) re-adds for the shapes it
+                        // already covered is a duplicate-clause no-op.
+                        //
+                        // KNOWN COST (measured, accepted -- see the fix report):
+                        // on quantifier-heavy corpus rows this feeds new ground
+                        // `Lt`/`Gt` atoms into MBQI's own trigger-matching corpus,
+                        // which can noticeably increase instantiation counts (one
+                        // corpus row measured 510 -> 2206) and, on a formula that
+                        // was already close to the default non-termination guard,
+                        // downgrade a confirmed `unsat` to the (always sound)
+                        // `unknown`. A LAZY variant (only split an atom once an
+                        // accepted candidate model is caught actually violating
+                        // it, wired into `check_level`'s main loop) was built and
+                        // measured as an alternative: it cut the number of splits
+                        // dramatically (27 vs blanket-all-atoms on that same row)
+                        // but did NOT reliably converge faster in practice -- on
+                        // the same corpus row it still did not reach a verdict
+                        // within 120s (vs this eager version's ~27s with the
+                        // guard raised), because each lazy split forces an
+                        // immediate re-solve that perturbs the CDCL(T)+MBQI
+                        // search trajectory on this search-order-sensitive row
+                        // regardless of how few splits are actually injected.
+                        // Given the eager version is simpler, keeps the fix
+                        // entirely inside `encode.rs` (no change to the
+                        // core `check_level` loop, one of this codebase's most
+                        // sensitive/heavily-guarded paths), and empirically
+                        // converges (just slower) rather than stalling, it is the
+                        // one kept. `OXIZ_MBQI_GUARD_MS` recovers full behavior
+                        // on rows this pushes past the default guard.
+                        let eq_lit = Lit::pos(var);
+                        let lt_term = manager.mk_lt(*lhs, *rhs);
+                        let gt_term = manager.mk_gt(*lhs, *rhs);
+                        let lt_lit = self.encode(lt_term, manager);
+                        let gt_lit = self.encode(gt_term, manager);
+                        self.sat.add_clause([eq_lit, lt_lit, gt_lit]);
                     }
 
                     Lit::pos(var)
