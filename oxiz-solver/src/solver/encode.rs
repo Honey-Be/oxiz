@@ -50,6 +50,11 @@ impl Solver {
                 let is_real = term.sort == manager.sorts.real_sort;
 
                 if is_int || is_real {
+                    // #427 — record the SORT with the arithmetic solver. Its
+                    // LIA/LRA mode comes from the `(set-logic …)` name, which
+                    // says nothing useful under `ALL` / no logic / `AUFLIRA`;
+                    // the sort is what actually decides integrality.
+                    self.arith.declare_sort(term_id, is_int);
                     if !self.arith_terms.contains(&term_id) {
                         self.arith_terms.insert(term_id);
                         self.trail.push(TrailOp::ArithTermAdded { term: term_id });
@@ -66,6 +71,10 @@ impl Solver {
                     }
                     // Also intern in ArithSolver for BV comparison constraints
                     // (BV comparisons are handled as bounded integer arithmetic)
+                    // — and they ARE integral, so declare them so (#427); a
+                    // `BV`-named logic already selected LIA, this just makes the
+                    // `ALL`/no-logic path agree.
+                    self.arith.declare_sort(term_id, true);
                     self.arith.intern(term_id);
                 }
             }
@@ -199,6 +208,7 @@ impl Solver {
                     // became reliable once the EUF proof forest was correctly
                     // backtracked; a leaked proof edge previously produced invalid
                     // conflict explanations.)
+                    self.arith.declare_sort(term_id, is_int); // #427
                     if !self.arith_terms.contains(&term_id) {
                         self.arith_terms.insert(term_id);
                         self.trail.push(TrailOp::ArithTermAdded { term: term_id });
@@ -216,10 +226,13 @@ impl Solver {
             TermKind::Select(_, _) => {
                 let is_int = term.sort == manager.sorts.int_sort;
                 let is_real = term.sort == manager.sorts.real_sort;
-                if (is_int || is_real) && !self.arith_terms.contains(&term_id) {
-                    self.arith_terms.insert(term_id);
-                    self.trail.push(TrailOp::ArithTermAdded { term: term_id });
-                    self.arith.intern(term_id);
+                if is_int || is_real {
+                    self.arith.declare_sort(term_id, is_int); // #427
+                    if !self.arith_terms.contains(&term_id) {
+                        self.arith_terms.insert(term_id);
+                        self.trail.push(TrailOp::ArithTermAdded { term: term_id });
+                        self.arith.intern(term_id);
+                    }
                 }
             }
 
@@ -1653,6 +1666,7 @@ impl Solver {
                 let is_real = t.sort == manager.sorts.real_sort;
 
                 if is_int || is_real {
+                    self.arith.declare_sort(term, is_int); // #427
                     // Track arithmetic terms
                     if !self.arith_terms.contains(&term) {
                         self.arith_terms.insert(term);

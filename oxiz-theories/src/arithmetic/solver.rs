@@ -6,7 +6,7 @@ use core::fmt;
 use crate::prelude::*;
 use crate::theory::{EqualityNotification, Theory, TheoryCombination, TheoryId, TheoryResult};
 use crate::ArithRat;
-use num_traits::{One, Signed};
+use num_traits::{One, Signed, Zero};
 use oxiz_core::ast::TermId;
 use oxiz_core::error::Result;
 use portable_bijectives::FlatRadixBimap;
@@ -48,7 +48,28 @@ pub struct ArithSolver {
     /// Reason to term mapping
     reasons: Vec<TermId>,
     /// Is this LIA (integers) or LRA (reals)?
+    ///
+    /// #427 — this is now only the FALLBACK for a term whose sort was never
+    /// declared (see `declared_sorts`). It is set from the `(set-logic …)`
+    /// name, which is not a reliable source of integrality: `ALL`, a missing
+    /// `(set-logic)`, and mixed names like `AUFLIRA`/`QF_LIRA` all match none of
+    /// the `LIA`/`IDL`/`NIA`/`BV` substrings `Solver::set_logic` tests, so they
+    /// fell through to the default LRA and every Int-sorted constraint was
+    /// solved over the RATIONALS.
     is_integer: bool,
+    /// #427 — per-TERM integrality, keyed by the term's SMT SORT rather than by
+    /// the logic name. `Some(true)` = Int-sorted (or a bitvector, whose values
+    /// are integers), `Some(false)` = Real-sorted, absent = never declared (the
+    /// `is_integer` fallback applies).
+    ///
+    /// Sort is a permanent property of a term, so this map is deliberately NOT
+    /// rolled back by `pop`: re-interning the same `TermId` after a backtrack
+    /// must recover the same integrality. Only `reset` clears it (the term
+    /// arena itself is being discarded there).
+    declared_sorts: FxHashMap<TermId, bool>,
+    /// Whether any term has been declared Int-sorted. Cheap gate for the
+    /// integrality check in `check()` — see `needs_integrality_check`.
+    any_int_declared: bool,
     /// Context stack
     context_stack: Vec<ContextState>,
     /// Accumulated shared equalities (from notify_equality calls)
@@ -128,6 +149,8 @@ impl ArithSolver {
             reason_counter: 0,
             reasons: Vec::new(),
             is_integer,
+            declared_sorts: FxHashMap::default(),
+            any_int_declared: false,
             context_stack: Vec::new(),
             shared_equalities: Vec::new(),
             last_conflict_distinct_ids: 0,
@@ -172,6 +195,61 @@ impl ArithSolver {
     #[must_use]
     pub fn is_integer(&self) -> bool {
         self.is_integer
+    }
+
+    /// #427 — declare a term's integrality from its SMT SORT.
+    ///
+    /// The caller (which holds the `TermManager`) is the only party that can see
+    /// a term's sort; the arithmetic solver only ever sees `TermId`s. Every path
+    /// that puts a term into this solver — `Solver::track_theory_vars` /
+    /// `Solver::encode` on the registration side, `TheoryManager` on the
+    /// assertion side — declares it here first, so the integrality of an
+    /// Int-sorted term no longer depends on the `(set-logic …)` name matching a
+    /// hardcoded substring.
+    ///
+    /// Idempotent, and monotone in the `true` direction only in the sense that
+    /// `any_int_declared` never un-sets: a term's sort cannot change.
+    pub fn declare_sort(&mut self, term: TermId, is_int: bool) {
+        self.declared_sorts.insert(term, is_int);
+        if is_int {
+            self.any_int_declared = true;
+        }
+    }
+
+    /// #427 — is `term` integer-valued? Declared sort wins; an undeclared term
+    /// falls back to the global LIA/LRA mode (so every logic-named path that was
+    /// already correct is bit-identical).
+    #[must_use]
+    fn term_is_integer(&self, term: TermId) -> bool {
+        match self.declared_sorts.get(&term) {
+            Some(&is_int) => is_int,
+            None => self.is_integer,
+        }
+    }
+
+    /// #427 — is the linear form `Σ cᵢ·tᵢ` guaranteed to take INTEGER values?
+    ///
+    /// Both conditions are load-bearing for the integer strengthenings below
+    /// (`t < k ⇒ t ≤ ⌈k⌉−1`, the `assert_eq` GCD-infeasibility test):
+    /// - every variable is integer-valued, and
+    /// - every coefficient is an integer.
+    ///
+    /// The coefficient half was NOT checked by the old global-mode gate, which
+    /// is unsound in its own right: under LIA `(1/2)·x = 3/2` took the
+    /// "non-integer constant ⇒ infeasible" branch even though `x = 3` satisfies
+    /// it. Requiring integral coefficients closes that too.
+    #[must_use]
+    fn expr_is_integral(&self, lhs: &[(TermId, ArithRat)]) -> bool {
+        lhs.iter()
+            .all(|(t, c)| c.denom() == &1 && self.term_is_integer(*t))
+    }
+
+    /// #427 — whether `check()` must confirm INTEGER feasibility, not just LP
+    /// feasibility: either the global mode is LIA, or at least one term has been
+    /// declared Int-sorted (the `ALL` / no-`set-logic` / mixed-logic case).
+    #[must_use]
+    fn needs_integrality_check(&self) -> bool {
+        self.is_integer || self.any_int_declared
     }
 
     /// Intern a term as a variable
@@ -328,7 +406,13 @@ impl ArithSolver {
 
         // For LIA, check GCD-based infeasibility BEFORE normalization
         // (normalization divides by GCD, which would lose the infeasibility signal)
-        if self.is_integer {
+        //
+        // #427 — gated on the INTEGRALITY OF THIS EXPRESSION (all variables
+        // Int-sorted, all coefficients integral), not on the global logic-derived
+        // mode. That both (a) extends the test to `ALL`/no-logic/mixed-logic
+        // problems, where it was silently skipped, and (b) stops it firing on a
+        // fractional-coefficient form, where it was unsound.
+        if self.expr_is_integral(lhs) {
             // Extract integer coefficients. `c.numer()` is `i128` (the `ArithRat`
             // numerator); kept i128 so a coefficient outside `i64` is never
             // silently truncated before the GCD-infeasibility test (truncation
@@ -397,11 +481,25 @@ impl ArithSolver {
     /// For LRA, uses infinitesimals: lhs <= rhs - δ
     /// For LIA, transforms to: lhs <= rhs - 1 (since no integer exists between k and k+1)
     pub fn assert_lt(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
-        // For integer arithmetic, x < k is equivalent to x <= k - 1
-        // because there's no integer strictly between k-1 and k
-        if self.is_integer {
-            // Transform: lhs < rhs becomes lhs <= rhs - 1
-            self.assert_le(lhs, rhs - ArithRat::one(), reason);
+        // For integer arithmetic, x < k is equivalent to x <= ceil(k) - 1
+        // because there's no integer strictly between ceil(k)-1 and ceil(k).
+        //
+        // #427 — keyed on `expr_is_integral` (this expression's variables and
+        // coefficients), NOT on the global logic-derived mode. Without this the
+        // `ALL` / no-`set-logic` / mixed-logic path leaves `x > 0 ∧ x < 1` as the
+        // δ-rational relaxation `x ≥ 0+δ ∧ x ≤ 1−δ`, which is LP-feasible; the
+        // integrality gate in `check()` would then have to recover the
+        // contradiction by branch-and-bound (a sound `Unknown` at best), instead
+        // of the simplex deriving the real conflict `x ≥ 1 ∧ x ≤ 0` directly.
+        //
+        // `ceil(rhs) - 1` rather than `rhs - 1`: for an INTEGRAL `rhs` the two
+        // agree (so every existing LIA path is bit-identical), but for a
+        // fractional `rhs` the old form was too STRONG — `2x < 1/2` became
+        // `2x ≤ -1/2` (i.e. `x ≤ -1`), wrongly excluding the solution `x = 0`.
+        if self.expr_is_integral(lhs) {
+            // Transform: lhs < rhs becomes lhs <= ceil(rhs) - 1
+            let bound = ArithRat::from_integer(rhs.ceil().to_integer() - 1);
+            self.assert_le(lhs, bound, reason);
             return;
         }
 
@@ -427,11 +525,15 @@ impl ArithSolver {
     /// For LRA, uses infinitesimals: lhs >= rhs + δ
     /// For LIA, transforms to: lhs >= rhs + 1 (since no integer exists between k and k+1)
     pub fn assert_gt(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
-        // For integer arithmetic, x > k is equivalent to x >= k + 1
-        // because there's no integer strictly between k and k+1
-        if self.is_integer {
-            // Transform: lhs > rhs becomes lhs >= rhs + 1
-            self.assert_ge(lhs, rhs + ArithRat::one(), reason);
+        // For integer arithmetic, x > k is equivalent to x >= floor(k) + 1
+        // because there's no integer strictly between floor(k) and floor(k)+1.
+        // #427 — see `assert_lt` for why this is gated on `expr_is_integral` and
+        // why the bound is `floor(rhs) + 1` (identical to `rhs + 1` whenever
+        // `rhs` is integral, correct instead of too-strong when it is not).
+        if self.expr_is_integral(lhs) {
+            // Transform: lhs > rhs becomes lhs >= floor(rhs) + 1
+            let bound = ArithRat::from_integer(rhs.floor().to_integer() + 1);
+            self.assert_ge(lhs, bound, reason);
             return;
         }
 
@@ -467,7 +569,8 @@ impl ArithSolver {
     #[must_use]
     pub fn value(&self, term: TermId) -> Option<ArithRat> {
         self.interner.get(&term).map(|&var| {
-            if self.is_integer {
+            // #427 — the TERM's sort decides the rounding, not the global mode.
+            if self.term_is_integer(term) {
                 // Get the full delta-rational value
                 let dval = self.simplex.delta_value(var);
 
@@ -577,45 +680,69 @@ impl ArithSolver {
     }
 
     /// One branch-and-bound node: the simplex is LP-feasible on entry. If every
-    /// interned variable already has an integer LP value, snapshot it as the
-    /// integer model and return `Sat`. Otherwise branch on the first fractional
-    /// variable `x` (value `v`): the `x ≤ ⌊v⌋` and `x ≥ ⌈v⌉` half-spaces partition
-    /// the search, and a leaf is integer-feasible iff one of them is.
+    /// INTEGER-SORTED interned variable already has an integer LP value, snapshot
+    /// those and return `Sat`. Otherwise branch on the first such variable `x`
+    /// whose value `v` is not integral: with `lo` the largest integer `≤ v`, the
+    /// `x ≤ lo` and `x ≥ lo+1` half-spaces partition the search, and a leaf is
+    /// integer-feasible iff one of them is.
+    ///
+    /// #427 — two changes from the LIA-mode-only version:
+    /// - only Int-SORTED variables are required to take integer values. A Real
+    ///   variable sharing the simplex (the mixed `ALL` problem, and any Real
+    ///   declared under an `…LIA…`-named logic) must NOT be branched on: doing so
+    ///   rejects the perfectly good model `0 < r < 1` as integer-infeasible.
+    /// - integrality is judged δ-AWARE. `Simplex::value` returns only the REAL
+    ///   part, so a variable sitting at `0 + δ` (from a strict bound the
+    ///   `expr_is_integral` strengthening did not reach — e.g. a mixed
+    ///   `x + r < 5`) reads as the integer `0` and would be accepted as an
+    ///   integer witness even though its true value is strictly above `0`.
+    ///   `DeltaRational::floor` already implements "largest integer ≤ value"
+    ///   correctly across the δ sign, and using `lo`/`lo+1` (rather than
+    ///   `⌊v⌋`/`⌈v⌉`) also guarantees BOTH branches exclude the current point, so
+    ///   a `real`-integral-but-δ-offset value cannot loop.
     fn bnb_node(&mut self, budget: &mut u32) -> IntFeasibility {
         if *budget == 0 {
             return IntFeasibility::Unknown;
         }
         *budget -= 1;
 
-        let mut fractional: Option<(TermId, ArithRat)> = None;
+        let mut fractional: Option<(TermId, i128)> = None;
         for (&term, &var) in self.interner.iter() {
-            let v = self.simplex.value(var);
-            if !v.is_integer() {
-                fractional = Some((term, v));
+            if !self.term_is_integer(term) {
+                continue;
+            }
+            let dval = self.simplex.delta_value(var);
+            if !dval.delta.is_zero() || !dval.real.is_integer() {
+                fractional = Some((term, dval.floor()));
                 break;
             }
         }
-        let Some((term, val)) = fractional else {
-            // All interned variables are integer-valued. The constraints are
-            // integer linear combinations, so the slacks are integer too — this
-            // LP vertex IS a valid integer model. Snapshot it for the model builder.
+        let Some((term, lo)) = fractional else {
+            // Every integer-sorted interned variable is integer-valued. The
+            // constraints are integer linear combinations of them, so this LP
+            // vertex restricted to those variables IS a valid integer assignment.
+            // Snapshot exactly those for the model builder (`rounded_int_value`
+            // is only consulted for Int-sorted terms; a Real variable's fractional
+            // LP value has no business in the integer model).
             let mut model: FxHashMap<VarId, ArithRat> = FxHashMap::default();
-            for (&_term, &var) in self.interner.iter() {
-                model.insert(var, self.simplex.value(var));
+            for (&t, &var) in self.interner.iter() {
+                if self.term_is_integer(t) {
+                    model.insert(var, self.simplex.value(var));
+                }
             }
             self.integer_model = Some(model);
             return IntFeasibility::Sat;
         };
 
-        let floor_v = ArithRat::from_integer(val.floor().to_integer());
-        let ceil_v = ArithRat::from_integer(val.ceil().to_integer());
+        let lo_v = ArithRat::from_integer(lo);
+        let hi_v = ArithRat::from_integer(lo + 1);
 
-        // Branch down (`x ≤ ⌊v⌋`) then up (`x ≥ ⌈v⌉`); `Sat`/`Unknown` short-circuit.
-        match self.bnb_branch(term, false, floor_v, budget) {
+        // Branch down (`x ≤ lo`) then up (`x ≥ lo+1`); `Sat`/`Unknown` short-circuit.
+        match self.bnb_branch(term, false, lo_v, budget) {
             IntFeasibility::Infeasible => {}
             decided => return decided,
         }
-        self.bnb_branch(term, true, ceil_v, budget)
+        self.bnb_branch(term, true, hi_v, budget)
     }
 
     /// Explore one B&B branch under a fresh context frame: tighten `term` by a
@@ -688,8 +815,11 @@ impl ArithSolver {
         let mut reasons: Vec<TermId> = Vec::new();
 
         // HIGH side: prove `term` cannot exceed `v`.
+        // #427 — the `v±1` (integer) vs strict (real) probe is chosen by the
+        // TERM's sort, not by the global mode.
+        let term_is_int = self.term_is_integer(term);
         self.push();
-        if self.is_integer {
+        if term_is_int {
             self.assert_ge(&[(term, one)], v + one, term); // term >= v+1
         } else {
             self.assert_gt(&[(term, one)], v, term); // term > v
@@ -712,7 +842,7 @@ impl ArithSolver {
 
         // LOW side: prove `term` cannot fall below `v`.
         self.push();
-        if self.is_integer {
+        if term_is_int {
             self.assert_le(&[(term, one)], v - one, term); // term <= v-1
         } else {
             self.assert_lt(&[(term, one)], v, term); // term < v
@@ -824,7 +954,15 @@ impl Theory for ArithSolver {
                 // (recorded in `integer_model` for the model builder). A branch-
                 // exhausted infeasibility or the node budget yields the sound
                 // `Unknown` — never a fabricated integer `Sat`.
-                if self.is_integer {
+                //
+                // #427 — the gate is `needs_integrality_check()`, not the global
+                // `is_integer`: under `ALL` / no `(set-logic)` / a mixed logic
+                // name the mode stays LRA, and this arm used to certify the LP
+                // RELAXATION as `Sat` for a problem whose variables are all
+                // Int-sorted (bounded pigeonhole: three holes in `{1,2}` pairwise
+                // distinct is rationally feasible at `1, 3/2, 2` and was reported
+                // `sat`).
+                if self.needs_integrality_check() {
                     match self.integer_branch_and_bound() {
                         IntFeasibility::Sat => Ok(TheoryResult::Sat),
                         IntFeasibility::Infeasible | IntFeasibility::Unknown => {
@@ -900,6 +1038,12 @@ impl Theory for ArithSolver {
         self.reasons.clear();
         self.context_stack.clear();
         self.shared_equalities.clear();
+        // #427 — the declared sorts are keyed by `TermId`; a reset discards the
+        // whole term association, so drop them too (unlike `pop`, which must keep
+        // them: sort is a permanent property of a still-live term).
+        self.declared_sorts.clear();
+        self.any_int_declared = false;
+        self.integer_model = None;
     }
 
     fn get_model(&self) -> Vec<(TermId, TermId)> {

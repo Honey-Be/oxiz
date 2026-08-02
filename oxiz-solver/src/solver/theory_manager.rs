@@ -739,14 +739,13 @@ impl TheoryManager {
                     // arithmetic solver as `1*t1 + (-1)*t2 = 0`.
                     // Use t1 as the reason term for conflict clause generation.
                     let reason = t1;
-                    self.arith.assert_eq(
-                        &[
-                            (t1, ArithRat::from_integer(1)),
-                            (t2, ArithRat::from_integer(-1)),
-                        ],
-                        ArithRat::from_integer(0),
-                        reason,
-                    );
+                    let eq_terms = [
+                        (t1, ArithRat::from_integer(1)),
+                        (t2, ArithRat::from_integer(-1)),
+                    ];
+                    self.declare_arith_sorts(&eq_terms); // #427
+                    self.arith
+                        .assert_eq(&eq_terms, ArithRat::from_integer(0), reason);
 
                     // Check ArithSolver for conflicts after each new equality.
                     use oxiz_theories::Theory;
@@ -1200,6 +1199,40 @@ impl TheoryManager {
             .unwrap_or_else(|| TermId::new(0))
     }
 
+    /// #427 — declare the SMT sort of every term about to enter the arithmetic
+    /// solver as a linear-form atom.
+    ///
+    /// `ArithSolver` only ever sees `TermId`s, so it cannot tell an Int-sorted
+    /// term from a Real-sorted one; left to guess it falls back to the LIA/LRA
+    /// mode `Solver::set_logic` derived from the logic NAME, which is exactly the
+    /// thing that is wrong under `ALL` / no `(set-logic)` / `AUFLIRA`.
+    ///
+    /// `Solver::track_theory_vars` already declares the terms it registers
+    /// (variables, numeric applications, numeric selects). This covers the
+    /// remainder — atoms that reach the simplex only through
+    /// `parse_arith_comparison`, e.g. an opaque `(* x y)` product or a `div`/`mod`
+    /// node, which `track_theory_vars` recurses THROUGH rather than registering.
+    fn declare_arith_sorts(&mut self, terms: &[(TermId, ArithRat)]) {
+        let int_sort = self.manager.sorts.int_sort;
+        for &(t, _) in terms {
+            if let Some(term) = self.manager.get(t) {
+                let sort = term.sort;
+                // Only Int/Real-sorted atoms carry a meaningful integrality; a
+                // bitvector atom is integral too (see `track_theory_vars`).
+                let is_bv = self
+                    .manager
+                    .sorts
+                    .get(sort)
+                    .is_some_and(oxiz_core::sort::Sort::is_bitvec);
+                if sort == int_sort || is_bv {
+                    self.arith.declare_sort(t, true);
+                } else if sort == self.manager.sorts.real_sort {
+                    self.arith.declare_sort(t, false);
+                }
+            }
+        }
+    }
+
     /// Convert a list of term IDs to a conflict clause
     /// Each term ID should correspond to a constraint that was asserted
     fn terms_to_conflict_clause(&self, terms: &[TermId]) -> SmallVec<[Lit; 8]> {
@@ -1356,6 +1389,7 @@ impl TheoryManager {
                         // For equality, use assert_eq which has GCD-based infeasibility detection
                         // This is critical for LIA: e.g., 2x + 2y = 7 is unsatisfiable because
                         // gcd(2,2) = 2 doesn't divide 7
+                        self.declare_arith_sorts(&terms); // #427
                         self.arith.assert_eq(&terms, constant, reason);
 
                         // Check ArithSolver for conflicts
@@ -1743,15 +1777,23 @@ impl TheoryManager {
                 }
 
                 // Look up the pre-parsed linear constraint for arithmetic
-                if let Some(parsed) = self.var_to_parsed_arith.get(&var) {
+                // (fields copied out of the map entry so the immutable borrow ends
+                // before `declare_arith_sorts` takes `&mut self` — #427)
+                let parsed_arith = self.var_to_parsed_arith.get(&var).map(|p| {
+                    (
+                        p.terms.iter().copied().collect::<Vec<(TermId, ArithRat)>>(),
+                        p.reason_term,
+                        p.constant,
+                        p.constraint_type,
+                    )
+                });
+                if let Some((terms, reason, constant, constraint_type)) = parsed_arith {
                     // Add constraint to ArithSolver
-                    let terms: Vec<(TermId, ArithRat)> = parsed.terms.iter().copied().collect();
-                    let reason = parsed.reason_term;
-                    let constant = parsed.constant;
+                    self.declare_arith_sorts(&terms); // #427
 
                     if is_positive {
                         // Positive assignment: constraint holds
-                        match parsed.constraint_type {
+                        match constraint_type {
                             ArithConstraintType::Lt => {
                                 // lhs - rhs < 0, i.e., sum of terms < constant
                                 self.arith.assert_lt(&terms, constant, reason);
@@ -1775,7 +1817,7 @@ impl TheoryManager {
                         // ~(a <= b) => a > b
                         // ~(a > b) => a <= b
                         // ~(a >= b) => a < b
-                        match parsed.constraint_type {
+                        match constraint_type {
                             ArithConstraintType::Lt => {
                                 // ~(lhs < rhs) => lhs >= rhs
                                 self.arith.assert_ge(&terms, constant, reason);
