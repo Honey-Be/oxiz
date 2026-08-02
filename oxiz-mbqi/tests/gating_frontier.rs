@@ -188,10 +188,16 @@ fn frontier_survives_a_cdqi_short_circuited_round() {
 
 /// A PARSED-trigger quantifier `∀x. p(x) :pattern (p x)` with a ground seed
 /// `p(a)` the trigger genuinely matches (so e-matching WOULD find the
-/// instance), plus a model that can NOT verify the quantifier. Distinct from
-/// `fuel_quant`: the trigger is the user's `:pattern`, so at saturation the
-/// quantifier is EXEMPT from the per-quant model-verify loop — its `Sat`
-/// rests entirely on "e-matching added nothing".
+/// instance). Distinct from `fuel_quant`: the trigger is the user's
+/// `:pattern`.
+///
+/// #426 — this used to be paired with a model that could NOT verify, because
+/// a FIRED parsed trigger was then exempt from the per-quant model-verify loop
+/// and its `Sat` rested entirely on "e-matching added nothing". That exemption
+/// is gone (a fired-but-INSUFFICIENT trigger justifies nothing), so the
+/// deadline/abort pins below now pair it with `Gated { verifies: true }`: the
+/// saturation is POSITIVELY earned, which makes the abort the SOLE difference
+/// between the control and the pin — a strictly stronger pin than before.
 fn parsed_trigger_quant(t: &mut Toy) -> (Tid, Tid) {
     const INT: u32 = 2;
     const P: u32 = 40;
@@ -216,23 +222,26 @@ fn parsed_trigger_quant(t: &mut Toy) -> (Tid, Tid) {
 fn expired_deadline_never_saturates_a_parsed_trigger_quantifier() {
     // Control: no deadline ⇒ the parsed-trigger path saturates to Sat with
     // exactly the one e-matched instance (the behaviour the pin protects).
+    // #426: `verifies: true` — the saturation must be POSITIVELY earned now.
     let mut t = Toy::new();
     let (q, pa) = parsed_trigger_quant(&mut t);
     let mut e = Engine::new(Config::default());
     e.assert(&t, pa);
     e.assert(&t, q);
-    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: false });
+    let (verdict, lemmas) = run(&mut e, &mut t, &Gated { active: true, verifies: true });
     assert_eq!(verdict, "Sat", "control: parsed-trigger saturation");
     assert_eq!(lemmas, 1, "control: the p(a) instance was e-matched");
 
     // Pin: the same scenario with an expired deadline must abort, not saturate.
+    // Same `verifies: true` model as the control, so the EXPIRED DEADLINE is
+    // the only difference — nothing else can be blamed for the `Unknown`.
     let mut t = Toy::new();
     let (q, pa) = parsed_trigger_quant(&mut t);
     let mut e = Engine::new(Config::default());
     e.assert(&t, pa);
     e.assert(&t, q);
     e.set_deadline(Some(std::time::Instant::now() - std::time::Duration::from_millis(1)));
-    let m = Gated { active: true, verifies: false };
+    let m = Gated { active: true, verifies: true };
     // Single-round shape: zero lemmas + BudgetExhausted (never Saturated).
     assert!(
         matches!(e.round_with(&mut t, &m), Verdict::BudgetExhausted),
@@ -281,7 +290,10 @@ fn max_substs_abort_with_all_lemmas_deduped_never_saturates() {
     e.assert(&t, pa);
     e.assert(&t, pb);
     e.assert(&t, q);
-    let m = Gated { active: true, verifies: false };
+    // #426: `verifies: true` — with the fired-trigger exemption gone, the
+    // model must be able to certify the quantifier, so the ONLY thing that can
+    // block `Saturated` in round 2 is the `max_match_substs` abort signal.
+    let m = Gated { active: true, verifies: true };
 
     // Round 1: truncated match set (1 of 2) still emits its kept instance.
     match e.round_with(&mut t, &m) {
@@ -327,7 +339,9 @@ fn deadline_cleared_after_expiry_restores_normal_rounds() {
     let mut e = Engine::new(Config::default());
     e.assert(&t, pa);
     e.assert(&t, q);
-    let m = Gated { active: true, verifies: false };
+    // #426: `verifies: true` — saturation must be positively earned, so the
+    // expired deadline is the sole cause of the abort.
+    let m = Gated { active: true, verifies: true };
 
     // Expired deadline: aborted round, no lemmas.
     e.set_deadline(Some(std::time::Instant::now() - std::time::Duration::from_millis(1)));

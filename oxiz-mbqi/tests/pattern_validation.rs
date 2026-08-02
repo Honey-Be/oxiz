@@ -134,12 +134,20 @@ fn never_fired_parsed_trigger_not_saturated() {
     );
 }
 
-/// The over-reach pin: a parsed trigger that DID fire keeps the
-/// trigger-semantics exemption. `∀x. P(f(x))` with pattern `(f x)` and
-/// ground `f(a)`: one instance, then e-matching adds nothing → `Saturated`
-/// (the host may report `Sat`) exactly as before E1.
+/// #426 SUCCESSOR of E1's `fired_parsed_trigger_keeps_exemption` over-reach
+/// pin. E1 pinned that a parsed trigger which DID fire keeps the
+/// trigger-semantics exemption outright — that residual exemption was itself
+/// a spurious-`sat` class (a trigger can fire and still be INSUFFICIENT), so
+/// the exemption is now only PROVISIONAL: `Saturated` must be earned
+/// positively. `∀x. P(f(x))` with pattern `(f x)`, ground `f(a)`: one
+/// instance is emitted, e-matching then adds nothing, and with the `Active`
+/// model (`eval_forall` = `None`) the verdict is the confirm-but-never-sat
+/// `SaturatedUnverified` — NOT `Sat`.
+///
+/// The full #426 battery (insufficiency, model-refutation, the obligation
+/// path, the kill-switch) lives in `pattern_sufficiency.rs`.
 #[test]
-fn fired_parsed_trigger_keeps_exemption() {
+fn fired_parsed_trigger_exemption_is_only_provisional() {
     let mut t = Toy::new();
     let x = t.var(1, INT);
     let f_x = t.app(100, &[x], INT);
@@ -154,9 +162,13 @@ fn fired_parsed_trigger_keeps_exemption() {
     e.assert(&t, q);
     let (lemmas, verdict) = drain(&mut e, &mut t);
     assert_eq!(lemmas.len(), 1, "the parsed trigger fires on f(a)");
-    assert_eq!(
+    assert_ne!(
         verdict, "Sat",
-        "a FIRED parsed trigger keeps its trigger-semantics saturation exemption"
+        "#426: firing alone is NOT positive justification for `Saturated`"
+    );
+    assert_eq!(
+        verdict, "SatUnverified",
+        "a fired-but-unverifiable parsed trigger is confirm-but-never-sat"
     );
 }
 

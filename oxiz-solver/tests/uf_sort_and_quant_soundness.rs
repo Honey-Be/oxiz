@@ -178,25 +178,38 @@ fn nested_congruence_trigger_is_sound() {
 }
 
 #[test]
-fn axiomatized_add_consistent_ground_fact_is_sat() {
+fn axiomatized_add_consistent_ground_fact_is_never_unsat() {
     // ∀a b. Add(a,b)=a+b [:pattern (Add a b)] ∧ Add(2,3)=5 — the axiom forces
     // Add(2,3)=2+3=5, consistent with the assertion (z3: sat).
     //
     // Pre-fix this returned the UNSOUND `unsat` (a spurious conflict from the
-    // quant+LIA path with `Add` mis-sorted as Bool). With the pattern-guided
-    // e-matching path (Phase 1) running to a fixpoint and the model-based
-    // enumeration skipping trigger-annotated axioms, it now converges to `sat`
-    // the way z3 does — no enumeration blow-up.
+    // quant+LIA path with `Add` mis-sorted as Bool) — THAT is what this test
+    // pins. With the pattern-guided e-matching path (Phase 1) running to a
+    // fixpoint and the model-based enumeration skipping trigger-annotated
+    // axioms, it converges without an enumeration blow-up.
+    //
+    // #426 DOWNGRADE (`sat` → `unknown`, measured completeness cost): the
+    // parsed `:pattern` fires and e-matching closes, but the host's
+    // `eval_forall` recognizers cannot CERTIFY `∀a b. Add(a,b) = a+b`
+    // (`None`), so the pass is `SaturatedUnverified` — confirm-but-never-sat.
+    // Answering `sat` here previously rested on the fired-trigger saturation
+    // exemption, which is exactly the unsound rule #426 removed (a trigger can
+    // fire and still be insufficient). cvc5 1.3.0 also answers `unknown` on
+    // this script; only z3, which constructs a real MBQI model, reaches `sat`.
+    // Recovering it is a HOST-side job (a stronger `eval_forall` /
+    // model-completion recognizer for definitional arithmetic axioms), not a
+    // reason to re-open the exemption. The soundness assertion — never the
+    // spurious `unsat` — is unchanged.
     let r = solve_streamed(&[
         "(declare-fun Add (Int Int) Int)",
         "(assert (forall ((a Int) (b Int)) (! (= (Add a b) (+ a b)) :pattern ((Add a b)))))",
         "(assert (= (Add 2 3) 5))",
         "(check-sat)",
     ]);
-    assert_eq!(
+    assert_ne!(
         r,
-        SolverResult::Sat,
-        "Add(2,3)=5 is consistent with the axiom"
+        SolverResult::Unsat,
+        "Add(2,3)=5 is consistent with the axiom — never the spurious unsat"
     );
 }
 
@@ -232,13 +245,20 @@ fn axiomatized_add_entailment_with_precondition_is_unsat() {
 }
 
 #[test]
-fn axiomatized_add_satisfiable_countermodel_is_sat() {
+fn axiomatized_add_satisfiable_countermodel_is_never_unsat() {
     // y>0 ∧ ¬(Add(x,y)>0) is SAT — x can be ≪ 0, so x+y ≤ 0. This is the
     // abductive search's EMPTY-subset entailment probe (no extra hypothesis):
     // it must NOT report entailment. Pre-fix the model-based MBQI enumerated
     // `Add(v,w)` over the integers without converging (an infinite hang); the
-    // pattern-guided path instantiates `Add(x,y)=x+y` once, saturates, and the
-    // model is reported `sat` (matching z3) — terminating, and sound.
+    // pattern-guided path instantiates `Add(x,y)=x+y` once and saturates —
+    // terminating, and never the spurious entailment.
+    //
+    // #426 DOWNGRADE (`sat` → `unknown`): same mechanism as
+    // `axiomatized_add_consistent_ground_fact_is_never_unsat` above — the fired
+    // parsed trigger no longer buys a saturation exemption and `eval_forall`
+    // cannot certify the `Add` definition, so the sound verdict is
+    // confirm-but-never-sat. The property the abductive search actually needs
+    // is "NOT `unsat`" (no entailment claimed), which is what is asserted.
     let r = solve_streamed(&[
         "(declare-fun Add (Int Int) Int)",
         "(assert (forall ((a Int) (b Int)) (! (= (Add a b) (+ a b)) :pattern ((Add a b)))))",
@@ -248,7 +268,11 @@ fn axiomatized_add_satisfiable_countermodel_is_sat() {
         "(assert (not (> (Add x y) 0)))",
         "(check-sat)",
     ]);
-    assert_eq!(r, SolverResult::Sat, "a countermodel exists (x ≪ 0)");
+    assert_ne!(
+        r,
+        SolverResult::Unsat,
+        "a countermodel exists (x ≪ 0) — entailment must NOT be reported"
+    );
 }
 
 // --- Conflict-Driven Quantifier Instantiation (CDQI) ---------------------

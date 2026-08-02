@@ -28,21 +28,27 @@ use rustc_hash::FxHashSet;
 pub enum Verdict<T> {
     /// New sound lemmas to assert before the next solve.
     NewLemmas(Vec<T>),
-    /// No new instances AND every quantifier is satisfied by the model:
-    /// triggered ones are e-match-saturated (standard trigger semantics) and
-    /// every trigger-free one was model-verified `Some(true)` (M3). If the
-    /// ground core is still SAT here, the host may report **`Sat`**.
+    /// No new instances AND every ACTIVE quantifier is POSITIVELY justified:
+    /// model-verified `Some(true)` (M3), or fully captured by its finite
+    /// guard box (`bounded_finite`). Since #426 there is no longer a purely
+    /// syntactic "its `:pattern` stopped firing" justification. If the ground
+    /// core is still SAT here, the host may report **`Sat`**.
     Saturated,
-    /// **Confirm-but-never-sat** (#425 phase 2). E-matching is closed and
-    /// every VERIFIABLE obligation passed (no quantifier was model-REFUTED),
-    /// but ≥ 1 active universal could be neither *exempted* by trigger
-    /// semantics (a parsed `:pattern` that never fired, or an augmented /
-    /// inferred trigger set) nor *model-verified* (`eval_forall` returned
-    /// `None`). The caller MAY confirm the accumulated ground instance set —
-    /// the instances are sound ground consequences, so a ground **UNSAT**
-    /// over them is a real `unsat` — but must **NEVER conclude `sat`**: the
-    /// unverified quantifier may still be violated. This is the sound half of
-    /// the pre-#425 early-stop (`Saturated`'s confirm-then-unsat path)
+    /// **Confirm-but-never-sat** (#425 phase 2, widened by #426). E-matching
+    /// is closed and no OBLIGATION was model-REFUTED, but ≥ 1 active
+    /// universal could not be positively justified:
+    ///  * #425 — a parsed `:pattern` that NEVER fired, or an augmented /
+    ///    inferred trigger set, that `eval_forall` left `None`;
+    ///  * #426 — a parsed `:pattern` that DID fire but is INSUFFICIENT: it
+    ///    matched something, just not enough to close the problem, and the
+    ///    model neither certifies (`None`) nor is trusted to refute
+    ///    (`Some(false)`) the quantifier.
+    ///
+    /// The caller MAY confirm the accumulated ground instance set — the
+    /// instances are sound ground consequences, so a ground **UNSAT** over
+    /// them is a real `unsat` — but must **NEVER conclude `sat`**: the
+    /// unjustified quantifier may still be violated. This is the sound half
+    /// of the pre-#425 early-stop (`Saturated`'s confirm-then-unsat path)
     /// without its `sat` half.
     SaturatedUnverified,
     /// No new instances, but at least one quantifier was model-REFUTED
@@ -108,6 +114,27 @@ pub struct Config {
     /// corpus A/B; set by the live solver from
     /// `SolverConfig::mbqi_additive_patterns` / `OXIZ_MBQI_ADDITIVE`.
     pub additive_patterns: bool,
+    /// **Strict pattern saturation (#426).** When set (the DEFAULT), a parsed
+    /// `:pattern` that has FIRED no longer buys an unconditional saturation
+    /// exemption — it is only *provisionally* exempt, and must still be
+    /// corroborated by `eval_forall` (`Some(true)`) or by its finite guard box
+    /// before the pass may conclude [`Verdict::Saturated`]. Anything else
+    /// demotes the pass to [`Verdict::SaturatedUnverified`]
+    /// (confirm-but-never-sat), NEVER to `Inconclusive`.
+    ///
+    /// #425 closed the NEVER-fired half of the exemption; #426 is the residual
+    /// FIRED-BUT-INSUFFICIENT half — a trigger that matches *something* but
+    /// not enough to derive the contradiction still bought the exemption, so
+    /// the engine reported `Saturated` → the host `sat` on unsat problems
+    /// (23/2000 seeds in the E1 randomized pattern differential's `undertrig`
+    /// class; z3 answers `unsat` via MBQI and cvc5 answers `unknown` on the
+    /// same inputs — neither reference solver ever answers `sat`).
+    ///
+    /// Clearing it restores the pre-#426 lax exemption **and the spurious
+    /// `sat`** — it exists only as a no-recompile A/B kill-switch, armed by
+    /// `OXIZ_MBQI_LAX_PATTERN_SAT=1` in [`Engine::new`] (the
+    /// `OXIZ_MBQI_GUARD_MS` / `OXIZ_MBQI_ADDITIVE` convention).
+    pub strict_pattern_saturation: bool,
 }
 
 impl Default for Config {
@@ -119,6 +146,10 @@ impl Default for Config {
             ccfv_ematch: false,
             ccfv_model_compl: false,
             additive_patterns: false,
+            // #426: sound-by-default. `Default` stays a PURE function — the
+            // env kill-switch is applied once in `Engine::new`, not here, so
+            // an explicitly-built `Config` means exactly what it says.
+            strict_pattern_saturation: true,
         }
     }
 }
@@ -145,7 +176,18 @@ pub struct Engine<S: Sig> {
 }
 
 impl<S: Sig> Engine<S> {
-    pub fn new(cfg: Config) -> Self {
+    pub fn new(mut cfg: Config) -> Self {
+        // #426 kill-switch, read ONCE per engine (never in `saturation_verdict`,
+        // which runs per pass): `OXIZ_MBQI_LAX_PATTERN_SAT=1` restores the
+        // pre-#426 unconditional fired-trigger exemption for a no-recompile
+        // A/B. It can only ever move a verdict in the UNSOUND direction, so it
+        // is opt-in and never consulted unless explicitly set.
+        if std::env::var("OXIZ_MBQI_LAX_PATTERN_SAT")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            cfg.strict_pattern_saturation = false;
+        }
         Engine {
             quants: Vec::new(),
             ground: GroundIndex::new(),
@@ -618,10 +660,10 @@ impl<S: Sig> Engine<S> {
     ///    confirm the accumulated ground set (trusting only a ground UNSAT)
     ///    and must never conclude `sat`.
     ///
-    /// A triggered quantifier is satisfied by trigger semantics once
-    /// e-matching adds nothing; a trigger-free, ACTIVE one must be
-    /// model-verified (inactive ones are vacuously satisfied). The host's
-    /// synthetic witnesses never cross into the engine → nothing fabricated.
+    /// Every ACTIVE quantifier must be POSITIVELY justified — since #426 there
+    /// is no purely syntactic "its `:pattern` stopped firing" justification
+    /// left (inactive ones are vacuously satisfied). The host's synthetic
+    /// witnesses never cross into the engine → nothing fabricated.
     ///
     /// NOTE: a bounded-guard FINITE quantifier (`∀x̄. (lo≤x̄≤hi ⇒ φ)`) is NOT
     /// auto-satisfied just because all its instances were emitted. The earlier
@@ -648,27 +690,41 @@ impl<S: Sig> Engine<S> {
         let mut unverified_seen = false;
         for qi in 0..self.quants.len() {
             let q = &self.quants[qi];
-            // The trigger-semantics EXEMPTION (skip model verification) holds
-            // only for a PARSED, UNAUGMENTED trigger that has actually FIRED:
-            //  * an INFERRED trigger drives e-matching but is not a user
-            //    contract — trigger semantics may only justify `Sat` for
-            //    parsed `:pattern`s, so an inferred-trigger quantifier must
-            //    still be model-verified exactly like a trigger-free one;
-            //  * an AUGMENTED quantifier (E1 additive mode) carries inferred
-            //    groups alongside the parsed ones, so the author's contract
-            //    no longer describes its trigger set — model-verify;
-            //  * a NEVER-FIRED parsed trigger (#425: dead symbol, ill-arity,
-            //    shape matching no ground term — none statically decidable
-            //    here) justifies nothing: its quantifier was never
-            //    instantiated even once, so "e-matching added nothing" is
-            //    vacuous — model-verify. Sound-direction only: this can turn
-            //    a former `Saturated` into `SaturatedUnverified` (sat →
-            //    confirm-but-never-sat: the host may still trust a ground
-            //    UNSAT over the accumulated instances) or `Inconclusive`,
-            //    never mint a verdict.
-            if !((q.triggers.is_empty() || q.inferred || q.augmented || !q.matched)
-                && model.is_active(lang, q.term))
-            {
+            // An INACTIVE quantifier (`Q` not asserted true in the model) is
+            // vacuously satisfied — the ONLY unconditional exemption left.
+            if !model.is_active(lang, q.term) {
+                continue;
+            }
+            // #426 — the trigger-semantics exemption is now PROVISIONAL.
+            //
+            // A PARSED, UNAUGMENTED trigger that has actually FIRED used to be
+            // exempt from model verification outright: "e-matching added
+            // nothing" was read as "trigger semantics satisfy this". #425
+            // closed the NEVER-fired half of that (a dead / ill-arity /
+            // shape-unmatched pattern justifies nothing, since its quantifier
+            // was never instantiated even once). #426 is the residual half: a
+            // trigger that fires but is INSUFFICIENT — it matches *something*,
+            // just not enough to derive the contradiction — is equally no
+            // justification, and the engine reported `Saturated` → the host
+            // `sat` on genuinely UNSAT problems.
+            //
+            // SMT-LIB `:pattern` is a heuristic annotation, not semantics:
+            // `(! φ :pattern p)` IS `φ`. So an e-match fixpoint is only ever
+            // evidence that the INSTANTIATION HEURISTIC is exhausted, never
+            // that `φ` holds. Both references agree — on the #426 repro z3
+            // falls through to MBQI and answers `unsat`, cvc5 answers
+            // `unknown`; neither ever answers `sat`.
+            //
+            // So the quantifier stays in the scan and must earn `Saturated`
+            // POSITIVELY (finite guard box, or `eval_forall`/model-completion
+            // `Some(true)`). What it keeps over a true obligation is only the
+            // FAILURE handling: a `Some(false)` here does NOT dominate into
+            // `Inconclusive` (see the `provisional` arm below).
+            let provisional =
+                !q.triggers.is_empty() && !q.inferred && !q.augmented && q.matched && q.universal;
+            if provisional && !self.cfg.strict_pattern_saturation {
+                // Pre-#426 lax exemption (`OXIZ_MBQI_LAX_PATTERN_SAT=1`
+                // A/B kill-switch only — this is the unsound direction).
                 continue;
             }
             // A BOUNDED-FINITE quantifier emitted ALL its instances over the
@@ -689,8 +745,28 @@ impl<S: Sig> Engine<S> {
             if !q.universal {
                 return Verdict::Inconclusive;
             }
-            match model.eval_forall(lang, cong, q.term) {
+            let ev = model.eval_forall(lang, cong, q.term);
+            if provisional && ev != Some(true) && std::env::var_os("OXIZ_MBQI_DBG").is_some() {
+                eprintln!(
+                    "[mbqi-dbg] quant {qi}: #426 provisional parsed-trigger exemption WITHDRAWN \
+                     (eval_forall={ev:?}) -> SaturatedUnverified"
+                );
+            }
+            match ev {
                 Some(true) => {}
+                // #426 — a model-REFUTED PROVISIONAL quantifier must NOT
+                // dominate into `Inconclusive`. `Inconclusive` is the host's
+                // bare `Unknown`: it skips the accumulated-instance ground
+                // confirm that `SaturatedUnverified` runs, and that confirm is
+                // exactly what rescues the under-triggered UNSAT rows (E1
+                // measured the corpus depending on it). Demoting instead to
+                // `SaturatedUnverified` is equally sound — every emitted
+                // instance is a guarded ground consequence `Q ⇒ φ[t̄]`, so a
+                // single-shot ground UNSAT over them proves the input unsat
+                // regardless of what any model claims — and strictly more
+                // complete. `Some(false)` on a real OBLIGATION keeps its
+                // pre-#426 dominating `Inconclusive`.
+                Some(false) if provisional => unverified_seen = true,
                 Some(false) => return Verdict::Inconclusive,
                 None => {
                     // P4 model-completion backstop: the structural recognizers
