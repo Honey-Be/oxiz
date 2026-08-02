@@ -2567,10 +2567,55 @@ fn tighten_hi(cur: &mut IntervalBound, value: num_rational::BigRational, strict:
 
 /// Is `[lo, hi]` nonempty over a DENSE order?  Empty iff `lo > hi`, or `lo == hi`
 /// with either side strict (an unbounded side is always nonempty).
+///
+/// **Only valid for a Real-sorted range.** For an Int-sorted one use
+/// [`interval_nonempty_for_sort`] — see there (#429).
 fn interval_nonempty(lo: &IntervalBound, hi: &IntervalBound) -> bool {
     match (lo, hi) {
         (Some((l, ls)), Some((h, hs))) => l < h || (l == h && !ls && !hs),
         _ => true,
+    }
+}
+
+/// #429 — does `[lo, hi]` contain an INTEGER?  The model-completion
+/// recognizers certify a universal by exhibiting a constant `k ∈ [lo, hi]` to
+/// complete the uninterpreted function to; when that function is Int-SORTED,
+/// `k` must be an integer, so a rationally-nonempty interval is not enough.
+/// `∀i. 0 < f(i) < 1` over `f : Int → Int` is UNSAT, yet `(0,1)` is a perfectly
+/// nonempty rational interval — that mismatch was a confirmed false-SAT.
+///
+/// Smallest admissible integer: `⌈lo⌉`, bumped by one when `lo` is an integer
+/// and the bound is strict.  Symmetrically for the upper side.
+fn interval_has_integer(lo: &IntervalBound, hi: &IntervalBound) -> bool {
+    let lo_i = lo.as_ref().map(|(l, strict)| {
+        let c = l.ceil().to_integer();
+        if *strict && l.is_integer() {
+            c + 1
+        } else {
+            c
+        }
+    });
+    let hi_i = hi.as_ref().map(|(h, strict)| {
+        let f = h.floor().to_integer();
+        if *strict && h.is_integer() {
+            f - 1
+        } else {
+            f
+        }
+    });
+    match (lo_i, hi_i) {
+        (Some(l), Some(h)) => l <= h,
+        _ => true,
+    }
+}
+
+/// #429 — the sort-correct emptiness test: over ℤ when the completed function
+/// is Int-sorted, over ℚ/ℝ otherwise.
+fn interval_nonempty_for_sort(lo: &IntervalBound, hi: &IntervalBound, integral: bool) -> bool {
+    if integral {
+        interval_has_integer(lo, hi)
+    } else {
+        interval_nonempty(lo, hi)
     }
 }
 
@@ -2630,13 +2675,16 @@ fn ground_rational(
 
 /// Parse one comparison atom of a range body — `cmp(f(x̄), c)` or `cmp(c, f(x̄))`
 /// with one side a bare uninterpreted application mentioning a bound var and the
-/// other a ground concrete rational.  Returns `(f-symbol, lo-update, hi-update)`
-/// reading the relation as `f <rel> c`.
+/// other a ground concrete rational.  Returns
+/// `(f-symbol, lo-update, hi-update, f-result-is-Int)` reading the relation as
+/// `f <rel> c`.  The Int flag (#429) is what tells the caller to test the
+/// intersected interval for an INTEGER point rather than for dense
+/// nonemptiness.
 fn range_atom(
     m: &TermManager,
     atom: TermId,
     want: &FxHashSet<Spur>,
-) -> Option<(u64, IntervalBound, IntervalBound)> {
+) -> Option<(u64, IntervalBound, IntervalBound, bool)> {
     let (sym, l, r) = match m.get(atom).map(|t| &t.kind)? {
         TermKind::Le(a, b) => (OP_LE, *a, *b),
         TermKind::Lt(a, b) => (OP_LT, *a, *b),
@@ -2645,11 +2693,13 @@ fn range_atom(
         TermKind::Eq(a, b) => (OP_EQ, *a, *b),
         _ => return None,
     };
-    let (fsym, c, f_on_left) = match (app_over_bound(m, l, want), app_over_bound(m, r, want)) {
-        (Some(f), None) => (f, ground_rational(m, r, want)?, true),
-        (None, Some(f)) => (f, ground_rational(m, l, want)?, false),
+    let (fsym, c, f_on_left, fapp) = match (app_over_bound(m, l, want), app_over_bound(m, r, want)) {
+        (Some(f), None) => (f, ground_rational(m, r, want)?, true, l),
+        (None, Some(f)) => (f, ground_rational(m, l, want)?, false, r),
         _ => return None, // not exactly one `f(x̄)` side over a ground constant
     };
+    // #429 — the completion constant must be a value of `f`'s RESULT sort.
+    let f_is_int = m.get(fapp).is_some_and(|t| t.sort == m.sorts.int_sort);
     let rel = if f_on_left { sym } else { flip_rel(sym) };
     let (lo, hi) = match rel {
         OP_LE => (None, Some((c, false))),
@@ -2659,7 +2709,7 @@ fn range_atom(
         OP_EQ => (Some((c.clone(), false)), Some((c, false))),
         _ => return None,
     };
-    Some((fsym, lo, hi))
+    Some((fsym, lo, hi, f_is_int))
 }
 
 /// **M3 recognizer — constant range completion** (dense Real / Int).  Body
@@ -2703,10 +2753,13 @@ fn try_range_completion(
     let mut fsym: Option<u64> = None;
     let mut lo: IntervalBound = None;
     let mut hi: IntervalBound = None;
+    // #429 — `f` is Int-sorted ⇒ the completion constant must be an integer.
+    let mut f_integral = false;
     for &atom in &conjuncts {
-        let Some((f, lo_u, hi_u)) = range_atom(m, atom, &want) else {
+        let Some((f, lo_u, hi_u, f_is_int)) = range_atom(m, atom, &want) else {
             return false; // a conjunct we cannot read as a single-`f` bound
         };
+        f_integral |= f_is_int;
         match fsym {
             None => fsym = Some(f),
             Some(p) if p != f => return false, // a second function ⇒ not a single-`f` range
@@ -2766,7 +2819,7 @@ fn try_range_completion(
             }
         }
     }
-    if !interval_nonempty(&flo, &fhi) {
+    if !interval_nonempty_for_sort(&flo, &fhi, f_integral) {
         return false;
     }
     // VERIFY the ground `f`-points (the #260 gate): each must be eq-pinned to a
@@ -3309,7 +3362,7 @@ fn classify_affine_def(
 fn classify_const_bound(m: &TermManager, a: TermId) -> Option<(u64, bool, num_rational::BigRational)> {
     let (x, _guard, matrix) = peel_implies(m, a)?;
     let want: FxHashSet<Spur> = [x].into_iter().collect();
-    let (fsym, lo, hi) = range_atom(m, matrix, &want)?;
+    let (fsym, lo, hi, _f_is_int) = range_atom(m, matrix, &want)?;
     match (lo, hi) {
         (Some((v, _)), None) => Some((fsym, true, v)),
         (None, Some((v, _))) => Some((fsym, false, v)),
@@ -3626,10 +3679,14 @@ fn try_threshold_guard(m: &TermManager, facts: &CompletionFacts, quant: TermId) 
     }
     let mut fsym: Option<u64> = None;
     let (mut lo, mut hi): (IntervalBound, IntervalBound) = (None, None);
+    // #429 — as in `try_range_completion`: an Int-sorted `f` needs an INTEGER
+    // in `ψ`'s interval, not merely a dense-nonempty one.
+    let mut f_integral = false;
     for &atom in &conjuncts {
-        let Some((f, lo_u, hi_u)) = range_atom(m, atom, &want) else {
+        let Some((f, lo_u, hi_u, f_is_int)) = range_atom(m, atom, &want) else {
             return false;
         };
+        f_integral |= f_is_int;
         // `range_atom` requires the non-`f` side ground, so if `z` occurs in the
         // atom it must be inside `f`'s application — exactly what we need.
         if !free_var_spurs(m, atom).contains(&zvar) {
@@ -3658,7 +3715,7 @@ fn try_threshold_guard(m: &TermManager, facts: &CompletionFacts, quant: TermId) 
     }
     // `ψ` must be feasible: an empty interval makes `z≥sk ⇒ ψ` ≡ `z < sk(x)`, i.e.
     // `∀z. z < sk(x)` — false for large `z` ⇒ the axiom is unsatisfiable.
-    interval_nonempty(&lo, &hi)
+    interval_nonempty_for_sort(&lo, &hi, f_integral)
 }
 
 // ─────────────────────────── array axiom recognizers ───────────────────────

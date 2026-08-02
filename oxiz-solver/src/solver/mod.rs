@@ -205,6 +205,11 @@ pub struct Solver {
     /// "cache mutated at assert-time, never scrubbed on pop" bug class as
     /// `forget_learned_since`/`reduce_clause_database`'s watch-list fixes).
     pub(super) dt_var_constructors: FxHashMap<TermId, oxiz_core::interner::Spur>,
+    /// #429 — `TermKind::StrLen` terms whose domain axiom
+    /// `(>= (str.len s) 0)` has already been encoded into the SAT core (see
+    /// `add_str_len_domain_axioms`). Entries are trail-undone on `pop()` for
+    /// the same reason as `dt_cover_done`.
+    pub(super) str_len_domain_done: FxHashSet<TermId>,
     /// Datatype-sorted subterms whose ground constructor-cover axiom
     /// `(or (= t (C₁ sels(t))) …)` has been encoded into the SAT core
     /// (see `add_dt_cover_axioms`). Entries are trail-undone on `pop()` —
@@ -355,6 +360,7 @@ impl Solver {
             arith_terms: FxHashSet::default(),
             dt_var_constructors: FxHashMap::default(),
             dt_cover_done: FxHashSet::default(),
+            str_len_domain_done: FxHashSet::default(),
             dt_selector_reduced: FxHashSet::default(),
             dt_tester_reduced: FxHashSet::default(),
             dt_selector_extra_reduced: FxHashSet::default(),
@@ -1605,6 +1611,11 @@ impl Solver {
                             // Remove the arithmetic term
                             self.arith_terms.remove(&term);
                         }
+                        TrailOp::StrLenDomainAdded { term } => {
+                            // The domain unit clause died with the SAT-level
+                            // pop; drop the marker so a later scope re-emits it.
+                            self.str_len_domain_done.remove(&term);
+                        }
                         TrailOp::DtCoverAdded { term } => {
                             // The cover CLAUSE died with the SAT-level pop; drop
                             // the marker so a later scope re-emits it.
@@ -1681,6 +1692,7 @@ impl Solver {
         self.bv_terms.clear();
         self.arith_terms.clear();
         self.dt_var_constructors.clear();
+        self.str_len_domain_done.clear();
         self.dt_cover_done.clear();
         self.dt_selector_reduced.clear();
         self.dt_tester_reduced.clear();

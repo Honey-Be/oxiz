@@ -30,10 +30,45 @@ pub enum CommandFlow {
     Stop,
 }
 
+/// Is `name` an operator the parser leaves as a bare uninterpreted `Apply`
+/// while the theory layer decides NOTHING about it?
+///
+/// Two families:
+///  * the Int/Real conversion ops (`abs`, `to_real`, `to_int`, `is_int`);
+///  * the **BitVec↔Int bridge** (#429). `bv2nat` (a.k.a. `bv2int`,
+///    SMT-LIB 2.7's `ubv_to_int`) and its inverses are not in the parser's
+///    builtin table at all, so `(bv2nat a)` becomes an `Apply` carrying the
+///    parser's `Bool` default sort and NONE of the operator's semantics — not
+///    the range `0 ≤ bv2nat(a) < 2^w`, not injectivity, not the bit-level link
+///    to `a`. `(assert (> (bv2nat a) 0)) (assert (< (bv2nat a) 1))` read a
+///    confident `sat` (z3+cvc5: `unsat`), as does `(> (bv2nat a) 300)` for an
+///    8-bit `a`. Deciding these needs a real BV↔Int bridge in the bit-blaster;
+///    until then the honest verdict is `unknown`, not a guess.
+fn is_undecided_op_name(name: &str) -> bool {
+    matches!(
+        name,
+        "abs"
+            | "to_real"
+            | "to_int"
+            | "is_int"
+            | "bv2nat"
+            | "bv2int"
+            | "ubv_to_int"
+            | "sbv_to_int"
+            | "int2bv"
+            | "nat2bv"
+    )
+        // Indexed spellings: the parser renders `(_ int2bv 8)` as the literal
+        // function name `"(_ int2bv 8)"`.
+        || name.starts_with("(_ int2bv")
+        || name.starts_with("(_ nat2bv")
+        || name.starts_with("(_ int_to_bv")
+}
+
 /// Whether `t` (or any subterm, including under quantifiers) contains an
 /// arithmetic operator the theory layer does NOT decide — integer `div`/`mod`,
-/// or one of the Int/Real conversion ops the parser keeps uninterpreted (`abs`,
-/// `to_real`, `to_int`, `is_int`). Each reaches EUF/arith as a free
+/// or one of the ops the parser keeps uninterpreted (see
+/// [`is_undecided_op_name`]). Each reaches EUF/arith as a free
 /// over-approximation, so a `Sat` resting on one is untrustworthy and
 /// [`Context::check_sat`] downgrades it to the sound `Unknown` (see there).
 /// `visited` dedups the hash-consed DAG so a shared subterm is walked once.
@@ -51,9 +86,7 @@ fn term_contains_undecided_op(
         // `((_ divisible n) x)` desugars to `(= (mod x n) 0)`, so it is caught by
         // the `Mod` arm above — only the non-desugarable conversion ops, parsed
         // as uninterpreted applications, need a name check here.
-        TermKind::Apply { func, .. }
-            if matches!(terms.resolve_str(*func), "abs" | "to_real" | "to_int" | "is_int") =>
-        {
+        TermKind::Apply { func, .. } if is_undecided_op_name(terms.resolve_str(*func)) => {
             return true;
         }
         _ => {}

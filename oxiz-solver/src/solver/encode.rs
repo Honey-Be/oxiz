@@ -236,8 +236,40 @@ impl Solver {
                 }
             }
 
-            // Constants and other leaf terms - nothing to track
-            _ => {}
+            // #429 — every OTHER Int/Real-sorted term is a foreign term
+            // produced by a non-arithmetic theory: a datatype selector
+            // (`(fst p)`), `str.len`, `div`/`mod`, a `match`, … The arithmetic
+            // linearizer now admits exactly these as Nelson-Oppen INTERFACE
+            // VARIABLES (see `extract_linear_terms`'s catch-all), so register
+            // them here too — same declare/intern/trail triple as the `Apply`
+            // and `Select` arms above — otherwise the simplex would carry a
+            // variable the encoder never declared the sort of (integrality
+            // silently falling back to the logic-name default, i.e. #427
+            // again) and the model builder would have no value for it.
+            //
+            // NUMERALS ARE EXCLUDED: `IntConst`/`RealConst`/`BitVecConst` are
+            // Int/Real-sorted too, and interning one as an UNCONSTRAINED
+            // variable would let the simplex pick any value for the literal
+            // `5`. They are handled as constants by the linearizer and must
+            // stay untracked here (this is what the old catch-all's "constants
+            // and other leaf terms" comment was about).
+            TermKind::IntConst(_)
+            | TermKind::RealConst(_)
+            | TermKind::BitVecConst { .. }
+            | TermKind::True
+            | TermKind::False => {}
+            _ => {
+                let is_int = term.sort == manager.sorts.int_sort;
+                let is_real = term.sort == manager.sorts.real_sort;
+                if is_int || is_real {
+                    self.arith.declare_sort(term_id, is_int); // #427
+                    if !self.arith_terms.contains(&term_id) {
+                        self.arith_terms.insert(term_id);
+                        self.trail.push(TrailOp::ArithTermAdded { term: term_id });
+                        self.arith.intern(term_id);
+                    }
+                }
+            }
         }
     }
 
@@ -247,6 +279,15 @@ impl Solver {
     /// Results are cached by `reason` (the comparison term id).
     /// `ParsedArithConstraint` is purely structural — it depends only on the
     /// term graph — so the cache is safe to retain across CDCL backtracks.
+    ///
+    /// `allow_opaque_leaves` (#429) enables the Nelson-Oppen **interface
+    /// variable** fallback: a sub-term whose head belongs to another theory
+    /// (a datatype selector, `str.len`, `div`/`mod`, …) is represented as one
+    /// opaque arithmetic variable instead of failing the WHOLE atom. Set at
+    /// the genuine Int/Real comparison sites; deliberately NOT set at the
+    /// `BvUlt`/`BvUle` sites, whose operands are bit-vectors the embedded
+    /// bit-blaster owns (see the `BvSlt` note below for why the BV/arith
+    /// bridge is kept narrow).
     pub(super) fn parse_arith_comparison(
         &mut self,
         lhs: TermId,
@@ -254,6 +295,7 @@ impl Solver {
         constraint_type: ArithConstraintType,
         reason: TermId,
         manager: &TermManager,
+        allow_opaque_leaves: bool,
     ) -> Option<ParsedArithConstraint> {
         // Fast path: return cached result if available.
         if let Some(cached) = self.arith_parse_cache.get(&reason) {
@@ -264,25 +306,20 @@ impl Solver {
         // core's rational). The accumulated value flows straight into the simplex
         // with NO narrowing: the whole arithmetic core is now `i128`, so the
         // `i64::MIN`-class literals whose negation overflowed `i64` are exact.
-        let mut terms: SmallVec<[(TermId, Ratio<i128>); 4]> = SmallVec::new();
-        let mut constant: Ratio<i128> = Ratio::zero();
-
-        // Parse LHS (add positive coefficients)
-        let lhs_ok =
-            self.extract_linear_terms(lhs, Ratio::one(), &mut terms, &mut constant, manager);
-        if lhs_ok.is_none() {
+        //
+        // #429 — two passes. The STRICT pass is exactly the historical parser
+        // (every existing formula keeps its bit-identical decomposition); only
+        // when it bails does the relaxed pass rerun with foreign sub-terms
+        // admitted as opaque interface variables, which is strictly more
+        // information than the old behaviour of dropping the atom entirely.
+        let mut parsed = self.extract_comparison_sides(lhs, rhs, manager, false);
+        if parsed.is_none() && allow_opaque_leaves {
+            parsed = self.extract_comparison_sides(lhs, rhs, manager, true);
+        }
+        let Some((terms, constant)) = parsed else {
             self.arith_parse_cache.insert(reason, None);
             return None;
-        }
-
-        // Parse RHS (subtract, so coefficients are negated)
-        // For lhs OP rhs, we want lhs - rhs OP 0
-        let rhs_ok =
-            self.extract_linear_terms(rhs, -Ratio::<i128>::one(), &mut terms, &mut constant, manager);
-        if rhs_ok.is_none() {
-            self.arith_parse_cache.insert(reason, None);
-            return None;
-        }
+        };
 
         // Combine like terms
         let mut combined: FxHashMap<TermId, Ratio<i128>> = FxHashMap::default();
@@ -315,8 +352,47 @@ impl Solver {
         Some(result)
     }
 
+    /// One pass of `lhs - rhs` linearisation, in either the strict or the
+    /// opaque-leaf mode (#429). Returns the raw (uncombined) term list and the
+    /// accumulated constant, or `None` if this pass bailed.
+    #[allow(clippy::type_complexity)]
+    fn extract_comparison_sides(
+        &self,
+        lhs: TermId,
+        rhs: TermId,
+        manager: &TermManager,
+        opaque_leaves: bool,
+    ) -> Option<(SmallVec<[(TermId, Ratio<i128>); 4]>, Ratio<i128>)> {
+        let mut terms: SmallVec<[(TermId, Ratio<i128>); 4]> = SmallVec::new();
+        let mut constant: Ratio<i128> = Ratio::zero();
+        // Parse LHS (add positive coefficients)
+        self.extract_linear_terms(
+            lhs,
+            Ratio::one(),
+            &mut terms,
+            &mut constant,
+            manager,
+            opaque_leaves,
+        )?;
+        // Parse RHS (subtract, so coefficients are negated).
+        // For lhs OP rhs, we want lhs - rhs OP 0
+        self.extract_linear_terms(
+            rhs,
+            -Ratio::<i128>::one(),
+            &mut terms,
+            &mut constant,
+            manager,
+            opaque_leaves,
+        )?;
+        Some((terms, constant))
+    }
+
     /// Extract linear terms recursively from an arithmetic expression
     /// Returns None if the term is not linear
+    ///
+    /// `opaque_leaves` (#429): admit a sub-term this parser cannot decompose as
+    /// a single OPAQUE arithmetic variable (a Nelson-Oppen interface variable)
+    /// rather than bailing. See `parse_arith_comparison`.
     #[allow(clippy::only_used_in_recursion)]
     pub(super) fn extract_linear_terms(
         &self,
@@ -325,6 +401,7 @@ impl Solver {
         terms: &mut SmallVec<[(TermId, Ratio<i128>); 4]>,
         constant: &mut Ratio<i128>,
         manager: &TermManager,
+        opaque_leaves: bool,
     ) -> Option<()> {
         let term = manager.get(term_id)?;
 
@@ -398,7 +475,13 @@ impl Solver {
             TermKind::Apply { .. } => {
                 let sort = term.sort;
                 let is_numeric = sort == manager.sorts.int_sort || sort == manager.sorts.real_sort;
-                if is_numeric {
+                if is_numeric || opaque_leaves {
+                    // #429 — `opaque_leaves` also admits an application whose
+                    // sort the parser could not resolve to Int/Real. That is
+                    // how an SMT-LIB operator oxiz does not implement reaches
+                    // this parser (`(bv2nat a)` falls through to a plain
+                    // `Apply` carrying the parser's `Bool` default), and in a
+                    // well-sorted input it can only be numeric.
                     terms.push((term_id, scale));
                     Some(())
                 } else {
@@ -414,7 +497,7 @@ impl Solver {
             TermKind::Select(_, _) => {
                 let sort = term.sort;
                 let is_numeric = sort == manager.sorts.int_sort || sort == manager.sorts.real_sort;
-                if is_numeric {
+                if is_numeric || opaque_leaves {
                     terms.push((term_id, scale));
                     Some(())
                 } else {
@@ -426,20 +509,22 @@ impl Solver {
             // Addition
             TermKind::Add(args) => {
                 for &arg in args {
-                    self.extract_linear_terms(arg, scale, terms, constant, manager)?;
+                    self.extract_linear_terms(arg, scale, terms, constant, manager, opaque_leaves)?;
                 }
                 Some(())
             }
 
             // Subtraction
             TermKind::Sub(lhs, rhs) => {
-                self.extract_linear_terms(*lhs, scale, terms, constant, manager)?;
-                self.extract_linear_terms(*rhs, -scale, terms, constant, manager)?;
+                self.extract_linear_terms(*lhs, scale, terms, constant, manager, opaque_leaves)?;
+                self.extract_linear_terms(*rhs, -scale, terms, constant, manager, opaque_leaves)?;
                 Some(())
             }
 
             // Negation
-            TermKind::Neg(arg) => self.extract_linear_terms(*arg, -scale, terms, constant, manager),
+            TermKind::Neg(arg) => {
+                self.extract_linear_terms(*arg, -scale, terms, constant, manager, opaque_leaves)
+            }
 
             // Multiplication of linear terms.  A product is linear iff AT MOST ONE
             // factor is non-constant.  Every other factor must reduce to a pure
@@ -473,6 +558,7 @@ impl Solver {
                         &mut sub_terms,
                         &mut sub_constant,
                         manager,
+                        opaque_leaves,
                     )?;
 
                     if sub_terms.is_empty() {
@@ -508,8 +594,39 @@ impl Solver {
                 }
             }
 
-            // Not linear
-            _ => None,
+            // #429 — a sub-term whose head belongs to ANOTHER theory: a
+            // datatype selector (`(fst p)`), `str.len`, `div`/`mod`, a `match`,
+            // an SMT-LIB operator oxiz does not implement, … Under the strict
+            // pass this returns `None`, and because `None` propagates all the
+            // way out of `parse_arith_comparison` the ENTIRE comparison atom is
+            // dropped from the arithmetic solver and survives only as a free
+            // Boolean — so `(> (fst p) 0) ∧ (< (fst p) 1)` was reported `sat`
+            // (#429; z3+cvc5 `unsat`). The whole atom vanishing is the bug: the
+            // Int-sorted foreign term is an INTERFACE VARIABLE between its
+            // producing theory and LIA/LRA, and its bounds belong to the
+            // simplex.
+            //
+            // SOUNDNESS. Representing `t` by one fresh, otherwise-unconstrained
+            // arithmetic variable `v_t` is the standard Nelson-Oppen
+            // purification: every model of the original formula induces a value
+            // for `v_t` (namely `t`'s), so the abstracted constraint set is
+            // IMPLIED by the original. Any conflict the simplex derives from it
+            // is therefore genuine (no false UNSAT), and adding constraints can
+            // never manufacture a `sat` (no false SAT). Hash-consing makes the
+            // mapping `t ↦ v_t` a function, so every occurrence of the same
+            // foreign term shares one variable — which is exactly what makes
+            // `0 < t ∧ t < 1` contradictory. Integrality comes from the term's
+            // own SMT sort via `declare_arith_sorts`/`track_theory_vars`
+            // (#427), so an Int-sorted interface variable is reasoned about
+            // over ℤ, not ℚ.
+            _ => {
+                if opaque_leaves {
+                    terms.push((term_id, scale));
+                    Some(())
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -735,6 +852,9 @@ impl Solver {
         // the ArithSolver may not enforce disequalities correctly.
         self.add_arith_diseq_split(term_to_encode, manager);
 
+        // #429 — `(>= (str.len s) 0)` for every `str.len` subterm.
+        self.add_str_len_domain_axioms(term_to_encode, manager);
+
         // Ground datatype exhaustiveness at the SAT level (#404 phase 2).
         self.add_dt_cover_axioms(term_to_encode, manager);
 
@@ -753,6 +873,60 @@ impl Solver {
             });
             self.trail
                 .push(TrailOp::NamedAssertionAdded { index: na_index });
+        }
+    }
+
+    /// #429 — the STRING↔ARITHMETIC interface axiom `(>= (str.len s) 0)`.
+    ///
+    /// `str.len` is an Int-sorted term produced by a NON-arithmetic theory. The
+    /// arithmetic linearizer now carries it as a Nelson-Oppen interface
+    /// variable (see `extract_linear_terms`'s catch-all), which is what makes
+    /// `0 < (str.len s) < 1` correctly UNSAT — but an interface variable is
+    /// *unconstrained* unless the producing theory states its domain, and
+    /// nothing in this solver ever told arithmetic that a string length is
+    /// non-negative. `(assert (< (str.len s) 0))` therefore read a confident
+    /// `sat` (z3+cvc5: `unsat`).
+    ///
+    /// The axiom is emitted at assertion time, once per distinct `StrLen`
+    /// subterm, using the house `dt_cover_done`/`TrailOp` idiom: the unit
+    /// clause lives at the current SAT level, so the marker is trail-undone on
+    /// `pop()` and a later scope re-emits it. Quantifier bodies are NOT
+    /// descended — a `(str.len x)` under a binder is not a ground term and its
+    /// instances pass through this same pass at their own assertion sites.
+    ///
+    /// Soundness: `len(s) ≥ 0` is valid in the SMT-LIB string theory, so the
+    /// clause is entailed by every model and can never create a false UNSAT.
+    fn add_str_len_domain_axioms(&mut self, root: TermId, manager: &mut TermManager) {
+        let mut stack: Vec<TermId> = vec![root];
+        let mut visited: FxHashSet<TermId> = FxHashSet::default();
+        let mut pending: Vec<TermId> = Vec::new();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            let Some(td) = manager.get(t) else { continue };
+            if matches!(td.kind, TermKind::Forall { .. } | TermKind::Exists { .. }) {
+                continue;
+            }
+            for c in oxiz_core::ast::get_children(&td.kind) {
+                stack.push(c);
+            }
+            if matches!(td.kind, TermKind::StrLen(_))
+                && td.sort == manager.sorts.int_sort
+                && !self.str_len_domain_done.contains(&t)
+            {
+                pending.push(t);
+            }
+        }
+        for t in pending {
+            if !self.str_len_domain_done.insert(t) {
+                continue;
+            }
+            self.trail.push(TrailOp::StrLenDomainAdded { term: t });
+            let zero = manager.mk_int(0);
+            let ge = manager.mk_ge(t, zero);
+            let lit = self.encode(ge, manager);
+            self.sat.add_clause([lit]);
         }
     }
 
@@ -1605,6 +1779,9 @@ impl Solver {
         // Eagerly add arith diseq split for Not(Eq(a,b)) assertions
         self.add_arith_diseq_split(term, manager);
 
+        // #429 — `(>= (str.len s) 0)` for every `str.len` subterm.
+        self.add_str_len_domain_axioms(term_to_encode, manager);
+
         // Ground datatype exhaustiveness at the SAT level (#404 phase 2).
         self.add_dt_cover_axioms(term_to_encode, manager);
 
@@ -1888,6 +2065,7 @@ impl Solver {
                             ArithConstraintType::Le,
                             term,
                             manager,
+                            true,
                         ) {
                             self.var_to_parsed_arith.insert(var, parsed);
                         }
@@ -2059,7 +2237,7 @@ impl Solver {
                 self.trail.push(TrailOp::ConstraintAdded { var });
                 // Parse and store linear constraint for ArithSolver
                 if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Lt, term, manager)
+                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Lt, term, manager, true)
                 {
                     self.var_to_parsed_arith.insert(var, parsed);
                 }
@@ -2076,7 +2254,7 @@ impl Solver {
                 self.trail.push(TrailOp::ConstraintAdded { var });
                 // Parse and store linear constraint for ArithSolver
                 if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Le, term, manager)
+                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Le, term, manager, true)
                 {
                     self.var_to_parsed_arith.insert(var, parsed);
                 }
@@ -2093,7 +2271,7 @@ impl Solver {
                 self.trail.push(TrailOp::ConstraintAdded { var });
                 // Parse and store linear constraint for ArithSolver
                 if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Gt, term, manager)
+                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Gt, term, manager, true)
                 {
                     self.var_to_parsed_arith.insert(var, parsed);
                 }
@@ -2110,7 +2288,7 @@ impl Solver {
                 self.trail.push(TrailOp::ConstraintAdded { var });
                 // Parse and store linear constraint for ArithSolver
                 if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Ge, term, manager)
+                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Ge, term, manager, true)
                 {
                     self.var_to_parsed_arith.insert(var, parsed);
                 }
@@ -2153,7 +2331,7 @@ impl Solver {
                 self.trail.push(TrailOp::ConstraintAdded { var });
                 // Parse as arithmetic constraint (bitvector as bounded integer)
                 if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Lt, term, manager)
+                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Lt, term, manager, false)
                 {
                     self.var_to_parsed_arith.insert(var, parsed);
                 }
@@ -2169,7 +2347,7 @@ impl Solver {
                     .insert(var, Constraint::Le(*lhs, *rhs));
                 self.trail.push(TrailOp::ConstraintAdded { var });
                 if let Some(parsed) =
-                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Le, term, manager)
+                    self.parse_arith_comparison(*lhs, *rhs, ArithConstraintType::Le, term, manager, false)
                 {
                     self.var_to_parsed_arith.insert(var, parsed);
                 }

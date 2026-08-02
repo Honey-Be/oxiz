@@ -27,6 +27,10 @@ pub(crate) enum TrailOp {
     BvTermAdded { term: TermId },
     /// An arithmetic term was added
     ArithTermAdded { term: TermId },
+    /// #429 — the domain axiom `(>= (str.len s) 0)` was encoded for this
+    /// `StrLen` term (see `Solver::add_str_len_domain_axioms`) — undone so a
+    /// later scope re-emits the unit clause the SAT-level pop discarded.
+    StrLenDomainAdded { term: TermId },
     /// A datatype constructor-cover axiom was encoded for this term
     /// (see `Solver::add_dt_cover_axioms`) — undone so a later scope
     /// re-emits the clause the SAT-level pop discarded.
