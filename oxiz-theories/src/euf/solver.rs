@@ -228,6 +228,37 @@ pub struct EufSolver {
     proof_trail: Vec<u32>,
     /// Scope checkpoints into `proof_trail`, parallel to `uf.trail_limits`.
     proof_trail_limits: Vec<usize>,
+    /// Undo trail for USE-LIST growth, `(node, length_before_the_append)`.
+    ///
+    /// The use-list has exactly the leak shape the `proof_trail` doc above
+    /// describes, and for the same structural reason: `pop()`'s
+    /// `use_list.truncate(num_nodes)` drops the lists OF the popped nodes, but
+    /// entries appended to a SURVIVING node's list inside the scope — by
+    /// `intern_app` (a new application registers itself under each argument's
+    /// root) and by `propagate`'s use-list merge — outlive the pop. Without
+    /// this trail they accumulate monotonically across every CDCL backtrack,
+    /// so `propagate`'s per-merge scan (`for i in 0..use_len`) keeps re-walking
+    /// entries whose merges were retracted long ago.
+    ///
+    /// Unlike the proof trail this is a PERFORMANCE fix, not a soundness one:
+    /// a stale use-list entry only causes a redundant congruence check. The
+    /// scan re-canonicalizes each user's arguments from current state and a
+    /// `sig_table` hit means the two nodes really are congruent, so acting on
+    /// a stale entry can only rediscover a true congruence — never invent one.
+    /// It can still shift the search trajectory (a congruence found earlier
+    /// than it otherwise would be), which is why the fix is gated by
+    /// `OXIZ_EUF_NO_USELIST_TRAIL=1` for A/B rather than assumed inert.
+    use_trail: Vec<(u32, u32)>,
+    /// Scope checkpoints into `use_trail`, parallel to `uf.trail_limits`.
+    use_trail_limits: Vec<usize>,
+    /// `false` when `OXIZ_EUF_NO_USELIST_TRAIL=1` restores the pre-fix leaking
+    /// behaviour (A/B kill-switch, read once per solver in [`Self::new`]).
+    uselist_trail: bool,
+    /// Merge counter, only consulted under `OXIZ_EUF_USELIST_DBG=1`.
+    merge_count: u64,
+    /// `OXIZ_EUF_USELIST_DBG=1`: periodically report use-list growth. Read once
+    /// per solver so the hot path costs a bool test, not an env lookup.
+    uselist_dbg: bool,
     /// Reusable BFS queue for explain_equality — avoids per-call VecDeque allocation.
     explain_queue: crate::prelude::VecDeque<u32>,
     /// Reusable visited flags for explain_equality — resized to proof_forest.len() and cleared at entry.
@@ -298,6 +329,16 @@ impl EufSolver {
             sig_trail_limits: Vec::new(),
             proof_trail: Vec::new(),
             proof_trail_limits: Vec::new(),
+            use_trail: Vec::new(),
+            use_trail_limits: Vec::new(),
+            // Read ONCE per solver, never in `propagate` (which runs per merge).
+            // The switch can only move behaviour in the LEAKING direction, so it
+            // is opt-in and never consulted unless explicitly set.
+            uselist_trail: !std::env::var("OXIZ_EUF_NO_USELIST_TRAIL")
+                .ok()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            merge_count: 0,
+            uselist_dbg: std::env::var_os("OXIZ_EUF_USELIST_DBG").is_some(),
             explain_queue: crate::prelude::VecDeque::new(),
             explain_visited: Vec::new(),
             explain_parent: Vec::new(),
@@ -455,8 +496,16 @@ impl EufSolver {
         self.proof_forest.push(SmallVec::new());
         self.term_to_node.insert(term, idx);
 
-        // Add to use lists
+        // Add to use lists. Inside a push scope the append is trailed: `arg` may
+        // be a node that SURVIVES the matching pop while `idx` does not, and
+        // `pop()`'s `use_list.truncate(num_nodes)` cannot reach an entry parked
+        // on a survivor's list (see `use_trail`).
+        let trail_uses = self.uselist_trail && !self.use_trail_limits.is_empty();
         for &arg in &flattened_args {
+            if trail_uses {
+                self.use_trail
+                    .push((arg, self.use_list[arg as usize].len() as u32));
+            }
             self.use_list[arg as usize].push(idx);
         }
 
@@ -686,13 +735,48 @@ impl EufSolver {
                 self.pending.push((user, existing, term));
             }
 
-            // Merge use lists: extend new_root's use-list with other_root's entries
-            // Using index-based copy to avoid borrow conflicts
-            let mut other_uses: SmallVec<[u32; 8]> = SmallVec::with_capacity(use_len);
-            for i in 0..use_len {
-                other_uses.push(self.use_list[other_root as usize][i]);
+            // Merge use lists: append other_root's entries to new_root's.
+            //
+            // Done through `split_at_mut` rather than the previous
+            // "copy into a temporary SmallVec, then extend" — that staged the
+            // whole list through a fresh allocation on EVERY merge, which is
+            // what the profile saw as ~27% self time in libc memcpy on
+            // `fuel-recursion-3/ob07`. One copy now, no temporary.
+            //
+            // Trailed inside a push scope for the reason documented on
+            // `use_trail`: `pop()`'s `use_list.truncate(num_nodes)` reaches the
+            // lists OF popped nodes, never entries appended to a SURVIVOR's
+            // list, so without this the merged-in entries accumulate across
+            // every backtrack and the `for i in 0..use_len` scan above keeps
+            // re-walking retracted merges.
+            let (dst_i, src_i) = (new_root as usize, other_root as usize);
+            if dst_i != src_i && use_len > 0 {
+                if self.uselist_trail && !self.use_trail_limits.is_empty() {
+                    self.use_trail
+                        .push((new_root, self.use_list[dst_i].len() as u32));
+                }
+                if dst_i < src_i {
+                    let (left, right) = self.use_list.split_at_mut(src_i);
+                    left[dst_i].extend_from_slice(&right[0][..use_len]);
+                } else {
+                    let (left, right) = self.use_list.split_at_mut(dst_i);
+                    right[0].extend_from_slice(&left[src_i][..use_len]);
+                }
             }
-            self.use_list[new_root as usize].extend(other_uses);
+
+            self.merge_count += 1;
+            // Powers of two rather than a fixed stride: the interesting shape is
+            // GROWTH, and a run may do a thousand merges or a billion. This way
+            // the trace is log-scale and never needs tuning to the workload.
+            if self.uselist_dbg && self.merge_count.is_power_of_two() {
+                let total: usize = self.use_list.iter().map(SmallVec::len).sum();
+                let max = self.use_list.iter().map(SmallVec::len).max().unwrap_or(0);
+                let merges = self.merge_count;
+                let nodes = self.nodes.len();
+                eprintln!(
+                    "[euf-uselist] merges={merges} nodes={nodes} use_entries={total} max_list={max}"
+                );
+            }
         }
 
         propagation_buf.clear();
@@ -1164,6 +1248,8 @@ impl Theory for EufSolver {
         self.sig_trail_limits.push(self.sig_trail.len());
         // Record proof_trail checkpoint, likewise mirroring uf.trail_limits.
         self.proof_trail_limits.push(self.proof_trail.len());
+        // Record use_trail checkpoint, likewise mirroring uf.trail_limits.
+        self.use_trail_limits.push(self.use_trail.len());
     }
 
     fn pop(&mut self) {
@@ -1201,6 +1287,22 @@ impl Theory for EufSolver {
                 while self.proof_trail.len() > proof_limit {
                     if let Some(node) = self.proof_trail.pop() {
                         self.proof_forest[node as usize].pop();
+                    }
+                }
+            }
+
+            // Rewind the use-list growth recorded since the matching push, in
+            // LIFO order, BEFORE the truncate below — that truncate only drops
+            // the lists OF popped nodes, never the entries this scope parked on
+            // a SURVIVOR's list (see `use_trail`). LIFO is what makes the
+            // recorded `old_len` the right restore point when several merges
+            // extended the same root inside one scope.
+            if let Some(use_limit) = self.use_trail_limits.pop() {
+                while self.use_trail.len() > use_limit {
+                    if let Some((node, old_len)) = self.use_trail.pop() {
+                        if let Some(list) = self.use_list.get_mut(node as usize) {
+                            list.truncate(old_len as usize);
+                        }
                     }
                 }
             }
@@ -1256,6 +1358,9 @@ impl Theory for EufSolver {
         self.sig_trail_limits.clear();
         self.proof_trail.clear();
         self.proof_trail_limits.clear();
+        self.use_trail.clear();
+        self.use_trail_limits.clear();
+        self.merge_count = 0;
         self.expl_cache.clear();
     }
 }
@@ -1263,6 +1368,78 @@ impl Theory for EufSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #39 — the use-list must not survive the pop that retracts its merge.
+    ///
+    /// `pop()`'s `use_list.truncate(num_nodes)` reaches the lists OF popped
+    /// nodes; it cannot reach entries this scope appended to a SURVIVOR's list.
+    /// Without `use_trail` those entries accumulate on every backtrack, and
+    /// because the union direction alternates across backtracks the growth is
+    /// not linear but FIBONACCI: `A <- A+B`, then `B <- B+(A+B)`, then
+    /// `A <- (A+B)+(A+2B)`. Measured on `fuel-recursion-3/ob07`: 371 nodes,
+    /// 39.7 MILLION use-list entries with a single list holding 37.1 million,
+    /// and `propagate` re-walking them on every merge.
+    ///
+    /// The pin is a length equality, not a wall-clock bound, so it cannot rot
+    /// into a flaky timing test.
+    #[test]
+    fn use_list_growth_is_undone_by_pop() {
+        const F: u32 = 7;
+        let mut s = EufSolver::new();
+        let a = s.intern(TermId::new(1));
+        let b = s.intern(TermId::new(2));
+        // Applications registered OUTSIDE any scope: these entries must survive.
+        s.intern_app(TermId::new(10), F, [a]);
+        s.intern_app(TermId::new(11), F, [b]);
+        let base: Vec<usize> = s.use_list.iter().map(SmallVec::len).collect();
+
+        // Ten push/merge/pop cycles over the same pair. Pre-fix, each cycle
+        // leaves `use_list[root]` longer than it found it; post-fix every cycle
+        // restores it exactly.
+        for i in 0..10u32 {
+            s.push();
+            // A fresh application inside the scope registers itself under `a`
+            // and `b` — the `intern_app` half of the leak.
+            s.intern_app(TermId::new(100 + i), F, [a, b]);
+            s.merge(a, b, TermId::new(0)).unwrap();
+            s.pop();
+            let now: Vec<usize> = s.use_list.iter().map(SmallVec::len).collect();
+            assert_eq!(
+                now, base,
+                "cycle {i}: use-list lengths must be restored by pop()"
+            );
+        }
+        // And the merge itself must still be retracted (the trail must not have
+        // broken backtracking).
+        assert!(!s.are_equal(a, b), "the merge was inside the popped scope");
+    }
+
+    /// The same cycle with the kill-switch semantics: when the trail is
+    /// disabled the lists DO grow, which is what makes the pin above meaningful
+    /// rather than vacuous.
+    #[test]
+    fn use_list_growth_without_the_trail_is_real() {
+        const F: u32 = 7;
+        let mut s = EufSolver::new();
+        s.uselist_trail = false;
+        let a = s.intern(TermId::new(1));
+        let b = s.intern(TermId::new(2));
+        s.intern_app(TermId::new(10), F, [a]);
+        s.intern_app(TermId::new(11), F, [b]);
+        let base: usize = s.use_list.iter().map(SmallVec::len).sum();
+        for i in 0..10u32 {
+            s.push();
+            s.intern_app(TermId::new(100 + i), F, [a, b]);
+            s.merge(a, b, TermId::new(0)).unwrap();
+            s.pop();
+        }
+        let now: usize = s.use_list.iter().map(SmallVec::len).sum();
+        assert!(
+            now > base,
+            "without the trail the use-list must accumulate ({now} vs {base}) \
+             — if this ever stops holding, the test above is no longer testing anything"
+        );
+    }
 
     #[test]
     fn test_euf_basic() {
