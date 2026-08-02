@@ -175,7 +175,10 @@ pub use cce::{CceStats, CoveredClauseElimination};
 pub use chronological_backtrack::{
     BacktrackDecision, ChronoBacktrackConfig, ChronoBacktrackEngine, ChronoBacktrackStats,
 };
-pub use clause::{Clause, ClauseDatabase, ClauseDatabaseStats, ClauseId, ClauseTier};
+pub use clause::{
+    Clause, ClauseDatabase, ClauseDatabaseStats, ClauseId, ClauseIndexScrub, ClauseTier,
+    NoClauseIndex,
+};
 pub use clause_maintenance::{ClauseMaintenance, MaintenanceStats};
 pub use clause_size_manager::{ClauseSizeManager, SizeAdjustmentStrategy, SizeManagerStats};
 pub use community::{

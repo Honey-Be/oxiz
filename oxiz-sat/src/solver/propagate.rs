@@ -19,6 +19,17 @@ impl Solver {
             let binary_len = self.binary_graph.get(lit).len();
             for idx in 0..binary_len {
                 let (implied_lit, clause_id) = self.binary_graph.get(lit)[idx];
+                debug_assert!(
+                    self.binary_edge_matches_clause(lit, implied_lit, clause_id),
+                    "stale binary-implication edge: {lit:?} => {implied_lit:?} claims clause \
+                     {clause_id:?}, but that slot no longer holds the binary clause that \
+                     installed it. `ClauseDatabase::remove` recycles ids through a free list, so \
+                     an edge that outlived its clause now aliases an unrelated one — and this \
+                     loop has NO deleted-clause guard, so it will propagate/conflict on it. \
+                     Whoever freed that id passed the wrong `ClauseIndexScrub` (`NoClauseIndex` \
+                     from inside the solver?) or mutated the clause's literals in place without \
+                     repairing the index."
+                );
                 let value = self.trail.lit_value(implied_lit);
                 if value.is_false() {
                     // Conflict in binary clause
@@ -56,6 +67,32 @@ impl Solver {
                         continue;
                     }
                 };
+
+                // BACKSTOP for the clause-id-recycle bug class (see
+                // `ClauseIndexScrub`). A watcher parked in `watches[lit]`
+                // asserts that `lit.negate()` is one of this clause's two
+                // WATCHED literals, i.e. sits at index 0 or 1 — the whole
+                // two-watched-literal scheme rests on it, and the code
+                // immediately below assumes it (`swap(0, 1)`, then rescanning
+                // only from index 2). It is exactly this assertion that breaks
+                // when an id is recycled underneath a leaked watcher: the
+                // `!c.deleted` guard above passes, because the slot is a live
+                // clause again — just a different one. O(1), debug-only, and it
+                // fires at the FIRST use of a corrupt entry rather than
+                // downstream in a wrong verdict.
+                debug_assert!(
+                    clause.lits.len() >= 2
+                        && (clause.lits[0] == lit.negate() || clause.lits[1] == lit.negate()),
+                    "stale watcher: watches[{:?}] holds {:?}, but that clause's watched literals \
+                     are {:?} — {:?} is not among them. Either the id was freed without scrubbing \
+                     the watch lists (`ClauseDatabase::remove` recycles ids; see \
+                     `ClauseIndexScrub`) or the clause's literals were mutated in place without \
+                     repairing the watches.",
+                    lit,
+                    watcher.clause,
+                    &clause.lits[..clause.lits.len().min(2)],
+                    lit.negate()
+                );
 
                 // Make sure the false literal is at position 1
                 if clause.lits[0] == lit.negate() {
@@ -191,6 +228,33 @@ impl Solver {
                     .add(implied.negate(), other_lit, clause_id);
                 self.stats.learned_clauses += 1;
             }
+        }
+    }
+
+    /// Debug backstop for the clause-id-recycle bug class: does the binary
+    /// implication edge `key ⇒ implied`, attributed to `clause_id`, still match
+    /// the clause actually stored at `clause_id`?
+    ///
+    /// Every edge is installed by `binary_graph.add(l.negate(), other, cid)`
+    /// for a binary clause `(l ∨ other)`, so a live edge implies: the slot
+    /// exists, is not deleted, holds exactly two literals, and those two
+    /// literals are `{key.negate(), implied}` as a SET (propagation permutes
+    /// `lits[0]`/`lits[1]` freely). Anything else means the edge outlived its
+    /// clause and now aliases whatever was recycled into that id.
+    ///
+    /// Only *called* from a `debug_assert!`, but deliberately NOT
+    /// `#[cfg(debug_assertions)]`: `debug_assert!` still type-checks its
+    /// argument in release builds, so gating the definition would break the
+    /// release build.
+    #[allow(dead_code)]
+    fn binary_edge_matches_clause(&self, key: Lit, implied: Lit, clause_id: ClauseId) -> bool {
+        match self.clauses.get(clause_id) {
+            Some(c) if !c.deleted && c.lits.len() == 2 => {
+                let expected = [key.negate(), implied];
+                (c.lits[0] == expected[0] && c.lits[1] == expected[1])
+                    || (c.lits[0] == expected[1] && c.lits[1] == expected[0])
+            }
+            _ => false,
         }
     }
 

@@ -13,7 +13,7 @@
 //!
 //! CCE is more powerful than subsumption and can lead to significant formula simplification.
 
-use crate::clause::{ClauseDatabase, ClauseId};
+use crate::clause::{ClauseDatabase, ClauseId, ClauseIndexScrub};
 use crate::literal::Lit;
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -93,7 +93,21 @@ impl CoveredClauseElimination {
     /// Run CCE elimination on the clause database
     ///
     /// Returns the number of clauses eliminated.
-    pub fn eliminate(&mut self, clauses: &mut ClauseDatabase) -> usize {
+    ///
+    /// `indexes` must be the [`ClauseIndexScrub`] sink for every id-keyed
+    /// structure that points into `clauses` — this pass frees clause ids, and
+    /// `ClauseDatabase::remove` recycles them through a free list, so a watch
+    /// list or implication graph left un-scrubbed would silently re-point at an
+    /// unrelated clause (see [`ClauseIndexScrub`]; four separate soundness bugs
+    /// in this crate, latest issue #428). Pass `NoClauseIndex` only if
+    /// `clauses` genuinely has no such structure attached. This pass is not
+    /// currently wired into [`crate::Solver`]; wiring it up means passing the
+    /// solver's real sink here.
+    pub fn eliminate(
+        &mut self,
+        clauses: &mut ClauseDatabase,
+        indexes: &mut impl ClauseIndexScrub,
+    ) -> usize {
         self.to_remove.clear();
         self.build_index(clauses);
 
@@ -136,7 +150,7 @@ impl CoveredClauseElimination {
 
         // Remove covered clauses
         for id in &self.to_remove {
-            clauses.remove(*id);
+            clauses.remove(*id, indexes);
         }
 
         self.stats.eliminated
@@ -163,6 +177,7 @@ impl Default for CoveredClauseElimination {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clause::NoClauseIndex;
     use crate::clause::Clause;
     use crate::literal::Var;
 
@@ -187,7 +202,7 @@ mod tests {
             false,
         ));
 
-        let eliminated = cce.eliminate(&mut db);
+        let eliminated = cce.eliminate(&mut db, &mut NoClauseIndex);
 
         // The first clause should be eliminated
         assert_eq!(eliminated, 1);
@@ -211,7 +226,7 @@ mod tests {
             false,
         ));
 
-        let eliminated = cce.eliminate(&mut db);
+        let eliminated = cce.eliminate(&mut db, &mut NoClauseIndex);
 
         // No clauses should be eliminated
         assert_eq!(eliminated, 0);
@@ -240,7 +255,7 @@ mod tests {
             false,
         ));
 
-        let eliminated = cce.eliminate(&mut db);
+        let eliminated = cce.eliminate(&mut db, &mut NoClauseIndex);
 
         // Three clauses should be eliminated (all covered by (a))
         assert_eq!(eliminated, 3);
@@ -265,7 +280,7 @@ mod tests {
             false,
         ));
 
-        cce.eliminate(&mut db);
+        cce.eliminate(&mut db, &mut NoClauseIndex);
         let stats = cce.stats();
 
         assert_eq!(stats.eliminated, 1);
@@ -298,7 +313,7 @@ mod tests {
         let mut cce = CoveredClauseElimination::new();
         let mut db = ClauseDatabase::new();
 
-        let eliminated = cce.eliminate(&mut db);
+        let eliminated = cce.eliminate(&mut db, &mut NoClauseIndex);
 
         assert_eq!(eliminated, 0);
         assert_eq!(db.len(), 0);
@@ -311,7 +326,7 @@ mod tests {
 
         db.add(Clause::new(vec![Lit::pos(Var::new(0))], false));
 
-        let eliminated = cce.eliminate(&mut db);
+        let eliminated = cce.eliminate(&mut db, &mut NoClauseIndex);
 
         assert_eq!(eliminated, 0);
         assert_eq!(db.len(), 1);

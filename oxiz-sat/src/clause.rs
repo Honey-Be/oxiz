@@ -245,6 +245,99 @@ impl Clause {
     }
 }
 
+/// Sink for every **id-keyed side index** that must be detached from a clause
+/// before that clause's [`ClauseId`] is freed.
+///
+/// # Why this trait exists (the invariant it enforces)
+///
+/// [`ClauseDatabase::remove`] does **not** destroy a clause: it marks the slot
+/// `deleted` and pushes the id onto a free list. The very next
+/// [`ClauseDatabase::add`] pops that id and overwrites the slot **in place,
+/// clearing `deleted`**. So an id is not a stable name for a clause — it is a
+/// recycled handle.
+///
+/// Every structure that stores a `ClauseId` (the two-watched-literal watch
+/// lists, the binary-implication graph, occurrence lists, …) therefore holds a
+/// *dangling* reference the moment a clause is removed, and that reference
+/// silently re-points at a completely unrelated clause as soon as the id is
+/// recycled. A `deleted`-flag check at the consumption site cannot catch this:
+/// the recycled slot is live again. In `oxiz-sat` this has produced spurious
+/// `Sat` **and** spurious `Unsat` verdicts — i.e. it is a soundness bug class,
+/// not a performance bug — and it was fixed as a one-off at four separate call
+/// sites before this trait existed (`reduce_clause_database`,
+/// `forget_learned_since`, the assertion-scope `pop` handler, and
+/// `check_subsumption` / issue #428).
+///
+/// Making the sink a **required argument of `remove`** is what stops the fifth
+/// recurrence: there is no way to free an id without naming the indexes that
+/// have to be scrubbed, so the compiler asks the question at every call site.
+///
+/// # Contract
+///
+/// `scrub_clause` is called with the clause's *current* literals, **before**
+/// the slot is marked deleted or pushed onto the free list. An implementation
+/// must remove every entry keyed on `id` from every index it owns. A clause's
+/// watchers/implication edges are keyed on the **negations** of its own
+/// literals (see [`crate::Solver`]'s installer sites), so the canonical
+/// implementation loops `for &lit in lits { index.remove(lit.negate(), id) }`.
+///
+/// # The guarantee, as a compiler check
+///
+/// Freeing a clause id without naming an index sink does not compile:
+///
+/// ```compile_fail
+/// use oxiz_sat::{ClauseDatabase, Lit, Var};
+/// let mut db = ClauseDatabase::new();
+/// let id = db.add_original([Lit::pos(Var::new(0)), Lit::neg(Var::new(1))]);
+/// db.remove(id); // error: this method takes 2 arguments but 1 was supplied
+/// ```
+///
+/// The caller has to say which indexes are being scrubbed — and, if the answer
+/// is genuinely "none", say that out loud:
+///
+/// ```
+/// use oxiz_sat::{ClauseDatabase, Lit, NoClauseIndex, Var};
+/// let mut db = ClauseDatabase::new();
+/// let id = db.add_original([Lit::pos(Var::new(0)), Lit::neg(Var::new(1))]);
+/// db.remove(id, &mut NoClauseIndex); // this database has no watchers
+/// assert_eq!(db.len(), 0);
+/// ```
+pub trait ClauseIndexScrub {
+    /// Detach every entry keyed on `id` from this index.
+    ///
+    /// `lits` are the removed clause's literals, read from the database just
+    /// before the slot is freed.
+    fn scrub_clause(&mut self, id: ClauseId, lits: &[Lit]);
+}
+
+/// The empty [`ClauseIndexScrub`]: a claim that the [`ClauseDatabase`] being
+/// mutated has **no id-keyed side index attached at all**.
+///
+/// Valid only for a free-standing database — a preprocessing/analysis pass that
+/// owns its own `ClauseDatabase` and never installs watchers, or a unit test.
+///
+/// **Passing this from inside a solver that owns watch lists or a binary
+/// implication graph reintroduces the exact soundness bug documented on
+/// [`ClauseIndexScrub`]** (issue #428 and its three siblings). If you are
+/// holding a `Solver`, you want its real index sink, not this. The
+/// `debug_assert`s in the solver's propagation loop are the backstop that
+/// catches the mistake, but they only fire in debug builds — do not rely on
+/// them instead of passing the real sink.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoClauseIndex;
+
+impl ClauseIndexScrub for NoClauseIndex {
+    #[inline]
+    fn scrub_clause(&mut self, _id: ClauseId, _lits: &[Lit]) {}
+}
+
+impl<T: ClauseIndexScrub + ?Sized> ClauseIndexScrub for &mut T {
+    #[inline]
+    fn scrub_clause(&mut self, id: ClauseId, lits: &[Lit]) {
+        (**self).scrub_clause(id, lits);
+    }
+}
+
 /// Statistics for clause database
 #[derive(Debug, Clone, Default)]
 pub struct ClauseDatabaseStats {
@@ -454,28 +547,49 @@ impl ClauseDatabase {
         self.clauses.get_mut(id.index())
     }
 
-    /// Mark a clause as deleted
+    /// Mark a clause as deleted, first detaching it from every id-keyed side
+    /// index.
     ///
-    /// The deleted clause slot is added to the free list for reuse (memory pool)
-    pub fn remove(&mut self, id: ClauseId) {
-        if let Some(clause) = self.clauses.get_mut(id.index())
-            && !clause.deleted
-        {
-            // Clone necessary info for stats update
-            let clause_copy = clause.clone();
+    /// The deleted clause slot is added to the free list for reuse (memory
+    /// pool), so `id` is handed straight back out by the next
+    /// [`Self::add`] — see [`ClauseIndexScrub`] for why that makes the
+    /// `indexes` argument mandatory rather than advisory. `scrub_clause` runs
+    /// **before** the slot is marked deleted or pushed onto the free list, and
+    /// runs even when the slot is already `deleted` (scrubbing is idempotent,
+    /// and a double-remove must not leave half a clause's entries behind).
+    ///
+    /// Pass the solver's index sink here. [`NoClauseIndex`] is the explicit —
+    /// and load-bearing — claim that this database has no watchers, no binary
+    /// implication graph and no occurrence lists pointing at it.
+    pub fn remove(&mut self, id: ClauseId, indexes: &mut impl ClauseIndexScrub) {
+        let Some(clause) = self.clauses.get_mut(id.index()) else {
+            return;
+        };
 
-            clause.deleted = true;
-            if clause.learned {
-                self.num_learned -= 1;
-            } else {
-                self.num_original -= 1;
-            }
-            // Add to free list for reuse
-            self.free_list.push(id);
+        // Detach BEFORE the id can be recycled. Not conditional on `deleted`:
+        // the pre-existing hand-written scrubs at the four historical call
+        // sites were unconditional too, and an entry that outlives its clause
+        // is exactly what this whole mechanism exists to prevent.
+        indexes.scrub_clause(id, &clause.lits);
 
-            // Update statistics after marking as deleted
-            self.update_stats_remove(&clause_copy);
+        if clause.deleted {
+            return;
         }
+
+        // Clone necessary info for stats update
+        let clause_copy = clause.clone();
+
+        clause.deleted = true;
+        if clause.learned {
+            self.num_learned -= 1;
+        } else {
+            self.num_original -= 1;
+        }
+        // Add to free list for reuse
+        self.free_list.push(id);
+
+        // Update statistics after marking as deleted
+        self.update_stats_remove(&clause_copy);
     }
 
     /// Compact the database by removing deleted clauses from the free list
@@ -573,9 +687,48 @@ mod tests {
         assert_eq!(db.num_original(), 1);
         assert_eq!(db.num_learned(), 1);
 
-        db.remove(c1);
+        db.remove(c1, &mut NoClauseIndex);
         assert_eq!(db.len(), 1);
         assert_eq!(db.num_original(), 0);
+    }
+
+    #[test]
+    fn remove_scrubs_side_indexes_before_the_id_is_recycled() {
+        // The bug class in one test: `remove` frees an id, the next `add`
+        // hands the SAME id back, and anything still keyed on that id now
+        // aliases an unrelated clause. `remove` must hand the literals to the
+        // index sink first.
+        struct RecordingIndex {
+            scrubbed: Vec<(ClauseId, Vec<Lit>)>,
+        }
+        impl ClauseIndexScrub for RecordingIndex {
+            fn scrub_clause(&mut self, id: ClauseId, lits: &[Lit]) {
+                self.scrubbed.push((id, lits.to_vec()));
+            }
+        }
+
+        let mut db = ClauseDatabase::new();
+        let a = Lit::pos(Var::new(0));
+        let b = Lit::neg(Var::new(1));
+        let c = Lit::pos(Var::new(2));
+
+        let old = db.add_original([a, b]);
+        let mut index = RecordingIndex {
+            scrubbed: Vec::new(),
+        };
+        db.remove(old, &mut index);
+
+        // The sink saw the OLD clause's literals, keyed on the OLD id ...
+        assert_eq!(index.scrubbed.len(), 1);
+        assert_eq!(index.scrubbed[0].0, old);
+        assert_eq!(index.scrubbed[0].1, vec![a, b]);
+
+        // ... and it saw them *before* recycling, which is the point: the id
+        // really is handed straight back out, so a sink that ran afterwards
+        // would have scrubbed the wrong clause's entries.
+        let new = db.add_original([c]);
+        assert_eq!(new, old, "free list recycles the id on the very next add");
+        assert!(!db.get(new).expect("recycled slot is live").deleted);
     }
 
     #[test]

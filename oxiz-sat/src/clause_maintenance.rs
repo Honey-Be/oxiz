@@ -6,7 +6,7 @@
 //! - Clause tier optimization
 //! - Memory compaction
 
-use crate::clause::{ClauseDatabase, ClauseId, ClauseTier};
+use crate::clause::{ClauseDatabase, ClauseId, ClauseIndexScrub, ClauseTier};
 use crate::literal::LBool;
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -84,10 +84,27 @@ impl ClauseMaintenance {
     /// - Detect and remove tautologies
     /// - Normalize clause representation
     /// - Update tier assignments based on usage
+    ///
+    /// `indexes` must be the [`ClauseIndexScrub`] sink for every id-keyed
+    /// structure that points into `clauses` — this pass frees clause ids
+    /// (tautologies), and `ClauseDatabase::remove` recycles them through a free
+    /// list, so an un-scrubbed watcher or implication edge silently re-points
+    /// at an unrelated clause (see [`ClauseIndexScrub`]; issue #428 and three
+    /// siblings).
+    ///
+    /// **Second, independent hazard, not fixed by `indexes`:** this pass also
+    /// mutates clauses **in place** (`normalize` dedups/sorts the literals,
+    /// `strengthen_clause` deletes falsified ones). Reordering or deleting a
+    /// *watched* literal invalidates the two-watched-literal invariant just as
+    /// thoroughly as a stale id does, and nothing here repairs it. An
+    /// integrator wiring this pass into [`crate::Solver`] must re-install
+    /// watches for every clause it touches, not just hand over a sink. It is
+    /// not currently wired in.
     pub fn periodic_maintenance(
         &mut self,
         clauses: &mut ClauseDatabase,
         assignments: &[LBool],
+        indexes: &mut impl ClauseIndexScrub,
     ) -> Vec<ClauseId> {
         self.stats.operations += 1;
         let mut removed_clauses = Vec::new();
@@ -105,7 +122,7 @@ impl ClauseMaintenance {
                 // Normalize clause (remove duplicates, sort, check tautology)
                 if clause.normalize() {
                     // Tautology detected - remove clause
-                    clauses.remove(clause_id);
+                    clauses.remove(clause_id, indexes);
                     removed_clauses.push(clause_id);
                     self.stats.tautologies_removed += 1;
                     continue;

@@ -12,7 +12,7 @@
 //! - "Bounded Variable Addition" (Manthey et al.)
 //! - "Equivalence Reasoning in SAT" (Heule)
 
-use crate::clause::ClauseDatabase;
+use crate::clause::{ClauseDatabase, ClauseIndexScrub};
 use crate::literal::Lit;
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -227,8 +227,23 @@ impl EquivalentLiteralSubstitution {
 
     /// Apply equivalence substitution to clause database
     ///
-    /// Replaces all literals with their canonical representative
-    pub fn substitute(&mut self, clauses: &mut ClauseDatabase) {
+    /// Replaces all literals with their canonical representative.
+    ///
+    /// `indexes` must be the [`ClauseIndexScrub`] sink for every id-keyed
+    /// structure that points into `clauses` — this pass frees clause ids, and
+    /// `ClauseDatabase::remove` recycles them through a free list, so an
+    /// un-scrubbed watcher or implication edge silently re-points at an
+    /// unrelated clause (see [`ClauseIndexScrub`]; issue #428 and three
+    /// siblings). The substitution branch below is a `remove` immediately
+    /// followed by an `add_original`, so the freed id is recycled at once.
+    ///
+    /// **Second, independent hazard, not fixed by `indexes`:** the substituted
+    /// clause is re-added with `add_original` and therefore has **no watchers
+    /// at all**, so it would never be propagated; and substitution rewrites
+    /// variables, so watches could not simply be carried over anyway. An
+    /// integrator wiring this pass into [`crate::Solver`] must re-install
+    /// watches for every clause it rewrites. It is not currently wired in.
+    pub fn substitute(&mut self, clauses: &mut ClauseDatabase, indexes: &mut impl ClauseIndexScrub) {
         let clause_ids: Vec<_> = clauses.iter_ids().collect();
 
         for cid in clause_ids {
@@ -265,7 +280,7 @@ impl EquivalentLiteralSubstitution {
 
                     if is_tautology {
                         // Remove tautology
-                        clauses.remove(cid);
+                        clauses.remove(cid, indexes);
                         self.stats.clauses_removed += 1;
                     } else {
                         // Remove duplicates and update clause
@@ -274,7 +289,7 @@ impl EquivalentLiteralSubstitution {
 
                         // This requires rebuilding the clause
                         // For now, we just mark it for removal and will add the new one
-                        clauses.remove(cid);
+                        clauses.remove(cid, indexes);
                         if !new_lits.is_empty() {
                             clauses.add_original(new_lits);
                         }
@@ -322,6 +337,7 @@ impl EquivalentLiteralSubstitution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clause::NoClauseIndex;
     use crate::literal::Var;
 
     #[test]
@@ -406,7 +422,7 @@ mod tests {
         db.add_original(vec![a, Lit::pos(Var::new(2))]);
 
         let before_count = db.len();
-        els.substitute(&mut db);
+        els.substitute(&mut db, &mut NoClauseIndex);
 
         // Clause should be modified
         assert!(els.stats().literals_substituted > 0 || before_count > 0);

@@ -12,7 +12,7 @@
 //! - "Effective Preprocessing in SAT" (Eén & Biere)
 //! - "Bounded Variable Elimination" (Subbarayan & Pradhan)
 
-use crate::clause::ClauseDatabase;
+use crate::clause::{ClauseDatabase, ClauseIndexScrub};
 use crate::literal::Lit;
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -277,8 +277,18 @@ impl BinaryImplicationGraph {
 
     /// Apply BIG optimizations to clause database
     ///
-    /// Removes redundant binary clauses found through transitive reduction
-    pub fn optimize(&mut self, clauses: &mut ClauseDatabase) {
+    /// Removes redundant binary clauses found through transitive reduction.
+    ///
+    /// `indexes` must be the [`ClauseIndexScrub`] sink for every id-keyed
+    /// structure that points into `clauses`: this pass frees clause ids, and
+    /// `ClauseDatabase::remove` recycles them through a free list, so an
+    /// un-scrubbed watcher or implication edge silently re-points at an
+    /// unrelated clause (see [`ClauseIndexScrub`]; issue #428 and three
+    /// siblings). Note this pass removes *binary* clauses specifically, which
+    /// in [`crate::Solver`] are the ones carried by the binary-implication
+    /// graph — the one index `propagate` consults with **no** deleted-clause
+    /// guard at all. This pass is not currently wired into the solver.
+    pub fn optimize(&mut self, clauses: &mut ClauseDatabase, indexes: &mut impl ClauseIndexScrub) {
         // Build the graph
         self.build(clauses);
 
@@ -296,7 +306,7 @@ impl BinaryImplicationGraph {
 
                 // Check if this binary clause is redundant
                 if redundant.contains(&(!a, b)) || redundant.contains(&(!b, a)) {
-                    clauses.remove(cid);
+                    clauses.remove(cid, indexes);
                 }
             }
         }
@@ -339,6 +349,7 @@ impl BinaryImplicationGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clause::NoClauseIndex;
     use crate::literal::Var;
 
     #[test]
@@ -432,7 +443,7 @@ mod tests {
         db.add_original(vec![a, c]); // ~a => c (redundant)
 
         let before = db.len();
-        big.optimize(&mut db);
+        big.optimize(&mut db, &mut NoClauseIndex);
         let after = db.len();
 
         // Should have removed at least one redundant clause

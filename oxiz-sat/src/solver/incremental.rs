@@ -43,42 +43,23 @@ impl Solver {
         }
         let to_remove: Vec<ClauseId> = self.learned_clause_ids.split_off(checkpoint);
         for id in to_remove {
-            // Detach every watcher that still references this clause BEFORE freeing
-            // its slot.  `ClauseDatabase::remove` pushes the id onto a free list
-            // that the next `add_*` recycles, and recycling clears the slot's
-            // `deleted` flag — so `propagate`'s "skip deleted clause" guard cannot
-            // catch a stale watcher once the id is reused.  Here the id is freed
-            // and then *immediately* reused by the next incremental `add_clause`
-            // (e.g. the bit-vector theory asserting the next constraint) with no
-            // intervening propagation to lazily clean the stale watchers, so the
-            // recycled clause would inherit the forgotten clause's watchers and
-            // mis-propagate — a spurious conflict that turns a SAT query UNSAT
-            // (regression: `bv_mul_aux_disjunction_const_is_sat_8bit`).  A clause's
-            // (at most two) watchers live in the watch lists of the negations of
-            // its own literals, so scrubbing `~l` for every literal `l` removes
-            // them regardless of which pair is currently watched.
-            // `self.clauses` and `self.watches` are DISJOINT fields, so the
-            // immutable borrow of the clause (to read its literals) and the
-            // mutable borrow of the watch lists coexist without copying the
-            // literals out — `Lit` is `Copy`, so `negate()` is itself free.
-            if let Some(clause) = self.clauses.get(id) {
-                // A binary learned clause ALSO lives in the binary implication
-                // graph (`learn_clause` inserts both edges), and `propagate` reads
-                // that graph with NO deleted-clause guard — so a recycled id would
-                // inherit a stale binary implication that keeps firing as a free
-                // propagation. Scrub those edges (keyed, like the watchers, on the
-                // negations of the clause's literals) alongside the watch lists.
-                let is_binary = clause.lits.len() == 2;
-                for &lit in &clause.lits {
-                    self.watches.remove_clause(lit.negate(), id);
-                    if is_binary {
-                        self.binary_graph.remove(lit.negate(), id);
-                    }
-                }
-            }
             // DRAT: log the deletion (learned clauses only) before removal.
             self.drat_delete_clause_id(id);
-            self.clauses.remove(id);
+            // Detach every watcher and binary-implication edge that still
+            // references this clause BEFORE freeing its slot.
+            // `ClauseDatabase::remove` pushes the id onto a free list that the
+            // next `add_*` recycles, and recycling clears the slot's `deleted`
+            // flag — so `propagate`'s "skip deleted clause" guard cannot catch a
+            // stale watcher once the id is reused (and the binary graph has no
+            // guard at all). Here the id is freed and then *immediately* reused by
+            // the next incremental `add_clause` (e.g. the bit-vector theory
+            // asserting the next constraint) with no intervening propagation to
+            // lazily clean the stale watchers, so the recycled clause would
+            // inherit the forgotten clause's watchers and mis-propagate — a
+            // spurious conflict that turns a SAT query UNSAT (regression:
+            // `bv_mul_aux_disjunction_const_is_sat_8bit`). The scrub is now part
+            // of the removal itself; see `ClauseIndexScrub`.
+            self.scrub_and_remove_clause(id);
         }
     }
 

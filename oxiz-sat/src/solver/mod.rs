@@ -18,7 +18,7 @@ pub use conflict::theory_probe;
 
 use crate::chb::CHB;
 use crate::chrono::ChronoBacktrack;
-use crate::clause::{ClauseDatabase, ClauseId};
+use crate::clause::{ClauseDatabase, ClauseId, ClauseIndexScrub};
 use crate::literal::{LBool, Lit, Var};
 use crate::lrb::LRB;
 use crate::memory_opt::{MemoryAction, MemoryOptimizer};
@@ -78,6 +78,44 @@ impl BinaryImplicationGraph {
     fn clear(&mut self) {
         for implications in &mut self.implications {
             implications.clear();
+        }
+    }
+}
+
+/// The solver's complete set of **id-keyed side indexes**, split-borrowed off
+/// `Solver` so it can be handed to [`ClauseDatabase::remove`].
+///
+/// This is the one place in the crate that knows *which* structures alias a
+/// `ClauseId` and how their keys are derived, so it is the one place that has
+/// to stay in sync when a new id-keyed index is added. Adding a field here
+/// fixes every clause-removal path in the solver at once — which is the whole
+/// point of the exercise: the four historical fixes
+/// (`reduce_clause_database`, `forget_learned_since`, the assertion-scope
+/// `pop` handler and `check_subsumption` / #428) each re-derived this loop by
+/// hand, and the fourth one was missing for a year.
+pub(super) struct SolverClauseIndexes<'a> {
+    watches: &'a mut WatchLists,
+    binary_graph: &'a mut BinaryImplicationGraph,
+}
+
+impl ClauseIndexScrub for SolverClauseIndexes<'_> {
+    fn scrub_clause(&mut self, id: ClauseId, lits: &[Lit]) {
+        // A clause's (at most two) watchers live in the watch lists keyed on
+        // the NEGATIONS of its own literals, so scrubbing `~l` for every
+        // literal `l` detaches them regardless of which pair is watched right
+        // now (propagation permutes `lits[0]`/`lits[1]` freely).
+        //
+        // A binary clause additionally contributes two implication edges,
+        // keyed the same way. `propagate` reads the binary graph with NO
+        // deleted-clause guard at all, so a leaked edge there fires
+        // unconditionally under whatever clause later occupies the id — the
+        // spurious-`unsat` mechanism of `pop_binary_graph_soundness`.
+        let is_binary = lits.len() == 2;
+        for &lit in lits {
+            self.watches.remove_clause(lit.negate(), id);
+            if is_binary {
+                self.binary_graph.remove(lit.negate(), id);
+            }
         }
     }
 }
@@ -575,6 +613,39 @@ impl Solver {
             let lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
             self.drat_delete(&lits);
         }
+    }
+
+    /// Split-borrow the solver's id-keyed side indexes as a
+    /// [`ClauseIndexScrub`] sink.
+    ///
+    /// `clauses`, `watches` and `binary_graph` are disjoint fields, so the
+    /// caller can hold `&mut self.clauses` and this sink simultaneously —
+    /// which is what lets the scrub read the clause's literals straight out of
+    /// the database instead of copying them out first.
+    #[inline]
+    pub(super) fn clause_indexes<'a>(
+        watches: &'a mut WatchLists,
+        binary_graph: &'a mut BinaryImplicationGraph,
+    ) -> SolverClauseIndexes<'a> {
+        SolverClauseIndexes {
+            watches,
+            binary_graph,
+        }
+    }
+
+    /// Free a clause id, detaching it from every id-keyed side index first.
+    ///
+    /// **This is the only sanctioned clause-removal path inside the solver.**
+    /// `ClauseDatabase::remove` recycles ids through a free list, so anything
+    /// still keyed on the id would silently alias the next clause added — see
+    /// [`ClauseIndexScrub`]. Callers that also need DRAT deletion logging or
+    /// memory-pool accounting do that around this call, as before; this helper
+    /// deliberately does *only* the scrub-and-free so it stays behaviourally
+    /// identical to the hand-written sequences it replaces.
+    #[inline]
+    pub(super) fn scrub_and_remove_clause(&mut self, id: ClauseId) {
+        let mut indexes = Self::clause_indexes(&mut self.watches, &mut self.binary_graph);
+        self.clauses.remove(id, &mut indexes);
     }
 
     /// DRAT: emit the empty clause (the UNSAT terminus) and flush. No-op unless
@@ -1782,30 +1853,14 @@ impl Solver {
                 let removed: SmallVec<[ClauseId; 32]> = self.clause_ledger.drain_since(mark).collect();
                 for clause_id in removed {
                     // Detach this clause's watchers AND binary-implication edges
-                    // BEFORE freeing its slot. `clauses.remove` pushes the id onto
-                    // the free list, and the next incremental `add_*` recycles it
-                    // (clearing the slot's `deleted` flag) — so a stale watcher
-                    // would defeat `propagate`'s "skip deleted clause" guard, and a
-                    // stale binary edge has NO guard at all. The earlier "watch
-                    // lists are cleaned up naturally" assumption was the exact
-                    // spurious-`unsat` hazard `forget_learned_since` already
-                    // repudiates for learned clauses. A clause's (≤2) watchers and
-                    // its binary edges live in the lists keyed on the negations of
-                    // its own literals. `clauses`/`watches`/`binary_graph` are
-                    // disjoint fields, so the immutable read of the literals and the
-                    // mutable scrubs coexist without copying.
-                    if let Some(clause) = self.clauses.get(clause_id) {
-                        let is_binary = clause.lits.len() == 2;
-                        for &lit in &clause.lits {
-                            self.watches.remove_clause(lit.negate(), clause_id);
-                            if is_binary {
-                                self.binary_graph.remove(lit.negate(), clause_id);
-                            }
-                        }
-                    }
-
-                    // Remove from clause database
-                    self.clauses.remove(clause_id);
+                    // BEFORE freeing its slot, then free it — both halves are now
+                    // one operation (`scrub_and_remove_clause` →
+                    // `ClauseDatabase::remove`, which takes the index sink as a
+                    // required argument). The earlier "watch lists are cleaned up
+                    // naturally" assumption was the exact spurious-`unsat` hazard
+                    // `forget_learned_since` already repudiates for learned
+                    // clauses.
+                    self.scrub_and_remove_clause(clause_id);
 
                     // Remove from learned clause tracking if it's a learned clause
                     self.learned_clause_ids.retain(|&id| id != clause_id);

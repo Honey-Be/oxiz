@@ -134,36 +134,21 @@ impl Solver {
 
         // Remove subsumed clauses
         for cid in to_remove {
-            // Detach every watcher that still references this clause BEFORE
-            // freeing its slot — see the identical scrub in
-            // `reduce_clause_database`/`forget_learned_since`/the assertion-
-            // pop handler for the full mechanism: `ClauseDatabase::remove`
-            // pushes the id onto a free list the next `add_*` recycles,
-            // clearing the slot's `deleted` flag, so `propagate`'s "skip
-            // deleted clause" guard cannot catch a stale watcher once the id
-            // is reused — the recycled clause silently inherits the deleted
-            // clause's watchers and mis-propagates (the exact false-`unsat`
-            // mechanism regression #428 covers: `check_subsumption` was the
-            // one clause-removal site in this module that never scrubbed).
-            // A subsumed candidate here always has `lits.len() >= 3` (the
-            // `clause.lits.len() < new_clause.len()` guard above combined
-            // with `check_subsumption` only being called for `learnt_clause.
-            // len() >= 3` learned clauses rules out binary candidates), so a
-            // `binary_graph` scrub is currently unreachable dead weight —
-            // included anyway, mirroring the sibling call sites' `is_binary`
-            // guard, so this stays correct if that invariant ever changes.
-            if let Some(clause) = self.clauses.get(cid) {
-                let is_binary = clause.lits.len() == 2;
-                for &lit in &clause.lits {
-                    self.watches.remove_clause(lit.negate(), cid);
-                    if is_binary {
-                        self.binary_graph.remove(lit.negate(), cid);
-                    }
-                }
-            }
             // DRAT: log the deletion (learned clauses only) before removal.
             self.drat_delete_clause_id(cid);
-            self.clauses.remove(cid);
+            // Detach every watcher (and, for a binary clause, every
+            // implication edge) that still references this clause BEFORE
+            // freeing its slot: `ClauseDatabase::remove` pushes the id onto a
+            // free list the next `add_*` recycles, clearing the slot's
+            // `deleted` flag, so `propagate`'s "skip deleted clause" guard
+            // cannot catch a stale watcher once the id is reused — the
+            // recycled clause silently inherits the deleted clause's watchers
+            // and mis-propagates (the exact false-`unsat` mechanism regression
+            // #428 covers: `check_subsumption` was the one clause-removal site
+            // in this module that never scrubbed). The scrub is no longer a
+            // per-call-site ritual — it is inside `remove`, keyed off the
+            // required index-sink argument (see `ClauseIndexScrub`).
+            self.scrub_and_remove_clause(cid);
             self.stats.deleted_clauses += 1;
         }
     }
@@ -202,6 +187,21 @@ impl Solver {
         }
 
         clause_id
+    }
+
+    /// Memory-pool bookkeeping for a clause that is about to be removed:
+    /// round-trip a buffer of its size through the size-class pool so the
+    /// optimizer's occupancy statistics see the free. Must be called while the
+    /// clause is still in the database (it reads the literal count from it).
+    /// No-op if the slot is gone — matching the `if let Some(clause)` guard the
+    /// three tier loops used to spell out inline.
+    #[inline]
+    fn account_pool_free(&mut self, cid: ClauseId) {
+        if let Some(clause) = self.clauses.get(cid) {
+            let num_lits = clause.lits.len();
+            let buf = self.memory_optimizer.allocate(num_lits);
+            self.memory_optimizer.free(buf, num_lits);
+        }
     }
 
     /// Reduce the learned clause database using tier-based deletion strategy
@@ -261,57 +261,35 @@ impl Solver {
         // Local: Delete bottom 75% (very aggressive)
         let num_local_delete = (local_candidates.len() * 3) / 4;
 
+        // Detaching a deleted clause's watchers BEFORE freeing its slot is the
+        // whole ballgame here: `ClauseDatabase::remove` pushes the id onto a
+        // free list the next `add_*` recycles, clearing the slot's `deleted`
+        // flag, so `propagate`'s "skip deleted clause" guard cannot catch a
+        // stale watcher once the id is reused — the recycled clause silently
+        // inherits the deleted clause's watchers and mis-propagates (the exact
+        // spurious-SAT mechanism `reduce_clause_database_soundness` covers).
+        // That scrub now lives inside `remove` itself (see `ClauseIndexScrub`);
+        // all this loop still owns is the memory-pool size accounting, which
+        // must read the clause while it is still there.
         for (cid, _) in core_candidates.iter().take(num_core_delete) {
-            // Detach every watcher that still references this clause BEFORE
-            // freeing its slot — see the identical scrub in
-            // `forget_learned_since` for the full mechanism: `ClauseDatabase::
-            // remove` pushes the id onto a free list the next `add_*` recycles,
-            // clearing the slot's `deleted` flag, so `propagate`'s "skip deleted
-            // clause" guard cannot catch a stale watcher once the id is reused —
-            // the recycled clause silently inherits the deleted clause's
-            // watchers and mis-propagates (the exact spurious-SAT mechanism
-            // that regression covers, reachable here too since this ordinary
-            // GC path recycles ids the same way). Track clause size for memory
-            // pool accounting before removal.
-            if let Some(clause) = self.clauses.get(*cid) {
-                let num_lits = clause.lits.len();
-                for &lit in &clause.lits {
-                    self.watches.remove_clause(lit.negate(), *cid);
-                }
-                let buf = self.memory_optimizer.allocate(num_lits);
-                self.memory_optimizer.free(buf, num_lits);
-            }
+            self.account_pool_free(*cid);
             // DRAT: log the deletion (learned clauses only) before removal.
             self.drat_delete_clause_id(*cid);
-            self.clauses.remove(*cid);
+            self.scrub_and_remove_clause(*cid);
             self.stats.deleted_clauses += 1;
         }
 
         for (cid, _) in mid_candidates.iter().take(num_mid_delete) {
-            if let Some(clause) = self.clauses.get(*cid) {
-                let num_lits = clause.lits.len();
-                for &lit in &clause.lits {
-                    self.watches.remove_clause(lit.negate(), *cid);
-                }
-                let buf = self.memory_optimizer.allocate(num_lits);
-                self.memory_optimizer.free(buf, num_lits);
-            }
+            self.account_pool_free(*cid);
             self.drat_delete_clause_id(*cid);
-            self.clauses.remove(*cid);
+            self.scrub_and_remove_clause(*cid);
             self.stats.deleted_clauses += 1;
         }
 
         for (cid, _) in local_candidates.iter().take(num_local_delete) {
-            if let Some(clause) = self.clauses.get(*cid) {
-                let num_lits = clause.lits.len();
-                for &lit in &clause.lits {
-                    self.watches.remove_clause(lit.negate(), *cid);
-                }
-                let buf = self.memory_optimizer.allocate(num_lits);
-                self.memory_optimizer.free(buf, num_lits);
-            }
+            self.account_pool_free(*cid);
             self.drat_delete_clause_id(*cid);
-            self.clauses.remove(*cid);
+            self.scrub_and_remove_clause(*cid);
             self.stats.deleted_clauses += 1;
         }
 
@@ -388,6 +366,88 @@ impl Solver {
         }
     }
 
+    /// Delete the literal at `drop_idx` from clause `clause_id` **in place**,
+    /// keeping the two-watched-literal index consistent.
+    ///
+    /// This is the mutating sibling of [`Solver::scrub_and_remove_clause`], and
+    /// it exists for the same reason (see [`crate::ClauseIndexScrub`]): a
+    /// `ClauseId` is a handle into structures that live *outside* the clause,
+    /// so any edit that changes which literals a clause is watched on has to
+    /// repair those structures. Deleting a **watched** literal in place leaves
+    /// a watcher parked in `watches[l.negate()]` for a clause that no longer
+    /// contains `l` — and that is not merely untidy:
+    ///
+    /// * `propagate` assumes the triggering literal is at index 0 or 1 and only
+    ///   rescans from index 2, so it can miss the one remaining non-false
+    ///   literal and unit-propagate a literal that is not actually implied; and
+    /// * the leftover watcher's *blocker* names the deleted literal, so
+    ///   `propagate`'s "blocker is true ⇒ clause satisfied" shortcut can skip a
+    ///   clause that is in fact unit or falsified.
+    ///
+    /// Both fabricate propagations, i.e. both can fabricate a verdict.
+    ///
+    /// Returns `Some((old_lits, new_lits))` on success (callers need both for
+    /// DRAT's delete-old + add-new encoding of an in-place strengthening), or
+    /// `None` if the request was **declined**, in which case the clause is left
+    /// exactly as it was. Declining is always sound — it just keeps a longer
+    /// clause — and happens when the strengthened clause has fewer than two
+    /// literals that are non-false at the current (level-0) assignment, i.e.
+    /// when no legal watch pair exists.
+    pub(super) fn strengthen_clause_in_place(
+        &mut self,
+        clause_id: ClauseId,
+        drop_idx: usize,
+    ) -> Option<(SmallVec<[Lit; 16]>, SmallVec<[Lit; 16]>)> {
+        let old_lits: SmallVec<[Lit; 16]> = match self.clauses.get(clause_id) {
+            Some(c) if !c.deleted && c.lits.len() > 2 && drop_idx < c.lits.len() => {
+                c.lits.iter().copied().collect()
+            }
+            _ => return None,
+        };
+
+        // Case A: the dropped literal is not one of the two WATCHED ones
+        // (indices 0 and 1). Both watchers keep pointing at literals the clause
+        // still contains, and their blockers — which are each other — are
+        // likewise untouched, so the index stays exact. Plain in-place removal,
+        // identical to what this code always did.
+        if drop_idx >= 2 {
+            let clause = self.clauses.get_mut(clause_id)?;
+            clause.lits.remove(drop_idx);
+            let new_lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
+            return Some((old_lits, new_lits));
+        }
+
+        // Case B: a watched literal is going away. Detach → mutate → re-attach.
+        let mut new_lits: SmallVec<[Lit; 16]> = old_lits.clone();
+        new_lits.remove(drop_idx);
+
+        // The *other* old watched literal survives and, after the shift, sits
+        // at index 0 either way (drop 0 ⇒ old[1] shifts down; drop 1 ⇒ old[0]
+        // stays). Keep watching it, and find it a partner. Both watched
+        // literals must be non-false, which at level 0 is a stable property.
+        if self.trail.lit_value(new_lits[0]).is_false() {
+            return None;
+        }
+        let partner = (1..new_lits.len()).find(|&j| !self.trail.lit_value(new_lits[j]).is_false())?;
+        new_lits.swap(1, partner);
+
+        // Detach against the OLD literal set — that is where the watchers are
+        // keyed. (`old_lits.len() > 2`, so this clause is not in the binary
+        // implication graph and the sink's binary branch is a no-op.)
+        let mut indexes = Self::clause_indexes(&mut self.watches, &mut self.binary_graph);
+        indexes.scrub_clause(clause_id, &old_lits);
+
+        let clause = self.clauses.get_mut(clause_id)?;
+        clause.lits = new_lits.iter().copied().collect();
+
+        // Re-attach on the new watch pair.
+        let (w0, w1) = (new_lits[0], new_lits[1]);
+        self.watches.add(w0.negate(), Watcher::new(clause_id, w1));
+        self.watches.add(w1.negate(), Watcher::new(clause_id, w0));
+
+        Some((old_lits, new_lits))
+    }
+
     /// Vivification: try to strengthen clauses by checking if some literals are redundant
     /// This is an inprocessing technique that should be called periodically
     pub(super) fn vivify_clauses(&mut self) {
@@ -454,26 +514,24 @@ impl Solver {
                 // Backtrack
                 self.backtrack(saved_level);
 
+                // The literal at skip_idx is implied by the rest, so it can be
+                // dropped from the clause (vivification succeeded). The removal
+                // goes through `strengthen_clause_in_place`, which repairs the
+                // watch index when the dropped literal is a watched one — doing
+                // it by hand here is what left `propagate` chasing a watcher for
+                // a literal the clause no longer contained.
                 if conflict
-                    && let Some(clause) = self.clauses.get_mut(clause_id)
-                    && clause.lits.len() > 2
+                    && let Some((old_lits, new_lits)) =
+                        self.strengthen_clause_in_place(clause_id, skip_idx)
                 {
-                    // The literal at skip_idx is implied by the rest
-                    // We can remove it from the clause (vivification succeeded).
-                    // DRAT models an in-place strengthening as delete-old +
-                    // add-new: capture both literal sets, then (after the mutable
-                    // borrow ends) emit `d old` followed by `new`. The DRAT
-                    // helpers no-op unless DRAT is enabled, so this is free in
-                    // the default build.
-                    let old_lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
-                    clause.lits.remove(skip_idx);
-                    let new_lits: SmallVec<[Lit; 16]> = clause.lits.iter().copied().collect();
                     vivified_count += 1;
                     if self.drat.is_some() {
-                        // Add the strengthened clause first, then delete the
-                        // original. Ordering does not matter for drat-trim's
-                        // backward check, but add-then-delete keeps the active
-                        // set consistent at every prefix.
+                        // DRAT models an in-place strengthening as delete-old +
+                        // add-new. Add the strengthened clause first, then delete
+                        // the original: ordering does not matter for drat-trim's
+                        // backward check, but add-then-delete keeps the active set
+                        // consistent at every prefix. The DRAT helpers no-op unless
+                        // DRAT is enabled, so this is free in the default build.
                         self.drat_add(&new_lits);
                         self.drat_delete(&old_lits);
                     }
@@ -596,44 +654,29 @@ impl Solver {
                 }
             }
 
-            // Apply strengthening if we found literals to remove
-            if !literals_to_remove.is_empty() {
-                // First, remove literals
-                let mut old_lits: SmallVec<[Lit; 16]> = SmallVec::new();
-                if let Some(clause) = self.clauses.get_mut(*clause_id) {
-                    // DRAT: capture the pre-mutation literal set so we can emit
-                    // delete-old + add-new (an in-place strengthening).
-                    old_lits = clause.lits.iter().copied().collect();
-                    // Remove literals in reverse order to preserve indices
-                    for &idx in literals_to_remove.iter().rev() {
-                        if idx < clause.lits.len() {
-                            clause.lits.remove(idx);
-                        }
-                    }
-                }
-
+            // Apply strengthening if we found a literal to remove. The loop
+            // above `break`s after the first candidate, so there is at most one
+            // — and the removal goes through `strengthen_clause_in_place`, which
+            // repairs the watch index when the dropped literal is a watched one
+            // (see that function; deleting a watched literal in place is the
+            // same broken-index class as freeing a clause id without scrubbing).
+            if let Some(&drop_idx) = literals_to_remove.first()
+                && let Some((old_lits, new_lits)) =
+                    self.strengthen_clause_in_place(*clause_id, drop_idx)
+            {
                 // DRAT: emit the strengthened clause, then delete the original.
                 if self.drat.is_some() {
-                    let new_lits: SmallVec<[Lit; 16]> = match self.clauses.get(*clause_id) {
-                        Some(c) => c.lits.iter().copied().collect(),
-                        None => SmallVec::new(),
-                    };
                     self.drat_add(&new_lits);
                     self.drat_delete(&old_lits);
                 }
 
-                // Then, recompute LBD (after the mutable borrow ends)
-                if let Some(clause) = self.clauses.get(*clause_id) {
-                    let lits_clone = clause.lits.clone();
-                    let new_lbd = self.compute_lbd(&lits_clone);
-
-                    // Now update the LBD
-                    if let Some(clause) = self.clauses.get_mut(*clause_id) {
-                        clause.lbd = new_lbd;
-                    }
-
-                    strengthened_count += 1;
+                // Recompute LBD for the shortened clause.
+                let new_lbd = self.compute_lbd(&new_lits);
+                if let Some(clause) = self.clauses.get_mut(*clause_id) {
+                    clause.lbd = new_lbd;
                 }
+
+                strengthened_count += 1;
             }
         }
     }
@@ -690,5 +733,200 @@ mod ledger_tests {
         // A pop with no matching push is a no-op (guarded by assertion depth).
         s.pop();
         assert_eq!(s.num_clauses(), base, "level-0 clauses are permanent");
+    }
+}
+
+/// "Would this device have caught the four historical recurrences?"
+///
+/// Each of the four clause-id-recycle soundness bugs
+/// (`reduce_clause_database`, `forget_learned_since`, the assertion-scope
+/// `pop` handler, and `check_subsumption` / issue #428) was the same mistake:
+/// free a clause id, let the next `add_*` recycle it, and leave the old
+/// clause's entry in an id-keyed index behind. Each was fixed by hand, at one
+/// call site, four separate times.
+///
+/// Since [`crate::ClauseIndexScrub`] landed, *writing* that mistake at a
+/// solver call site no longer compiles — `ClauseDatabase::remove` will not
+/// accept a call that does not name an index sink (there is a `compile_fail`
+/// doctest on the trait pinning that). The one way left to express it is to
+/// hand the solver's database [`NoClauseIndex`], i.e. to claim in writing that
+/// the solver has no watch lists. These tests do exactly that, on the exact
+/// shapes the four bugs had, and pin that the runtime backstop in `propagate`
+/// catches it at the first use of the corrupted entry — so the escape hatch is
+/// covered too, not just the compiler-enforced path.
+#[cfg(test)]
+mod clause_index_scrub_regressions {
+    use super::*;
+    use crate::clause::NoClauseIndex;
+    use crate::literal::{Lit, Var};
+
+    /// Shape of #428 (`check_subsumption`) and of `reduce_clause_database`:
+    /// a **long** clause's id is freed without scrubbing the watch lists, then
+    /// recycled by the next add. The recycled clause inherits watchers keyed on
+    /// literals it does not contain, and `propagate`'s `!c.deleted` guard waves
+    /// them through because the slot is a live clause again — just a different
+    /// one.
+    #[cfg(debug_assertions)] // the backstop is a `debug_assert!`
+    #[test]
+    #[should_panic(expected = "stale watcher")]
+    fn unscrubbed_long_clause_recycle_is_caught() {
+        let mut s = Solver::new();
+        s.ensure_vars(6);
+        let (a, b, c) = (Var::new(0), Var::new(1), Var::new(2));
+        let (d, e) = (Var::new(3), Var::new(4));
+
+        // (a ∨ b ∨ c): watched on `a` and `b`, i.e. watchers parked in
+        // watches[¬a] and watches[¬b].
+        assert!(s.add_clause([Lit::pos(a), Lit::pos(b), Lit::pos(c)]));
+        let victim = ClauseId::new(0);
+
+        // THE BUG, verbatim: free the id, scrub nothing. This is what
+        // `check_subsumption` did until #428 — and the only way left to say it.
+        s.clauses.remove(victim, &mut NoClauseIndex);
+
+        // The next add pops that id off the free list and overwrites the slot,
+        // clearing `deleted`. Now watches[¬a] points at (d ∨ e).
+        assert!(s.add_clause([Lit::pos(d), Lit::pos(e)]));
+
+        // Falsify `a` and let propagation walk watches[¬a].
+        assert!(s.add_clause([Lit::neg(a)]));
+        let _ = s.solve();
+    }
+
+    /// Shape of the assertion-scope `pop` handler and of
+    /// `forget_learned_since`: a **binary** clause's id is freed without
+    /// scrubbing. Worse than the watcher case — `propagate` reads the binary
+    /// implication graph with no deleted-clause guard whatsoever, so the leaked
+    /// edge fires unconditionally under whatever clause lands on the id.
+    #[cfg(debug_assertions)] // the backstop is a `debug_assert!`
+    #[test]
+    #[should_panic(expected = "stale binary-implication edge")]
+    fn unscrubbed_binary_clause_recycle_is_caught() {
+        let mut s = Solver::new();
+        s.ensure_vars(6);
+        let (x, y) = (Var::new(0), Var::new(1));
+        let (p, q) = (Var::new(2), Var::new(3));
+
+        // (¬x ∨ y): records the implication x ⇒ y in the binary graph.
+        assert!(s.add_clause([Lit::neg(x), Lit::pos(y)]));
+        let victim = ClauseId::new(0);
+
+        // THE BUG: free the id, scrub neither the watch lists nor the graph.
+        s.clauses.remove(victim, &mut NoClauseIndex);
+
+        // Recycle the id with an unrelated clause ...
+        assert!(s.add_clause([Lit::pos(p), Lit::pos(q)]));
+        // ... then make `x` true so the leaked x ⇒ y edge is consulted.
+        assert!(s.add_clause([Lit::pos(x)]));
+        let _ = s.solve();
+    }
+
+    /// The same three scenarios, scrubbed properly through the sanctioned path,
+    /// must be quiet *and* give the right answer. Without this the two
+    /// `should_panic` tests above would also pass if `propagate` panicked
+    /// unconditionally.
+    #[test]
+    fn scrubbed_recycle_is_silent_and_sound() {
+        let mut s = Solver::new();
+        s.ensure_vars(6);
+        let (x, y) = (Var::new(0), Var::new(1));
+        let (p, q) = (Var::new(2), Var::new(3));
+
+        assert!(s.add_clause([Lit::neg(x), Lit::pos(y)]));
+        // The sanctioned path: scrub + free, in one operation.
+        s.scrub_and_remove_clause(ClauseId::new(0));
+
+        assert!(s.add_clause([Lit::pos(p), Lit::pos(q)]));
+        assert!(s.add_clause([Lit::pos(x)]));
+        assert!(s.add_clause([Lit::neg(y)]));
+
+        // (¬x ∨ y) is gone, so x ∧ ¬y ∧ (p ∨ q) is satisfiable. A leaked edge
+        // would have propagated y and fabricated a conflict — spurious UNSAT.
+        assert_eq!(s.solve(), SolverResult::Sat);
+    }
+
+    /// The fifth instance of the class, found by the new backstop rather than
+    /// by a downstream wrong answer: `vivify_clauses` deleted literals from a
+    /// clause **in place**, and when the deleted literal was one of the two
+    /// watched ones the watcher stayed parked under a literal the clause no
+    /// longer contained. `strengthen_clause_in_place` now detaches, mutates and
+    /// re-attaches; this pins the repair directly.
+    #[test]
+    fn in_place_strengthening_repairs_the_watch_index() {
+        let mut s = Solver::new();
+        s.ensure_vars(4);
+        let lits = [
+            Lit::pos(Var::new(0)),
+            Lit::pos(Var::new(1)),
+            Lit::pos(Var::new(2)),
+            Lit::pos(Var::new(3)),
+        ];
+        assert!(s.add_clause(lits));
+        let cid = ClauseId::new(0);
+
+        // Drop lits[0] — a WATCHED literal. The old watcher in watches[¬lits[0]]
+        // must not survive.
+        let (old, new) = s
+            .strengthen_clause_in_place(cid, 0)
+            .expect("three non-false literals remain, so a legal watch pair exists");
+        assert_eq!(old.len(), 4);
+        assert_eq!(new.len(), 3);
+        assert!(!new.contains(&lits[0]));
+
+        for &l in &old {
+            for w in s.watches.get(l.negate()) {
+                if w.clause == cid {
+                    let held = &s.clauses.get(cid).expect("clause is live").lits;
+                    assert!(
+                        held.contains(&l.negate().negate()),
+                        "watcher for {cid:?} parked in watches[{:?}], but the clause no longer \
+                         contains {:?} — the in-place edit left the index dangling",
+                        l.negate(),
+                        l
+                    );
+                }
+            }
+        }
+
+        // And the surviving watchers must be exactly the new lits[0]/lits[1].
+        for (i, &l) in new.iter().enumerate() {
+            let watched = s
+                .watches
+                .get(l.negate())
+                .iter()
+                .any(|w| w.clause == cid);
+            assert_eq!(
+                watched,
+                i < 2,
+                "literal {l:?} at index {i} should {}be watched",
+                if i < 2 { "" } else { "not " }
+            );
+        }
+    }
+
+    /// Dropping a literal at index ≥ 2 leaves the watched pair untouched, so it
+    /// must take the cheap path and change nothing about the index. (This is
+    /// the case the original in-place removal always got right; the repair must
+    /// not regress it.)
+    #[test]
+    fn in_place_strengthening_of_an_unwatched_literal_is_cheap_and_correct() {
+        let mut s = Solver::new();
+        s.ensure_vars(4);
+        let lits = [
+            Lit::pos(Var::new(0)),
+            Lit::pos(Var::new(1)),
+            Lit::pos(Var::new(2)),
+            Lit::pos(Var::new(3)),
+        ];
+        assert!(s.add_clause(lits));
+        let cid = ClauseId::new(0);
+
+        let (_, new) = s
+            .strengthen_clause_in_place(cid, 3)
+            .expect("dropping an unwatched literal always succeeds");
+        assert_eq!(&new[..2], &lits[..2], "the watched pair is unchanged");
+        for &l in &lits[..2] {
+            assert!(s.watches.get(l.negate()).iter().any(|w| w.clause == cid));
+        }
     }
 }

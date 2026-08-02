@@ -11,7 +11,7 @@
 //! This is more powerful than traditional clause minimization as it uses
 //! the full constraint graph, not just the implication graph.
 
-use crate::clause::{ClauseDatabase, ClauseId};
+use crate::clause::{ClauseDatabase, ClauseId, ClauseIndexScrub};
 use crate::literal::{LBool, Lit};
 #[allow(unused_imports)]
 use crate::prelude::*;
@@ -193,8 +193,25 @@ impl AsymmetricBranching {
 
     /// Strengthen all clauses in the database
     ///
-    /// Returns the number of clauses that were strengthened
-    pub fn strengthen_all(&mut self, clauses: &mut ClauseDatabase) -> usize {
+    /// Returns the number of clauses that were strengthened.
+    ///
+    /// `indexes` must be the [`ClauseIndexScrub`] sink for every id-keyed
+    /// structure that points into `clauses`. This pass is the worst offender of
+    /// the family: it does `remove(id)` immediately followed by `add_learned`,
+    /// so the freed id is recycled by the **very next statement** — an
+    /// un-scrubbed watcher does not merely *risk* aliasing an unrelated clause,
+    /// it deterministically does (see [`ClauseIndexScrub`], issue #428).
+    ///
+    /// **Second, independent hazard, not fixed by `indexes`:** the replacement
+    /// clause is installed with `add_learned` and therefore has **no watchers
+    /// at all**, so it would never be propagated. Any integrator wiring this
+    /// pass into [`crate::Solver`] must install watches for the new clause as
+    /// well as hand over a real sink here. It is not currently wired in.
+    pub fn strengthen_all(
+        &mut self,
+        clauses: &mut ClauseDatabase,
+        indexes: &mut impl ClauseIndexScrub,
+    ) -> usize {
         let mut strengthened_count = 0;
 
         // Collect clause IDs to avoid borrow checker issues
@@ -208,7 +225,7 @@ impl AsymmetricBranching {
                     && new_lits.len() < lits.len()
                 {
                     // Remove old clause and add strengthened version
-                    clauses.remove(id);
+                    clauses.remove(id, indexes);
                     clauses.add_learned(new_lits);
                     strengthened_count += 1;
                 }
@@ -233,6 +250,7 @@ impl AsymmetricBranching {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clause::NoClauseIndex;
     use crate::clause::Clause;
     use crate::literal::Var;
 
@@ -318,7 +336,7 @@ mod tests {
             false,
         ));
 
-        let _count = ab.strengthen_all(&mut db);
+        let _count = ab.strengthen_all(&mut db, &mut NoClauseIndex);
 
         // strengthen_all completed successfully (count is usize, always >= 0)
     }
