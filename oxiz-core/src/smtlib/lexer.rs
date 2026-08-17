@@ -140,7 +140,35 @@ impl<'a> Lexer<'a> {
             }
             _ => {
                 let sym = self.read_symbol_chars();
-                TokenKind::Symbol(sym)
+                if sym.is_empty() {
+                    // `first` can neither START nor CONTINUE an SMT-LIB simple
+                    // symbol, so `read_symbol_chars` consumed nothing. Handing
+                    // back the empty `Symbol("")` it produced would leave
+                    // `self.pos` exactly where it was, and every later
+                    // `next_token` would mint the same zero-width token at the
+                    // same offset for ever — any caller scanning to `Eof` (the
+                    // parser's balanced-paren error recovery, a token counter, a
+                    // highlighter) never terminates. `,` is enough to trigger
+                    // it: the symbol set is alphanumerics plus
+                    // `+ - / * = % ? ! . $ _ ~ & ^ < > @`.
+                    //
+                    // Consume exactly the one offending character and hand it
+                    // back as a one-character symbol, the way the bare `#` case
+                    // above does. The parser then rejects it by name — the same
+                    // place z3 reports it (`unknown constant ,`) — so the
+                    // information is not dropped, only relocated to the layer
+                    // that has a name table.
+                    //
+                    // Ported from upstream OxiZ 0.3.3; upstream also records a
+                    // `LexError`, which this fork has no infrastructure for
+                    // (there is no error vector on `Lexer` at all). That half is
+                    // a separate item — the progress guarantee is what closes
+                    // the hang.
+                    self.pos += first.len_utf8();
+                    TokenKind::Symbol(self.input[start..self.pos].to_string())
+                } else {
+                    TokenKind::Symbol(sym)
+                }
             }
         };
 
