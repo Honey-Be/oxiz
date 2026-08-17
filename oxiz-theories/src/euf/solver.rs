@@ -15,14 +15,6 @@ use smallvec::SmallVec;
 /// congruence closure without consuming significant memory.
 const EUF_EXPL_CACHE_CAPACITY: usize = 1024;
 
-/// Signature update entry used in batched congruence-closure updates.
-#[derive(Debug)]
-struct SigUpdateEntry {
-    func: u32,
-    args: SmallVec<[u32; 4]>,
-    node: u32,
-    fp: ENodeFingerprint,
-}
 
 /// Records an insertion into sig_table or fingerprint_table for undo on pop().
 #[derive(Debug, Clone)]
@@ -529,6 +521,30 @@ impl EufSolver {
         idx
     }
 
+    /// Publish a node's signature into `sig_table` + `fingerprint_table`,
+    /// trailing both when inside a push scope (#431).
+    #[inline]
+    fn publish_signature(
+        &mut self,
+        func: u32,
+        args: SmallVec<[u32; 4]>,
+        node: u32,
+        fp: ENodeFingerprint,
+        in_scope: bool,
+    ) {
+        if in_scope {
+            self.sig_trail.push(SigTrailEntry::InsertedSig {
+                key: (func, args.clone()),
+            });
+        }
+        self.sig_table.insert((func, args), node);
+        self.fingerprint_table.entry(fp).or_default().push(node);
+        if in_scope {
+            self.sig_trail
+                .push(SigTrailEntry::InsertedFingerprint { fp, node_idx: node });
+        }
+    }
+
     /// Append a proof-forest edge to `node`, recording it in `proof_trail` when
     /// inside a push scope so `pop()` can undo it.  All proof-edge insertions go
     /// through here to keep the undo trail complete.
@@ -598,7 +614,15 @@ impl EufSolver {
             // --- Optimization 2: Batch signature updates ---
             // Collect all (new_signature, node_id) pairs first, then apply
             // to the sig_table in a single batch to avoid repeated hash lookups.
-            let mut sig_updates: SmallVec<[SigUpdateEntry; 16]> = SmallVec::new();
+            // #431 — signatures are published EAGERLY, inside the scan below.
+            // Batching them until after the scan made congruence between two
+            // parents in the SAME use-list undetectable: the first parent's new
+            // signature was not yet in `sig_table`, so the second parent's
+            // lookup missed and both were batched. The fingerprint pre-filter
+            // compounded it — the first parent's fingerprint was not published
+            // either, so the second took the fast exit and never consulted
+            // `sig_table` at all.
+            let in_scope = !self.sig_trail_limits.is_empty();
             // Collect congruence merges to enqueue
             propagation_buf.clear();
 
@@ -646,12 +670,8 @@ impl EufSolver {
                 // at the top of canonicalize_args_with_props_into, so handing over a
                 // freshly-empty buffer to the next iteration is fine).
                 if !self.fingerprint_table.contains_key(&new_fp) {
-                    sig_updates.push(SigUpdateEntry {
-                        func,
-                        args: mem::take(&mut canon_buf),
-                        node: user,
-                        fp: new_fp,
-                    });
+                    let args = mem::take(&mut canon_buf);
+                    self.publish_signature(func, args, user, new_fp, in_scope);
                     self.nodes[user as usize].fingerprint = new_fp;
                     continue;
                 }
@@ -689,45 +709,13 @@ impl EufSolver {
                         propagation_buf.push((user, existing, TermId::new(0)));
                     }
                 } else {
-                    // No congruence match; batch the signature update for later.
-                    // The already-owned key buffer is moved into the entry (no clone);
-                    // canon_buf stays freshly-empty for the next iteration.
-                    sig_updates.push(SigUpdateEntry {
-                        func,
-                        args: sig.1,
-                        node: user,
-                        fp: new_fp,
-                    });
+                    // No congruence match; publish NOW so a later parent in the
+                    // same use-list can see it.
+                    self.publish_signature(func, sig.1, user, new_fp, in_scope);
                 }
 
                 // Update the node's fingerprint
                 self.nodes[user as usize].fingerprint = new_fp;
-            }
-
-            // Apply batched signature updates. When inside a push scope, record
-            // each insertion into the trail so pop() can undo them without rebuild.
-            // The guard is hoisted above the clone to avoid unnecessary SmallVec
-            // allocations on non-incremental workloads (no active push scope).
-            let in_scope = !self.sig_trail_limits.is_empty();
-            for entry in sig_updates {
-                let SigUpdateEntry {
-                    func,
-                    args,
-                    node,
-                    fp,
-                } = entry;
-                if in_scope {
-                    // Clone before consuming args in the insert call.
-                    self.sig_trail.push(SigTrailEntry::InsertedSig {
-                        key: (func, args.clone()),
-                    });
-                }
-                self.sig_table.insert((func, args), node);
-                self.fingerprint_table.entry(fp).or_default().push(node);
-                if in_scope {
-                    self.sig_trail
-                        .push(SigTrailEntry::InsertedFingerprint { fp, node_idx: node });
-                }
             }
 
             // Enqueue congruence merges
@@ -2267,35 +2255,44 @@ mod tests {
         // Union orientation: equal ranks -> b becomes child of a; rep is a (0).
         assert_eq!(s.uf.find_no_compress(b), a, "b's class rep must be a");
 
-        // Pre-existing batching quirk (must be preserved bit-for-bit): both
-        // users take the fingerprint-miss branch in the same scan, so no
-        // congruence between h(a,b) and h(b,a) fires in this burst.
+        // #431 — THIS ASSERTION USED TO REQUIRE THE OPPOSITE, and in doing so
+        // it froze a false-SAT. `h` is not commutative, but with `a = b` both
+        // applications canonicalize to `h([r,r])`, so they ARE congruent: z3
+        // and cvc5 both answer `unsat` for
+        // `(= a b) AND (not (= (h a b) (h b a)))`. The old pin was generated as
+        // a behaviour-identity snapshot of pre-optimization code, and a
+        // behaviour-identity pin is only as sound as the behaviour it was taken
+        // from.
         assert!(
-            !s.are_equal(hab, hba),
-            "batched updates must not detect the in-burst hab/hba collision"
+            s.are_equal(hab, hba),
+            "#431: the in-burst h(a,b)/h(b,a) congruence must fire"
         );
 
-        // sig_table winner pin: the batch applied (h,[0,0])->hab THEN
-        // (h,[0,0])->hba, so the LAST insert (hba = node 3) owns the slot.
+        // Eager publication means the FIRST node scanned owns the slot: it
+        // publishes, and the second HITS that entry and merges instead of
+        // publishing over it.
         let key: (u32, SmallVec<[u32; 4]>) = (h, SmallVec::from_slice(&[0u32, 0u32]));
         assert_eq!(
             s.sig_table.get(&key).copied(),
-            Some(hba),
-            "last batched insert must win the sig_table slot"
+            Some(hab),
+            "the first publisher owns the sig_table slot"
         );
 
-        // Fingerprint bucket order pin: pushed in scan order [hab, hba].
+        // ...and the fingerprint bucket lists only that node, because the
+        // second one merged instead of publishing.
         let fp = ENodeFingerprint::compute(h, &[0, 0]);
         assert_eq!(
             s.fingerprint_table.get(&fp).map(|v| v.as_slice()),
-            Some(&[hab, hba][..]),
-            "fingerprint bucket must list nodes in scan order"
+            Some(&[hab][..]),
+            "only the publisher is in the fingerprint bucket"
         );
 
         // Publicly observable consequence: a new application with the same
-        // canonical signature resolves to the sig_table winner.
+        // canonical signature resolves to the published node, and the two are
+        // in one class either way.
         let joined = s.intern_app(TermId::new(12), h, [a, b]);
-        assert_eq!(joined, hba, "intern_app must return the sig_table winner");
+        assert_eq!(joined, hab, "intern_app must return the published node");
+        assert!(s.are_equal(joined, hba), "and it is congruent to h(b,a)");
 
         // ---- Scenario B ----
         let mut s = EufSolver::new();
