@@ -1322,6 +1322,32 @@ impl Solver {
                         }
                     }
 
+                    // `OXIZ_MBQI_ROUND_DBG`: one line per completed instantiation
+                    // round — round index, instances accumulated so far, term-bank
+                    // size, and wall ms consumed. This is the measurement the
+                    // work-bounded-emission question needs and the existing
+                    // `OXIZ_MBQI_DBG` cannot answer: that one prints per LEMMA and
+                    // per drop (thousands of lines, no round or time axis), so it
+                    // shows what was emitted but not the RATE, which is the whole
+                    // question — a deadline-bounded loop converts engine speed into
+                    // more instantiation per window rather than into finishing
+                    // earlier.
+                    #[cfg(feature = "std")]
+                    if std::env::var_os("OXIZ_MBQI_ROUND_DBG").is_some() {
+                        let since = mbqi_deadline
+                            .map(|d| {
+                                let now = std::time::Instant::now();
+                                if d > now { d - now } else { std::time::Duration::ZERO }
+                            })
+                            .map_or(0, |left| left.as_millis());
+                        eprintln!(
+                            "[mbqi-round] round={} instances={} terms={} guard_left_ms={}",
+                            mbqi_iteration,
+                            clean_instances.len(),
+                            manager.len(),
+                            since,
+                        );
+                    }
                     mbqi_iteration += 1;
                     if mbqi_iteration >= max_mbqi_iterations {
                         return SatLevel::Unknown;
