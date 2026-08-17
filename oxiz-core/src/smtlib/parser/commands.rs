@@ -30,6 +30,41 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Read a `set-option` VALUE, which the SMT-LIB grammar makes an
+    /// `<attribute_value>`: a symbol, a numeral, a decimal, a hex/binary
+    /// literal, a string literal, or nothing at all.
+    ///
+    /// This used to be `expect_symbol().unwrap_or_default()`, and
+    /// `expect_symbol` accepts ONLY `TokenKind::Symbol` — so every NUMERIC
+    /// option was silently reduced to the empty string. `(set-option :timeout
+    /// 5000)`, the standard spelling z3 accepts, set nothing and reported
+    /// nothing. The failure is invisible by construction: the option handler
+    /// downstream sees a value it cannot interpret and does nothing, which is
+    /// indistinguishable from the option not having been written.
+    ///
+    /// Returns the empty string when the next token is `)` — an option with no
+    /// value, which the grammar allows — WITHOUT consuming it, so the caller's
+    /// `expect_rparen` still lines up. Any other token is consumed and
+    /// rendered, matching the old behaviour's token accounting exactly (the old
+    /// code consumed the token even when it rejected it).
+    pub(super) fn parse_option_value(&mut self) -> String {
+        if matches!(self.lexer.peek().map(|t| t.kind), Some(TokenKind::RParen)) {
+            return String::new();
+        }
+        match self.lexer.next_token().map(|t| t.kind) {
+            Some(
+                TokenKind::Symbol(s)
+                | TokenKind::Numeral(s)
+                | TokenKind::Decimal(s)
+                | TokenKind::Hexadecimal(s)
+                | TokenKind::Binary(s)
+                | TokenKind::StringLit(s),
+            ) => s,
+            Some(TokenKind::Keyword(s)) => format!(":{s}"),
+            _ => String::new(),
+        }
+    }
+
     /// Expect a symbol token and return its string value
     pub(super) fn expect_symbol(&mut self) -> Result<String> {
         let token = self
@@ -145,7 +180,7 @@ impl<'a> Parser<'a> {
             "set-option" => {
                 let opt = self.expect_keyword()?;
                 // option value is optional / may be missing
-                let val = self.expect_symbol().unwrap_or_default();
+                let val = self.parse_option_value();
                 self.expect_rparen()?;
                 Command::SetOption(opt, val)
             }
@@ -376,10 +411,14 @@ impl<'a> Parser<'a> {
                     .filter_map(|(pname, _)| self.bindings.get(pname).map(|&t| (pname.clone(), t)))
                     .collect();
 
-                // Create placeholder vars for parameters
+                // Create placeholder vars for parameters, KEEPING their terms:
+                // re-deriving them at each call site from the name alone is the
+                // defect `FunctionMacro` exists to remove.
+                let mut param_terms = Vec::with_capacity(params.len());
                 for (pname, psort) in &params {
                     let sort_id = self.parse_sort_name(psort)?;
                     let param_term = self.manager.mk_var(pname, sort_id);
+                    param_terms.push(param_term);
                     self.bindings.insert(pname.clone(), param_term);
                 }
 
@@ -396,8 +435,14 @@ impl<'a> Parser<'a> {
                 }
 
                 // Register function definition
-                self.function_defs
-                    .insert(name.clone(), (params.clone(), body));
+                self.function_defs.insert(
+                    name.clone(),
+                    super::FunctionMacro {
+                        params: params.clone(),
+                        param_terms,
+                        body,
+                    },
+                );
 
                 // For nullary define-fun, inline it directly as a binding
                 if params.is_empty() {

@@ -970,37 +970,37 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 // Check for defined function
-                if let Some((params, body)) = self.function_defs.get(&op).cloned() {
+                if let Some(mac) = self.function_defs.get(&op).cloned() {
                     // Parse arguments
                     let args = self.parse_term_list()?;
 
-                    if args.len() != params.len() {
+                    if args.len() != mac.params.len() {
                         return Err(OxizError::ParseError {
                             position: 0,
                             message: format!(
                                 "wrong number of arguments for {}: expected {}, got {}",
                                 op,
-                                params.len(),
+                                mac.params.len(),
                                 args.len()
                             ),
                         });
                     }
 
-                    // Substitute arguments into the body
+                    // Substitute the formals' RECORDED terms — the ones the body
+                    // was actually built with. The old code re-derived them from
+                    // each formal's name (declared-globals lookup, `Bool`
+                    // fallback), and since terms are hash-consed on
+                    // `(name, sort)` a formal whose name did not collide with a
+                    // same-sorted global got a different `TermId`, so the
+                    // substitution silently missed every occurrence and the
+                    // formal stayed FREE in the expansion. See `FunctionMacro`.
                     let mut substitution = FxHashMap::default();
-                    for ((param_name, _param_sort), &arg) in params.iter().zip(args.iter()) {
-                        // Find the parameter variable in the body
-                        let param_sort = self
-                            .constants
-                            .get(param_name)
-                            .copied()
-                            .unwrap_or(self.manager.sorts.bool_sort);
-                        let param_var = self.manager.mk_var(param_name, param_sort);
+                    for (&param_var, &arg) in mac.param_terms.iter().zip(args.iter()) {
                         substitution.insert(param_var, arg);
                     }
 
                     // Apply substitution to get the result
-                    self.manager.substitute(body, &substitution)
+                    self.manager.substitute(mac.body, &substitution)
                 } else {
                     let args = self.parse_term_list()?;
                     // An APPLIED datatype constructor must build a DtConstructor

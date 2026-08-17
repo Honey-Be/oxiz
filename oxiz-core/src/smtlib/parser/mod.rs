@@ -142,6 +142,36 @@ pub enum Command {
 }
 
 /// Parser state
+/// A `define-fun` macro, as recorded at DEFINITION time.
+///
+/// `param_terms` is the whole point. Expansion used to re-derive each formal's
+/// term from its bare NAME — looking the name up in declared globals for a sort
+/// and falling back to `Bool` — but terms are hash-consed on `(name, sort)`, so
+/// any formal whose name did not happen to collide with a same-sorted global
+/// produced a DIFFERENT `TermId` than the one the body was built with. The
+/// substitution then matched nothing and the formal stayed free in the
+/// "expanded" body: every call to the macro collapsed to the same open term.
+///
+/// That is a silent constraint corruption in both directions. It weakens
+/// (`(not (= (double z) 10))` with `z = 5` became satisfiable) and it
+/// STRENGTHENS: two calls that should be independent become one shared
+/// constraint, so `(isfive 5)` and `(not (isfive 6))` — both trivially true —
+/// collapse to `(= n 5)` and `(not (= n 5))` and the script reports `unsat`.
+/// A false `unsat` is the fatal direction for a negate-and-refute caller.
+///
+/// Recording the terms removes the re-derivation entirely; there is no name
+/// lookup left to get wrong.
+#[derive(Debug, Clone)]
+pub struct FunctionMacro {
+    /// `(name, sort-string)` per formal — kept for `Command::DefineFun`'s
+    /// public shape and for the arity error message.
+    pub params: Vec<(String, String)>,
+    /// The formals' terms EXACTLY as bound while the body was parsed.
+    pub param_terms: Vec<TermId>,
+    /// The macro body.
+    pub body: TermId,
+}
+
 pub struct Parser<'a> {
     pub(super) lexer: Lexer<'a>,
     pub(super) manager: &'a mut TermManager,
@@ -155,7 +185,7 @@ pub struct Parser<'a> {
     /// Sort aliases from define-sort
     pub(super) sort_aliases: FxHashMap<String, (Vec<String>, String)>,
     /// Function definitions from define-fun
-    pub(super) function_defs: FxHashMap<String, (Vec<(String, String)>, TermId)>,
+    pub(super) function_defs: FxHashMap<String, FunctionMacro>,
     /// Term annotations (term -> attributes)
     pub(super) annotations: FxHashMap<TermId, Vec<Attribute>>,
     /// Error recovery mode enabled
@@ -350,8 +380,8 @@ pub struct ParserEnv {
     pub functions: FxHashMap<String, (Vec<SortId>, SortId)>,
     /// Sort aliases (`define-sort`): name → (params, body).
     pub sort_aliases: FxHashMap<String, (Vec<String>, String)>,
-    /// Defined functions (`define-fun`): name → (params, body term).
-    pub function_defs: FxHashMap<String, (Vec<(String, String)>, TermId)>,
+    /// Defined functions (`define-fun`): name → its [`FunctionMacro`].
+    pub function_defs: FxHashMap<String, FunctionMacro>,
     /// Datatype constructor names → their datatype sort.
     pub dt_constructors: FxHashMap<String, SortId>,
     /// Datatype selector names → (owning constructor name, field index, result sort).
