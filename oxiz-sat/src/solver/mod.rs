@@ -450,6 +450,22 @@ pub struct Solver {
     /// lock-step with `assertion_levels`/`assertion_trail_sizes`. The base entry
     /// ([`Checkpoint::ORIGIN`]) is never popped (level-0 clauses are permanent).
     pub(super) assertion_clause_marks: Vec<Checkpoint>,
+    /// [`Self::trivially_unsat`] as it stood at each `push`, kept in lock-step
+    /// with `assertion_levels`. `pop` RESTORES this instead of clearing the
+    /// flag, because a level-0 contradiction established BEFORE the push is
+    /// permanent and the pop has removed nothing that could justify forgetting
+    /// it. The flag is the ONLY record of some contradictions: `add_clause`
+    /// sets it and returns WITHOUT storing a clause when a unit conflicts with
+    /// an existing level-0 assignment (the `level == 0` arm), so clearing it
+    /// leaves nothing for propagation to re-derive.
+    ///
+    /// Witness (this is not theoretical): `(assert p) (assert (not p))
+    /// (push 1) (pop 1) (check-sat)` answered `sat` — z3 and cvc5 answer
+    /// `unsat` — while `(get-assertions)` still listed both. A BARE matched
+    /// push/pop, with nothing inside it, discarded a propositional
+    /// contradiction. Moving the push/pop BEFORE either assert, or between
+    /// them, or dropping the `pop`, all answer `unsat` correctly.
+    pub(super) assertion_trivially_unsat: Vec<bool>,
     /// Model (if sat)
     pub(super) model: Vec<LBool>,
     /// Whether formula is trivially unsatisfiable
@@ -536,6 +552,7 @@ impl Solver {
             assertion_trail_sizes: vec![0],
             clause_ledger: VecScopedStack::new(),
             assertion_clause_marks: vec![Checkpoint::ORIGIN],
+            assertion_trivially_unsat: vec![false],
             model: Vec::new(),
             trivially_unsat: false,
             phase: Vec::new(),
@@ -1834,6 +1851,9 @@ impl Solver {
         self.assertion_trail_sizes.push(self.trail.size());
         // Mark the ledger height so this scope's clauses can be drained on pop.
         self.assertion_clause_marks.push(self.clause_ledger.checkpoint());
+        // Remember whether the formula was ALREADY unsatisfiable entering this
+        // scope, so `pop` can restore rather than clear (see the field docs).
+        self.assertion_trivially_unsat.push(self.trivially_unsat);
     }
 
     /// Pop to previous assertion level
@@ -1897,8 +1917,13 @@ impl Solver {
             // Ensure we're at decision level 0 with proper heap re-insertion
             self.backtrack_with_phase_saving(0);
 
-            // Clear the trivially_unsat flag as we've removed problematic clauses
-            self.trivially_unsat = false;
+            // RESTORE the flag to its value at the matching `push` — do not
+            // clear it. Clearing was correct only for a contradiction this scope
+            // introduced (whose clauses the drain above removed); a level-0
+            // contradiction that predates the push is permanent, and for the
+            // `add_clause` `level == 0` arm the flag is its ONLY record, so
+            // clearing it made a bare `(push)(pop)` answer `sat` on `p ∧ ¬p`.
+            self.trivially_unsat = self.assertion_trivially_unsat.pop().unwrap_or(false);
         }
     }
 
@@ -1930,6 +1955,8 @@ impl Solver {
         self.clause_ledger.clear();
         self.assertion_clause_marks.clear();
         self.assertion_clause_marks.push(Checkpoint::ORIGIN);
+        self.assertion_trivially_unsat.clear();
+        self.assertion_trivially_unsat.push(false);
         self.model.clear();
         self.num_vars = 0;
         self.restart_threshold = self.config.restart_interval;
