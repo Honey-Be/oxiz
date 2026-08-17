@@ -490,6 +490,39 @@ pub struct SolverConfig {
     /// the `OXIZ_MBQI_GUARD_MS` convention) or
     /// `(set-option :oxiz.mbqi-additive-patterns true)`.
     pub mbqi_additive_patterns: bool,
+    /// **Work-bounded round emission.** Maximum number of ground instances the
+    /// MBQI round loop may accumulate for one `check-sat` before it stops
+    /// emitting. `0` disables the bound (the historical deadline-only loop).
+    ///
+    /// ## Why a WORK bound and not only a wall bound
+    ///
+    /// The round loop is otherwise bounded only by `OXIZ_MBQI_GUARD_MS` (plus a
+    /// 100-round cap that never binds — measured 2 to 7 rounds per episode), so
+    /// the verdict is a function of MACHINE SPEED: a faster engine emits more
+    /// instances inside the same window, and a contended machine emits fewer.
+    /// Both directions are measured, not hypothetical:
+    ///
+    /// * making backtracking cheaper ([`crate`]-external
+    ///   `BacktrackMode::Trail`, push+pop containment 46% → ~0%) DROWNED five
+    ///   fuel-recursion corpus rows, because the freed throughput was
+    ///   reinvested into more instantiation per window rather than into
+    ///   finishing earlier — which is why that mode is still opt-in;
+    /// * the corpus sweep protocol requires an IDLE machine for the same reason
+    ///   in reverse; contention silently moves verdicts.
+    ///
+    /// A work bound removes both. It also makes budget exhaustion AFFORDABLE to
+    /// recover from: exhaustion arrives with wall clock left over, so the
+    /// accumulated instances (sound ground consequences) can be handed to the
+    /// same single-shot confirm the `SaturatedUnverified` path uses, trusting
+    /// only its `unsat` half. Deadline expiry cannot do that — there is by
+    /// definition no time left.
+    ///
+    /// Calibrated from a 209-row instance census: verified rows peak far below
+    /// the runaways (hundreds to ~1.1k versus 2.0k, 4.1k, 6.9k and three rows
+    /// above 72k). Env `OXIZ_MBQI_INSTANCE_BUDGET` overrides at construction
+    /// (the `OXIZ_MBQI_GUARD_MS` convention); `0` restores the historical loop
+    /// exactly.
+    pub mbqi_instance_budget: usize,
 }
 
 impl Default for SolverConfig {
@@ -527,6 +560,7 @@ impl SolverConfig {
             ccfv_ematch: true,
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
+            mbqi_instance_budget: 0,
         }
     }
 
@@ -558,6 +592,7 @@ impl SolverConfig {
             ccfv_ematch: true,
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
+            mbqi_instance_budget: 0,
         }
     }
 
@@ -589,6 +624,7 @@ impl SolverConfig {
             ccfv_ematch: true,
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
+            mbqi_instance_budget: 0,
         }
     }
 
@@ -620,6 +656,7 @@ impl SolverConfig {
             ccfv_ematch: true,
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
+            mbqi_instance_budget: 0,
         }
     }
 

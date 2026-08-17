@@ -795,6 +795,29 @@ impl Solver {
         let max_mbqi_iterations = 100;
         let mut mbqi_iteration = 0;
 
+        // WORK bound on round emission, complementing the wall bound below.
+        //
+        // The 100-iteration cap above never binds — measured 2 to 7 rounds per
+        // episode on the corpus — so without this the only bound is the
+        // wall-clock deadline, which makes the verdict a function of machine
+        // speed in BOTH directions: a faster engine emits more instances inside
+        // the window (making backtracking cheaper drowned five fuel-recursion
+        // rows by reinvesting the freed time into instantiation), and a
+        // contended machine emits fewer (why the sweep protocol demands an idle
+        // machine). Counting the WORK makes the verdict independent of both.
+        //
+        // `0` (the default) is the historical deadline-only loop, byte for
+        // byte. See `SolverConfig::mbqi_instance_budget` for the calibration.
+        let mbqi_instance_budget: usize = {
+            #[cfg(feature = "std")]
+            let env = std::env::var("OXIZ_MBQI_INSTANCE_BUDGET")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok());
+            #[cfg(not(feature = "std"))]
+            let env: Option<usize> = None;
+            env.unwrap_or(self.config.mbqi_instance_budget)
+        };
+
         // Wall-clock backstop for the MBQI loop.  Quantifier instantiation over
         // an infinite domain is only semi-decidable: a `forall`-with-`:pattern`
         // axiom whose model is genuinely SAT (e.g. `y>0 ∧ ¬(Add(x,y)>0)` with
@@ -869,6 +892,45 @@ impl Solver {
             #[cfg(feature = "std")]
             if self.has_quantifiers && mbqi_deadline.is_some_and(|d| std::time::Instant::now() >= d)
             {
+                return SatLevel::Unknown;
+            }
+            // Work bound. Unlike deadline expiry, exhaustion here arrives with
+            // wall clock LEFT OVER, so the accumulated instances — sound ground
+            // consequences of the assertions — can be handed to the same
+            // single-shot confirm the `SaturatedUnverified` arm uses, trusting
+            // ONLY its `unsat` half. That makes the bound a strictly better
+            // stopping point than the deadline it replaces: the deadline path
+            // discards the whole lemma set unread because there is no time left
+            // to read it.
+            //
+            // Checked at the loop TOP, before this round's ground solve, so the
+            // question "do the accumulated instances entail unsat" is answered
+            // by the FRESH single-shot solver rather than by the incremental one
+            // whose across-round `unsat` is exactly what
+            // `verify_clean_unsat` exists to distrust.
+            if self.has_quantifiers
+                && mbqi_instance_budget > 0
+                && clean_instances.len() >= mbqi_instance_budget
+            {
+                #[cfg(feature = "std")]
+                if std::env::var_os("OXIZ_MBQI_ROUND_DBG").is_some() {
+                    eprintln!(
+                        "[mbqi-round] BUDGET EXHAUSTED at round={} instances={} (budget {})",
+                        mbqi_iteration,
+                        clean_instances.len(),
+                        mbqi_instance_budget,
+                    );
+                }
+                if self.config.clean_mbqi {
+                    let reverify = SatLevel::from_definite(
+                        self.verify_clean_saturated(&clean_instances, manager),
+                    );
+                    if reverify == SatLevel::DefiniteUnsat {
+                        // Exactly `SaturatedUnverified`'s unsat path:
+                        // PossiblySat ⊓ DefiniteUnsat = DefiniteUnsat.
+                        return SatLevel::PossiblySat.meet(reverify);
+                    }
+                }
                 return SatLevel::Unknown;
             }
             // Move the persistent theory state + the real term manager into an

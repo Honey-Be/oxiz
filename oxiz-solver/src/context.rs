@@ -984,6 +984,20 @@ impl Context {
                 config.mbqi_additive_patterns = value == "true";
                 self.solver.set_config(config);
             }
+            // Work-bounded round emission: the maximum number of ground
+            // instances the MBQI loop may accumulate for one `check-sat`. `0`
+            // (the default) leaves the historical deadline-only loop. See
+            // `SolverConfig::mbqi_instance_budget` for why a work bound and not
+            // only a wall bound. A value that does not parse is IGNORED rather
+            // than treated as `0`: silently disabling a bound the caller asked
+            // for is the wrong direction to fail in.
+            "oxiz.mbqi-instance-budget" => {
+                if let Ok(n) = value.parse::<usize>() {
+                    let mut config = self.solver.config().clone();
+                    config.mbqi_instance_budget = n;
+                    self.solver.set_config(config);
+                }
+            }
             // Output mode for `(check-sat)`: `z3` (default, the collapsed 3-valued
             // `sat`/`unsat`/`unknown`) or `full` (the un-collapsed 5-level verdict
             // `definite-sat`/`possibly-sat`/`unknown`/`possibly-unsat`/
