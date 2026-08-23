@@ -47,6 +47,15 @@ pub struct ArithSolver {
     reason_counter: u32,
     /// Reason to term mapping
     reasons: Vec<TermId>,
+    /// #433: unit-atom bounds recorded at ASSERT time, append-only and
+    /// truncate-rolled on `pop` (a `ContextState` field carries the length —
+    /// the pop-scrub rule for assert-time-populated state). One entry per
+    /// single-term, unit-coefficient `assert_le`/`assert_ge`/`assert_eq`:
+    /// `(term, is_lower, integer bound value, asserting atom)`. This exists
+    /// because the simplex holds every constraint through a SLACK variable —
+    /// `1 <= x` bounds the slack, not `x` — so "the asserted bounds of x" is
+    /// not a question its bound store can answer.
+    unit_bounds: Vec<(TermId, bool, i128, TermId)>,
     /// Is this LIA (integers) or LRA (reals)?
     ///
     /// #427 — this is now only the FALLBACK for a term whose sort was never
@@ -115,6 +124,8 @@ enum IntFeasibility {
 struct ContextState {
     num_vars: usize,
     num_reasons: usize,
+    /// #433: `unit_bounds` length at push time.
+    num_unit_bounds: usize,
     num_shared_equalities: usize,
 }
 
@@ -147,6 +158,7 @@ impl ArithSolver {
             simplex: Simplex::new(),
             interner: FlatRadixBimap::new(),
             reason_counter: 0,
+            unit_bounds: Vec::new(),
             reasons: Vec::new(),
             is_integer,
             declared_sorts: FxHashMap::default(),
@@ -354,7 +366,52 @@ impl ArithSolver {
     }
 
     /// Assert: lhs <= rhs
+    /// #433: record a single-term atom bound (`c*t <= rhs` / `c*t >= rhs`,
+    /// any nonzero rational `c`) for an INTEGER-sorted term, normalised to a
+    /// bound on `t` itself and tightened to its integer endpoint
+    /// (`2t <= 25` records `t <= 12`; `2t >= 5` records `t >= 3`). Sound for
+    /// integer terms only, which is why the sort gate is here — a negative
+    /// coefficient flips the direction (`-t <= r` is `t >= -r`). The first
+    /// differential ran with a `|c| = 1` gate and found 32 of its 120 seeds
+    /// still open purely on `(* 2 x)`-style atoms; general division closed
+    /// every one. Multi-term atoms stay out of scope by design (see
+    /// `unit_bounds`).
+    fn record_unit_bound(
+        &mut self,
+        lhs: &[(TermId, ArithRat)],
+        rhs: ArithRat,
+        reason: TermId,
+        is_le: bool,
+        strict: bool,
+    ) {
+        let [(term, coef)] = lhs else { return };
+        if coef.is_zero() {
+            return;
+        }
+        if !self.term_is_integer(*term) {
+            return;
+        }
+        let bound = rhs / *coef;
+        // A negative coefficient flips the direction; `is_le` below is the
+        // post-normalisation side, so the strict adjustment lands on the
+        // correct side automatically.
+        let is_le = is_le == (*coef > ArithRat::from_integer(0));
+        let val = if is_le {
+            if strict && bound.is_integer() {
+                bound.to_integer() - 1 // t < 5  ⇒  t <= 4
+            } else {
+                bound.floor().to_integer() // t <= 25/2, t < 5/2  ⇒  t <= 12, t <= 2
+            }
+        } else if strict && bound.is_integer() {
+            bound.to_integer() + 1 // t > 5  ⇒  t >= 6
+        } else {
+            bound.ceil().to_integer() // t >= 5/2, t > 5/2  ⇒  t >= 3
+        };
+        self.unit_bounds.push((*term, !is_le, val, reason));
+    }
+
     pub fn assert_le(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
+        self.record_unit_bound(lhs, rhs, reason, true, false);
         let mut expr = LinExpr::new();
 
         for (term, coef) in lhs {
@@ -373,6 +430,7 @@ impl ArithSolver {
 
     /// Assert: lhs >= rhs
     pub fn assert_ge(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
+        self.record_unit_bound(lhs, rhs, reason, false, false);
         let mut expr = LinExpr::new();
 
         for (term, coef) in lhs {
@@ -396,6 +454,8 @@ impl ArithSolver {
     ///
     /// Example: 2x + 2y = 7 is infeasible because gcd(2,2) = 2 doesn't divide 7.
     pub fn assert_eq(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
+        self.record_unit_bound(lhs, rhs, reason, true, false);
+        self.record_unit_bound(lhs, rhs, reason, false, false);
         let mut expr = LinExpr::new();
 
         for (term, coef) in lhs {
@@ -481,6 +541,7 @@ impl ArithSolver {
     /// For LRA, uses infinitesimals: lhs <= rhs - δ
     /// For LIA, transforms to: lhs <= rhs - 1 (since no integer exists between k and k+1)
     pub fn assert_lt(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
+        self.record_unit_bound(lhs, rhs, reason, true, true);
         // For integer arithmetic, x < k is equivalent to x <= ceil(k) - 1
         // because there's no integer strictly between ceil(k)-1 and ceil(k).
         //
@@ -525,6 +586,7 @@ impl ArithSolver {
     /// For LRA, uses infinitesimals: lhs >= rhs + δ
     /// For LIA, transforms to: lhs >= rhs + 1 (since no integer exists between k and k+1)
     pub fn assert_gt(&mut self, lhs: &[(TermId, ArithRat)], rhs: ArithRat, reason: TermId) {
+        self.record_unit_bound(lhs, rhs, reason, false, true);
         // For integer arithmetic, x > k is equivalent to x >= floor(k) + 1
         // because there's no integer strictly between floor(k) and floor(k)+1.
         // #427 — see `assert_lt` for why this is gated on `expr_is_integral` and
@@ -808,6 +870,38 @@ impl ArithSolver {
     /// never a real Bool atom) is one side's pinning bound. The scratch frame is
     /// pushed and popped, so `reasons`/`reason_counter`/simplex are fully
     /// restored (the probe leaves NO residue — verified against `push`/`pop`).
+    /// #433: one pass over the unit-bound journal, folded to the STRONGEST
+    /// asserted integer bounds per term: `term -> ((lo, lo_atom), (hi,
+    /// hi_atom))`, keeping the maximal lower and minimal upper (ties keep the
+    /// first, i.e. the earliest-asserted atom). Entries are on the current
+    /// trail by construction (`unit_bounds` is truncate-rolled on `pop`).
+    /// A term with only one side bounded appears with the other side `None`.
+    #[must_use]
+    pub fn asserted_unit_int_bounds(
+        &self,
+    ) -> FxHashMap<TermId, (Option<(i128, TermId)>, Option<(i128, TermId)>)> {
+        let mut out: FxHashMap<TermId, (Option<(i128, TermId)>, Option<(i128, TermId)>)> =
+            FxHashMap::default();
+        for &(term, is_lower, val, atom) in &self.unit_bounds {
+            let entry = out.entry(term).or_default();
+            let side = if is_lower { &mut entry.0 } else { &mut entry.1 };
+            let stronger = match side {
+                None => true,
+                Some((cur, _)) => {
+                    if is_lower {
+                        val > *cur
+                    } else {
+                        val < *cur
+                    }
+                }
+            };
+            if stronger {
+                *side = Some((val, atom));
+            }
+        }
+        out
+    }
+
     #[must_use]
     pub fn fixed_value_with_reasons(&mut self, term: TermId) -> Option<(ArithRat, Vec<TermId>)> {
         let v = self.value(term)?;
@@ -1006,6 +1100,7 @@ impl Theory for ArithSolver {
         self.context_stack.push(ContextState {
             num_vars: self.interner.len(),
             num_reasons: self.reasons.len(),
+            num_unit_bounds: self.unit_bounds.len(),
             num_shared_equalities: self.shared_equalities.len(),
         });
         self.simplex.push();
@@ -1026,6 +1121,7 @@ impl Theory for ArithSolver {
             self.interner.truncate(state.num_vars);
             self.reasons.truncate(state.num_reasons);
             self.reason_counter = state.num_reasons as u32;
+            self.unit_bounds.truncate(state.num_unit_bounds);
             self.shared_equalities.truncate(state.num_shared_equalities);
             self.simplex.pop();
         }
@@ -1036,6 +1132,7 @@ impl Theory for ArithSolver {
         self.interner.clear();
         self.reason_counter = 0;
         self.reasons.clear();
+        self.unit_bounds.clear();
         self.context_stack.clear();
         self.shared_equalities.clear();
         // #427 — the declared sorts are keyed by `TermId`; a reset discards the

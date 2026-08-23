@@ -882,6 +882,16 @@ impl Solver {
         // sound. See `verify_clean_unsat`.
         let mut clean_instances: Vec<TermId> = Vec::new();
 
+        // #433 int case-split state (see the `SatResult::Sat` arm). `done` is
+        // CALL-LOCAL, deliberately: the split clauses added under a pushed
+        // scope are retracted by the SAT solver's own scoping, so a
+        // longer-lived memo would be the assert-time-populated-cache bug class
+        // (a scrubbed clause with a surviving "already done" mark = the split
+        // silently lost after pop). The round cap bounds re-solves; the span
+        // and per-round caps live in `assert_int_case_splits`.
+        let mut int_split_rounds = 0usize;
+        let mut int_split_done: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+
         // Propagate the wall-clock deadline INTO the ground SAT solver so a single
         // non-terminating ground solve (e.g. a dense-real f-tower instance set)
         // bails to `Unknown` rather than overshooting the cap — the MBQI
@@ -984,6 +994,32 @@ impl Solver {
                     return SatLevel::Unknown;
                 }
                 SatResult::Sat => {
+                    // #433 (non-convex arith⇄EUF): before accepting this model,
+                    // case-split any EUF-shared integer term whose ASSERTED
+                    // bounds pin it to a small span. `1 <= x <= 2` with
+                    // `f(1) = f(2) = a` entails `f(x) = a`, but no SINGLE value
+                    // is entailed, so the fixed-value propagation in
+                    // `model_based_combination` never fires and the conflict
+                    // is invisible — `(not (= (f x) a))` reported `sat`. The
+                    // asserted clause is the LIA tautology
+                    // `bounds ⇒ (x = lo ∨ … ∨ x = hi)` (conditional on the
+                    // bound atoms in their model polarity, so it is valid on
+                    // every branch, not just this one), and the loop re-solves:
+                    // whichever disjunct the SAT core picks makes `x` FIXED,
+                    // which the existing propagation then carries into EUF.
+                    // Runs for the quantified path too — the ground model MBQI
+                    // instantiates against deserves the same completion.
+                    if int_split_rounds < Self::INT_CASE_SPLIT_MAX_ROUNDS
+                        && std::env::var_os("OXIZ_NO_INT_CASE_SPLIT").is_none()
+                        && self.assert_int_case_splits(&mut int_split_done, manager) > 0
+                    {
+                        int_split_rounds += 1;
+                        #[cfg(feature = "std")]
+                        if std::env::var_os("OXIZ_INT_SPLIT_DBG").is_some() {
+                            eprintln!("[int-split] round {int_split_rounds} re-solving");
+                        }
+                        continue;
+                    }
                     // If no quantifiers, we're done
                     if !self.has_quantifiers {
                         // Grade the `Sat` on the `SatLevel` lattice: it is a
@@ -1424,6 +1460,102 @@ impl Solver {
                 }
             }
         }
+    }
+
+    /// #433 (non-convex arith⇄EUF): span and re-solve caps for the int case
+    /// split. Span 12 and 48 terms per round follow the sizing upstream OxiZ
+    /// v0.3.2 shipped for the same feature — wide enough for the guard-bound
+    /// shapes that motivated it, narrow enough not to reopen the enumeration
+    /// blowup the whole family exists to avoid. The round cap bounds the
+    /// re-solve loop: each round only fires when at least one NEW term was
+    /// split, and each split term is FIXED by the added clause on the next
+    /// model, so rounds are naturally few; the cap is the backstop, not the
+    /// budget.
+    const INT_CASE_SPLIT_MAX_SPAN: i128 = 12;
+    const INT_CASE_SPLIT_MAX_TERMS_PER_ROUND: usize = 48;
+    const INT_CASE_SPLIT_MAX_ROUNDS: usize = 8;
+
+    /// Assert, for every not-yet-split EUF-shared integer term whose ASSERTED
+    /// bounds span at most [`Self::INT_CASE_SPLIT_MAX_SPAN`], the LIA
+    /// tautology `bounds ⇒ (t = lo ∨ … ∨ t = hi)` as a SAT clause. Returns how
+    /// many clauses were added; the caller re-solves when nonzero.
+    ///
+    /// The clause is CONDITIONAL on the bound atoms — each contributes the
+    /// negation of its literal in the CURRENT MODEL's polarity (a bound can
+    /// come from a negatively-assigned atom: `¬(x <= 2)` asserts `x >= 3`), so
+    /// the clause is valid on every branch of the search, not an assumption
+    /// smuggled in from this one. A reason atom the model somehow left
+    /// unassigned skips its term (defensive: `solve` returned `Sat`, so a full
+    /// model is expected).
+    ///
+    /// Fixed terms (`lo == hi`) are skipped — `model_based_combination`'s
+    /// fixed-value propagation already carries those into EUF; this exists for
+    /// exactly the terms where NO single value is entailed.
+    fn assert_int_case_splits(
+        &mut self,
+        done: &mut rustc_hash::FxHashSet<TermId>,
+        manager: &mut TermManager,
+    ) -> usize {
+        // One journal fold, then one pass over the EUF-interned terms — the
+        // simplex holds every constraint through a slack variable, so "the
+        // asserted bounds of t" comes from the assert-time unit-bound journal
+        // (`asserted_unit_int_bounds`), not from the simplex bound store.
+        let bounds = self.arith.asserted_unit_int_bounds();
+        let candidates: Vec<(TermId, i128, i128, TermId, TermId)> = {
+            let mut out = Vec::new();
+            for t in self.euf.interned_term_ids() {
+                if done.contains(&t) {
+                    continue;
+                }
+                let Some(&(Some((lo, rl)), Some((hi, rh)))) = bounds.get(&t) else {
+                    continue;
+                };
+                if lo >= hi || hi - lo > Self::INT_CASE_SPLIT_MAX_SPAN {
+                    continue;
+                }
+                out.push((t, lo, hi, rl, rh));
+                if out.len() >= Self::INT_CASE_SPLIT_MAX_TERMS_PER_ROUND {
+                    break;
+                }
+            }
+            out
+        };
+        let mut added = 0usize;
+        'cand: for (t, lo, hi, rl, rh) in candidates {
+            let mut clause: Vec<oxiz_sat::Lit> =
+                Vec::with_capacity((hi - lo) as usize + 3);
+            let mut reasons = [Some(rl), (rh != rl).then_some(rh)];
+            for r in reasons.iter_mut().flatten() {
+                let lit = self.encode(*r, manager);
+                let falsifier = match self.sat.model_value(lit.var()) {
+                    oxiz_sat::LBool::True => oxiz_sat::Lit::neg(lit.var()),
+                    oxiz_sat::LBool::False => oxiz_sat::Lit::pos(lit.var()),
+                    _ => continue 'cand,
+                };
+                clause.push(falsifier);
+            }
+            for v in lo..=hi {
+                let c = manager.mk_int(v);
+                let eq = manager.mk_eq(t, c);
+                clause.push(self.encode(eq, manager));
+            }
+            done.insert(t);
+            #[cfg(feature = "std")]
+            if std::env::var_os("OXIZ_INT_SPLIT_DBG").is_some() {
+                eprintln!(
+                    "[int-split] term={t:?} lo={lo} hi={hi} clause_len={} lits={clause:?}",
+                    clause.len()
+                );
+            }
+            let ok = self.sat.add_clause(clause);
+            #[cfg(feature = "std")]
+            if std::env::var_os("OXIZ_INT_SPLIT_DBG").is_some() {
+                eprintln!("[int-split] add_clause -> {ok}");
+            }
+            let _ = ok;
+            added += 1;
+        }
+        added
     }
 
     /// Check satisfiability under assumptions
