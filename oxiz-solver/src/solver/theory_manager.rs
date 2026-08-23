@@ -798,9 +798,24 @@ impl TheoryManager {
                 let Some(t_node) = self.euf.term_to_node(t) else {
                     continue;
                 };
+                // `OXIZ_MBC_DBG`: one line per EUF-interned term with its
+                // arith value and whether the fixed-value probe confirmed it.
+                // This is what located #434: after an int-case-split re-solve,
+                // the split term probes FIXED while a variable linked to it by
+                // a LEVEL-0 equality carries a value violating that equality —
+                // i.e. the equality is missing from the re-solve's arith
+                // state, which points at the solve-boundary theory-frame
+                // accounting, not at the split.
+                let dbg = std::env::var_os("OXIZ_MBC_DBG").is_some();
                 let Some((v, reasons)) = self.arith.fixed_value_with_reasons(t) else {
+                    if dbg {
+                        eprintln!("[mbc] {t:?}: not fixed (value={:?})", self.arith.value(t));
+                    }
                     continue;
                 };
+                if dbg {
+                    eprintln!("[mbc] {t:?}: FIXED at {v:?} ({} reasons)", reasons.len());
+                }
                 if !v.is_integer() {
                     continue;
                 }
