@@ -164,6 +164,25 @@ pub(crate) enum Constraint {
     /// the EUF solver so that congruence closure can detect conflicts
     /// (e.g., `t(m) = true` and `t(co) = false` but `m = co`).
     BoolApp(TermId),
+    /// #433: a Bool-sorted term used as a UF ARGUMENT, watched so its truth
+    /// value reaches EUF. `k(p)` vs `k(q)` with `p` and `q` both assigned true
+    /// is a congruence (`p` and `q` share the canonical true node), but nothing
+    /// told EUF the values — [`Constraint::BoolApp`] completes only Bool-valued
+    /// application RESULTS, and a plain Bool variable or an `and`/`or`/`not`
+    /// compound in argument position had no completion at all, so
+    /// `p, q, k(p) != k(q)` reported `sat`.
+    ///
+    /// `negated` handles the argument whose encoded literal is NEGATIVE
+    /// (`k((not p))` encodes the arg to `¬p`, whose variable is `p`'s): the
+    /// watched variable's assignment is then the term's value FLIPPED. On
+    /// assignment, EUF merges the term's node with the canonical true/false
+    /// node for `assignment XOR negated`.
+    BoolValue {
+        /// The Bool-sorted argument term whose node gets the value merge.
+        term: TermId,
+        /// `true` iff the watched variable holds the term's NEGATION.
+        negated: bool,
+    },
 }
 
 /// Type of arithmetic constraint

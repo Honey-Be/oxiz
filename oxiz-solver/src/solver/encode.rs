@@ -38,6 +38,105 @@ impl Solver {
     /// Compound terms that have already been fully traversed are recorded in
     /// `tracked_compound_terms` to avoid redundant O(depth) re-walks when the
     /// same sub-expression appears in multiple parent constraints.
+    /// #433: walk a theory term and put a [`Constraint::BoolValue`] watch on
+    /// every Bool-sorted UF ARGUMENT found, so the argument's truth value
+    /// reaches EUF.
+    ///
+    /// `k(p)` and `k(q)` with `p`, `q` both asserted true are congruent — both
+    /// arguments belong in the canonical true class — but `Constraint::BoolApp`
+    /// completes only Bool-valued application RESULTS, and nothing at all
+    /// completed an argument, so `p, q, k(p) != k(q)` reported `sat`.
+    ///
+    /// Called from the arms a theory term can enter the encoder through: the
+    /// non-Bool `Eq`, the arithmetic comparisons, and `Apply` itself. The walk
+    /// is needed because those arms do NOT encode their operands (they hand
+    /// them to the theory solvers as terms), so an application buried inside
+    /// `(= (k p) (k q))` never reaches the `Apply` arm of `encode`.
+    ///
+    /// Each watchable argument is ENCODED first — a compound like `(and p q)`
+    /// gets its Tseitin variable and gate clauses here if it never appeared as
+    /// an atom — and the watch lands on the encoded literal's VARIABLE with
+    /// the literal's polarity folded in (`k((not p))` watches `p`'s variable,
+    /// negated). A variable already carrying a constraint is left alone: for
+    /// `BoolApp`/`BoolValue` the value merge is already covered, and for a
+    /// theory atom (`k((= x y))`) the slot holds the atom's own constraint —
+    /// that corner keeps its historical (incomplete, sound-direction)
+    /// behaviour rather than losing the atom's theory link.
+    ///
+    /// Explicit stack (the fork's no-unguarded-recursion rule for term walks);
+    /// the `visited` set is call-local, so nothing here is assert-time state
+    /// that `pop()` would need to scrub — the registrations themselves are
+    /// trail-undone via `ConstraintAdded`. `OXIZ_NO_BOOL_ARG_CONGRUENCE`
+    /// disables the whole pass for A/B attribution.
+    pub(super) fn register_bool_arg_watches(&mut self, root: TermId, manager: &mut TermManager) {
+        if std::env::var_os("OXIZ_NO_BOOL_ARG_CONGRUENCE").is_some() {
+            return;
+        }
+        let mut stack: SmallVec<[TermId; 16]> = smallvec::smallvec![root];
+        let mut visited = FxHashSet::default();
+        while let Some(tid) = stack.pop() {
+            if !visited.insert(tid) {
+                continue;
+            }
+            let Some(t) = manager.get(tid).cloned() else {
+                continue;
+            };
+            match &t.kind {
+                TermKind::Apply { args, .. } => {
+                    let args: SmallVec<[TermId; 4]> = args.clone();
+                    for arg in args {
+                        let watchable = manager.get(arg).is_some_and(|a| {
+                            a.sort == manager.sorts.bool_sort
+                                && !matches!(a.kind, TermKind::True | TermKind::False)
+                        });
+                        if watchable {
+                            let arg_lit = self.encode(arg, manager);
+                            let watch_var = arg_lit.var();
+                            if !self.var_to_constraint.contains_key(&watch_var) {
+                                self.var_to_constraint.insert(
+                                    watch_var,
+                                    Constraint::BoolValue {
+                                        term: arg,
+                                        negated: arg_lit.is_neg(),
+                                    },
+                                );
+                                self.trail.push(TrailOp::ConstraintAdded { var: watch_var });
+                            }
+                        }
+                        stack.push(arg);
+                    }
+                }
+                TermKind::Add(args) | TermKind::Mul(args) => {
+                    stack.extend(args.iter().copied());
+                }
+                TermKind::Sub(l, r) | TermKind::Div(l, r) | TermKind::Mod(l, r) => {
+                    stack.push(*l);
+                    stack.push(*r);
+                }
+                TermKind::Neg(x) => stack.push(*x),
+                TermKind::Select(a, i) => {
+                    stack.push(*a);
+                    stack.push(*i);
+                }
+                TermKind::Store(a, i, v) => {
+                    stack.push(*a);
+                    stack.push(*i);
+                    stack.push(*v);
+                }
+                TermKind::Ite(c, th, el) => {
+                    stack.push(*c);
+                    stack.push(*th);
+                    stack.push(*el);
+                }
+                TermKind::DtConstructor { args, .. } => {
+                    stack.extend(args.iter().copied());
+                }
+                TermKind::DtSelector { arg, .. } => stack.push(*arg),
+                _ => {}
+            }
+        }
+    }
+
     pub(super) fn track_theory_vars(&mut self, term_id: TermId, manager: &TermManager) {
         let Some(term) = manager.get(term_id) else {
             return;
@@ -2038,6 +2137,29 @@ impl Solver {
                     self.sat
                         .add_clause([lhs_lit.negate(), rhs_lit.negate(), result]);
 
+                    // #433 NOTE — a `Constraint::Eq` registration was TRIED
+                    // here and REMOVED, deliberately. The iff gate alone is a
+                    // false-SAT (`(= b1 b2)`, `h(b1) = 1`, `h(b2) != 1`
+                    // reported `sat` — EUF never saw the merge), but
+                    // registering the equality as an EUF constraint cost a
+                    // measured 2-3x on the long corpus rows (7.4 s -> 21.6 s,
+                    // 18.3 s -> 49.1 s, 42 s -> guard-out), and the
+                    // `BoolValue` argument watches SUBSUME it for
+                    // completeness: Bool is a TWO-VALUED domain, so equality
+                    // is value agreement — when the equality literal is true
+                    // these gate clauses force both operands to one value and
+                    // the watches merge both nodes into the same canonical
+                    // true/false class (EUF sees them equal); when false, the
+                    // operands take opposite values and land in the two
+                    // canonical classes, which carry a `true != false`
+                    // disequality (EUF sees them apart). An operand with no
+                    // watch is a Bool that never appears as a UF argument —
+                    // its node participates in no congruence signature, so
+                    // the equality has nothing to tell EUF that the gate
+                    // clauses do not already tell the SAT core. A theory
+                    // equality over an INFINITE domain has no such value
+                    // route, which is why the non-Bool arm's registration is
+                    // load-bearing and this one was not.
                     result
                 } else {
                     // Theory equality: create a fresh boolean variable
@@ -2244,6 +2366,9 @@ impl Solver {
                 // Track theory variables for model extraction
                 self.track_theory_vars(*lhs, manager);
                 self.track_theory_vars(*rhs, manager);
+                // #433: Bool UF arguments buried in this atom.
+                self.register_bool_arg_watches(*lhs, manager);
+                self.register_bool_arg_watches(*rhs, manager);
                 Lit::pos(var)
             }
             TermKind::Le(lhs, rhs) => {
@@ -2261,6 +2386,9 @@ impl Solver {
                 // Track theory variables for model extraction
                 self.track_theory_vars(*lhs, manager);
                 self.track_theory_vars(*rhs, manager);
+                // #433: Bool UF arguments buried in this atom.
+                self.register_bool_arg_watches(*lhs, manager);
+                self.register_bool_arg_watches(*rhs, manager);
                 Lit::pos(var)
             }
             TermKind::Gt(lhs, rhs) => {
@@ -2278,6 +2406,9 @@ impl Solver {
                 // Track theory variables for model extraction
                 self.track_theory_vars(*lhs, manager);
                 self.track_theory_vars(*rhs, manager);
+                // #433: Bool UF arguments buried in this atom.
+                self.register_bool_arg_watches(*lhs, manager);
+                self.register_bool_arg_watches(*rhs, manager);
                 Lit::pos(var)
             }
             TermKind::Ge(lhs, rhs) => {
@@ -2295,6 +2426,9 @@ impl Solver {
                 // Track theory variables for model extraction
                 self.track_theory_vars(*lhs, manager);
                 self.track_theory_vars(*rhs, manager);
+                // #433: Bool UF arguments buried in this atom.
+                self.register_bool_arg_watches(*lhs, manager);
+                self.register_bool_arg_watches(*rhs, manager);
                 Lit::pos(var)
             }
             TermKind::BvConcat(_, _)
@@ -2410,7 +2544,7 @@ impl Solver {
                 let var = self.get_or_create_var(term);
                 Lit::pos(var)
             }
-            TermKind::Apply { .. } => {
+            TermKind::Apply { args, .. } => {
                 // Uninterpreted function application - theory term
                 let var = self.get_or_create_var(term);
                 // Register Bool-valued function applications as theory
@@ -2423,6 +2557,13 @@ impl Solver {
                         .insert(var, Constraint::BoolApp(term));
                     self.trail.push(TrailOp::ConstraintAdded { var });
                 }
+                // #433: watch the Bool-sorted arguments (see
+                // `register_bool_arg_watches`). This call covers a Bool-valued
+                // application appearing as an ATOM; applications buried inside
+                // a theory atom (`(= (k p) (k q))` never encodes `(k p)`) are
+                // covered by the same call from the theory-atom arms.
+                let _ = args;
+                self.register_bool_arg_watches(term, manager);
                 Lit::pos(var)
             }
             TermKind::Forall { .. } => {

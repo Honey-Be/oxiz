@@ -1037,6 +1037,22 @@ impl TheoryManager {
                     }
                     // BigInt too large for i64 -- fall through to plain intern.
                 }
+                // #433: same canonical-Bool tie as `intern_term_for_congruence`
+                // — the two intern paths must agree on where `true`/`false`
+                // land, and the `term_to_node` short-circuit at the top makes
+                // whichever runs first authoritative for the mapping.
+                TermKind::True => {
+                    let node = self.euf.intern(term);
+                    let (t, _) = self.ensure_bool_nodes();
+                    let _ = self.euf.merge(node, t, term);
+                    return node;
+                }
+                TermKind::False => {
+                    let node = self.euf.intern(term);
+                    let (_, f) = self.ensure_bool_nodes();
+                    let _ = self.euf.merge(node, f, term);
+                    return node;
+                }
                 _ => {}
             }
         }
@@ -1164,6 +1180,34 @@ impl TheoryManager {
                     }
                     self.interned_bv_constants.insert(key, new_node);
                     return new_node;
+                }
+                // #433: tie the Bool literals to the CANONICAL true/false
+                // nodes (the ones `Constraint::BoolApp` merges against).
+                // Without this, `(= b true)` merged `b` with a private
+                // per-term "true" leaf unrelated to the class a true-assigned
+                // Bool application lives in, so the two "true"s never met and
+                // congruence across them was silently lost.
+                //
+                // Intern-then-MERGE rather than returning the canonical node
+                // directly: `intern` records the real `term → node` mapping,
+                // so the other intern path (`intern_term_deep`, which carries
+                // this same arm) and any later lookup stay consistent. The
+                // merge is a tautology (`true = TRUE`), so it can never be a
+                // spurious conflict source, and its reason term having no SAT
+                // variable is fine — `terms_to_conflict_clause` skips var-less
+                // reasons, and dropping a tautology from a conflict clause
+                // keeps the clause valid.
+                TermKind::True => {
+                    let node = self.euf.intern(term);
+                    let (t, _) = self.ensure_bool_nodes();
+                    let _ = self.euf.merge(node, t, term);
+                    return node;
+                }
+                TermKind::False => {
+                    let node = self.euf.intern(term);
+                    let (_, f) = self.ensure_bool_nodes();
+                    let _ = self.euf.merge(node, f, term);
+                    return node;
                 }
                 _ => {}
             }
@@ -1882,6 +1926,23 @@ impl TheoryManager {
                     return TheoryCheckResult::Conflict(conflict_lits);
                 }
             }
+            Constraint::BoolValue { term, negated } => {
+                // #433: a Bool-sorted UF ARGUMENT's truth value, exactly the
+                // `BoolApp` completion but with the polarity of the watched
+                // literal folded in (see the variant docs).
+                let node = self.intern_term_for_congruence(term, manager);
+                let (true_node, false_node) = self.ensure_bool_nodes();
+                let value = is_positive != negated;
+                let merge_target = if value { true_node } else { false_node };
+                let constraint_term = self.term_for_var(var);
+                if let Err(_e) = self.euf.merge(node, merge_target, constraint_term) {
+                    return TheoryCheckResult::Sat;
+                }
+                if let Some(conflict_terms) = self.euf.check_conflicts() {
+                    let conflict_lits = self.terms_to_conflict_clause(&conflict_terms);
+                    return TheoryCheckResult::Conflict(conflict_lits);
+                }
+            }
         }
         TheoryCheckResult::Sat
     }
@@ -2380,7 +2441,7 @@ impl ParallelTheoryChecker {
                 | Constraint::Gt(_, _) => {
                     arith_assertions.push((*var, constraint.clone(), *is_positive));
                 }
-                Constraint::BoolApp(_) => {
+                Constraint::BoolApp(_) | Constraint::BoolValue { .. } => {
                     euf_assertions.push((*var, constraint.clone(), *is_positive));
                 }
             }
