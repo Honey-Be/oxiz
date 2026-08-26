@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Mathematical foundations for OxiZ SMT solver"
+readme = "README.md"
 keywords = ["smt", "math", "simplex", "polynomial", "algebra"]
 categories = ["algorithms", "mathematics"]
 
@@ -20,6 +21,7 @@ rustc-hash.workspace = true
 thiserror = { workspace = true, default-features = false }
 rand = { workspace = true, optional = true }
 hashbrown.workspace = true
+oxiz-time = { workspace = true }
 
 [features]
 default = ["std"]
@@ -31,6 +33,7 @@ std = [
     "thiserror/std",
     "rustc-hash/std",
     "rand",
+    "oxiz-time/std",
 ]
 # Reserved: the `simd` module is compiled unconditionally and relies on
 # auto-vectorization, so this feature currently enables no extra code. It is

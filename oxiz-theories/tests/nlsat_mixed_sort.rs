@@ -14,6 +14,14 @@
 //!
 //! Verdicts are cross-checked against Z3 semantics conceptually; no external
 //! solver is invoked.
+//!
+//! ## Feature gate
+//!
+//! The whole file exercises `oxiz_theories::nlsat`, which exists only under the
+//! `nlsat` feature (on by default) -- that feature is what pulls the
+//! `oxiz-nlsat` crate into the graph. A `--no-default-features --features std`
+//! build has no such module, so this file compiles to nothing there.
+#![cfg(feature = "nlsat")]
 
 use num_rational::Rational64;
 use oxiz_core::ast::TermManager;
@@ -52,7 +60,7 @@ fn test_qf_nira_int_square_with_real_half_is_sat() {
         "mixed Int/Real (x*x=4 ∧ y=1.5) must not be reported UNSAT — Real y must stay real"
     );
     assert!(
-        matches!(result, Some(NlDispatchResult::Sat(_))),
+        matches!(result, Some(NlDispatchResult::Sat { .. })),
         "mixed Int/Real (x*x=4 ∧ y=1.5) is satisfiable (x=±2, y=1.5)"
     );
 }
@@ -91,7 +99,7 @@ fn test_qf_nira_sat_requires_non_integral_real() {
         "a Real x in (0,1) must not be rejected as if it were an integer"
     );
     assert!(
-        matches!(result, Some(NlDispatchResult::Sat(_))),
+        matches!(result, Some(NlDispatchResult::Sat { .. })),
         "y*y=4 ∧ 0<x<1 is satisfiable (y=±2, x non-integral)"
     );
 }
@@ -109,7 +117,7 @@ fn test_qf_nia_pure_integer_square_still_sat() {
 
     let result = dispatch_nia_constraints(&[eq], &manager, true);
     assert!(
-        matches!(result, Some(NlDispatchResult::Sat(_))),
+        matches!(result, Some(NlDispatchResult::Sat { .. })),
         "x*x=4 with x:Int is SAT (x=±2)"
     );
 }
@@ -142,7 +150,7 @@ fn test_nia_dropped_disjunction_does_not_fabricate_sat() {
     let result = dispatch_nia_constraints(&[eq_prod, disj], &manager, true);
 
     assert!(
-        !matches!(result, Some(NlDispatchResult::Sat(_))),
+        !matches!(result, Some(NlDispatchResult::Sat { .. })),
         "a dropped disjunction must not let the relaxed x*y=12 be certified SAT"
     );
 }
@@ -170,7 +178,7 @@ fn test_nra_dropped_disjunction_does_not_fabricate_sat() {
     let result = dispatch_nra_constraints(&[eq_sq, disj], &manager);
 
     assert!(
-        !matches!(result, Some(NlDispatchResult::Sat(_))),
+        !matches!(result, Some(NlDispatchResult::Sat { .. })),
         "a dropped disjunction must not let the relaxed x*x=4 be certified SAT"
     );
 }
@@ -199,7 +207,7 @@ fn test_nia_untranslatable_operand_does_not_fabricate_sat() {
     let result = dispatch_nia_constraints(&[eq_sq, eq_div], &manager, true);
 
     assert!(
-        !matches!(result, Some(NlDispatchResult::Sat(_))),
+        !matches!(result, Some(NlDispatchResult::Sat { .. })),
         "an untranslatable div atom must not be dropped into a false SAT"
     );
 }

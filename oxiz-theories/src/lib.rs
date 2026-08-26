@@ -61,6 +61,24 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+// The wasm32 clock guard. Every `Instant` / `SystemTime` this crate reads goes
+// through `oxiz-time`, whose types ARE `std::time`'s on every target with a
+// working clock and frozen stubs on wasm32-unknown-unknown (which has none and
+// aborts on `Instant::now()`); see `oxiz_time`'s crate docs.
+//
+// A missing `"oxiz-time/std"` in this crate's `std` feature list would silently
+// hand a *native* build the frozen clock -- timeouts that never fire, timing
+// statistics stuck at zero. Catch that here, at compile time, instead of in
+// production.
+#[cfg(all(
+    feature = "std",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+const _: () = assert!(
+    !oxiz_time::IS_FROZEN,
+    "oxiz-time/std must be forwarded from this crate's `std` feature"
+);
+
 mod prelude;
 
 // === Always-available modules (no_std compatible) ===
@@ -106,6 +124,15 @@ pub mod nl_ground_reduce;
 #[cfg(feature = "std")]
 pub mod nl_repair_search;
 #[cfg(feature = "std")]
+pub mod nl_witness;
+/// Nonlinear arithmetic via the `oxiz-nlsat` cell-decomposition core.
+///
+/// Gated on `nlsat` (which implies `std`) rather than on `std` alone: this is
+/// the only module in the crate that reaches the `oxiz-nlsat` dependency, so
+/// it is also the only one a build that drops that dependency has to lose.
+/// Its neighbours above — `nl_eval`, `nl_ground_reduce`, `nl_repair_search` —
+/// are self-contained and stay available in every `std` build.
+#[cfg(feature = "nlsat")]
 pub mod nlsat;
 #[cfg(feature = "std")]
 pub mod sls;

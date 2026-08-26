@@ -344,11 +344,9 @@ impl ModelBuilder<'_> {
         }
 
         loop {
-            let step = match frames.last_mut() {
-                Some(top) => top.advance(&mut values, carry.take()),
-                // Only the finishing arm below empties the stack, and it
-                // returns; reaching here would mean the driver lost its root.
-                None => return None,
+            let step = {
+                let top = frames.last_mut()?;
+                top.advance(&mut values, carry.take())
             };
 
             let finished = match step {
@@ -368,9 +366,9 @@ impl ModelBuilder<'_> {
                 }
                 Step::Done(result) => result,
                 Step::Combine(kind) => {
-                    let base = match frames.last() {
-                        Some(top) => top.base,
-                        None => return None,
+                    let base = {
+                        let top = frames.last()?;
+                        top.base
                     };
                     self.combine_eager(kind, &values[base..])
                 }
@@ -908,6 +906,9 @@ mod tests {
     /// Both tests that use this pin their nesting depth against
     /// [`MAX_EVAL_DEPTH`], a production constant, so neither those depths nor
     /// this stack can be scaled without changing what they mean.
+    // STACK-1MIB: deliberately 1 MiB, not swept to 128 KiB — pins the
+    // realistic embedder worker-thread budget, not a scaled test depth.
+    // See TODO.md "v0.3.2 backlog".
     const WORKER_STACK: usize = 1 << 20;
 
     /// The stack the far-past-the-budget test runs on: one eighth of

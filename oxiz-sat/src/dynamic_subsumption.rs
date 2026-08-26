@@ -31,6 +31,32 @@
 //! - MiniSat and Glucose subsumption implementation
 //! - Eén & Biere: "Effective Preprocessing in SAT Through Variable and Clause Elimination" (2005)
 //! - Z3's subsumption implementation
+//!
+//! ## Alternative implementation — not the wired production pass
+//!
+//! [`DynamicSubsumption`] is exported but never constructed inside the
+//! solver. The self-subsumption rule it implements *is* now wired, as
+//! `Solver::self_subsuming_resolution` (`solver/self_subsumption.rs`), run
+//! from `Solver::inprocess` under
+//! [`crate::SolverConfig::enable_self_subsumption`]; plain forward
+//! subsumption runs there too, as
+//! [`crate::Preprocessor::subsumption_elimination`].
+//!
+//! The wired pass is not this one because this engine's design is
+//! *incremental*: it maintains its own `occurrences` map that the caller must
+//! keep in step through [`DynamicSubsumption::on_clause_added`] /
+//! [`DynamicSubsumption::on_clause_removed`] on every clause-database
+//! mutation — including the ones performed by clause-database reduction,
+//! vivification and variable elimination — and it *reports* actions
+//! ([`SubsumptionResult`]) rather than applying them, so a caller still has to
+//! own watch-list repair and proof emission for each one. The inprocessing
+//! pass instead rebuilds occurrence lists from scratch at each stop, which
+//! costs one linear scan per inprocessing interval and removes an entire class
+//! of desynchronization bug.
+//!
+//! Retained as the reference formulation of learn-time (rather than
+//! interval-driven) subsumption — the natural basis for a future
+//! check-on-learn hook — and exercised by this module's own tests.
 
 use crate::clause::{ClauseDatabase, ClauseId};
 use crate::literal::Lit;
@@ -173,7 +199,7 @@ impl DynamicSubsumption {
         }
 
         #[cfg(feature = "std")]
-        let start = std::time::Instant::now();
+        let start = oxiz_time::Instant::now();
         let mut results = Vec::new();
 
         self.stats.checks_performed += 1;
@@ -278,7 +304,7 @@ impl DynamicSubsumption {
         }
 
         #[cfg(feature = "std")]
-        let start = std::time::Instant::now();
+        let start = oxiz_time::Instant::now();
         let mut results = Vec::new();
 
         // Check all learned clauses against each other
@@ -307,7 +333,7 @@ impl DynamicSubsumption {
                 }
 
                 for &id_j in clause_ids[(i + 1)..].iter() {
-                    if std::time::Instant::now() > deadline {
+                    if oxiz_time::Instant::now() > deadline {
                         self.stats.checks_timeout += 1;
                         break 'outer;
                     }

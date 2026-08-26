@@ -7,13 +7,20 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Machine Learning-Guided Heuristics for OxiZ SMT Solver"
+readme = "README.md"
 keywords = ["machine-learning", "smt", "solver", "heuristics", "neural-network"]
 categories = ["algorithms", "science"]
 
 [dependencies]
 oxiz-core = { workspace = true, features = ["std"] }
 oxiz-sat = { workspace = true, features = ["std"] }
-oxiz-solver = { workspace = true, features = ["std"] }
+# `"nlsat"` is named explicitly, not inherited. The workspace dependency table
+# sets `default-features = false`, so this line's feature list is the whole
+# feature set this crate gets; before `nlsat` was split out of `oxiz-theories`'s
+# `std`, "std" alone carried the nonlinear (QF_NRA/QF_NIA) solver in. Naming it
+# keeps this crate deciding exactly the logics it decided before.
+oxiz-solver = { workspace = true, features = ["std", "nlsat"] }
+oxiz-time = { workspace = true, features = ["std"] }
 
 # Numerics & Math
 num-traits = { workspace = true, features = ["std"] }

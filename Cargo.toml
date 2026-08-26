@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "oxiz",
+    "oxiz-time",
     "oxiz-core",
     "oxiz-math",
     "oxiz-sat",
@@ -24,6 +25,7 @@ members = [
 # To build oxiz-py: cd oxiz-py && maturin build
 default-members = [
     "oxiz",
+    "oxiz-time",
     "oxiz-core",
     "oxiz-math",
     "oxiz-sat",
@@ -42,7 +44,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 # Edition 2024 itself only requires rustc 1.85, but the workspace makes
 # pervasive use of let-chains (`if ... && let Some(x) = ... { }`, ~350
@@ -72,20 +74,33 @@ collapsible_if = "allow"
 
 [workspace.dependencies]
 # Meta crate
-oxiz = { version = "0.3.2", path = "oxiz" }
+oxiz = { version = "0.3.3", path = "oxiz" }
+
+# Wasm-safe `std::time` drop-ins. Bottom of the workspace DAG (no deps of its
+# own) and depended on by every crate that reads a clock: `std::time::Instant`
+# aborts on wasm32-unknown-unknown, and OxiZ reads it on the main check-sat
+# path. See oxiz-time/src/lib.rs.
+#
+# `default-features = false` here matches the other core crates, so a consumer
+# that writes `{ workspace = true }` inherits *no* std. Every crate in this
+# workspace therefore states its own intent explicitly -- either
+# `features = ["std"]` on its dependency line, or `"oxiz-time/std"` in its own
+# `std` feature list. Getting that wrong is caught at compile time by the
+# `const _: () = assert!(!oxiz_time::IS_FROZEN)` guard each consumer carries.
+oxiz-time = { version = "0.3.3", path = "oxiz-time", default-features = false }
 
 # Core crates (default-features = false so downstream can control std)
-oxiz-core = { version = "0.3.2", path = "oxiz-core", default-features = false }
-oxiz-math = { version = "0.3.2", path = "oxiz-math", default-features = false }
-oxiz-sat = { version = "0.3.2", path = "oxiz-sat", default-features = false }
-oxiz-nlsat = { version = "0.3.2", path = "oxiz-nlsat" }
-oxiz-theories = { version = "0.3.2", path = "oxiz-theories", default-features = false }
-oxiz-solver = { version = "0.3.2", path = "oxiz-solver", default-features = false }
-oxiz-opt = { version = "0.3.2", path = "oxiz-opt" }
-oxiz-spacer = { version = "0.3.2", path = "oxiz-spacer" }
-oxiz-proof = { version = "0.3.2", path = "oxiz-proof" }
-oxiz-smtcomp = { version = "0.3.2", path = "oxiz-smtcomp" }
-oxiz-ml = { version = "0.3.2", path = "oxiz-ml" }
+oxiz-core = { version = "0.3.3", path = "oxiz-core", default-features = false }
+oxiz-math = { version = "0.3.3", path = "oxiz-math", default-features = false }
+oxiz-sat = { version = "0.3.3", path = "oxiz-sat", default-features = false }
+oxiz-nlsat = { version = "0.3.3", path = "oxiz-nlsat" }
+oxiz-theories = { version = "0.3.3", path = "oxiz-theories", default-features = false }
+oxiz-solver = { version = "0.3.3", path = "oxiz-solver", default-features = false }
+oxiz-opt = { version = "0.3.3", path = "oxiz-opt" }
+oxiz-spacer = { version = "0.3.3", path = "oxiz-spacer" }
+oxiz-proof = { version = "0.3.3", path = "oxiz-proof" }
+oxiz-smtcomp = { version = "0.3.3", path = "oxiz-smtcomp" }
+oxiz-ml = { version = "0.3.3", path = "oxiz-ml" }
 
 # Memory & Interning
 bumpalo = "3.20"
@@ -162,8 +177,8 @@ web-sys = { version = "0.3", features = [
 wasm-bindgen-test = "0.3"
 
 # Compression (OxiARC - Pure Rust)
-oxiarc-deflate = "0.4.0"
-oxiarc-brotli = "0.4.0"
+oxiarc-deflate = "0.4.1"
+oxiarc-brotli = "0.4.1"
 
 # PDF (Pure Rust)
 pdf-writer = "0.15"
@@ -195,6 +210,9 @@ chrono = "0.4"
 # NOTE: never add "extension-module" here -- see oxiz-py/Cargo.toml
 pyo3 = { version = "0.29", features = ["num-bigint"] }
 
+# Deliberately size-tuned (opt-level = "z") for wasm builds. This is NOT the
+# profile to use for benchmarks, timing claims, or SMT-COMP builds -- use
+# `release-speed` below for those.
 [profile.release]
 opt-level = "z"
 lto = true
@@ -202,8 +220,16 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
-[profile.bench]
+# Speed-tuned profile for benchmarks, timing claims, and SMT-COMP builds; the
+# default release profile above stays size-tuned for wasm.
+[profile.release-speed]
 inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+
+[profile.bench]
+inherits = "release-speed"
 debug = true
 
 [profile.dev]

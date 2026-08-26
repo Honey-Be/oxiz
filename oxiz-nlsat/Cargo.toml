@@ -7,12 +7,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Non-linear arithmetic solver for OxiZ (CAD-based)"
+readme = "README.md"
 keywords = ["smt", "nlsat", "nonlinear", "arithmetic", "cad"]
 categories = ["algorithms", "mathematics"]
 
 [dependencies]
 oxiz-core = { workspace = true, features = ["std"] }
 oxiz-math = { workspace = true, features = ["std"] }
+oxiz-time = { workspace = true, features = ["std"] }
 num-rational = { workspace = true, features = ["std"] }
 num-bigint = { workspace = true, features = ["std"] }
 num-traits = { workspace = true, features = ["std"] }

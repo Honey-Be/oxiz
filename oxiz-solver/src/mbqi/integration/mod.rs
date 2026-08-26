@@ -12,9 +12,9 @@ use oxiz_core::ast::traversal::collect_free_vars_including_patterns;
 use oxiz_core::ast::{TermId, TermKind, TermManager};
 use oxiz_core::interner::Spur;
 use oxiz_core::sort::{SortId, SortKind};
-use smallvec::SmallVec;
 #[cfg(feature = "std")]
-use std::time::{Duration, Instant};
+use oxiz_time::{Duration, Instant};
+use smallvec::SmallVec;
 
 use super::conflict_driven::ConflictScores;
 use super::counterexample::CounterExampleGenerator;
@@ -738,6 +738,16 @@ impl MBQIIntegration {
                         .min(FINITE_ENUM_LIMIT),
                 )
             }
+            // `RoundingMode` has exactly five elements, but reporting
+            // `Some(5)` here would be unsound: this bound is a promise that
+            // the *generator* really enumerates that many candidates, and the
+            // candidate list is built from the completed model's universe plus
+            // same-sort model values — neither of which seeds the five modes
+            // for a non-uninterpreted sort.  Claiming finiteness would let
+            // `all_domains_finitely_exhausted` report an exhaustion that never
+            // happened.  Until the generator seeds them, `None` (= "not
+            // finitely enumerated") is the honest answer.
+            SortKind::RoundingMode => None,
             // Int / Real / String are infinite; BitVec / FloatingPoint /
             // Array / Datatype / parametric sorts are not exhaustively
             // enumerated by the finite candidate sampler.
