@@ -134,6 +134,25 @@ pub(crate) struct TheoryManager {
     /// disequality edges — bounded by the number of *distinct* integer literal
     /// values in the original formula, not by the total number of term IDs
     /// created across all MBQI iterations (which grows without bound).
+    ///
+    /// **#434 — this map travels with `euf` across solve boundaries and is NOT
+    /// per-round scratch.** It is a derived index over the PERSISTENT EUF node
+    /// space, and `intern_term_for_congruence` returns early for a term EUF has
+    /// already interned:
+    ///
+    /// ```ignore
+    /// if let Some(idx) = self.euf.term_to_node(term) { return idx; }
+    /// ```
+    ///
+    /// so a value whose constant node was created in an earlier round can never
+    /// re-register here. Reinitialising the map while `euf` persists therefore
+    /// disabled BOTH of its jobs from the second round on — the entailed-value
+    /// merge in `model_based_combination` (which looks the canonical node up by
+    /// value) and the pairwise constant-disequality edges — silently, and in
+    /// the false-`sat` direction. Staleness after a `pop` is handled the way it
+    /// always was, by evicting entries whose node index is past
+    /// `euf.node_count()`; that eviction is what makes carrying the map
+    /// forward safe.
     interned_int_constants: FxHashMap<i64, u32>,
     /// Canonical EUF nodes for distinct bit-vector constant *values*, keyed by
     /// `(value, width)`.  Mirrors `interned_int_constants` but for the BV theory:
@@ -534,6 +553,12 @@ fn encode_bv_term_recursive(
 pub(crate) struct TheoryParts {
     pub manager: TermManager,
     pub euf: EufSolver,
+    /// #434: canonical EUF nodes for distinct integer / bit-vector constant
+    /// VALUES. These travel WITH `euf` because they are a derived index OVER
+    /// it, not per-solve scratch — see the field docs on
+    /// `TheoryManager::interned_int_constants`.
+    pub interned_int_constants: FxHashMap<i64, u32>,
+    pub interned_bv_constants: FxHashMap<(u64, u32), u32>,
     pub arith: ArithSolver,
     pub bv: BvSolver,
     pub bv_terms: FxHashSet<TermId>,
@@ -552,10 +577,13 @@ impl TheoryManager {
         max_decisions: u64,
         has_bv_arith_ops: bool,
         suppress_stale_bounds: bool,
+        persist_const_index: bool,
     ) -> Self {
         let TheoryParts {
             manager,
             euf,
+            interned_int_constants,
+            interned_bv_constants,
             arith,
             bv,
             bv_terms,
@@ -565,6 +593,20 @@ impl TheoryManager {
             var_to_term,
             statistics,
         } = parts;
+        // #434: the maps are carried forward with `euf`, then re-evicted
+        // against the LIVE node count. The eviction is defensive: the per-pop
+        // eviction already keeps them consistent within one manager's
+        // lifetime, but a manager boundary is not a pop, so nothing else
+        // guarantees the node indices are still in range if EUF was truncated
+        // between solves. An entry evicted here simply re-registers on use.
+        let live_nodes = euf.node_count();
+        let (mut interned_int_constants, mut interned_bv_constants) = if persist_const_index {
+            (interned_int_constants, interned_bv_constants)
+        } else {
+            (FxHashMap::default(), FxHashMap::default())
+        };
+        interned_int_constants.retain(|_v, &mut n| (n as usize) < live_nodes);
+        interned_bv_constants.retain(|_k, &mut n| (n as usize) < live_nodes);
         Self {
             manager: Arc::new(manager),
             euf,
@@ -589,8 +631,8 @@ impl TheoryManager {
             max_conflicts,
             max_decisions,
             has_bv_arith_ops,
-            interned_int_constants: FxHashMap::default(),
-            interned_bv_constants: FxHashMap::default(),
+            interned_int_constants,
+            interned_bv_constants,
             assigned_phase: FxHashMap::default(),
             bool_true_node: None,
             bool_false_node: None,
@@ -612,6 +654,8 @@ impl TheoryManager {
         TheoryParts {
             manager,
             euf: self.euf,
+            interned_int_constants: self.interned_int_constants,
+            interned_bv_constants: self.interned_bv_constants,
             arith: self.arith,
             bv: self.bv,
             bv_terms: self.bv_terms,
@@ -806,16 +850,22 @@ impl TheoryManager {
                 // i.e. the equality is missing from the re-solve's arith
                 // state, which points at the solve-boundary theory-frame
                 // accounting, not at the split.
-                let dbg = std::env::var_os("OXIZ_MBC_DBG").is_some();
+                // `OXIZ_MBC_DBG`: one line per EUF-interned term — its printed
+                // form, its arith value, and whether the fixed-value probe
+                // confirmed it. Written for #434; the printed form is the point,
+                // since a bare `TermId` in this trace was misread once already.
+                if std::env::var_os("OXIZ_MBC_DBG").is_some() {
+                    let mgr = Arc::clone(&self.manager);
+                    let pr = oxiz_core::smtlib::Printer::new(&mgr);
+                    eprintln!(
+                        "[mbc] {} ({t:?}): value={:?}",
+                        pr.print_term(t),
+                        self.arith.value(t)
+                    );
+                }
                 let Some((v, reasons)) = self.arith.fixed_value_with_reasons(t) else {
-                    if dbg {
-                        eprintln!("[mbc] {t:?}: not fixed (value={:?})", self.arith.value(t));
-                    }
                     continue;
                 };
-                if dbg {
-                    eprintln!("[mbc] {t:?}: FIXED at {v:?} ({} reasons)", reasons.len());
-                }
                 if !v.is_integer() {
                     continue;
                 }
@@ -834,7 +884,9 @@ impl TheoryManager {
                 if t_node == const_node || self.euf.are_equal(t_node, const_node) {
                     continue;
                 }
-                // Entailed merge: fires congruence; reason is a placeholder.
+                // Entailed merge: fires congruence. The EUF reason is a
+                // PLACEHOLDER (the term itself), so record what actually
+                // justifies the edge — see `arith_merge_justifications`.
                 let _ = self.euf.merge(t_node, const_node, t);
                 self.pending_arith_eq_reasons.extend(reasons);
                 progress = true;

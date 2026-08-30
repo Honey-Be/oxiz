@@ -542,6 +542,40 @@ pub struct SolverConfig {
     /// (the `OXIZ_MBQI_GUARD_MS` convention); `0` restores the historical loop
     /// exactly.
     pub mbqi_instance_budget: usize,
+    /// **#434 — carry the canonical integer/BV constant index across the
+    /// per-round `TheoryManager`. DEFAULT `false`, and the default is a
+    /// deliberate choice to keep a KNOWN completeness bug rather than ship an
+    /// unsoundness.**
+    ///
+    /// `TheoryManager::interned_int_constants` is a derived index over the
+    /// PERSISTENT `euf`, but it is rebuilt empty on every `TheoryManager`
+    /// construction — once per iteration of `check_level`'s loop. Since
+    /// `intern_term_for_congruence` returns early for a term EUF already
+    /// interned, a value registered in round 1 can never re-register, so from
+    /// round 2 on the index is permanently empty and both of its jobs stop:
+    /// `model_based_combination`'s entailed-value merge (which looks the
+    /// canonical node up BY VALUE) and the pairwise constant-disequality edges.
+    /// That is a real bug, and it loses conflicts — the false-`sat` direction.
+    ///
+    /// Turning it on measurably closes those (see
+    /// `corpus-triage/434-*.smt2`), and measurably OPENS a false-`unsat`:
+    /// re-enabling the merge in later rounds makes the solver refute
+    /// satisfiable scripts that `z3` and `cvc5` both call `sat` — reproduced
+    /// down to a script with no case split and no quantifiers, where the only
+    /// ingredient is asserting a valid clause AFTER a `(check-sat)` and
+    /// re-solving. The merge is recorded in the EUF proof forest with a
+    /// PLACEHOLDER reason (the merged term, which has no SAT variable), so a
+    /// conflict explained through that edge produces a clause the theory does
+    /// not entail. Widening the clause at the two MBC conflict sites does not
+    /// cover a conflict detected anywhere else, and an attempt to attach a
+    /// per-edge justification did not close the repro either.
+    ///
+    /// The design that closes #434 without this hazard asserts ACKERMANN
+    /// lemmas — `(or (not (= a_i b_i)) ... (= (f a) (f b)))`, valid in FOL with
+    /// equality and therefore independent of the model, the decision level and
+    /// every value map — instead of merging. Until that lands, a completeness
+    /// bug in the `sat` direction is strictly preferable to a false proof.
+    pub persist_const_index: bool,
 }
 
 impl Default for SolverConfig {
@@ -580,6 +614,7 @@ impl SolverConfig {
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
             mbqi_instance_budget: 0,
+            persist_const_index: false,
         }
     }
 
@@ -612,6 +647,7 @@ impl SolverConfig {
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
             mbqi_instance_budget: 0,
+            persist_const_index: false,
         }
     }
 
@@ -644,6 +680,7 @@ impl SolverConfig {
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
             mbqi_instance_budget: 0,
+            persist_const_index: false,
         }
     }
 
@@ -676,6 +713,7 @@ impl SolverConfig {
             ccfv_model_compl: false,
             mbqi_additive_patterns: false,
             mbqi_instance_budget: 0,
+            persist_const_index: false,
         }
     }
 

@@ -991,6 +991,14 @@ impl Context {
             // only a wall bound. A value that does not parse is IGNORED rather
             // than treated as `0`: silently disabling a bound the caller asked
             // for is the wrong direction to fail in.
+            // #434: see `SolverConfig::persist_const_index` — OFF by default
+            // and deliberately so; it trades a known completeness bug for the
+            // absence of a known unsoundness.
+            "oxiz.persist-const-index" => {
+                let mut config = self.solver.config().clone();
+                config.persist_const_index = value == "true";
+                self.solver.set_config(config);
+            }
             "oxiz.mbqi-instance-budget" => {
                 if let Ok(n) = value.parse::<usize>() {
                     let mut config = self.solver.config().clone();

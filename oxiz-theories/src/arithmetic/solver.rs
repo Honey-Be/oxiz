@@ -920,12 +920,22 @@ impl ArithSolver {
         }
         let high_infeasible = match self.check() {
             Ok(TheoryResult::Unsat(rs)) => {
+                // #434: the conflict must actually USE the probe's own bound.
+                // If the explanation never mentions it, the state was ALREADY
+                // infeasible and this `Unsat` says nothing about `term` — every
+                // term would then read as "fixed" at whatever `value()` last
+                // returned, with a reason set that omits the literals the
+                // caller will build a conflict clause from. That clause is a
+                // FALSE GLOBAL constraint: measured on
+                // `434-*-anti-over-merge`, it killed a satisfiable branch the
+                // solver had not explored yet and turned `sat` into `unsat`.
+                let used_probe = rs.contains(&term);
                 for r in rs {
                     if r != term && !reasons.contains(&r) {
                         reasons.push(r);
                     }
                 }
-                true
+                used_probe
             }
             _ => false,
         };
@@ -943,12 +953,14 @@ impl ArithSolver {
         }
         let low_infeasible = match self.check() {
             Ok(TheoryResult::Unsat(rs)) => {
+                // Same guard as the HIGH side — see there.
+                let used_probe = rs.contains(&term);
                 for r in rs {
                     if r != term && !reasons.contains(&r) {
                         reasons.push(r);
                     }
                 }
-                true
+                used_probe
             }
             _ => false,
         };

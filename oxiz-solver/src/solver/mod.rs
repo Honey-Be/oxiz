@@ -151,6 +151,12 @@ pub struct Solver {
     pub(super) var_to_term: Vec<TermId>,
     /// SAT variable to theory constraint mapping
     pub(super) var_to_constraint: FxHashMap<Var, Constraint>,
+    /// #434: canonical EUF nodes for distinct integer / bit-vector constant
+    /// VALUES, parked here between solves. They are a derived index over the
+    /// persistent `euf` and must outlive the per-round `TheoryManager`; see
+    /// `TheoryManager::interned_int_constants`.
+    pub(super) interned_int_constants: FxHashMap<i64, u32>,
+    pub(super) interned_bv_constants: FxHashMap<(u64, u32), u32>,
     /// SAT variable to parsed arithmetic constraint mapping
     pub(super) var_to_parsed_arith: FxHashMap<Var, ParsedArithConstraint>,
     /// Current logic
@@ -333,6 +339,8 @@ impl Solver {
             term_to_var: FxHashMap::default(),
             var_to_term: Vec::new(),
             var_to_constraint: FxHashMap::default(),
+            interned_int_constants: FxHashMap::default(),
+            interned_bv_constants: FxHashMap::default(),
             var_to_parsed_arith: FxHashMap::default(),
             logic: None,
             assertions: Vec::new(),
@@ -583,6 +591,8 @@ impl Solver {
         let parts = TheoryParts {
             manager: core::mem::take(manager),
             euf: core::mem::take(&mut self.euf),
+            interned_int_constants: core::mem::take(&mut self.interned_int_constants),
+            interned_bv_constants: core::mem::take(&mut self.interned_bv_constants),
             arith: core::mem::take(&mut self.arith),
             bv: core::mem::take(&mut self.bv),
             bv_terms: core::mem::take(&mut self.bv_terms),
@@ -607,6 +617,7 @@ impl Solver {
             // a conflict with <2 distinct atom terms — provably no real reason),
             // so always-on restores soundness without risking a spurious sat.
             true,
+            self.config.persist_const_index,
         )
     }
 
@@ -617,6 +628,8 @@ impl Solver {
         let parts = tm.into_parts();
         *manager = parts.manager;
         self.euf = parts.euf;
+        self.interned_int_constants = parts.interned_int_constants;
+        self.interned_bv_constants = parts.interned_bv_constants;
         self.arith = parts.arith;
         self.bv = parts.bv;
         self.bv_terms = parts.bv_terms;
