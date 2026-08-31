@@ -243,25 +243,38 @@ impl<W: Write + Send> LratWriter<W> {
         self.next_id += 1;
 
         if let Some(writer) = &mut self.writer {
-            // LRAT format: <id> <lits> 0 [<hints>] 0
+            // LRAT addition line: `<id> <lits> 0 <hints> 0`.
+            //
+            // BACKPORT from upstream v0.3.3, whose comment describes this
+            // implementation exactly. The hint section is a mandatory part of
+            // every LRAT *addition* line and MUST always be terminated by a
+            // trailing `0`, even when there are no hints. Emitting a hint-less
+            // line (`<id> <lits> 0`) — as this did for original clauses and any
+            // clause added with an empty hint slice — produces a line with a
+            // single `0` terminator, which a checker parses as "literals
+            // continue" and then chokes on the missing second `0`. Writing the
+            // second `0` unconditionally yields the well-formed
+            // `<id> <lits> 0 0` for the empty-hint case.
+            //
+            // This was not academic: `oxiz-proof`'s newly-ported
+            // `lrat_check::check_lrat_proof` rejected our own writer's output
+            // with "line 1: addition line missing hint terminator 0", so the
+            // producer and the checker in this same tree did not agree on the
+            // format. `add_original_clause` passes empty hints ALWAYS, which
+            // made every original-clause line unparseable.
             write!(writer, "{} ", clause_id)?;
 
-            // Write literals
+            // Write literals, then their terminating `0`.
             for &lit in lits {
                 write!(writer, "{} ", lit.to_dimacs())?;
             }
-            write!(writer, "0")?;
+            write!(writer, "0 ")?;
 
-            // Write hints if provided
-            if !hints.is_empty() {
-                write!(writer, " ")?;
-                for &hint in hints {
-                    write!(writer, "{} ", hint)?;
-                }
-                write!(writer, "0")?;
+            // Write hints (possibly none) followed by the mandatory terminating `0`.
+            for &hint in hints {
+                write!(writer, "{} ", hint)?;
             }
-
-            writeln!(writer)?;
+            writeln!(writer, "0")?;
         }
 
         Ok(clause_id)
@@ -272,6 +285,26 @@ impl<W: Write + Send> LratWriter<W> {
     /// Original clauses are added with their sequential IDs
     pub fn add_original_clause(&mut self, lits: &[Lit]) -> std::io::Result<u64> {
         self.add_clause(lits, &[])
+    }
+
+    /// Consume the next sequential id for an ORIGINAL clause WITHOUT writing a
+    /// line. BACKPORT from upstream v0.3.3.
+    ///
+    /// An LRAT checker numbers the input formula `1..=N` from the accompanying
+    /// CNF, in file order, and never expects those clauses to reappear as
+    /// addition lines — only DERIVED clauses and deletions do.
+    /// [`Self::add_original_clause`] predates that distinction mattering here:
+    /// it writes every original as a hint-less addition line, which is harmless
+    /// for a checker that reads clause content out of the LRAT stream itself,
+    /// and wrong for one handed the formula separately.
+    ///
+    /// Use this when a producer's original-clause ids must line up with an
+    /// external CNF numbering — which is the case for `oxiz-proof`'s
+    /// `lrat_check::check_lrat_proof`, the checker in this same tree.
+    pub fn reserve_original_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Log clause deletion
@@ -860,6 +893,11 @@ mod tests {
             !b_bytes.is_empty(),
             "reassigned sink must receive the clause bytes"
         );
-        assert_eq!(b_bytes, b"1 1 2 0\n");
+        // Empty-hint LRAT addition lines carry the mandatory trailing hint `0`,
+        // so the well-formed form is `1 1 2 0 0` (literals `0`, then hints `0`).
+        // This assertion previously pinned `1 1 2 0` — it was pinning the format
+        // BUG, which is why the malformed output survived until the checker was
+        // ported into this tree and rejected it.
+        assert_eq!(b_bytes, b"1 1 2 0 0\n");
     }
 }
