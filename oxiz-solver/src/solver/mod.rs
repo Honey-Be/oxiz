@@ -1691,6 +1691,14 @@ impl Solver {
         done: &mut rustc_hash::FxHashSet<(TermId, TermId)>,
         manager: &mut TermManager,
     ) -> usize {
+        // Read ONCE. The pair loop below is quadratic in a symbol's application
+        // count, and this file's own rule (see `EufSolver::uselist_dbg`) is that
+        // a flag consulted in a hot path is read per solver, not per iteration.
+        #[cfg(feature = "std")]
+        let dbg = std::env::var_os("OXIZ_ACKERMANN_DBG").is_some();
+        #[cfg(not(feature = "std"))]
+        let dbg = false;
+
         // Group the EUF-interned applications by (symbol, arity). Only
         // applications EUF knows about can be in a disagreement it is party to.
         let mut by_sym: rustc_hash::FxHashMap<(oxiz_core::interner::Spur, usize), Vec<TermId>> =
@@ -1703,7 +1711,7 @@ impl Solver {
         }
 
         #[cfg(feature = "std")]
-        if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+        if dbg {
             eprintln!(
                 "[ackermann] scan: {} interned, {} apply-groups {:?}",
                 self.euf.interned_term_ids().len(),
@@ -1762,7 +1770,7 @@ impl Solver {
                         }
                     }
                     #[cfg(feature = "std")]
-                    if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+                    if dbg {
                         let vals: Vec<_> = pa
                             .iter()
                             .zip(qa.iter())
@@ -1805,7 +1813,7 @@ impl Solver {
             clause.push(self.encode(concl, manager));
             done.insert(key);
             #[cfg(feature = "std")]
-            if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+            if dbg {
                 eprintln!("[ackermann] {p:?} vs {q:?} clause_len={} lits={clause:?}", clause.len());
             }
             let _ = self.sat.add_clause(clause);

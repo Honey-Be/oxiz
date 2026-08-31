@@ -25,6 +25,22 @@
 //!
 //! These tests therefore pin BOTH sides: the default behaviour (so a change of
 //! default is loud), and what the option buys (so the knowledge is not lost).
+//!
+//! # UPDATE — #434 is closed, and this option is not what closed it
+//!
+//! The obligation above (`ENTAILED_IN_ROUND_TWO`) is now refuted on the
+//! DEFAULT path, by Ackermann lemmas: the congruence clause
+//! `(x1 ≠ 3) ∨ (f0(x1) = f0(3))` is valid in first-order logic with equality,
+//! so it discharges the arrangement without merging on a model-chosen value
+//! and without any of the soundness debt described above. See
+//! `oxiz-solver/tests/ackermann_arrangement.rs`.
+//!
+//! What that leaves this file: the index gap is still REAL (the description of
+//! the mechanism above is unchanged and correct), but it is no longer the only
+//! route to the shape it was blocking, so `persist_const_index` has lost its
+//! motivating use case. Its remaining job is reproducing #435 — the false
+//! `unsat` that turning it ON exposes, whose cause is still unlocated. Do not
+//! read the option's continued existence as an endorsement of enabling it.
 
 use oxiz_solver::Context;
 

@@ -49,6 +49,8 @@ pub mod lazy;
 pub mod lean;
 pub mod lean_enhanced;
 pub mod lfsc;
+/// Pure-Rust LRAT proof checker, ported verbatim from upstream `v0.3.3`.
+pub mod lrat_check;
 pub mod merge;
 pub mod metadata;
 pub mod minimize;
