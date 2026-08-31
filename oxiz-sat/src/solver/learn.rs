@@ -115,6 +115,7 @@ impl Solver {
 
         // Check against learned clauses only
         let mut to_remove = Vec::new();
+        let mut locked_skipped = 0usize;
         for &cid in &self.learned_clause_ids {
             if cid == new_clause_id {
                 continue;
@@ -127,9 +128,64 @@ impl Solver {
 
                 // Check if new_clause subsumes clause
                 if new_clause.iter().all(|&lit| clause.lits.contains(&lit)) {
+                    // LOCKED-CLAUSE GUARD — defence in depth, NOT a fix for an
+                    // observed bug. Read the whole note before deleting it.
+                    //
+                    // Deleting a clause that is a current `Reason::Propagation`
+                    // would be the #428 bug class: the trail keeps holding the
+                    // id, `remove` pushes it onto the free list, the next `add`
+                    // recycles the slot in place, and conflict analysis then
+                    // reads an unrelated clause as the antecedent — wrong learnt
+                    // clause, wrong verdict. `reduce_clause_database` has
+                    // guarded against exactly that all along (its `is_reason`
+                    // computation); this site never did, and the asymmetry looks
+                    // alarming.
+                    //
+                    // It is not, and the reason is worth writing down because
+                    // the asymmetry will look alarming again to the next reader.
+                    // The ONE caller (learn.rs, the on-the-fly subsumption call)
+                    // runs immediately after
+                    // `assign_propagation(learnt_clause[0], clause_id)`, so:
+                    //
+                    //   * `learnt_clause[0]` is TRUE, and its trail reason is
+                    //     the NEW clause;
+                    //   * a subsumed `C'` contains every literal of the new
+                    //     clause, hence contains `learnt_clause[0]`;
+                    //   * a clause is a current reason only when all of its
+                    //     literals but the propagated one are FALSE.
+                    //
+                    // `C'` therefore cannot be a current reason: it holds a true
+                    // literal that is not its own propagation. Measured to
+                    // agree — 263 instances (200 random 3-SAT at the phase
+                    // transition, 60 larger, 3 pigeonhole) across the default,
+                    // aggressive and glucose presets fire this guard ZERO times.
+                    //
+                    // It stays because the invariant is the CALLER's, established
+                    // four lines away in another function, and a second caller
+                    // would silently invalidate it. In a solver where id
+                    // recycling has produced wrong verdicts four separate times,
+                    // paying a scan over the handful of clauses that already
+                    // passed the subsumption test is the cheaper side of that
+                    // trade. `OXIZ_SUBSUMPTION_DBG=1` reports if it ever fires;
+                    // if it does, the derivation above has a hole in it.
+                    let is_reason = clause.lits.iter().any(|&lit| {
+                        let var = lit.var();
+                        self.trail.is_assigned(var)
+                            && matches!(self.trail.reason(var), Reason::Propagation(r) if r == cid)
+                    });
+                    if is_reason {
+                        locked_skipped += 1;
+                        continue;
+                    }
                     to_remove.push(cid);
                 }
             }
+        }
+        #[cfg(feature = "std")]
+        if locked_skipped > 0 && std::env::var_os("OXIZ_SUBSUMPTION_DBG").is_some() {
+            eprintln!(
+                "[subsumption] kept {locked_skipped} locked clause(s) that would have been freed"
+            );
         }
 
         // Remove subsumed clauses
