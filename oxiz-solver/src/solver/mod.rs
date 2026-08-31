@@ -904,6 +904,9 @@ impl Solver {
         // and per-round caps live in `assert_int_case_splits`.
         let mut int_split_rounds = 0usize;
         let mut int_split_done: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+        let mut ack_rounds = 0usize;
+        let mut ack_done: rustc_hash::FxHashSet<(TermId, TermId)> =
+            rustc_hash::FxHashSet::default();
 
         // Propagate the wall-clock deadline INTO the ground SAT solver so a single
         // non-terminating ground solve (e.g. a dense-real f-tower instance set)
@@ -1030,6 +1033,26 @@ impl Solver {
                         #[cfg(feature = "std")]
                         if std::env::var_os("OXIZ_INT_SPLIT_DBG").is_some() {
                             eprintln!("[int-split] round {int_split_rounds} re-solving");
+                        }
+                        continue;
+                    }
+                    // #434 — the ARRANGEMENT obligation. The case split above
+                    // FORCES a shared term to a value, which the existing
+                    // propagation then carries into EUF; it cannot help when
+                    // two terms merely AGREE in the model without either being
+                    // pinned. The Ackermann lemma covers exactly that, and
+                    // being valid in FOL with equality it is safe on every
+                    // branch — see `assert_ackermann_lemmas`. Ordered after the
+                    // split so the cheaper, more informative completion runs
+                    // first.
+                    if ack_rounds < Self::ACKERMANN_MAX_ROUNDS
+                        && std::env::var_os("OXIZ_NO_ACKERMANN").is_none()
+                        && self.assert_ackermann_lemmas(&mut ack_done, manager) > 0
+                    {
+                        ack_rounds += 1;
+                        #[cfg(feature = "std")]
+                        if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+                            eprintln!("[ackermann] round {ack_rounds} re-solving");
                         }
                         continue;
                     }
@@ -1566,6 +1589,226 @@ impl Solver {
                 eprintln!("[int-split] add_clause -> {ok}");
             }
             let _ = ok;
+            added += 1;
+        }
+        added
+    }
+
+    const ACKERMANN_MAX_PAIRS_PER_ROUND: usize = 32;
+    const ACKERMANN_MAX_ROUNDS: usize = 8;
+
+    /// Assert ACKERMANN lemmas for #434 — the Nelson-Oppen ARRANGEMENT
+    /// obligation this solver never discharged.
+    ///
+    /// # The gap
+    ///
+    /// `model_based_combination` catches only one direction: EUF says two
+    /// shared terms are equal while arithmetic gives them different values.
+    /// The other direction is #434 — the arithmetic model gives `x1` and `3`
+    /// the same value, but nothing ever tells EUF so, leaving `(f0 x1)` and
+    /// `(f0 3)` free to differ. The reported "model" is then not a FUNCTION.
+    ///
+    /// # Why a lemma and not a merge
+    ///
+    /// The tempting repair is to propagate the equality the model exhibits.
+    /// That is unsound, and measurably so: the model's value for `x1` is
+    /// CHOSEN, not entailed, so merging on it mints refutations of branches
+    /// the search has not explored (2 fabricated `unsat` per 200 seeds of
+    /// `arith_euf_merge_diff.py` when `persist_const_index` did exactly this).
+    ///
+    /// An Ackermann lemma
+    ///
+    /// ```text
+    /// (a₁ ≠ b₁) ∨ … ∨ (aₙ ≠ bₙ) ∨ (f(a⃗) = f(b⃗))
+    /// ```
+    ///
+    /// is VALID in first-order logic with equality — it is congruence written
+    /// as a clause. It holds in every model, so it does not depend on this
+    /// model, this decision level, or any value map, and adding it can never
+    /// turn a satisfiable problem unsatisfiable. It can only expose an
+    /// inconsistency that was already there. That is the whole reason this
+    /// approach was chosen over the merge: soundness stops being an argument
+    /// about when the propagation is justified.
+    ///
+    /// # The model's only job
+    ///
+    /// The model picks WHICH pair to Ackermannize — emitting all `O(k²)` pairs
+    /// eagerly is what makes textbook Ackermannization unaffordable. A pair is
+    /// worth a lemma when EUF does not already know the applications are equal
+    /// and every argument pair agrees in the current arithmetic model, because
+    /// that is exactly the configuration in which the reported model is not a
+    /// function. Being wrong about that costs a useless clause, never a wrong
+    /// verdict.
+    ///
+    /// Arguments without an arithmetic value are skipped, so this covers the
+    /// EUF↔arith arrangement (the #434 shape) and not yet arrangements over
+    /// other shared sorts.
+    /// The arithmetic model value of `t`, treating a NUMERIC LITERAL as its own
+    /// value.
+    ///
+    /// `ArithSolver::value` resolves through its variable interner, and a
+    /// literal like `3` never becomes a variable — so it answers `None`. That
+    /// is correct for the simplex and wrong for "what does the model say this
+    /// term is", which is the question the Ackermann pair filter asks. Without
+    /// this fallback the filter rejected every pair in the #434 repro, since
+    /// each one compares a variable against a literal.
+    ///
+    /// Integer terms go through `rounded_int_value`, which is what
+    /// [`ModelBuilder`] itself uses — it prefers the branch-and-bound integer
+    /// model over the simplex's rational vertex. Reading `value()` instead was
+    /// the second bug in this filter: on the #434 repro the simplex vertex said
+    /// `x1 = 2` while the model that would actually be REPORTED said `x1 = 3`,
+    /// so the lemma was emitted for the wrong pair — correct, valid, and
+    /// useless. A filter that guesses which pair to Ackermannize has to read
+    /// the same model the verdict will be built from.
+    fn model_value_of(&self, t: TermId, manager: &TermManager) -> Option<oxiz_theories::ArithRat> {
+        if let Some(term) = manager.get(t) {
+            match &term.kind {
+                TermKind::IntConst(v) => {
+                    let n: i128 = i128::try_from(v).ok()?;
+                    return Some(oxiz_theories::ArithRat::from_integer(n));
+                }
+                TermKind::RealConst(r) => {
+                    return Some(oxiz_theories::ArithRat::new(
+                        i128::from(*r.numer()),
+                        i128::from(*r.denom()),
+                    ));
+                }
+                _ => {}
+            }
+            if term.sort == manager.sorts.int_sort {
+                return self
+                    .arith
+                    .rounded_int_value(t)
+                    .map(oxiz_theories::ArithRat::from_integer);
+            }
+        }
+        self.arith.value(t)
+    }
+
+    fn assert_ackermann_lemmas(
+        &mut self,
+        done: &mut rustc_hash::FxHashSet<(TermId, TermId)>,
+        manager: &mut TermManager,
+    ) -> usize {
+        // Group the EUF-interned applications by (symbol, arity). Only
+        // applications EUF knows about can be in a disagreement it is party to.
+        let mut by_sym: rustc_hash::FxHashMap<(oxiz_core::interner::Spur, usize), Vec<TermId>> =
+            rustc_hash::FxHashMap::default();
+        for t in self.euf.interned_term_ids() {
+            let Some(term) = manager.get(t) else { continue };
+            if let TermKind::Apply { func, args } = &term.kind {
+                by_sym.entry((*func, args.len())).or_default().push(t);
+            }
+        }
+
+        #[cfg(feature = "std")]
+        if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+            eprintln!(
+                "[ackermann] scan: {} interned, {} apply-groups {:?}",
+                self.euf.interned_term_ids().len(),
+                by_sym.len(),
+                by_sym.iter().map(|(k, v)| (k.1, v.len())).collect::<Vec<_>>()
+            );
+        }
+        let mut candidates: Vec<(TermId, TermId, Vec<(TermId, TermId)>)> = Vec::new();
+        'group: for apps in by_sym.values() {
+            for i in 0..apps.len() {
+                for j in (i + 1)..apps.len() {
+                    let (p, q) = (apps[i], apps[j]);
+                    let key = if p < q { (p, q) } else { (q, p) };
+                    if done.contains(&key) {
+                        continue;
+                    }
+                    // Already congruent: the lemma would be a tautology the
+                    // solver has nothing to learn from.
+                    let (Some(pn), Some(qn)) = (self.euf.term_to_node(p), self.euf.term_to_node(q))
+                    else {
+                        continue;
+                    };
+                    if self.euf.are_equal(pn, qn) {
+                        continue;
+                    }
+                    let (Some(pt), Some(qt)) = (manager.get(p), manager.get(q)) else {
+                        continue;
+                    };
+                    let (
+                        TermKind::Apply { args: pa, .. },
+                        TermKind::Apply { args: qa, .. },
+                    ) = (&pt.kind, &qt.kind)
+                    else {
+                        continue;
+                    };
+                    // Every argument pair must AGREE in the arithmetic model —
+                    // that is what makes the reported model a non-function.
+                    //
+                    // A pair that fails this rejects THAT PAIR only. Rejecting
+                    // the whole symbol group here was the first version's bug:
+                    // in the #434 repro `f0(2)` vs `f0(3)` disagrees and would
+                    // have abandoned `f0` entirely, never reaching the `f0(3)`
+                    // vs `f0(x1)` pair that is the actual defect.
+                    let mut pairs = Vec::with_capacity(pa.len());
+                    let mut usable = true;
+                    for (&a, &b) in pa.iter().zip(qa.iter()) {
+                        if a == b {
+                            continue;
+                        }
+                        match (self.model_value_of(a, manager), self.model_value_of(b, manager)) {
+                            (Some(va), Some(vb)) if va == vb => pairs.push((a, b)),
+                            _ => {
+                                usable = false;
+                                break;
+                            }
+                        }
+                    }
+                    #[cfg(feature = "std")]
+                    if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+                        let vals: Vec<_> = pa
+                            .iter()
+                            .zip(qa.iter())
+                            .map(|(&a, &b)| {
+                                (
+                                    self.model_value_of(a, manager),
+                                    self.model_value_of(b, manager),
+                                )
+                            })
+                            .collect();
+                        eprintln!(
+                            "[ackermann]   pair {p:?}/{q:?} usable={usable} pairs={} vals={vals:?}",
+                            pairs.len()
+                        );
+                    }
+                    if !usable || pairs.is_empty() {
+                        // Syntactically identical arguments — EUF should
+                        // already have these congruent, so there is nothing to
+                        // add and a unit `f(a⃗) = f(b⃗)` would be asserting a
+                        // fact rather than a lemma.
+                        continue;
+                    }
+                    candidates.push((p, q, pairs));
+                    if candidates.len() >= Self::ACKERMANN_MAX_PAIRS_PER_ROUND {
+                        break 'group;
+                    }
+                }
+            }
+        }
+
+        let mut added = 0usize;
+        for (p, q, pairs) in candidates {
+            let key = if p < q { (p, q) } else { (q, p) };
+            let mut clause: Vec<oxiz_sat::Lit> = Vec::with_capacity(pairs.len() + 1);
+            for (a, b) in pairs {
+                let eq = manager.mk_eq(a, b);
+                clause.push(self.encode(eq, manager).negate());
+            }
+            let concl = manager.mk_eq(p, q);
+            clause.push(self.encode(concl, manager));
+            done.insert(key);
+            #[cfg(feature = "std")]
+            if std::env::var_os("OXIZ_ACKERMANN_DBG").is_some() {
+                eprintln!("[ackermann] {p:?} vs {q:?} clause_len={} lits={clause:?}", clause.len());
+            }
+            let _ = self.sat.add_clause(clause);
             added += 1;
         }
         added

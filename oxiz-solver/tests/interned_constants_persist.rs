@@ -55,15 +55,28 @@ const ENTAILED_IN_ROUND_TWO: &str = "(set-logic QF_UFLIA)\n\
      (assert (not (= a b)))\n\
      (check-sat)\n";
 
-/// DEFAULT behaviour, pinned so that flipping the default is a test change and
-/// not a silent one: the conflict is MISSED and the answer is the sound-but-
-/// incomplete `sat`. z3 and cvc5 both say `unsat`.
+/// DEFAULT behaviour. **This gap is now CLOSED, and not by this option.**
+///
+/// It used to pin `sat` — the sound-but-incomplete answer — because the only
+/// known repair was `persist_const_index`, which buys the merge at the price of
+/// fabricated refutations. #434's Ackermann lemmas close the same shape from
+/// the other side: they add the congruence CLAUSE
+/// `(x1 ≠ 3) ∨ (f0(x1) = f0(3))`, which is valid in FOL with equality and so
+/// costs no soundness at all. The default now agrees with z3 and cvc5.
+///
+/// Attribution, so this is not mistaken for the option finally working:
+/// `OXIZ_NO_ACKERMANN=1` puts the `sat` back, while `persist_const_index` stays
+/// off throughout.
+///
+/// The consequence for this file is worth stating plainly: the obligation the
+/// option existed to discharge is discharged elsewhere, soundly. What keeps the
+/// option in the tree is now only its role as the #435 reproducer.
 #[test]
-fn the_default_still_misses_the_second_round_conflict() {
+fn the_default_closes_the_second_round_conflict_via_ackermann() {
     assert_eq!(
         verdict(ENTAILED_IN_ROUND_TWO),
-        "sat",
-        "known gap — see the module docs and `persist_const_index`"
+        "unsat",
+        "#434's Ackermann lemmas close this without the unsound merge"
     );
 }
 
