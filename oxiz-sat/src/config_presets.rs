@@ -76,6 +76,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: true, // LRB for structured problems
             enable_inprocessing: true,
+            enable_vivification: true,
             inprocessing_interval: 5000,
             enable_chronological_backtrack: true,
             chrono_backtrack_threshold: 100,
@@ -102,7 +103,8 @@ impl ConfigPreset {
             enable_lazy_hyper_binary: false,
             use_chb_branching: false,
             use_lrb_branching: false,   // VSIDS for random
-            enable_inprocessing: false, // Less helpful for random
+            enable_inprocessing: false,
+            enable_vivification: true, // Less helpful for random
             inprocessing_interval: 10000,
             enable_chronological_backtrack: false,
             chrono_backtrack_threshold: 100,
@@ -130,6 +132,7 @@ impl ConfigPreset {
             use_chb_branching: true, // CHB good for crypto
             use_lrb_branching: false,
             enable_inprocessing: true,
+            enable_vivification: true,
             inprocessing_interval: 10000,
             enable_chronological_backtrack: true,
             chrono_backtrack_threshold: 50,
@@ -157,6 +160,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: true,
             enable_inprocessing: true,
+            enable_vivification: true,
             inprocessing_interval: 3000, // More frequent
             enable_chronological_backtrack: true,
             chrono_backtrack_threshold: 100,
@@ -184,6 +188,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: false,
             enable_inprocessing: false,
+            enable_vivification: true,
             inprocessing_interval: 20000,
             enable_chronological_backtrack: false,
             chrono_backtrack_threshold: 100,
@@ -211,6 +216,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: true,
             enable_inprocessing: true,
+            enable_vivification: true,
             inprocessing_interval: 2000,
             enable_chronological_backtrack: true,
             chrono_backtrack_threshold: 200,
@@ -234,6 +240,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: false, // VSIDS like Glucose
             enable_inprocessing: false,
+            enable_vivification: true,
             inprocessing_interval: 10000,
             enable_chronological_backtrack: false,
             chrono_backtrack_threshold: 100,
@@ -257,6 +264,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: false, // Classic VSIDS
             enable_inprocessing: false,
+            enable_vivification: true,
             inprocessing_interval: 10000,
             enable_chronological_backtrack: false,
             chrono_backtrack_threshold: 100,
@@ -280,6 +288,7 @@ impl ConfigPreset {
             use_chb_branching: false,
             use_lrb_branching: false, // VMTF in real CaDiCaL
             enable_inprocessing: true,
+            enable_vivification: true,
             inprocessing_interval: 4000,
             enable_chronological_backtrack: true,
             chrono_backtrack_threshold: 100,

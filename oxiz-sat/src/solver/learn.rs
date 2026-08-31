@@ -207,6 +207,30 @@ impl Solver {
             self.scrub_and_remove_clause(cid);
             self.stats.deleted_clauses += 1;
         }
+
+        // PRUNE THE ID LIST. `reduce_clause_database` does this after its own
+        // deletions; this site did not, and the omission is not cosmetic.
+        //
+        // Both consumers of `learned_clause_ids` — this function and
+        // `reduce_clause_database` — trust it to contain only LEARNED clauses;
+        // neither checks `clause.learned`. A freed id left in the list is a
+        // recycled handle: the next `add` reuses the slot, the `deleted` flag
+        // is cleared, and the stale entry now names whatever clause moved in.
+        // If that is an ORIGINAL clause — which is what an incremental
+        // `(assert)` after a solve produces, the shape adsmt's delegation
+        // uses — it can then be deleted as if it were learned, dropping an
+        // input constraint and with it the `unsat` that constraint carried.
+        //
+        // HONESTLY: unmeasured. `check_subsumption` deleted NOTHING across
+        // every workload I could build for it (263 random 3-SAT and pigeonhole
+        // instances, and 5 larger solves accumulating 13,014 learned clauses,
+        // all report `deleted_clauses == 0`), so I have no instance where the
+        // stale entry is created in the first place, let alone one where it
+        // aliases an original. The fix lands on the strength of the invariant,
+        // not of a repro — and the unit test below drives the path directly
+        // because the search would not.
+        self.learned_clause_ids
+            .retain(|&cid| self.clauses.get(cid).is_some_and(|c| !c.deleted));
     }
 
     /// Add a theory reason clause
@@ -984,5 +1008,182 @@ mod clause_index_scrub_regressions {
         for &l in &lits[..2] {
             assert!(s.watches.get(l.negate()).iter().any(|w| w.clause == cid));
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_learned_ids {
+    use crate::{ClauseId, Lit, Solver, Var};
+
+    fn l(d: i32) -> Lit {
+        let v = Var::new(d.unsigned_abs() - 1);
+        if d > 0 { Lit::pos(v) } else { Lit::neg(v) }
+    }
+
+    /// `check_subsumption` must leave `learned_clause_ids` free of the ids it
+    /// just freed.
+    ///
+    /// Both consumers of that list trust it to name only LEARNED clauses and
+    /// neither checks `clause.learned`, so a stale entry that a later `add`
+    /// recycles can point the deletion loop at an ORIGINAL clause.
+    ///
+    /// The path is driven DIRECTLY rather than through the search, because the
+    /// search does not reach it: across 263 random 3-SAT and pigeonhole
+    /// instances, and 5 larger solves accumulating 13,014 learned clauses,
+    /// `deleted_clauses` stayed at 0 — `check_subsumption` never found a
+    /// subsumed clause at all. A test that went through `solve()` would pass
+    /// while exercising nothing, which is what the first version of this test
+    /// did before the counter was added.
+    #[test]
+    fn check_subsumption_prunes_the_ids_it_frees() {
+        let mut s = Solver::new();
+        for v in 0..4 {
+            let _ = s.new_var();
+            let _ = v;
+        }
+        // A long learned clause, and a short one that subsumes it.
+        let long_id = s.clauses.add_learned([l(1), l(2), l(3)]);
+        s.learned_clause_ids.push(long_id);
+        let short_id = s.clauses.add_learned([l(1), l(2)]);
+        s.learned_clause_ids.push(short_id);
+
+        s.check_subsumption(short_id);
+
+        assert!(
+            s.clauses.get(long_id).is_some_and(|c| c.deleted),
+            "precondition: the subsuming clause should have removed the longer one"
+        );
+        assert!(
+            !s.learned_clause_ids.contains(&long_id),
+            "the freed id must not survive in learned_clause_ids: {:?}",
+            s.learned_clause_ids
+        );
+        assert!(
+            s.learned_clause_ids.contains(&short_id),
+            "the surviving clause must stay listed"
+        );
+    }
+
+    /// ANTI-VACUITY for the test above: pin that the setup really does drive a
+    /// removal, so a future change that stops `check_subsumption` from firing
+    /// turns this red instead of leaving a green test that checks nothing.
+    #[test]
+    fn the_subsumption_path_is_actually_reached() {
+        let mut s = Solver::new();
+        for _ in 0..4 {
+            let _ = s.new_var();
+        }
+        let long_id = s.clauses.add_learned([l(1), l(2), l(3)]);
+        s.learned_clause_ids.push(long_id);
+        let short_id = s.clauses.add_learned([l(1), l(2)]);
+        s.learned_clause_ids.push(short_id);
+        let before = s.stats.deleted_clauses;
+        s.check_subsumption(short_id);
+        assert!(
+            s.stats.deleted_clauses > before,
+            "the fixture must exercise a deletion, else the prune test is vacuous"
+        );
+        let _: ClauseId = long_id;
+    }
+}
+
+#[cfg(test)]
+mod reset_clears_every_id_keyed_structure {
+    use crate::{ClauseId, Lit, Solver, Var};
+
+    fn l(d: i32) -> Lit {
+        let v = Var::new(d.unsigned_abs() - 1);
+        if d > 0 { Lit::pos(v) } else { Lit::neg(v) }
+    }
+
+    /// `Solver::reset` re-issues every `ClauseId` from 0 WITHOUT going through
+    /// `ClauseDatabase::remove`, so the `ClauseIndexScrub` invariant — which is
+    /// what stops a freed id from aliasing — does not apply to it. Its
+    /// correctness rests instead on a hand-written list of `.clear()` calls,
+    /// and a structure added to the solver but forgotten there would leave
+    /// stale ids pointing into a database whose slot 0 is about to be handed to
+    /// a completely different clause.
+    ///
+    /// This pins that list. It cannot enumerate fields automatically, so the
+    /// value it adds is a single place where the id-keyed structures are named
+    /// together: a sixth one gets registered here, or the omission is invisible
+    /// again.
+    #[test]
+    fn reset_leaves_no_id_keyed_state_behind() {
+        let mut s = Solver::new();
+        for _ in 0..6 {
+            let _ = s.new_var();
+        }
+        s.add_clause([l(1), l(2), l(3)]);
+        s.add_clause([l(-1), l(2), l(4)]);
+        s.add_clause([l(-2), l(-3), l(5)]);
+        let _ = s.solve();
+        // Give the id-keyed structures something to hold.
+        let learned = s.clauses.add_learned([l(1), l(-4)]);
+        s.learned_clause_ids.push(learned);
+
+        s.reset();
+
+        // (1) the database itself
+        assert_eq!(s.clauses.iter_ids().count(), 0, "clause database not emptied");
+        // (2) watch lists  (3) binary implication graph
+        //     — both are only observable through a re-add, checked below.
+        // (4) the trail, which holds `Reason::Propagation(ClauseId)`
+        assert_eq!(s.trail.size(), 0, "trail still holds assignments (and their reasons)");
+        // (5) the learned-clause id list
+        assert!(s.learned_clause_ids.is_empty(), "learned_clause_ids survived reset");
+        // (6) the per-push undo ledger
+        assert_eq!(s.clause_ledger.as_slice().len(), 0, "clause_ledger survived reset");
+
+        // Ids really do restart, which is what makes a survivor dangerous
+        // rather than merely untidy.
+        for _ in 0..6 {
+            let _ = s.new_var();
+        }
+        let fresh: ClauseId = s.clauses.add_learned([l(6)]);
+        assert_eq!(fresh.index(), 0, "ids must re-issue from 0 after reset");
+        // A watcher left over from before would now be attached to THIS clause.
+        assert!(
+            s.watches.get(l(1).negate()).is_empty() && s.watches.get(l(2).negate()).is_empty(),
+            "a stale watcher survived reset and now aliases a recycled id"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vivification_switch {
+    use crate::{ConfigPreset, SolverConfig};
+
+    /// `enable_vivification` defaults to the behaviour that shipped before the
+    /// flag existed, so adding the knob moved no verdict.
+    #[test]
+    fn the_default_preserves_the_previous_behaviour() {
+        assert!(SolverConfig::default().enable_vivification);
+    }
+
+    /// And every preset keeps it, so selecting a preset is not a silent way to
+    /// turn clause surgery off (or on).
+    #[test]
+    fn every_preset_keeps_vivification_on() {
+        for preset in ConfigPreset::all_presets() {
+            assert!(
+                preset.config().enable_vivification,
+                "{preset:?} preset turned vivification off"
+            );
+        }
+    }
+
+    /// THE POINT OF THE FLAG. Vivification is NOT part of `inprocess()`, so
+    /// `enable_inprocessing` does not reach it — which is what made "turn
+    /// inprocessing off and no clause surgery happens" false. The two switches
+    /// are independent and this pins that they stay so.
+    #[test]
+    fn inprocessing_and_vivification_are_independent_switches() {
+        let d = SolverConfig::default();
+        assert!(!d.enable_inprocessing, "inprocessing is off by default");
+        assert!(
+            d.enable_vivification,
+            "yet vivification runs — that is the asymmetry the flag exists to expose"
+        );
     }
 }

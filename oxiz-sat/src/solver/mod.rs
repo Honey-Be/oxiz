@@ -198,6 +198,25 @@ pub struct SolverConfig {
     pub use_lrb_branching: bool,
     /// Enable inprocessing (periodic preprocessing during search)
     pub enable_inprocessing: bool,
+    /// Enable clause VIVIFICATION during search.
+    ///
+    /// Separate from [`Self::enable_inprocessing`] because vivification is NOT
+    /// part of `inprocess()` — it runs from the main `solve()` loop, gated only
+    /// on being at level 0 after every tenth restart following a database
+    /// reduction. "Turn inprocessing off and no clause surgery happens" was
+    /// therefore false, and an LRAT-producer design relied on exactly that
+    /// belief before it was checked.
+    ///
+    /// It matters beyond the surprise: `strengthen_clause_in_place` keeps a
+    /// clause's `ClauseId` while REPLACING its literals, so an id no longer
+    /// names the same clause content over time. That is a second id-instability
+    /// mechanism, entirely independent of the free list, and anything keeping a
+    /// long-lived map from `ClauseId` to something else — a proof-id table,
+    /// most obviously — has to either handle it or switch this off.
+    ///
+    /// Defaults to `true`, which is the behaviour that shipped before the flag
+    /// existed; this exposes the knob without moving any verdict.
+    pub enable_vivification: bool,
     /// Inprocessing interval (number of conflicts between inprocessing)
     pub inprocessing_interval: u64,
     /// Enable chronological backtracking
@@ -224,6 +243,7 @@ impl core::fmt::Debug for SolverConfig {
             .field("use_chb_branching", &self.use_chb_branching)
             .field("use_lrb_branching", &self.use_lrb_branching)
             .field("enable_inprocessing", &self.enable_inprocessing)
+            .field("enable_vivification", &self.enable_vivification)
             .field("inprocessing_interval", &self.inprocessing_interval)
             .field(
                 "enable_chronological_backtrack",
@@ -271,6 +291,7 @@ impl Default for SolverConfig {
             use_chb_branching: false,
             use_lrb_branching: false,
             enable_inprocessing: false,
+            enable_vivification: true,
             inprocessing_interval: 5000,
             enable_chronological_backtrack: true,
             chrono_backtrack_threshold: 100,
@@ -1116,8 +1137,11 @@ impl Solver {
                     self.reduce_clause_database();
                     self.conflicts_since_deletion = 0;
 
-                    // Vivification after clause database reduction (at level 0 after restart)
-                    if self.stats.restarts.is_multiple_of(10) {
+                    // Vivification after clause database reduction (at level 0
+                    // after restart). NOTE the gate: this is NOT behind
+                    // `enable_inprocessing` — vivification is not part of
+                    // `inprocess()` — so it runs on the DEFAULT search path.
+                    if self.config.enable_vivification && self.stats.restarts.is_multiple_of(10) {
                         let saved_level = self.trail.decision_level();
                         if saved_level == 0 {
                             self.vivify_clauses();

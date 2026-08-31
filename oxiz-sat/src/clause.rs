@@ -272,6 +272,35 @@ impl Clause {
 /// recurrence: there is no way to free an id without naming the indexes that
 /// have to be scrubbed, so the compiler asks the question at every call site.
 ///
+/// # The guarantee is ONE-SIDED — read this before relying on it
+///
+/// It covers the **single-clause** path, and only that. Two limits, both of
+/// which have already misled a reader (me, 2026-08-31, while scoping an LRAT
+/// producer that would have keyed a proof-id map off this invariant):
+///
+/// 1. **Bulk invalidation bypasses it entirely.** `Solver::reset` does
+///    `self.clauses = ClauseDatabase::new()`, which invalidates every id at
+///    once and re-issues from `0` on the next `add` — with no `remove` call, no
+///    `scrub_clause` call, and no question asked by the compiler. It is correct
+///    today only because `reset` then clears each id-keyed structure BY HAND,
+///    which is precisely the discipline this trait exists to abolish. It is
+///    reachable from SMT-LIB `(reset)` / `(reset-assertions)`.
+///
+/// 2. **The solver's sink is two structures; there are more.**
+///    `Solver::clause_indexes` builds it from `watches` and `binary_graph`.
+///    Also keyed on `ClauseId`, and NOT scrubbed here: the trail's
+///    `Reason::Propagation(ClauseId)`, `learned_clause_ids`, and
+///    `clause_ledger`. The trail is deliberately outside — a reason cannot be
+///    detached, so removal sites guard with a locked-clause check instead — but
+///    the other two are each pruned ad hoc at their own call sites, which is
+///    how `check_subsumption` came to leave stale ids behind for as long as it
+///    did.
+///
+/// So: "the compiler will not let an id be freed unsafely" is true of one path
+/// and false as a general statement about this solver. Anything that keys a
+/// long-lived map off `ClauseId` — a proof-id table, an external index — needs
+/// to handle bulk invalidation on its own.
+///
 /// # Contract
 ///
 /// `scrub_clause` is called with the clause's *current* literals, **before**
