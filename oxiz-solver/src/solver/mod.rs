@@ -1597,6 +1597,37 @@ impl Solver {
     const ACKERMANN_MAX_PAIRS_PER_ROUND: usize = 32;
     const ACKERMANN_MAX_ROUNDS: usize = 8;
 
+    // BUDGET CAPS WERE TRIED AND REJECTED BY MEASUREMENT (2026-08-31).
+    //
+    // The corpus gate showed this mechanism gains 5 rows and LOSES 3
+    // (`fuel-recursion-2/ob13` 5s unsat -> 32s unknown, `seq-vstd-2/ob07`
+    // 13s -> 25s unknown, `seq-vstd-3/ob05` 39s -> timeout; all three
+    // deterministic across repeats and all three restored by
+    // `OXIZ_NO_ACKERMANN=1`, so the whole cost is attributable here).
+    //
+    // The obvious reading was "it burns budget", since the pair walk is
+    // quadratic in a symbol's application count and the emit cap bounds
+    // lemmas rather than the SCAN — measured at 32,713 pair evaluations on
+    // ob13 across 8 rounds, from two symbols carrying 59 applications each.
+    // Two caps were built and measured against that reading:
+    //
+    //   config                      ob13      sv2/ob07  sv3/ob05  dm3/ob11
+    //   no Ackermann                unsat 5s  unsat 13s unsat 39s timeout
+    //   as shipped (8 rounds, no scan cap)
+    //                               unk 32s   unk 25s   TIMEOUT   UNSAT
+    //   rounds 8 -> 3               unk 37s   unk 37s   unk 55s   timeout
+    //   scan capped at 4096 pairs   unk 32s   unk 37s   unk 55s   timeout
+    //
+    // Neither cap recovers a single lost row, and both COST `dm3/ob11` —
+    // a row the full budget converts. So the cost is not the budget: it is
+    // the lemmas themselves changing the search, and their new atoms feeding
+    // the quantifier instantiation loop. Capping only truncates the walk
+    // before it reaches the productive pairs.
+    //
+    // Shipping uncapped is therefore the measured best of the three, at a
+    // disclosed net of +2 rows. If a cheaper policy exists it is a SELECTION
+    // rule — which pairs deserve a lemma — not a smaller number.
+
     /// Assert ACKERMANN lemmas for #434 — the Nelson-Oppen ARRANGEMENT
     /// obligation this solver never discharged.
     ///
